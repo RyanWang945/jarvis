@@ -153,6 +153,41 @@ def test_deepseek_planner_sends_tools_and_parses_tool_calls(monkeypatch) -> None
     assert plans == [ToolCallPlan(tool_name="echo", tool_args={"text": "selected by model"})]
 
 
+def test_deepseek_completion_assessment_parses_json(monkeypatch) -> None:
+    captured_payload = {}
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"decision": "failed", "summary": "DoD was not satisfied."}'
+                        }
+                    }
+                ]
+            }
+
+    def fake_post(*args, **kwargs):
+        captured_payload.update(kwargs["json"])
+        return FakeResponse()
+
+    monkeypatch.setattr("app.llm.deepseek.httpx.post", fake_post)
+
+    client = DeepSeekClient(api_key="test-key")
+    assessment = client.assess_completion(
+        task={"title": "Assess output", "dod": "Covers tradeoffs"},
+        result={"ok": True, "summary": "Short answer"},
+        can_retry=True,
+    )
+
+    assert captured_payload["response_format"] == {"type": "json_object"}
+    assert assessment == {"decision": "failed", "summary": "DoD was not satisfied."}
+
+
 def test_inline_worker_runs_shell_work_order(tmp_path) -> None:
     client = InlineWorkerClient()
     order = WorkOrder(
@@ -410,6 +445,57 @@ def test_aggregate_uses_semantic_assessment_only_for_non_objective_success(monke
     assert update["next_node"] == "summarize"
     assert update["task_list"][0]["status"] == "success"
     assert update["task_list"][0]["result_summary"] == "semantic success"
+
+
+def test_aggregate_llm_assessment_can_fail_non_objective_success(monkeypatch) -> None:
+    from app.agent.nodes import aggregate
+    from app.agent.state import initial_state
+
+    monkeypatch.setenv("JARVIS_PLANNER_TYPE", "llm")
+    monkeypatch.setenv("JARVIS_DEEPSEEK_API_KEY", "test-key")
+    get_settings.cache_clear()
+
+    def fake_assess_completion(self, *, task, result, can_retry):
+        return {"decision": "failed", "summary": "LLM says DoD was not met."}
+
+    monkeypatch.setattr("app.agent.nodes.DeepSeekClient.assess_completion", fake_assess_completion)
+
+    event = build_user_event(instruction="Assess narrative result")
+    state = initial_state(event, thread_id="thread-assess-2")
+    state["task_list"] = [
+        {
+            "id": "task-1",
+            "title": "Assess narrative result",
+            "description": "Assess narrative result",
+            "status": "running",
+            "resource_key": None,
+            "dod": "Answer covers the important tradeoffs.",
+            "verification_cmd": None,
+            "tool_name": "delegate_to_claude_code",
+            "tool_args": {"instruction": "write assessment"},
+            "worker_type": "coder",
+            "order_id": "order-1",
+            "retry_count": 0,
+            "max_retries": 0,
+            "result_summary": None,
+        }
+    ]
+    state["worker_results"] = {
+        "order-1": WorkResult(
+            order_id="order-1",
+            task_id="task-1",
+            ca_thread_id="thread-assess-2",
+            worker_type="coder",
+            ok=True,
+            summary="worker succeeded",
+        ).model_dump()
+    }
+
+    update = aggregate(state)
+
+    assert update["next_node"] == "blocked"
+    assert update["task_list"][0]["status"] == "failed"
+    assert update["task_list"][0]["result_summary"] == "LLM says DoD was not met."
 
 
 def test_wait_approval_interrupt_and_reject(tmp_path, monkeypatch) -> None:

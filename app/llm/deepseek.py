@@ -87,6 +87,46 @@ class DeepSeekClient:
             return plans
         return _legacy_json_plans(message)
 
+    def assess_completion(
+        self,
+        *,
+        task: dict[str, Any],
+        result: dict[str, Any],
+        can_retry: bool,
+    ) -> dict[str, str]:
+        message = self.chat(
+            [
+                LLMMessage(
+                    role="system",
+                    content=(
+                        "You are Jarvis Completion Assessor. Decide whether a completed worker "
+                        "result satisfies the task's definition of done. Return strict JSON only. "
+                        "Allowed decisions: success, retry, failed, blocked. Use retry only when "
+                        "the issue is likely fixable by rerunning the same work and can_retry is true. "
+                        "Use failed when the worker output shows the task did not satisfy the DoD. "
+                        "Use blocked when human input or missing external context is required."
+                    ),
+                ),
+                LLMMessage(
+                    role="user",
+                    content=json.dumps(
+                        {
+                            "task": task,
+                            "worker_result": result,
+                            "can_retry": can_retry,
+                            "response_schema": {
+                                "decision": "success | retry | failed | blocked",
+                                "summary": "short reason",
+                            },
+                        },
+                        ensure_ascii=False,
+                    ),
+                ),
+            ],
+            response_format={"type": "json_object"},
+        )
+        return _completion_assessment_from_message(message, can_retry=can_retry)
+
 
 def _tool_to_chat_tool(tool: ToolSpec) -> dict[str, Any]:
     parameters = tool.args_schema or {"type": "object", "properties": {}}
@@ -149,6 +189,21 @@ def _legacy_json_plans(message: dict[str, Any]) -> list[ToolCallPlan]:
             )
         )
     return plans
+
+
+def _completion_assessment_from_message(message: dict[str, Any], *, can_retry: bool) -> dict[str, str]:
+    content = message.get("content")
+    if not isinstance(content, str) or not content.strip():
+        return {"decision": "success", "summary": "Worker completed successfully."}
+
+    body = json.loads(content)
+    decision = str(body.get("decision") or "success").strip().lower()
+    if decision not in {"success", "retry", "failed", "blocked"}:
+        decision = "success"
+    if decision == "retry" and not can_retry:
+        decision = "failed"
+    summary = _clean_string(body.get("summary")) or "Completion assessment finished."
+    return {"decision": decision, "summary": summary}
 
 
 def _parse_arguments(value: object) -> dict[str, Any]:

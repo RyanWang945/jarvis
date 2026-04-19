@@ -447,12 +447,30 @@ def _assess_task_completion_semantically(
     task: Task,
     result: WorkResult | None,
 ) -> CompletionAssessment:
-    # Placeholder for LLM-based DoD assessment. Until that is wired, a successful
-    # Worker result is treated as success after deterministic checks have passed.
-    if result and result.ok:
+    if result is None:
+        return CompletionAssessment("blocked", "Worker result missing.")
+    settings = get_settings()
+    if settings.planner_type != "llm" or not settings.deepseek_api_key:
         return CompletionAssessment("success", result.summary)
-    summary = "Worker result missing." if result is None else (result.summary or result.stderr or "Worker failed.")
-    return CompletionAssessment("blocked", summary)
+
+    try:
+        assessment = DeepSeekClient(
+            api_key=settings.deepseek_api_key,
+            base_url=settings.deepseek_base_url,
+            model=settings.deepseek_model,
+            timeout_seconds=settings.deepseek_timeout_seconds,
+        ).assess_completion(
+            task=_task_assessment_payload(task),
+            result=result.model_dump(),
+            can_retry=_can_retry(task),
+        )
+    except Exception as exc:
+        return CompletionAssessment("success", f"{result.summary} Completion assessment unavailable: {exc}")
+
+    decision = assessment["decision"]
+    if decision == "retry" and not _can_retry(task):
+        decision = "failed"
+    return CompletionAssessment(decision, assessment["summary"])
 
 
 def _is_objective_success(task: Task) -> bool:
@@ -468,6 +486,19 @@ def _is_objective_success(task: Task) -> bool:
     ):
         return True
     return False
+
+
+def _task_assessment_payload(task: Task) -> dict[str, Any]:
+    return {
+        "id": task["id"],
+        "title": task["title"],
+        "description": task["description"],
+        "dod": task.get("dod"),
+        "tool_name": task.get("tool_name"),
+        "worker_type": task.get("worker_type"),
+        "retry_count": task.get("retry_count"),
+        "max_retries": task.get("max_retries"),
+    }
 
 
 def _retry_task(

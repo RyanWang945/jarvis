@@ -183,7 +183,7 @@ v2.0 新增：
 | P2-M6-3 | 实现 Worker 完成事件路由 | `EventBus` + `DispatcherService` 投递回调 | P0 | Done |
 | P2-M6-4 | 实现 `Command(resume=worker_result)` | Worker 完成后唤醒 CA Agent | P0 | Done |
 | P2-M6-5 | 实现 Worker 超时取消 | `cancel()` 终止超时的 Worker | P1 | Pending |
-| P2-M6-6 | 实现 `aggregate` 的 LLM 决策 | 复杂场景接入 LLM 判断是否重新规划 | P1 | Pending |
+| P2-M6-6 | 实现 `aggregate` 的 LLM 决策 | 复杂场景接入 LLM 判断是否重新规划 | P1 | In Progress |
 
 验收标准：
 
@@ -199,7 +199,8 @@ v2.0 新增：
 - Thread Worker 可异步 dispatch，`poll()` 在 Future 完成后返回 `WorkResult`。
 - 已新增 in-process `WorkerEventBus` 和 `DispatcherService`，Thread Worker Future 完成后自动发布 `worker_complete` / `worker_failed` 并 resume CA thread。
 - FastAPI 在 `JARVIS_WORKER_MODE=thread` 时会随 lifespan 启停 DispatcherService。
-- 剩余工作：Worker 超时取消、复杂 aggregate LLM 决策，以及进入 M7 资源锁。
+- aggregate 已接入规则优先的 LLM completion assessment：确定性规则先判断，非客观成功任务才调用 DeepSeek 判断 DoD 是否满足。
+- 剩余工作：Worker 超时取消、LLM 触发 replan/strategize 的完整闭环，以及进入 M7 资源锁。
 
 #### M7：资源锁与会话调度
 
