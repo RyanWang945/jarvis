@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     log_dir: Path = Field(default=Path("logs"))
     data_dir: Path = Field(default=Path("data"))
     planner_type: str = "llm"
+    worker_mode: str = "inline"
+    worker_max_workers: int = 4
     deepseek_api_key: str | None = None
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_model: str = "deepseek-chat"

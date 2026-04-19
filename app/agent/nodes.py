@@ -11,7 +11,7 @@ from app.config import get_settings
 from app.llm.deepseek import DeepSeekClient
 from app.tools import get_default_tool_registry
 from app.tools.specs import ToolCallPlan
-from app.workers import WorkOrder, WorkResult, get_inline_worker_client
+from app.workers import WorkOrder, WorkResult, get_worker_client
 
 HIGH_RISK_PATTERNS = [
     r"\bgit\s+push\b",
@@ -145,7 +145,7 @@ def dispatch(state: AgentState) -> dict[str, Any]:
     if not state.get("dispatch_queue"):
         return {"status": "failed", "last_error": "No work orders to dispatch.", "next_node": "blocked"}
 
-    client = get_inline_worker_client()
+    client = get_worker_client()
     active_workers = dict(state.get("active_workers", {}))
     work_orders = dict(state.get("work_orders", {}))
     approved_order_ids = set(state.get("approved_order_ids", []))
@@ -191,7 +191,7 @@ def route_after_dispatch(state: AgentState) -> str:
 def monitor(state: AgentState) -> dict[str, Any]:
     worker_results = dict(state.get("worker_results", {}))
     active_workers = dict(state.get("active_workers", {}))
-    client = get_inline_worker_client()
+    client = get_worker_client()
 
     for task_id, order_id in list(active_workers.items()):
         if order_id not in worker_results:

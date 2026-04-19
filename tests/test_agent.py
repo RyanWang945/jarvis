@@ -1,4 +1,5 @@
 import json
+import time
 
 from fastapi.testclient import TestClient
 
@@ -8,7 +9,7 @@ from app.config import get_settings
 from app.llm.deepseek import DeepSeekClient
 from app.main import create_app
 from app.tools.specs import ToolCallPlan, ToolSpec
-from app.workers import InlineWorkerClient, WorkOrder, WorkResult
+from app.workers import InlineWorkerClient, ThreadWorkerClient, WorkOrder, WorkResult
 
 
 def test_graph_runner_completes_echo_task(tmp_path, monkeypatch) -> None:
@@ -467,7 +468,7 @@ def test_recover_unfinished_replays_persisted_worker_result(tmp_path, monkeypatc
             return None
 
     pending_client = PendingWorkerClient()
-    monkeypatch.setattr("app.agent.nodes.get_inline_worker_client", lambda: pending_client)
+    monkeypatch.setattr("app.agent.nodes.get_worker_client", lambda: pending_client)
 
     runner = ThreadManager(tmp_path)
     event = build_user_event(instruction="Recover worker result")
@@ -532,3 +533,46 @@ def test_agent_run_detail_api_returns_recovery_fields(tmp_path, monkeypatch) -> 
     assert len(body["approvals"]) == 1
 
     get_thread_manager.cache_clear()
+
+
+def test_thread_worker_client_runs_work_order_asynchronously(monkeypatch) -> None:
+    def fake_execute(order):
+        time.sleep(0.05)
+        return WorkResult(
+            order_id=order.order_id,
+            task_id=order.task_id,
+            ca_thread_id=order.ca_thread_id,
+            worker_type=order.worker_type,
+            ok=True,
+            summary="threaded ok",
+        )
+
+    monkeypatch.setattr("app.workers.threaded.execute_work_order", fake_execute)
+
+    client = ThreadWorkerClient(max_workers=1)
+    order = WorkOrder(
+        order_id="order-thread-1",
+        task_id="task-thread-1",
+        ca_thread_id="thread-1",
+        worker_type="echo",
+        action="echo",
+        args={"text": "hello"},
+        reason="Thread worker test",
+    )
+
+    assert client.dispatch(order) == "order-thread-1"
+    assert client.poll(order.order_id) is None
+
+    deadline = time.monotonic() + 1
+    result = None
+    while time.monotonic() < deadline:
+        result = client.poll(order.order_id)
+        if result is not None:
+            break
+        time.sleep(0.01)
+
+    client.shutdown()
+
+    assert result is not None
+    assert result.ok is True
+    assert result.summary == "threaded ok"
