@@ -52,7 +52,12 @@ def build_agent_graph(checkpointer=None):
     graph.add_conditional_edges(
         "aggregate",
         route_after_aggregate,
-        {"summarize": "summarize", "blocked": "blocked", "strategize": "strategize"},
+        {
+            "summarize": "summarize",
+            "blocked": "blocked",
+            "strategize": "strategize",
+            "dispatch": "dispatch",
+        },
     )
     graph.add_conditional_edges(
         "wait_approval",

@@ -180,14 +180,24 @@ result = client.poll(order.order_id)
 
 问题成立，但不能简单把失败都路由回 `strategize`。必须保留失败历史，并用 `retry_count / max_retries` 控制重试。
 
-### 待办
+### 状态
+
+规则版失败重试已完成。复杂 DoD / LLM 语义判断仍待实现。
+
+### 完成内容
 
 - `aggregate` 根据失败类型和 retry 上限决定：
   - 全部成功：`summarize`
-  - 可重试：`strategize`
+  - 可重试：生成新的 WorkOrder 并回到 `dispatch`
   - 不可重试：`blocked`
-- 将失败 `WorkResult`、stderr、summary 带入下一次 strategize 上下文。
-- 避免重新规划时无声覆盖旧任务历史。
+- 保留失败 `WorkResult`，新 retry 使用新的 `order_id`，避免覆盖旧结果。
+- 增加测试覆盖可重试失败和 retry 预算耗尽后的 blocked。
+
+### 剩余待办
+
+- 将失败 `WorkResult`、stderr、summary 带入下一次 LLM strategize 上下文。
+- 实现复杂 DoD / 目标达成的 LLM 判断，而不只是依赖 Worker `ok`。
+- 避免复杂重新规划时无声覆盖旧任务历史。
 
 ## P1：修正文档进展状态
 

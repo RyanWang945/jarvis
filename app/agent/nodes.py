@@ -241,24 +241,52 @@ def route_after_monitor(state: AgentState) -> str:
 
 def aggregate(state: AgentState) -> dict[str, Any]:
     worker_results = state.get("worker_results", {})
+    work_orders = dict(state.get("work_orders", {}))
     tasks: list[Task] = []
     failed = False
+    dispatch_queue: list[dict[str, Any]] = []
     for task in state["task_list"]:
         updated = task.copy()
         order_id = updated.get("order_id")
         result = WorkResult(**worker_results[order_id]) if order_id and order_id in worker_results else None
         if result is None:
-            updated["status"] = "blocked"
-            updated["result_summary"] = "Worker result missing."
-            failed = True
+            if _can_retry(updated):
+                retry = _retry_task(updated, work_orders, ca_thread_id=state["thread_id"])
+                updated = retry["task"]
+                dispatch_queue.append(retry["order"])
+            else:
+                updated["status"] = "blocked"
+                updated["result_summary"] = "Worker result missing."
+                failed = True
         elif result.ok:
             updated["status"] = "success"
             updated["result_summary"] = result.summary
         else:
-            updated["status"] = "failed"
-            updated["result_summary"] = result.summary or result.stderr or "Worker failed."
-            failed = True
+            failure_summary = result.summary or result.stderr or "Worker failed."
+            if _can_retry(updated):
+                retry = _retry_task(
+                    updated,
+                    work_orders,
+                    ca_thread_id=state["thread_id"],
+                    failure_summary=failure_summary,
+                )
+                updated = retry["task"]
+                dispatch_queue.append(retry["order"])
+            else:
+                updated["status"] = "failed"
+                updated["result_summary"] = failure_summary
+                failed = True
         tasks.append(updated)
+
+    if dispatch_queue:
+        return {
+            "status": "dispatching",
+            "task_list": tasks,
+            "dispatch_queue": dispatch_queue,
+            "work_orders": work_orders,
+            "active_workers": {},
+            "next_node": "dispatch",
+        }
 
     return {
         "status": "failed" if failed else "running",
@@ -381,6 +409,53 @@ def _update_current_task(state: AgentState, *, status: str, result_summary: str 
             updated["result_summary"] = result_summary
         tasks.append(updated)
     return tasks
+
+
+def _can_retry(task: Task) -> bool:
+    return int(task.get("retry_count") or 0) < int(task.get("max_retries") or 0)
+
+
+def _retry_task(
+    task: Task,
+    work_orders: dict[str, dict[str, Any]],
+    *,
+    ca_thread_id: str,
+    failure_summary: str | None = None,
+) -> dict[str, Any]:
+    previous_order_id = task.get("order_id")
+    previous_order = work_orders.get(previous_order_id or "")
+    retry_count = int(task.get("retry_count") or 0) + 1
+    order_id = str(uuid4())
+
+    updated = task.copy()
+    updated["status"] = "pending"
+    updated["retry_count"] = retry_count
+    updated["order_id"] = order_id
+    if failure_summary:
+        updated["result_summary"] = f"Retry {retry_count}: {failure_summary}"
+    else:
+        updated["result_summary"] = f"Retry {retry_count}: worker result missing."
+
+    if previous_order:
+        order_dump = dict(previous_order)
+        order_dump["order_id"] = order_id
+        order_dump["task_id"] = updated["id"]
+    else:
+        order = WorkOrder(
+            order_id=order_id,
+            task_id=updated["id"],
+            ca_thread_id=ca_thread_id,
+            worker_type=updated.get("worker_type") or "echo",
+            action="echo",
+            args=updated.get("tool_args", {}),
+            risk_level="low",
+            reason=updated.get("description") or "Retry task",
+            verification_cmd=updated.get("verification_cmd"),
+        )
+        order_dump = order.model_dump()
+
+    work_orders[order_id] = order_dump
+    return {"task": updated, "order": order_dump}
 
 
 def _classify_risk(command: str | None) -> RiskLevel:

@@ -261,6 +261,103 @@ def test_monitor_waits_again_when_resume_leaves_active_workers(monkeypatch) -> N
     assert monitor_update["next_node"] == "monitor"
 
 
+def test_aggregate_retries_failed_task_until_max_retries() -> None:
+    from app.agent.nodes import aggregate
+    from app.agent.state import initial_state
+
+    event = build_user_event(instruction="Retry failed worker")
+    state = initial_state(event, thread_id="thread-retry-1")
+    order = WorkOrder(
+        order_id="order-1",
+        task_id="task-1",
+        ca_thread_id="thread-retry-1",
+        worker_type="echo",
+        action="echo",
+        args={"text": "retry me"},
+        reason="Retry failed worker",
+    )
+    state["task_list"] = [
+        {
+            "id": "task-1",
+            "title": "Retry failed worker",
+            "description": "Retry failed worker",
+            "status": "running",
+            "resource_key": None,
+            "dod": "Task execution completed successfully.",
+            "verification_cmd": None,
+            "tool_name": "echo",
+            "tool_args": {"text": "retry me"},
+            "worker_type": "echo",
+            "order_id": "order-1",
+            "retry_count": 0,
+            "max_retries": 1,
+            "result_summary": None,
+        }
+    ]
+    state["work_orders"] = {"order-1": order.model_dump()}
+    state["worker_results"] = {
+        "order-1": WorkResult(
+            order_id="order-1",
+            task_id="task-1",
+            ca_thread_id="thread-retry-1",
+            worker_type="echo",
+            ok=False,
+            summary="first attempt failed",
+        ).model_dump()
+    }
+
+    update = aggregate(state)
+
+    assert update["next_node"] == "dispatch"
+    assert update["task_list"][0]["status"] == "pending"
+    assert update["task_list"][0]["retry_count"] == 1
+    assert update["task_list"][0]["order_id"] != "order-1"
+    assert update["dispatch_queue"][0]["order_id"] == update["task_list"][0]["order_id"]
+    assert update["dispatch_queue"][0]["args"] == {"text": "retry me"}
+
+
+def test_aggregate_blocks_failed_task_after_retry_budget_exhausted() -> None:
+    from app.agent.nodes import aggregate
+    from app.agent.state import initial_state
+
+    event = build_user_event(instruction="Do not retry failed worker")
+    state = initial_state(event, thread_id="thread-retry-2")
+    state["task_list"] = [
+        {
+            "id": "task-1",
+            "title": "Do not retry failed worker",
+            "description": "Do not retry failed worker",
+            "status": "running",
+            "resource_key": None,
+            "dod": "Task execution completed successfully.",
+            "verification_cmd": None,
+            "tool_name": "echo",
+            "tool_args": {"text": "no retry"},
+            "worker_type": "echo",
+            "order_id": "order-1",
+            "retry_count": 1,
+            "max_retries": 1,
+            "result_summary": None,
+        }
+    ]
+    state["worker_results"] = {
+        "order-1": WorkResult(
+            order_id="order-1",
+            task_id="task-1",
+            ca_thread_id="thread-retry-2",
+            worker_type="echo",
+            ok=False,
+            summary="second attempt failed",
+        ).model_dump()
+    }
+
+    update = aggregate(state)
+
+    assert update["next_node"] == "blocked"
+    assert update["task_list"][0]["status"] == "failed"
+    assert update["task_list"][0]["result_summary"] == "second attempt failed"
+
+
 def test_wait_approval_interrupt_and_reject(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("JARVIS_PLANNER_TYPE", "rule_based")
     get_settings.cache_clear()
