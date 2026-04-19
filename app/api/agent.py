@@ -32,6 +32,7 @@ class AgentRunResponse(BaseModel):
     summary: str | None
     tasks: list[dict[str, Any]]
     pending_approval_id: str | None = None
+    diagnostics: dict[str, Any] | None = None
 
 
 @router.post("/run", response_model=AgentRunResponse)
@@ -52,6 +53,7 @@ def run_agent(request: AgentRunRequest) -> AgentRunResponse:
         summary=result.summary,
         tasks=result.tasks,
         pending_approval_id=result.pending_approval_id,
+        diagnostics=result.diagnostics,
     )
 
 
@@ -69,6 +71,7 @@ def approve_agent(request: AgentApprovalRequest) -> AgentRunResponse:
         summary=result.summary,
         tasks=result.tasks,
         pending_approval_id=result.pending_approval_id,
+        diagnostics=result.diagnostics,
     )
 
 
@@ -86,6 +89,7 @@ def reject_agent(request: AgentApprovalRequest) -> AgentRunResponse:
         summary=result.summary,
         tasks=result.tasks,
         pending_approval_id=result.pending_approval_id,
+        diagnostics=result.diagnostics,
     )
 
 

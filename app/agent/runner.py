@@ -1,6 +1,6 @@
 import json
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import RLock
 from typing import Any
@@ -24,6 +24,7 @@ class AgentRunResult:
     summary: str | None
     tasks: list[dict[str, Any]]
     pending_approval_id: str | None
+    diagnostics: dict[str, Any] | None = None
 
 
 class ThreadManager:
@@ -63,7 +64,7 @@ class ThreadManager:
             # Persist business state
             self._persist_run_state(result, parsed, instruction)
 
-            return parsed
+            return self._with_diagnostics(parsed)
 
     def resume(self, thread_id: str, resume_value: Any) -> AgentRunResult:
         with self._lock:
@@ -79,7 +80,7 @@ class ThreadManager:
             # so completed runs do not leave stale waiting approvals in the business DB.
             self._persist_run_state(result, parsed, None)
 
-            return parsed
+            return self._with_diagnostics(parsed)
 
     def inspect_run(self, thread_id: str) -> dict[str, Any] | None:
         run = self._business_db.runs.get_by_thread(thread_id)
@@ -309,6 +310,31 @@ class ThreadManager:
                 detail=f"approval_id={approval['approval_id']}",
             )
 
+    def _with_diagnostics(self, result: AgentRunResult) -> AgentRunResult:
+        if result.status not in {"blocked", "failed"}:
+            return result
+        diagnostics = self._latest_worker_diagnostics(result.thread_id)
+        if not diagnostics:
+            return result
+        return replace(result, diagnostics=diagnostics)
+
+    def _latest_worker_diagnostics(self, thread_id: str) -> dict[str, Any] | None:
+        rows = self._business_db.work_results.get_by_thread(thread_id)
+        if not rows:
+            return None
+        row = rows[-1]
+        return {
+            "order_id": row.get("order_id"),
+            "task_id": row.get("task_id"),
+            "worker_type": row.get("worker_type"),
+            "ok": bool(row.get("ok")),
+            "exit_code": row.get("exit_code"),
+            "summary": row.get("summary"),
+            "stdout_tail": _tail(row.get("stdout") or ""),
+            "stderr_tail": _tail(row.get("stderr") or ""),
+            "artifacts": _parse_artifacts(row.get("artifacts")),
+        }
+
     def _parse_result(self, result: AgentState) -> AgentRunResult:
         thread_id = result.get("thread_id", "")
         status = result.get("status", "blocked")
@@ -337,14 +363,7 @@ class ThreadManager:
 
 
 def _worker_result_payload(row: dict[str, Any]) -> dict[str, Any]:
-    artifacts = row.get("artifacts")
-    if isinstance(artifacts, str) and artifacts:
-        try:
-            artifacts_value = json.loads(artifacts)
-        except json.JSONDecodeError:
-            artifacts_value = []
-    else:
-        artifacts_value = []
+    artifacts_value = _parse_artifacts(row.get("artifacts"))
     return {
         "order_id": row["order_id"],
         "task_id": row["task_id"],
@@ -357,3 +376,22 @@ def _worker_result_payload(row: dict[str, Any]) -> dict[str, Any]:
         "artifacts": artifacts_value,
         "summary": row.get("summary") or "",
     }
+
+
+def _parse_artifacts(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    if isinstance(value, str) and value:
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return []
+        if isinstance(parsed, list):
+            return [str(item) for item in parsed]
+    return []
+
+
+def _tail(value: str, limit: int = 2000) -> str:
+    if len(value) <= limit:
+        return value
+    return value[-limit:]

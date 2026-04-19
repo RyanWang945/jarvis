@@ -126,6 +126,7 @@ def _result_payload(result: AgentRunResult) -> dict[str, Any]:
         "summary": result.summary,
         "tasks": result.tasks,
         "pending_approval_id": result.pending_approval_id,
+        "diagnostics": result.diagnostics,
     }
 
 

@@ -17,6 +17,13 @@ from app.workers import InlineWorkerClient, ThreadWorkerClient, WorkOrder, WorkR
 from app.workers.executor import execute_work_order
 
 
+class _completed:
+    def __init__(self, *, returncode: int = 0, stdout: str = "", stderr: str = "") -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
 def test_graph_runner_completes_echo_task(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("JARVIS_PLANNER_TYPE", "rule_based")
     get_settings.cache_clear()
@@ -45,6 +52,24 @@ def test_graph_runner_runs_shell_task(tmp_path, monkeypatch) -> None:
     assert result.tasks[0]["status"] == "success"
     assert result.tasks[0]["worker_type"] == "shell"
     assert result.tasks[0]["result_summary"] == "Command exited with code 0."
+
+
+def test_blocked_run_returns_worker_diagnostics(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("JARVIS_PLANNER_TYPE", "rule_based")
+    get_settings.cache_clear()
+    runner = ThreadManager(tmp_path)
+    event = build_user_event(
+        instruction="Run failing command",
+        command="python -c \"import sys; print('out'); sys.stderr.write('err'); sys.exit(2)\"",
+    )
+
+    result = runner.run_event(event)
+
+    assert result.status == "blocked"
+    assert result.diagnostics is not None
+    assert result.diagnostics["exit_code"] == 2
+    assert "out" in result.diagnostics["stdout_tail"]
+    assert "err" in result.diagnostics["stderr_tail"]
 
 
 def test_graph_runner_blocks_high_risk_shell_task_for_approval(tmp_path, monkeypatch) -> None:
@@ -303,16 +328,27 @@ def test_skill_registry_exposes_default_skills() -> None:
 def test_coder_worker_invokes_claude_with_publish_workflow_guidance(tmp_path, monkeypatch) -> None:
     get_settings.cache_clear()
     captured = {}
-
-    class Completed:
-        returncode = 0
-        stdout = "committed and pushed"
-        stderr = ""
+    git_dir = tmp_path / ".git"
+    git_dir.mkdir()
+    stale_lock = git_dir / "index.lock"
+    stale_lock.write_text("", encoding="utf-8")
 
     def fake_run(command, **kwargs):
-        captured["command"] = command
-        captured["kwargs"] = kwargs
-        return Completed()
+        if command[0] != "git":
+            captured["command"] = command
+            captured["kwargs"] = kwargs
+            return _completed(stdout="committed and pushed")
+        if command[-1] == "--branch":
+            return _completed(stdout="## main...origin/main\n")
+        if command[-1] == "--show-current":
+            return _completed(stdout="main\n")
+        if command[-2:] == ["--short", "HEAD"]:
+            return _completed(stdout="abc1234\n")
+        if command[-1] == "--pretty=%s":
+            return _completed(stdout="docs: add readme\n")
+        if command[-2:] == ["get-url", "origin"]:
+            return _completed(stdout="git@github.com:RyanWang945/nltk.git\n")
+        return _completed()
 
     monkeypatch.setattr("app.skills.coder.which", lambda provider: f"C:/bin/{provider}.ps1")
     monkeypatch.setattr("app.skills.coder.subprocess.run", fake_run)
@@ -349,6 +385,11 @@ def test_coder_worker_invokes_claude_with_publish_workflow_guidance(tmp_path, mo
     assert "If the task explicitly asks to push" in prompt
     assert "Run this verification command before finishing: git status --short" in prompt
     assert "Update README.md" in prompt
+    assert "JARVIS_POSTFLIGHT" in result.stdout
+    assert "Removed stale .git/index.lock." in result.stdout
+    assert not stale_lock.exists()
+    assert "git_commit:abc1234" in result.artifacts
+    assert "git_upstream:synced" in result.artifacts
 
 
 def test_tool_registry_prefers_coder_for_development_publish_workflows() -> None:
