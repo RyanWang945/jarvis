@@ -51,3 +51,5 @@ Invoke-RestMethod http://127.0.0.1:8000/agent/run `
 ```
 
 `JARVIS_PLANNER_TYPE=llm` uses DeepSeek tool calling for planning. `rule_based` is only a local fallback for tests or offline debugging.
+
+`JARVIS_WORKER_MODE=thread` enables the experimental threaded worker client and starts the in-process dispatcher that resumes agent threads when workers finish.

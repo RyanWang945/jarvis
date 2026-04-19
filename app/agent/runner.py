@@ -2,6 +2,7 @@ import json
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
+from threading import RLock
 from typing import Any
 from uuid import uuid4
 
@@ -33,47 +34,50 @@ class ThreadManager:
         self._checkpointer.setup()
         self._graph = build_agent_graph(checkpointer=self._checkpointer)
         self._business_db = get_business_db(data_dir / "business.db")
+        self._lock = RLock()
 
     @property
     def db(self) -> BusinessDB:
         return self._business_db
 
     def run_event(self, event: AgentEvent) -> AgentRunResult:
-        thread_id = event.thread_id or str(uuid4())
-        state = initial_state(event, thread_id)
-        config = {"configurable": {"thread_id": thread_id}}
+        with self._lock:
+            thread_id = event.thread_id or str(uuid4())
+            state = initial_state(event, thread_id)
+            config = {"configurable": {"thread_id": thread_id}}
 
-        # Record run start
-        instruction = event.payload.get("instruction") if isinstance(event.payload, dict) else None
-        self._business_db.runs.save({
-            "run_id": str(uuid4()),
-            "thread_id": thread_id,
-            "status": "created",
-            "instruction": instruction,
-        })
+            # Record run start
+            instruction = event.payload.get("instruction") if isinstance(event.payload, dict) else None
+            self._business_db.runs.save({
+                "run_id": str(uuid4()),
+                "thread_id": thread_id,
+                "status": "created",
+                "instruction": instruction,
+            })
 
-        result: AgentState = self._graph.invoke(state, config=config)
-        parsed = self._parse_result(result)
+            result: AgentState = self._graph.invoke(state, config=config)
+            parsed = self._parse_result(result)
 
-        # Persist business state
-        self._persist_run_state(result, parsed, instruction)
+            # Persist business state
+            self._persist_run_state(result, parsed, instruction)
 
-        return parsed
+            return parsed
 
     def resume(self, thread_id: str, resume_value: Any) -> AgentRunResult:
-        config = {"configurable": {"thread_id": thread_id}}
-        result: AgentState = self._graph.invoke(
-            Command(resume=resume_value),
-            config=config,
-        )
-        parsed = self._parse_result(result)
+        with self._lock:
+            config = {"configurable": {"thread_id": thread_id}}
+            result: AgentState = self._graph.invoke(
+                Command(resume=resume_value),
+                config=config,
+            )
+            parsed = self._parse_result(result)
 
-        self._persist_approval_decision(thread_id, resume_value)
-        # Persist business state after resume. Approval decisions are recorded first
-        # so completed runs do not leave stale waiting approvals in the business DB.
-        self._persist_run_state(result, parsed, None)
+            self._persist_approval_decision(thread_id, resume_value)
+            # Persist business state after resume. Approval decisions are recorded first
+            # so completed runs do not leave stale waiting approvals in the business DB.
+            self._persist_run_state(result, parsed, None)
 
-        return parsed
+            return parsed
 
     def inspect_run(self, thread_id: str) -> dict[str, Any] | None:
         run = self._business_db.runs.get_by_thread(thread_id)

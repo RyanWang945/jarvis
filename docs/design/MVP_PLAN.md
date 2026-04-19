@@ -179,9 +179,9 @@ v2.0 新增：
 | 编号 | 任务 | 产出 | 优先级 | 状态 |
 | --- | --- | --- | --- | --- |
 | P2-M6-1 | 实现 `ThreadWorkerClient` | `ThreadPoolExecutor` 异步执行 | P0 | Done |
-| P2-M6-2 | 实现 `monitor` + `interrupt()` 异步等待 | CA Agent 在 Worker 跑时挂起 | P0 | In Progress |
-| P2-M6-3 | 实现 Worker 完成事件路由 | `EventBus` + `DispatcherService` 投递回调 | P0 | Pending |
-| P2-M6-4 | 实现 `Command(resume=worker_result)` | Worker 完成后唤醒 CA Agent | P0 | In Progress |
+| P2-M6-2 | 实现 `monitor` + `interrupt()` 异步等待 | CA Agent 在 Worker 跑时挂起 | P0 | Done |
+| P2-M6-3 | 实现 Worker 完成事件路由 | `EventBus` + `DispatcherService` 投递回调 | P0 | Done |
+| P2-M6-4 | 实现 `Command(resume=worker_result)` | Worker 完成后唤醒 CA Agent | P0 | Done |
 | P2-M6-5 | 实现 Worker 超时取消 | `cancel()` 终止超时的 Worker | P1 | Pending |
 | P2-M6-6 | 实现 `aggregate` 的 LLM 决策 | 复杂场景接入 LLM 判断是否重新规划 | P1 | Pending |
 
@@ -197,7 +197,9 @@ v2.0 新增：
 - 已新增 `ThreadWorkerClient`，通过 `JARVIS_WORKER_MODE=thread` 切换。
 - Skill 执行逻辑已抽为 `execute_work_order()`，Inline / Thread Worker 复用同一执行路径。
 - Thread Worker 可异步 dispatch，`poll()` 在 Future 完成后返回 `WorkResult`。
-- CA Agent 仍依赖现有 `monitor` / `interrupt()` / 手动 resume 或 recover；自动 Worker 完成事件路由尚未接入。
+- 已新增 in-process `WorkerEventBus` 和 `DispatcherService`，Thread Worker Future 完成后自动发布 `worker_complete` / `worker_failed` 并 resume CA thread。
+- FastAPI 在 `JARVIS_WORKER_MODE=thread` 时会随 lifespan 启停 DispatcherService。
+- 剩余工作：Worker 超时取消、复杂 aggregate LLM 决策，以及进入 M7 资源锁。
 
 #### M7：资源锁与会话调度
 

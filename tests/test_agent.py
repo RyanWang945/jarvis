@@ -4,12 +4,13 @@ import time
 from fastapi.testclient import TestClient
 
 from app.agent.events import build_user_event
+from app.agent.dispatcher import DispatcherService
 from app.agent.runner import ThreadManager
 from app.config import get_settings
 from app.llm.deepseek import DeepSeekClient
 from app.main import create_app
 from app.tools.specs import ToolCallPlan, ToolSpec
-from app.workers import InlineWorkerClient, ThreadWorkerClient, WorkOrder, WorkResult
+from app.workers import InlineWorkerClient, ThreadWorkerClient, WorkOrder, WorkResult, WorkerEventBus
 
 
 def test_graph_runner_completes_echo_task(tmp_path, monkeypatch) -> None:
@@ -576,3 +577,49 @@ def test_thread_worker_client_runs_work_order_asynchronously(monkeypatch) -> Non
     assert result is not None
     assert result.ok is True
     assert result.summary == "threaded ok"
+
+
+def test_dispatcher_resumes_thread_after_worker_completion(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("JARVIS_PLANNER_TYPE", "rule_based")
+    get_settings.cache_clear()
+
+    def fake_execute(order):
+        time.sleep(0.05)
+        return WorkResult(
+            order_id=order.order_id,
+            task_id=order.task_id,
+            ca_thread_id=order.ca_thread_id,
+            worker_type=order.worker_type,
+            ok=True,
+            summary="dispatcher completed worker",
+        )
+
+    monkeypatch.setattr("app.workers.threaded.execute_work_order", fake_execute)
+
+    event_bus = WorkerEventBus()
+    worker_client = ThreadWorkerClient(max_workers=1, event_bus=event_bus)
+    monkeypatch.setattr("app.agent.nodes.get_worker_client", lambda: worker_client)
+
+    manager = ThreadManager(tmp_path)
+    dispatcher = DispatcherService(manager, event_bus=event_bus)
+    result = manager.run_event(build_user_event(instruction="Run through dispatcher"))
+
+    assert result.status == "monitoring"
+
+    deadline = time.monotonic() + 1
+    processed = 0
+    while time.monotonic() < deadline:
+        processed += dispatcher.drain_once()
+        run = manager.db.runs.get_by_thread(result.thread_id)
+        if run and run["status"] == "completed":
+            break
+        time.sleep(0.01)
+
+    worker_client.shutdown()
+
+    assert processed == 1
+    run = manager.db.runs.get_by_thread(result.thread_id)
+    assert run is not None
+    assert run["status"] == "completed"
+    tasks = manager.db.tasks.get_by_run(run["run_id"])
+    assert tasks[0]["status"] == "success"

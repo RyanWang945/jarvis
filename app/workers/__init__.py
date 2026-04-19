@@ -1,4 +1,5 @@
 from app.workers.base import WorkOrder, WorkResult, WorkerClient
+from app.workers.events import WorkerEvent, WorkerEventBus, get_worker_event_bus
 from app.workers.inline import InlineWorkerClient, get_inline_worker_client
 from app.workers.threaded import ThreadWorkerClient, get_thread_worker_client
 
@@ -16,8 +17,11 @@ __all__ = [
     "ThreadWorkerClient",
     "WorkOrder",
     "WorkResult",
+    "WorkerEvent",
+    "WorkerEventBus",
     "WorkerClient",
     "get_inline_worker_client",
     "get_thread_worker_client",
+    "get_worker_event_bus",
     "get_worker_client",
 ]

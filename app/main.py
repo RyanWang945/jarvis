@@ -1,8 +1,11 @@
 import logging
+from contextlib import asynccontextmanager
 
 import uvicorn
 from fastapi import FastAPI, Request
 
+from app.agent.dispatcher import DispatcherService
+from app.api.agent import get_thread_manager
 from app.api.routes import router
 from app.config import get_settings
 from app.logging_config import configure_logging
@@ -10,11 +13,26 @@ from app.logging_config import configure_logging
 logger = logging.getLogger(__name__)
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    settings = get_settings()
+    dispatcher: DispatcherService | None = None
+    if settings.worker_mode == "thread":
+        dispatcher = DispatcherService(get_thread_manager())
+        dispatcher.start()
+        app.state.dispatcher = dispatcher
+    try:
+        yield
+    finally:
+        if dispatcher:
+            dispatcher.stop()
+
+
 def create_app() -> FastAPI:
     settings = get_settings()
     configure_logging(settings)
 
-    app = FastAPI(title=settings.app_name)
+    app = FastAPI(title=settings.app_name, lifespan=lifespan)
     app.include_router(router)
 
     @app.middleware("http")
