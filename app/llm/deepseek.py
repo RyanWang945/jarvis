@@ -101,8 +101,10 @@ class DeepSeekClient:
                     content=(
                         "You are Jarvis Completion Assessor. Decide whether a completed worker "
                         "result satisfies the task's definition of done. Return strict JSON only. "
-                        "Allowed decisions: success, retry, failed, blocked. Use retry only when "
+                        "Allowed decisions: success, retry, replan, failed, blocked. Use retry only when "
                         "the issue is likely fixable by rerunning the same work and can_retry is true. "
+                        "Use replan when the same work order is unlikely to satisfy the DoD and a different "
+                        "strategy or tool is needed. "
                         "Use failed when the worker output shows the task did not satisfy the DoD. "
                         "Use blocked when human input or missing external context is required."
                     ),
@@ -115,7 +117,7 @@ class DeepSeekClient:
                             "worker_result": result,
                             "can_retry": can_retry,
                             "response_schema": {
-                                "decision": "success | retry | failed | blocked",
+                                "decision": "success | retry | replan | failed | blocked",
                                 "summary": "short reason",
                             },
                         },
@@ -198,7 +200,7 @@ def _completion_assessment_from_message(message: dict[str, Any], *, can_retry: b
 
     body = json.loads(content)
     decision = str(body.get("decision") or "success").strip().lower()
-    if decision not in {"success", "retry", "failed", "blocked"}:
+    if decision not in {"success", "retry", "replan", "failed", "blocked"}:
         decision = "success"
     if decision == "retry" and not can_retry:
         decision = "failed"

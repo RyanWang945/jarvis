@@ -86,5 +86,22 @@ def get_default_tool_registry() -> ToolRegistry:
                 risk_level="high",
                 exposed_to_llm=True,
             ),
+            ToolSpec(
+                name="web_search",
+                description="Search the web for current public information using Tavily.",
+                args_schema={
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "max_results": {"type": "integer", "minimum": 1, "maximum": 8},
+                        "search_depth": {"type": "string", "enum": ["basic", "advanced"]},
+                    },
+                    "required": ["query"],
+                },
+                skill="web_search",
+                action="search",
+                risk_level="low",
+                exposed_to_llm=True,
+            ),
         ]
     )

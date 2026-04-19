@@ -9,8 +9,10 @@ from app.agent.runner import ThreadManager
 from app.config import get_settings
 from app.llm.deepseek import DeepSeekClient
 from app.main import create_app
+from app.skills import get_default_skill_registry
 from app.tools.specs import ToolCallPlan, ToolSpec
 from app.workers import InlineWorkerClient, ThreadWorkerClient, WorkOrder, WorkResult, WorkerEventBus
+from app.workers.executor import execute_work_order
 
 
 def test_graph_runner_completes_echo_task(tmp_path, monkeypatch) -> None:
@@ -188,6 +190,34 @@ def test_deepseek_completion_assessment_parses_json(monkeypatch) -> None:
     assert assessment == {"decision": "failed", "summary": "DoD was not satisfied."}
 
 
+def test_deepseek_completion_assessment_allows_replan(monkeypatch) -> None:
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"decision": "replan", "summary": "Need a different tool."}'
+                        }
+                    }
+                ]
+            }
+
+    monkeypatch.setattr("app.llm.deepseek.httpx.post", lambda *args, **kwargs: FakeResponse())
+
+    client = DeepSeekClient(api_key="test-key")
+    assessment = client.assess_completion(
+        task={"title": "Assess output", "dod": "Covers tradeoffs"},
+        result={"ok": True, "summary": "Short answer"},
+        can_retry=False,
+    )
+
+    assert assessment == {"decision": "replan", "summary": "Need a different tool."}
+
+
 def test_inline_worker_runs_shell_work_order(tmp_path) -> None:
     client = InlineWorkerClient()
     order = WorkOrder(
@@ -208,6 +238,88 @@ def test_inline_worker_runs_shell_work_order(tmp_path) -> None:
     assert result is not None
     assert result.ok is True
     assert result.exit_code == 0
+
+
+def test_skill_registry_exposes_default_skills() -> None:
+    registry = get_default_skill_registry()
+
+    assert registry.get("echo").name == "echo"
+    assert registry.get("shell").name == "shell"
+    assert registry.get("web_search").name == "web_search"
+
+
+def test_tavily_search_requires_api_key(monkeypatch) -> None:
+    monkeypatch.delenv("JARVIS_TAVILY_API_KEY", raising=False)
+    get_settings.cache_clear()
+
+    result = execute_work_order(
+        WorkOrder(
+            order_id="search-order-1",
+            task_id="search-task-1",
+            ca_thread_id="thread-search-1",
+            worker_type="web_search",
+            action="search",
+            args={"query": "latest Python release"},
+            reason="Search web",
+        )
+    )
+
+    assert result.ok is False
+    assert "Tavily API key" in result.summary
+
+
+def test_tavily_search_normalizes_response(monkeypatch) -> None:
+    monkeypatch.setenv("JARVIS_TAVILY_API_KEY", "test-key")
+    get_settings.cache_clear()
+
+    captured = {}
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {
+                "query": "latest Python release",
+                "answer": "Python 3.14",
+                "results": [
+                    {
+                        "title": "Python Downloads",
+                        "url": "https://www.python.org/downloads/",
+                        "content": "Download Python",
+                        "score": 0.9,
+                        "raw_content": "ignored",
+                    }
+                ],
+            }
+
+    def fake_post(*args, **kwargs):
+        captured["url"] = args[0]
+        captured["headers"] = kwargs["headers"]
+        captured["json"] = kwargs["json"]
+        return FakeResponse()
+
+    monkeypatch.setattr("app.skills.tavily.httpx.post", fake_post)
+
+    result = execute_work_order(
+        WorkOrder(
+            order_id="search-order-2",
+            task_id="search-task-2",
+            ca_thread_id="thread-search-2",
+            worker_type="web_search",
+            action="search",
+            args={"query": "latest Python release", "max_results": 20},
+            reason="Search web",
+        )
+    )
+
+    body = json.loads(result.stdout)
+    assert result.ok is True
+    assert captured["url"] == "https://api.tavily.com/search"
+    assert captured["headers"]["Authorization"] == "Bearer test-key"
+    assert captured["json"]["max_results"] == 8
+    assert body["answer"] == "Python 3.14"
+    assert body["results"][0]["url"] == "https://www.python.org/downloads/"
 
 
 def test_dispatch_creates_active_workers_and_monitor_collects_results(monkeypatch) -> None:
@@ -496,6 +608,163 @@ def test_aggregate_llm_assessment_can_fail_non_objective_success(monkeypatch) ->
     assert update["next_node"] == "blocked"
     assert update["task_list"][0]["status"] == "failed"
     assert update["task_list"][0]["result_summary"] == "LLM says DoD was not met."
+
+
+def test_aggregate_llm_assessment_can_trigger_replan(monkeypatch) -> None:
+    from app.agent.nodes import aggregate
+    from app.agent.state import initial_state
+
+    monkeypatch.setenv("JARVIS_PLANNER_TYPE", "llm")
+    monkeypatch.setenv("JARVIS_DEEPSEEK_API_KEY", "test-key")
+    get_settings.cache_clear()
+
+    def fake_assess_completion(self, *, task, result, can_retry):
+        return {"decision": "replan", "summary": "Need a different approach."}
+
+    monkeypatch.setattr("app.agent.nodes.DeepSeekClient.assess_completion", fake_assess_completion)
+
+    event = build_user_event(instruction="Assess narrative result")
+    state = initial_state(event, thread_id="thread-replan-1")
+    state["task_list"] = [
+        {
+            "id": "task-1",
+            "title": "Assess narrative result",
+            "description": "Assess narrative result",
+            "status": "running",
+            "resource_key": None,
+            "dod": "Answer covers the important tradeoffs.",
+            "verification_cmd": None,
+            "tool_name": "delegate_to_claude_code",
+            "tool_args": {"instruction": "write assessment"},
+            "worker_type": "coder",
+            "order_id": "order-1",
+            "retry_count": 0,
+            "max_retries": 0,
+            "result_summary": None,
+        }
+    ]
+    state["worker_results"] = {
+        "order-1": WorkResult(
+            order_id="order-1",
+            task_id="task-1",
+            ca_thread_id="thread-replan-1",
+            worker_type="coder",
+            ok=True,
+            summary="worker succeeded",
+        ).model_dump()
+    }
+
+    update = aggregate(state)
+
+    assert update["next_node"] == "strategize"
+    assert update["task_list"][0]["status"] == "cancelled"
+    assert update["task_list"][0]["result_summary"] == "Replanning: Need a different approach."
+
+
+def test_strategize_appends_replanned_tasks_without_overwriting_history(monkeypatch) -> None:
+    from app.agent.nodes import strategize
+    from app.agent.state import initial_state
+
+    monkeypatch.setenv("JARVIS_PLANNER_TYPE", "rule_based")
+    get_settings.cache_clear()
+
+    event = build_user_event(instruction="Create a new plan")
+    state = initial_state(event, thread_id="thread-replan-2")
+    state["task_list"] = [
+        {
+            "id": "old-task",
+            "title": "Old task",
+            "description": "Old task",
+            "status": "cancelled",
+            "resource_key": None,
+            "dod": "Old DoD",
+            "verification_cmd": None,
+            "tool_name": "delegate_to_claude_code",
+            "tool_args": {"instruction": "old"},
+            "worker_type": "coder",
+            "order_id": "old-order",
+            "retry_count": 0,
+            "max_retries": 0,
+            "result_summary": "Replanning: Need a different approach.",
+        }
+    ]
+    state["work_orders"] = {
+        "old-order": WorkOrder(
+            order_id="old-order",
+            task_id="old-task",
+            ca_thread_id="thread-replan-2",
+            worker_type="echo",
+            action="echo",
+            args={"text": "old"},
+            reason="old",
+        ).model_dump()
+    }
+
+    update = strategize(state)
+
+    assert update["next_node"] == "dispatch"
+    assert len(update["task_list"]) == 2
+    assert update["task_list"][0]["id"] == "old-task"
+    assert update["task_list"][1]["id"] != "old-task"
+    assert "old-order" in update["work_orders"]
+
+
+def test_llm_replan_context_is_sent_to_planner(monkeypatch) -> None:
+    from app.agent.nodes import _planned_tool_calls
+    from app.agent.state import initial_state
+
+    monkeypatch.setenv("JARVIS_PLANNER_TYPE", "llm")
+    monkeypatch.setenv("JARVIS_DEEPSEEK_API_KEY", "test-key")
+    get_settings.cache_clear()
+
+    captured = {}
+
+    def fake_plan_tasks(self, *, instruction, tools):
+        captured["instruction"] = instruction
+        return [ToolCallPlan(tool_name="echo", tool_args={"text": "new plan"})]
+
+    monkeypatch.setattr("app.agent.nodes.DeepSeekClient.plan_tasks", fake_plan_tasks)
+
+    event = build_user_event(instruction="Create a new plan")
+    state = initial_state(event, thread_id="thread-replan-context")
+    state["task_list"] = [
+        {
+            "id": "old-task",
+            "title": "Old task",
+            "description": "Old task",
+            "status": "cancelled",
+            "resource_key": None,
+            "dod": "Answer covers tradeoffs",
+            "verification_cmd": None,
+            "tool_name": "delegate_to_claude_code",
+            "tool_args": {"instruction": "old"},
+            "worker_type": "coder",
+            "order_id": "old-order",
+            "retry_count": 0,
+            "max_retries": 0,
+            "result_summary": "Replanning: Need a different approach.",
+        }
+    ]
+    state["worker_results"] = {
+        "old-order": WorkResult(
+            order_id="old-order",
+            task_id="old-task",
+            ca_thread_id="thread-replan-context",
+            worker_type="coder",
+            ok=True,
+            stdout="short output",
+            stderr="",
+            summary="worker succeeded",
+        ).model_dump()
+    }
+
+    plans = _planned_tool_calls(state)
+
+    assert plans == [ToolCallPlan(tool_name="echo", tool_args={"text": "new plan"})]
+    assert "Replanning context from previous attempts" in captured["instruction"]
+    assert "Need a different approach" in captured["instruction"]
+    assert "Answer covers tradeoffs" in captured["instruction"]
+    assert "short output" in captured["instruction"]
 
 
 def test_wait_approval_interrupt_and_reject(tmp_path, monkeypatch) -> None:

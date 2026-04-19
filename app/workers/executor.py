@@ -1,60 +1,53 @@
-from app.skills import EchoSkill, ShellSkill
-from app.skills.base import SkillRequest, SkillResult
+from app.skills import ShellSkill, get_default_skill_registry
+from app.skills.base import SkillRequest
 from app.workers.base import WorkOrder, WorkResult
 
 
 def execute_work_order(order: WorkOrder) -> WorkResult:
-    if order.worker_type == "shell":
-        result = ShellSkill().run(
-            SkillRequest(
-                skill="shell",
-                action=order.action,
-                workdir=order.workdir,
-                args=order.args,
-                risk_level=order.risk_level,
-                timeout_seconds=order.timeout_seconds,
-            )
-        )
-    elif order.worker_type == "echo":
-        result = EchoSkill().run(
-            SkillRequest(
-                skill="echo",
-                action=order.action,
-                workdir=order.workdir,
-                args=order.args,
-                risk_level=order.risk_level,
-                timeout_seconds=order.timeout_seconds,
-            )
-        )
-    else:
-        result = SkillResult(
+    try:
+        skill = get_default_skill_registry().get(order.worker_type)
+    except ValueError:
+        result = WorkResult(
+            order_id=order.order_id,
+            task_id=order.task_id,
+            ca_thread_id=order.ca_thread_id,
+            worker_type=order.worker_type,
             ok=False,
-            exit_code=None,
             stderr=f"{order.worker_type} worker is not implemented.",
             summary=f"{order.worker_type} worker is not implemented.",
         )
-
-    if result.ok and order.verification_cmd:
-        result = ShellSkill().run(
+    else:
+        skill_result = skill.run(
             SkillRequest(
-                skill="shell",
-                action="verify",
+                skill=skill.name,
+                action=order.action,
                 workdir=order.workdir,
-                args={"command": order.verification_cmd},
-                risk_level="low",
+                args=order.args,
+                risk_level=order.risk_level,
                 timeout_seconds=order.timeout_seconds,
             )
         )
-
-    return WorkResult(
-        order_id=order.order_id,
-        task_id=order.task_id,
-        ca_thread_id=order.ca_thread_id,
-        worker_type=order.worker_type,
-        ok=result.ok,
-        exit_code=result.exit_code,
-        stdout=result.stdout,
-        stderr=result.stderr,
-        artifacts=result.artifacts,
-        summary=result.summary,
-    )
+        if skill_result.ok and order.verification_cmd:
+            skill_result = ShellSkill().run(
+                SkillRequest(
+                    skill="shell",
+                    action="verify",
+                    workdir=order.workdir,
+                    args={"command": order.verification_cmd},
+                    risk_level="low",
+                    timeout_seconds=order.timeout_seconds,
+                )
+            )
+        result = WorkResult(
+            order_id=order.order_id,
+            task_id=order.task_id,
+            ca_thread_id=order.ca_thread_id,
+            worker_type=order.worker_type,
+            ok=skill_result.ok,
+            exit_code=skill_result.exit_code,
+            stdout=skill_result.stdout,
+            stderr=skill_result.stderr,
+            artifacts=skill_result.artifacts,
+            summary=skill_result.summary,
+        )
+    return result

@@ -182,7 +182,7 @@ result = client.poll(order.order_id)
 
 ### 状态
 
-规则优先的 completion assessment 层已完成。复杂 DoD 的 LLM 语义判断已接入；LLM 触发 replan/strategize 的完整闭环仍待实现。
+规则优先的 completion assessment 层已完成。复杂 DoD 的 LLM 语义判断已接入；LLM 可触发 `replan` 回到 `strategize`，并保留旧任务历史。
 
 ### 完成内容
 
@@ -195,12 +195,12 @@ result = client.poll(order.order_id)
 - 将 `aggregate` 拆为 `CompletionAssessment`：确定性规则先判断，规则无法确定时进入语义判断入口。
 - 语义判断入口已接入 DeepSeek JSON assessment，只在 `planner_type=llm` 且配置 API key 时启用。
 - 未配置 LLM 时保留 fallback：Worker 成功视为成功。
+- LLM assessment 支持 `replan`，aggregate 会将当前任务标记为 `cancelled`，再回到 `strategize` 追加新任务。
 
 ### 剩余待办
 
-- 将失败 `WorkResult`、stderr、summary 带入下一次 LLM strategize 上下文。
-- 让 LLM assessment 的 `retry` / `failed` / `blocked` 进一步触发 replan/strategize，而不只是 retry 同一 WorkOrder。
-- 避免复杂重新规划时无声覆盖旧任务历史。
+- 将失败 `WorkResult`、stderr、summary 更完整地带入下一次 LLM strategize 上下文。
+- 细化 `retry` vs `replan` 策略，例如按工具类型、错误类型和资源风险选择。
 
 ## P1：修正文档进展状态
 

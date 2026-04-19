@@ -103,21 +103,30 @@ v2.0 新增：
 
 #### M3：Skill 执行层（复用 + 抽象）
 
-| 编号 | 任务 | 产出 | 优先级 |
-| --- | --- | --- | --- |
-| P1-M3-1 | 定义 Skill 统一接口 | `SkillRequest`、`SkillResult`（保持兼容） | P0 |
-| P1-M3-2 | 实现 Echo Skill | 用于测试 Graph 和任务流 | P0 |
-| P1-M3-3 | 实现 Shell Skill | 本地命令执行 | P0 |
+| 编号 | 任务 | 产出 | 优先级 | 状态 |
+| --- | --- | --- | --- | --- |
+| P1-M3-1 | 定义 Skill 统一接口 | `SkillRequest`、`SkillResult`（保持兼容） | P0 | Done |
+| P1-M3-2 | 实现 Echo Skill | 用于测试 Graph 和任务流 | P0 | Done |
+| P1-M3-3 | 实现 Shell Skill | 本地命令执行 | P0 | Done |
 | P1-M3-4 | 实现命令超时 | 防止进程卡死 | P0 |
 | P1-M3-5 | 实现输出截断 | 防止日志和上下文膨胀 | P0 |
 | P1-M3-6 | 实现 `ShellWorker` | 封装 Shell Skill 为 Worker | P0 |
 | P1-M3-7 | 实现 Obsidian/File Skill | 写入本地 Markdown 复盘 | P1 |
+| P1-M3-8 | 实现 Skill Registry | 新 Skill 可注册接入，不改 Worker executor | P0 | Done |
+| P1-M3-9 | 实现 Tavily Search Skill | `web_search` 工具 | P1 | Done |
+| P1-M3-10 | 实现 Image Generation Skill | 画图工具，产物写入 artifacts | P1 | Pending |
 
 验收标准：
 
 - Skill 调用结果结构化返回。
 - Shell 命令包含工作目录、超时、退出码、stdout/stderr。
 - `ShellWorker` 接收 `WorkOrder`，返回 `WorkResult`。
+
+当前进展：
+
+- 已新增 `SkillRegistry`，`execute_work_order()` 通过 skill 名分发，避免继续在 executor 中手写 if/elif。
+- 已接入 Tavily `web_search` skill，配置项为 `JARVIS_TAVILY_API_KEY`。
+- 后续画图工具应按同一模式实现 `ImageGenerationSkill`，图片写入 `data/artifacts/images/...`，路径放入 `SkillResult.artifacts`。
 
 #### M4：风险分级与本地授权（LangGraph 1.0+ interrupt）
 
@@ -200,7 +209,8 @@ v2.0 新增：
 - 已新增 in-process `WorkerEventBus` 和 `DispatcherService`，Thread Worker Future 完成后自动发布 `worker_complete` / `worker_failed` 并 resume CA thread。
 - FastAPI 在 `JARVIS_WORKER_MODE=thread` 时会随 lifespan 启停 DispatcherService。
 - aggregate 已接入规则优先的 LLM completion assessment：确定性规则先判断，非客观成功任务才调用 DeepSeek 判断 DoD 是否满足。
-- 剩余工作：Worker 超时取消、LLM 触发 replan/strategize 的完整闭环，以及进入 M7 资源锁。
+- LLM assessment 可返回 `replan`，aggregate 会保留旧任务历史并回到 `strategize` 追加新任务。
+- 剩余工作：Worker 超时取消、把 replan 的失败上下文更完整地传给 LLM planner，以及进入 M7 资源锁。
 
 #### M7：资源锁与会话调度
 

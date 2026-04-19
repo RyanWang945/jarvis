@@ -20,6 +20,8 @@ class Settings(BaseSettings):
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_model: str = "deepseek-chat"
     deepseek_timeout_seconds: float = 60.0
+    tavily_api_key: str | None = None
+    tavily_base_url: str = "https://api.tavily.com"
     feishu_app_id: str | None = None
     feishu_app_secret: str | None = None
     obsidian_vault_path: Path | None = None

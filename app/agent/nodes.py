@@ -28,7 +28,7 @@ HIGH_RISK_PATTERNS = [
     r"\bgit\s+config\s+--global\b",
 ]
 
-CompletionDecision = Literal["success", "retry", "failed", "blocked", "needs_assessment"]
+CompletionDecision = Literal["success", "retry", "replan", "failed", "blocked", "needs_assessment"]
 
 
 @dataclass(frozen=True)
@@ -67,9 +67,10 @@ def strategize(state: AgentState) -> dict[str, Any]:
     payload = _payload(state)
     instruction = str(payload.get("instruction") or "")
     registry = get_default_tool_registry()
+    previous_tasks = [task.copy() for task in state.get("task_list", [])]
     tasks: list[Task] = []
     dispatch_queue: list[dict[str, Any]] = []
-    work_orders: dict[str, dict[str, Any]] = {}
+    work_orders: dict[str, dict[str, Any]] = dict(state.get("work_orders", {}))
 
     for item in planned_calls:
         tool_name = item.tool_name or "echo"
@@ -136,10 +137,10 @@ def strategize(state: AgentState) -> dict[str, Any]:
 
     return {
         "status": "strategizing",
-        "task_list": tasks,
+        "task_list": previous_tasks + tasks,
         "dispatch_queue": dispatch_queue,
         "work_orders": work_orders,
-        "approved_order_ids": [],
+        "approved_order_ids": state.get("approved_order_ids", []),
         "active_workers": {},
         "worker_results": {},
         "next_node": "dispatch",
@@ -253,6 +254,7 @@ def aggregate(state: AgentState) -> dict[str, Any]:
     work_orders = dict(state.get("work_orders", {}))
     tasks: list[Task] = []
     failed = False
+    needs_replan = False
     dispatch_queue: list[dict[str, Any]] = []
     for task in state["task_list"]:
         updated = task.copy()
@@ -271,6 +273,10 @@ def aggregate(state: AgentState) -> dict[str, Any]:
             )
             updated = retry["task"]
             dispatch_queue.append(retry["order"])
+        elif assessment.decision == "replan":
+            updated["status"] = "cancelled"
+            updated["result_summary"] = f"Replanning: {assessment.summary}"
+            needs_replan = True
         else:
             updated["status"] = "blocked" if assessment.decision == "blocked" else "failed"
             updated["result_summary"] = assessment.summary
@@ -285,6 +291,17 @@ def aggregate(state: AgentState) -> dict[str, Any]:
             "work_orders": work_orders,
             "active_workers": {},
             "next_node": "dispatch",
+        }
+
+    if needs_replan and not failed:
+        return {
+            "status": "strategizing",
+            "task_list": tasks,
+            "work_orders": work_orders,
+            "active_workers": {},
+            "worker_results": {},
+            "last_error": "Replanning after completion assessment.",
+            "next_node": "strategize",
         }
 
     return {
@@ -595,6 +612,38 @@ def _planner_instruction(payload: dict[str, Any], instruction: str) -> str:
     return "\n\n".join(context)
 
 
+def _replan_context(state: AgentState) -> str | None:
+    lines: list[str] = []
+    worker_results = state.get("worker_results", {})
+    for task in state.get("task_list", []):
+        result_summary = _clean_optional(task.get("result_summary"))
+        if not result_summary:
+            continue
+        if task.get("status") not in {"cancelled", "failed", "blocked"}:
+            continue
+        lines.append(
+            "\n".join(
+                [
+                    f"- Previous task: {task.get('title') or task.get('description') or task['id']}",
+                    f"  status: {task.get('status')}",
+                    f"  worker: {task.get('worker_type')}",
+                    f"  DoD: {task.get('dod')}",
+                    f"  outcome: {result_summary}",
+                ]
+            )
+        )
+        order_id = task.get("order_id")
+        if order_id and order_id in worker_results:
+            result = WorkResult(**worker_results[order_id])
+            if result.stderr:
+                lines.append(f"  stderr: {result.stderr[:1000]}")
+            if result.stdout:
+                lines.append(f"  stdout: {result.stdout[:1000]}")
+    if not lines:
+        return None
+    return "Replanning context from previous attempts:\n" + "\n".join(lines)
+
+
 def _planned_tool_calls(state: AgentState) -> list[ToolCallPlan]:
     settings = get_settings()
     if settings.planner_type != "llm":
@@ -604,6 +653,9 @@ def _planned_tool_calls(state: AgentState) -> list[ToolCallPlan]:
 
     payload = _payload(state)
     instruction = str(payload.get("instruction") or "")
+    replan_context = _replan_context(state)
+    if replan_context:
+        instruction = f"{instruction}\n\n{replan_context}"
     client = DeepSeekClient(
         api_key=settings.deepseek_api_key,
         base_url=settings.deepseek_base_url,
@@ -650,6 +702,8 @@ def _tool_to_worker_type(tool_name: str) -> str:
         return "shell"
     if tool_name == "delegate_to_claude_code":
         return "coder"
+    if tool_name == "web_search":
+        return "web_search"
     return "echo"
 
 

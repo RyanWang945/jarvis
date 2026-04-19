@@ -38,6 +38,7 @@ JARVIS_WORKER_MAX_WORKERS=4
 JARVIS_DEEPSEEK_API_KEY=sk-...
 JARVIS_DEEPSEEK_BASE_URL=https://api.deepseek.com
 JARVIS_DEEPSEEK_MODEL=deepseek-chat
+JARVIS_TAVILY_API_KEY=tvly-...
 JARVIS_OBSIDIAN_VAULT_PATH=E:\path\to\vault
 ```
 
@@ -53,3 +54,5 @@ Invoke-RestMethod http://127.0.0.1:8000/agent/run `
 `JARVIS_PLANNER_TYPE=llm` uses DeepSeek tool calling for planning. `rule_based` is only a local fallback for tests or offline debugging.
 
 `JARVIS_WORKER_MODE=thread` enables the experimental threaded worker client and starts the in-process dispatcher that resumes agent threads when workers finish.
+
+`JARVIS_TAVILY_API_KEY` enables the `web_search` tool backed by Tavily.
