@@ -2,7 +2,7 @@
 
 版本：v2.0 baseline 后续修复清单
 来源：Claude Code review + 本地复核
-状态：待处理
+状态：部分完成，剩余项继续跟踪
 
 ## 当前基线说明
 
@@ -17,13 +17,21 @@
 - 高危 WorkOrder 在 dispatch 前进入 `waiting_approval`。
 - LangGraph SQLite checkpoint 已接入。
 
-未完成：
+仍未完成：
 
-- 真正的 `interrupt()` / `Command(resume=...)` 挂起恢复。
-- 业务 DB 和 Repository。
 - Worker 回调补偿。
 - Thread Worker 并行执行。
 - 失败后的重新规划闭环。
+
+本轮已推进：
+
+- `dispatch` / `monitor` 语义分离。
+- `wait_approval` 最小 `interrupt()` / `Command(resume=...)` 闭环。
+- 业务 DB schema、Repository、run/task/work_order/work_result/approval/audit 基础写入。
+- Approval approve/reject 后更新业务表状态。
+- 审批通过后复用原始 WorkOrder，保留 risk / verification / timeout。
+- `runs.thread_id` 去重更新，WorkResult artifacts 已落库。
+- Worker resume 已支持 `worker_failed` 事件归一化。
 
 ## P0：修复 dispatch / monitor 语义分离
 
@@ -47,7 +55,11 @@ result = client.poll(order.order_id)
 
 注意：InlineWorkerClient 本身仍是同步执行 Skill，所以 `dispatch` 在 Inline 模式下仍会阻塞到 Skill 完成；但这不影响节点职责拆分，且能为 ThreadWorkerClient 平滑替换留接口。
 
-### 待办
+### 状态
+
+已完成。
+
+### 完成内容
 
 - 修改 `dispatch`：移除 dispatch 后立即 `poll` 的逻辑。
 - 修改 `monitor`：负责所有 `poll()` 和 `worker_results` 写入。
@@ -68,7 +80,11 @@ result = client.poll(order.order_id)
 
 问题成立。当前系统能返回 `waiting_approval`，但不具备文档目标中的 long-run event loop 能力。
 
-### 待办
+### 状态
+
+最小闭环已完成。剩余工作是 Worker 回调恢复、服务启动恢复扫描，以及 CLI 授权入口。
+
+### 完成内容
 
 - 将 Runner 升级为 `ThreadManager` 或新增等价接口。
 - `wait_approval` 使用 `interrupt()` 挂起审批。
@@ -86,7 +102,11 @@ result = client.poll(order.order_id)
 
 问题成立。checkpoint 不能替代业务 DB。
 
-### 待办
+### 状态
+
+基础 DB 和 Repository 已完成并接入 Runner 持久化。WorkOrder/WorkResult 的核心字段已覆盖，包括审批后的原始风险元数据和 artifacts。剩余工作是更细粒度审计、Worker 回调补偿，以及把 dispatch / Skill 调用点直接纳入审计。
+
+### 完成内容
 
 - 设计并初始化 SQLite 业务表：
   - `runs`
@@ -100,7 +120,29 @@ result = client.poll(order.order_id)
   - WorkOrder/WorkResult Repository
   - Approval Repository
   - Audit Repository
-- 在 CA Agent 节点和 WorkerClient 中写入关键状态。
+- 在 Runner 汇总写入关键业务状态。
+
+### 剩余待办
+
+- 增加服务启动时未完成 thread 扫描。
+- 增加 Worker 回调丢失补偿。
+- 将 dispatch / Skill 调用点直接写入 audit，替代仅在 Runner 汇总写入。
+
+## P0：审批后 WorkOrder 保真
+
+### 问题
+
+审批通过后如果重新构造 WorkOrder，容易丢失 `verification_cmd`、`timeout_seconds`，并错误降级 `risk_level`。
+
+### 状态
+
+已完成。
+
+### 完成内容
+
+- 审批通过后从 `work_orders[order_id]` 取回原始 WorkOrder。
+- 使用 `approved_order_ids` 表示该 order 已授权，dispatch 仅绕过本次风险拦截，不修改原始风险等级。
+- 增加测试覆盖审批后仍执行 verification，并持久化 high risk、verification command、timeout。
 
 ## P1：aggregate 失败后重新规划
 

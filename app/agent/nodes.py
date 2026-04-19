@@ -4,6 +4,8 @@ import re
 from typing import Any
 from uuid import uuid4
 
+from langgraph.types import interrupt
+
 from app.agent.state import AgentState, PendingAction, RiskLevel, Task
 from app.config import get_settings
 from app.llm.deepseek import DeepSeekClient
@@ -58,6 +60,7 @@ def strategize(state: AgentState) -> dict[str, Any]:
     registry = get_default_tool_registry()
     tasks: list[Task] = []
     dispatch_queue: list[dict[str, Any]] = []
+    work_orders: dict[str, dict[str, Any]] = {}
 
     for item in planned_calls:
         tool_name = item.tool_name or "echo"
@@ -115,7 +118,9 @@ def strategize(state: AgentState) -> dict[str, Any]:
             timeout_seconds=30,
         )
         tasks.append(task)
-        dispatch_queue.append(order.model_dump())
+        order_dump = order.model_dump()
+        dispatch_queue.append(order_dump)
+        work_orders[order.order_id] = order_dump
 
     if not tasks:
         return {"status": "failed", "last_error": "Strategize produced no work orders.", "next_node": "blocked"}
@@ -124,6 +129,8 @@ def strategize(state: AgentState) -> dict[str, Any]:
         "status": "strategizing",
         "task_list": tasks,
         "dispatch_queue": dispatch_queue,
+        "work_orders": work_orders,
+        "approved_order_ids": [],
         "active_workers": {},
         "worker_results": {},
         "next_node": "dispatch",
@@ -140,12 +147,14 @@ def dispatch(state: AgentState) -> dict[str, Any]:
 
     client = get_inline_worker_client()
     active_workers = dict(state.get("active_workers", {}))
-    worker_results = dict(state.get("worker_results", {}))
+    work_orders = dict(state.get("work_orders", {}))
+    approved_order_ids = set(state.get("approved_order_ids", []))
     task_list = [task.copy() for task in state["task_list"]]
 
     for order_dict in state.get("dispatch_queue", []):
         order = WorkOrder(**order_dict)
-        if order.risk_level in {"high", "critical"}:
+        work_orders[order.order_id] = order.model_dump()
+        if order.risk_level in {"high", "critical"} and order.order_id not in approved_order_ids:
             for task in task_list:
                 if task["id"] == order.task_id:
                     task["status"] = "waiting"
@@ -159,9 +168,6 @@ def dispatch(state: AgentState) -> dict[str, Any]:
             }
 
         client.dispatch(order)
-        result = client.poll(order.order_id)
-        if result is not None:
-            worker_results[order.order_id] = result.model_dump()
         active_workers[order.task_id] = order.order_id
         for task in task_list:
             if task["id"] == order.task_id:
@@ -171,8 +177,9 @@ def dispatch(state: AgentState) -> dict[str, Any]:
         "status": "dispatching",
         "task_list": task_list,
         "dispatch_queue": [],
+        "work_orders": work_orders,
+        "approved_order_ids": list(approved_order_ids),
         "active_workers": active_workers,
-        "worker_results": worker_results,
         "next_node": "monitor",
     }
 
@@ -194,11 +201,37 @@ def monitor(state: AgentState) -> dict[str, Any]:
         if order_id in worker_results:
             active_workers.pop(task_id, None)
 
+    if active_workers:
+        worker_event = interrupt(
+            {
+                "type": "wait_workers",
+                "active_workers": dict(active_workers),
+            }
+        )
+        if isinstance(worker_event, dict) and worker_event.get("event_type") in {
+            "worker_complete",
+            "worker_failed",
+        }:
+            payload = worker_event.get("payload", {})
+            order_id = payload.get("order_id")
+            if order_id:
+                normalized = _normalize_worker_event_payload(
+                    payload,
+                    order_id=order_id,
+                    active_workers=active_workers,
+                    work_orders=state.get("work_orders", {}),
+                    failed=worker_event.get("event_type") == "worker_failed",
+                )
+                worker_results[order_id] = normalized
+                for tid, oid in list(active_workers.items()):
+                    if oid == order_id:
+                        active_workers.pop(tid, None)
+
     return {
         "status": "monitoring",
         "active_workers": active_workers,
         "worker_results": worker_results,
-        "next_node": "aggregate" if not active_workers else "blocked",
+        "next_node": "aggregate" if not active_workers else "monitor",
     }
 
 
@@ -239,15 +272,71 @@ def route_after_aggregate(state: AgentState) -> str:
 
 
 def wait_approval(state: AgentState) -> dict[str, Any]:
-    tasks = _update_current_task(
-        state,
-        status="waiting",
-        result_summary=f"Waiting for approval: {state.get('pending_approval_id')}",
+    approval = interrupt(
+        {
+            "type": "approval_required",
+            "pending_approval_id": state.get("pending_approval_id"),
+            "pending_action": state.get("pending_action"),
+        }
     )
-    return {
-        "task_list": tasks,
-        "final_summary": "Task is waiting for local approval before executing a high-risk action.",
-    }
+
+    if isinstance(approval, dict) and approval.get("approved"):
+        tasks = _update_current_task(
+            state, status="approved", result_summary="Approved by user."
+        )
+        pending = state.get("pending_action")
+        if pending:
+            order_id = pending.get("order_id") or str(uuid4())
+            work_orders = dict(state.get("work_orders", {}))
+            order_dump = work_orders.get(order_id)
+            if order_dump is None:
+                order_dump = WorkOrder(
+                    order_id=order_id,
+                    task_id=state.get("current_task_id", ""),
+                    ca_thread_id=state["thread_id"],
+                    worker_type=pending["kind"],
+                    action=pending["action"],
+                    args=pending["args"],
+                    workdir=pending["workdir"],
+                    risk_level=pending["risk_level"],
+                    reason=pending["reason"],
+                ).model_dump()
+                work_orders[order_id] = order_dump
+            approved_order_ids = set(state.get("approved_order_ids", []))
+            approved_order_ids.add(order_id)
+            updated_tasks: list[Task] = []
+            for task in tasks:
+                t = task.copy()
+                if t["id"] == state.get("current_task_id"):
+                    t["order_id"] = order_id
+                updated_tasks.append(t)
+            return {
+                "task_list": updated_tasks,
+                "dispatch_queue": [order_dump],
+                "work_orders": work_orders,
+                "approved_order_ids": list(approved_order_ids),
+                "pending_action": None,
+                "pending_approval_id": None,
+                "next_node": "dispatch",
+            }
+        return {
+            "task_list": tasks,
+            "next_node": "summarize",
+        }
+    else:
+        tasks = _update_current_task(
+            state, status="blocked", result_summary="Rejected by user."
+        )
+        return {
+            "task_list": tasks,
+            "next_node": "blocked",
+            "pending_action": None,
+            "pending_approval_id": None,
+        }
+
+
+def route_after_wait_approval(state: AgentState) -> str:
+    return state.get("next_node") or "blocked"
 
 
 def summarize(state: AgentState) -> dict[str, Any]:
@@ -418,4 +507,36 @@ def _pending_action_from_order(order: WorkOrder) -> PendingAction:
         "risk_level": order.risk_level,
         "reason": order.reason,
         "status": "waiting_approval",
+        "order_id": order.order_id,
     }
+
+
+def _normalize_worker_event_payload(
+    payload: dict[str, Any],
+    *,
+    order_id: str,
+    active_workers: dict[str, str],
+    work_orders: dict[str, dict[str, Any]],
+    failed: bool,
+) -> dict[str, Any]:
+    task_id = payload.get("task_id")
+    if not task_id:
+        task_id = next(
+            (tid for tid, active_order_id in active_workers.items() if active_order_id == order_id),
+            "",
+        )
+    order_dict = work_orders.get(order_id, {})
+    worker_type = payload.get("worker_type") or order_dict.get("worker_type") or "echo"
+    result = WorkResult(
+        order_id=order_id,
+        task_id=task_id,
+        ca_thread_id=payload.get("ca_thread_id") or order_dict.get("ca_thread_id") or "",
+        worker_type=worker_type,
+        ok=bool(payload.get("ok", not failed)),
+        exit_code=payload.get("exit_code"),
+        stdout=payload.get("stdout", ""),
+        stderr=payload.get("stderr", ""),
+        artifacts=payload.get("artifacts", []),
+        summary=payload.get("summary", "Worker failed." if failed else ""),
+    )
+    return result.model_dump()

@@ -61,6 +61,7 @@ class PendingAction(TypedDict):
     risk_level: RiskLevel
     reason: str
     status: ActionStatus
+    order_id: str | None
 
 
 class AgentState(TypedDict):
@@ -73,6 +74,8 @@ class AgentState(TypedDict):
     resource_key: str | None
     pending_action: PendingAction | None
     dispatch_queue: list[dict[str, Any]]
+    work_orders: dict[str, dict[str, Any]]
+    approved_order_ids: list[str]
     active_workers: dict[str, str]
     worker_results: dict[str, dict[str, Any]]
     pending_approval_id: str | None
@@ -94,6 +97,8 @@ def initial_state(event: AgentEvent, thread_id: str) -> AgentState:
         "resource_key": None,
         "pending_action": None,
         "dispatch_queue": [],
+        "work_orders": {},
+        "approved_order_ids": [],
         "active_workers": {},
         "worker_results": {},
         "pending_approval_id": None,

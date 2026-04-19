@@ -11,6 +11,7 @@ from app.agent.nodes import (
     route_after_dispatch,
     route_after_monitor,
     route_after_strategize,
+    route_after_wait_approval,
     strategize,
     summarize,
     wait_approval,
@@ -46,14 +47,18 @@ def build_agent_graph(checkpointer=None):
     graph.add_conditional_edges(
         "monitor",
         route_after_monitor,
-        {"aggregate": "aggregate", "blocked": "blocked"},
+        {"aggregate": "aggregate", "monitor": "monitor", "blocked": "blocked"},
     )
     graph.add_conditional_edges(
         "aggregate",
         route_after_aggregate,
         {"summarize": "summarize", "blocked": "blocked", "strategize": "strategize"},
     )
-    graph.add_edge("wait_approval", END)
+    graph.add_conditional_edges(
+        "wait_approval",
+        route_after_wait_approval,
+        {"dispatch": "dispatch", "blocked": "blocked", "summarize": "summarize"},
+    )
     graph.add_edge("summarize", END)
     graph.add_edge("blocked", END)
     return graph.compile(checkpointer=checkpointer)

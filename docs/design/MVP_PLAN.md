@@ -79,11 +79,11 @@ v2.0 新增：
 
 | 编号 | 任务 | 产出 | 优先级 | 状态 |
 | --- | --- | --- | --- | --- |
-| P1-M2-1 | 设计 SQLite 业务表 | `tasks`、`work_orders`、`work_results`、`approvals`、`audit_logs`、`runs` | P0 | Pending |
-| P1-M2-2 | 实现数据库初始化 | 应用启动初始化数据库 | P0 | Pending |
-| P1-M2-3 | 实现 Task Repository | 任务创建、更新、查询 | P0 | Pending |
-| P1-M2-4 | 实现 WorkOrder/Result Repository | Worker 派发和结果记录 | P0 | Pending |
-| P1-M2-5 | 实现 Audit Repository | Skill 调用和关键状态审计 | P0 | Pending |
+| P1-M2-1 | 设计 SQLite 业务表 | `tasks`、`work_orders`、`work_results`、`approvals`、`audit_logs`、`runs` | P0 | Done |
+| P1-M2-2 | 实现数据库初始化 | ThreadManager 初始化业务 DB | P0 | Done |
+| P1-M2-3 | 实现 Task Repository | 任务创建、更新、查询 | P0 | Done |
+| P1-M2-4 | 实现 WorkOrder/Result Repository | Worker 派发和结果记录 | P0 | Done |
+| P1-M2-5 | 实现 Audit Repository | Skill 调用和关键状态审计 | P0 | In Progress |
 | P1-M2-6 | 接入 LangGraph SQLite checkpoint | 节点状态可恢复 | P0 | Done |
 
 验收标准：
@@ -92,6 +92,14 @@ v2.0 新增：
 - CA Agent 关键状态能 checkpoint。
 - 可通过 API 或 CLI 查询任务状态。
 - 审计日志记录每次 Worker 调用。
+
+当前进展：
+
+- 已有业务 DB schema、Repository、run/task/work_order/work_result/approval/audit 的基础写入。
+- 已有 `/agent/runs` 和 `/agent/runs/{thread_id}` 查询入口。
+- WorkOrder 审批后保留原始 risk / verification / timeout；WorkResult 已持久化 artifacts。
+- `runs.thread_id` 已按单 thread 单 run 模型去重更新。
+- 仍需把审计粒度下沉到每次 dispatch / Skill 调用，并补 Worker 回调补偿。
 
 #### M3：Skill 执行层（复用 + 抽象）
 
@@ -113,15 +121,15 @@ v2.0 新增：
 
 #### M4：风险分级与本地授权（LangGraph 1.0+ interrupt）
 
-| 编号 | 任务 | 产出 | 优先级 |
-| --- | --- | --- | --- |
-| P4-M4-1 | 定义命令风险规则 | low/medium/high/critical | P0 |
-| P4-M4-2 | 实现 `risk_gate` 节点 | 执行前风险判断 | P0 |
-| P4-M4-3 | 实现 `interrupt()` 审批挂起 | 高危动作进入 `waiting_approval` | P0 |
-| P4-M4-4 | 实现本地 `ApprovalRequest` | 授权请求生命周期 | P0 |
-| P4-M4-5 | 实现授权 API/CLI | 本地允许或拒绝授权 | P0 |
-| P4-M4-6 | 实现 `Command(resume=...)` 恢复 | 授权后 Graph 继续 | P0 |
-| P4-M4-7 | 实现拒绝后的阻塞状态 | 拒绝后不执行危险动作 | P0 |
+| 编号 | 任务 | 产出 | 优先级 | 状态 |
+| --- | --- | --- | --- | --- |
+| P4-M4-1 | 定义命令风险规则 | low/medium/high/critical | P0 | Done |
+| P4-M4-2 | 实现 `risk_gate` 节点 | 执行前风险判断 | P0 | In Progress |
+| P4-M4-3 | 实现 `interrupt()` 审批挂起 | 高危动作进入 `waiting_approval` | P0 | Done |
+| P4-M4-4 | 实现本地 `ApprovalRequest` | 授权请求生命周期 | P0 | Done |
+| P4-M4-5 | 实现授权 API/CLI | 本地允许或拒绝授权 | P0 | API Done / CLI Pending |
+| P4-M4-6 | 实现 `Command(resume=...)` 恢复 | 授权后 Graph 继续 | P0 | Done |
+| P4-M4-7 | 实现拒绝后的阻塞状态 | 拒绝后不执行危险动作 | P0 | Done |
 
 验收标准：
 
@@ -130,6 +138,8 @@ v2.0 新增：
 - 本地授权允许后 CA Agent 能继续（`Command(resume=...)`）。
 - 拒绝后任务进入 `blocked`。
 - interrupt 状态可 checkpoint，恢复后重新进入 `risk_gate`。
+
+当前进展：审批最小闭环已跑通；审批 API 已支持 `approval_id` 校验；风险判断仍内嵌在 `dispatch`，还未拆成独立 `risk_gate` 节点。
 
 #### M5：恢复、查询与归档
 

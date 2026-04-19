@@ -14,7 +14,7 @@ AgentEventType = Literal[
     "worker_complete",
     "worker_failed",
 ]
-AgentEventSource = Literal["api", "cli", "scheduler", "feishu", "system"]
+AgentEventSource = Literal["api", "cli", "scheduler", "feishu", "system", "worker"]
 
 
 class AgentEvent(BaseModel):
