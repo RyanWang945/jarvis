@@ -358,6 +358,60 @@ def test_aggregate_blocks_failed_task_after_retry_budget_exhausted() -> None:
     assert update["task_list"][0]["result_summary"] == "second attempt failed"
 
 
+def test_aggregate_uses_semantic_assessment_only_for_non_objective_success(monkeypatch) -> None:
+    from app.agent.nodes import CompletionAssessment, aggregate
+    from app.agent.state import initial_state
+
+    calls = []
+
+    def fake_semantic_assessment(task, result):
+        calls.append((task, result))
+        return CompletionAssessment("success", "semantic success")
+
+    monkeypatch.setattr(
+        "app.agent.nodes._assess_task_completion_semantically",
+        fake_semantic_assessment,
+    )
+
+    event = build_user_event(instruction="Assess narrative result")
+    state = initial_state(event, thread_id="thread-assess-1")
+    state["task_list"] = [
+        {
+            "id": "task-1",
+            "title": "Assess narrative result",
+            "description": "Assess narrative result",
+            "status": "running",
+            "resource_key": None,
+            "dod": "Answer covers the important tradeoffs.",
+            "verification_cmd": None,
+            "tool_name": "delegate_to_claude_code",
+            "tool_args": {"instruction": "write assessment"},
+            "worker_type": "coder",
+            "order_id": "order-1",
+            "retry_count": 0,
+            "max_retries": 0,
+            "result_summary": None,
+        }
+    ]
+    state["worker_results"] = {
+        "order-1": WorkResult(
+            order_id="order-1",
+            task_id="task-1",
+            ca_thread_id="thread-assess-1",
+            worker_type="coder",
+            ok=True,
+            summary="worker succeeded",
+        ).model_dump()
+    }
+
+    update = aggregate(state)
+
+    assert len(calls) == 1
+    assert update["next_node"] == "summarize"
+    assert update["task_list"][0]["status"] == "success"
+    assert update["task_list"][0]["result_summary"] == "semantic success"
+
+
 def test_wait_approval_interrupt_and_reject(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("JARVIS_PLANNER_TYPE", "rule_based")
     get_settings.cache_clear()

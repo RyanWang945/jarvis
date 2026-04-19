@@ -182,7 +182,7 @@ result = client.poll(order.order_id)
 
 ### 状态
 
-规则版失败重试已完成。复杂 DoD / LLM 语义判断仍待实现。
+规则优先的 completion assessment 层已完成。复杂 DoD / LLM 语义判断仍待实现。
 
 ### 完成内容
 
@@ -192,6 +192,8 @@ result = client.poll(order.order_id)
   - 不可重试：`blocked`
 - 保留失败 `WorkResult`，新 retry 使用新的 `order_id`，避免覆盖旧结果。
 - 增加测试覆盖可重试失败和 retry 预算耗尽后的 blocked。
+- 将 `aggregate` 拆为 `CompletionAssessment`：确定性规则先判断，规则无法确定时进入语义判断入口。
+- 当前语义判断入口是占位实现，默认把 Worker 成功视为成功，后续再接 LLM。
 
 ### 剩余待办
 

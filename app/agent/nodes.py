@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import re
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Literal
 from uuid import uuid4
 
 from langgraph.types import interrupt
@@ -26,6 +27,14 @@ HIGH_RISK_PATTERNS = [
     r"\bvercel\b.*\b--prod\b",
     r"\bgit\s+config\s+--global\b",
 ]
+
+CompletionDecision = Literal["success", "retry", "failed", "blocked", "needs_assessment"]
+
+
+@dataclass(frozen=True)
+class CompletionAssessment:
+    decision: CompletionDecision
+    summary: str
 
 
 def ingest_event(state: AgentState) -> dict[str, Any]:
@@ -249,33 +258,23 @@ def aggregate(state: AgentState) -> dict[str, Any]:
         updated = task.copy()
         order_id = updated.get("order_id")
         result = WorkResult(**worker_results[order_id]) if order_id and order_id in worker_results else None
-        if result is None:
-            if _can_retry(updated):
-                retry = _retry_task(updated, work_orders, ca_thread_id=state["thread_id"])
-                updated = retry["task"]
-                dispatch_queue.append(retry["order"])
-            else:
-                updated["status"] = "blocked"
-                updated["result_summary"] = "Worker result missing."
-                failed = True
-        elif result.ok:
+        assessment = _assess_task_completion(updated, result)
+        if assessment.decision == "success":
             updated["status"] = "success"
-            updated["result_summary"] = result.summary
+            updated["result_summary"] = assessment.summary
+        elif assessment.decision == "retry":
+            retry = _retry_task(
+                updated,
+                work_orders,
+                ca_thread_id=state["thread_id"],
+                failure_summary=assessment.summary,
+            )
+            updated = retry["task"]
+            dispatch_queue.append(retry["order"])
         else:
-            failure_summary = result.summary or result.stderr or "Worker failed."
-            if _can_retry(updated):
-                retry = _retry_task(
-                    updated,
-                    work_orders,
-                    ca_thread_id=state["thread_id"],
-                    failure_summary=failure_summary,
-                )
-                updated = retry["task"]
-                dispatch_queue.append(retry["order"])
-            else:
-                updated["status"] = "failed"
-                updated["result_summary"] = failure_summary
-                failed = True
+            updated["status"] = "blocked" if assessment.decision == "blocked" else "failed"
+            updated["result_summary"] = assessment.summary
+            failed = True
         tasks.append(updated)
 
     if dispatch_queue:
@@ -413,6 +412,62 @@ def _update_current_task(state: AgentState, *, status: str, result_summary: str 
 
 def _can_retry(task: Task) -> bool:
     return int(task.get("retry_count") or 0) < int(task.get("max_retries") or 0)
+
+
+def _assess_task_completion(task: Task, result: WorkResult | None) -> CompletionAssessment:
+    rule_assessment = _assess_task_completion_by_rules(task, result)
+    if rule_assessment.decision != "needs_assessment":
+        return rule_assessment
+    return _assess_task_completion_semantically(task, result)
+
+
+def _assess_task_completion_by_rules(
+    task: Task,
+    result: WorkResult | None,
+) -> CompletionAssessment:
+    if result is None:
+        summary = "Worker result missing."
+        if _can_retry(task):
+            return CompletionAssessment("retry", summary)
+        return CompletionAssessment("blocked", summary)
+
+    if not result.ok:
+        summary = result.summary or result.stderr or "Worker failed."
+        if _can_retry(task):
+            return CompletionAssessment("retry", summary)
+        return CompletionAssessment("failed", summary)
+
+    if _is_objective_success(task):
+        return CompletionAssessment("success", result.summary)
+
+    return CompletionAssessment("needs_assessment", result.summary)
+
+
+def _assess_task_completion_semantically(
+    task: Task,
+    result: WorkResult | None,
+) -> CompletionAssessment:
+    # Placeholder for LLM-based DoD assessment. Until that is wired, a successful
+    # Worker result is treated as success after deterministic checks have passed.
+    if result and result.ok:
+        return CompletionAssessment("success", result.summary)
+    summary = "Worker result missing." if result is None else (result.summary or result.stderr or "Worker failed.")
+    return CompletionAssessment("blocked", summary)
+
+
+def _is_objective_success(task: Task) -> bool:
+    if task.get("verification_cmd"):
+        return True
+    tool_name = task.get("tool_name")
+    worker_type = task.get("worker_type")
+    dod = (task.get("dod") or "").lower()
+    if tool_name in {"run_shell_command", "run_tests", "echo"}:
+        return True
+    if worker_type in {"shell", "echo"} and any(
+        marker in dod for marker in ("completed", "success", "passed", "exited")
+    ):
+        return True
+    return False
 
 
 def _retry_task(
