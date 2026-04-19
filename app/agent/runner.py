@@ -11,6 +11,7 @@ from langgraph.types import Command
 
 from app.agent.events import AgentEvent
 from app.agent.graph import build_agent_graph
+from app.agent.reports import write_run_report
 from app.agent.state import AgentState, initial_state
 from app.persistence import get_business_db, BusinessDB
 from app.workers import WorkOrder, WorkResult
@@ -28,6 +29,7 @@ class AgentRunResult:
 class ThreadManager:
     def __init__(self, data_dir: Path) -> None:
         data_dir.mkdir(parents=True, exist_ok=True)
+        self._data_dir = data_dir
         self._checkpoint_path = data_dir / "langgraph_checkpoints.sqlite"
         self._conn = sqlite3.connect(str(self._checkpoint_path), check_same_thread=False)
         self._checkpointer = SqliteSaver(self._conn)
@@ -91,6 +93,19 @@ class ThreadManager:
             "approvals": self._business_db.approvals.get_by_thread(thread_id),
             "audit_logs": self._business_db.audits.get_by_thread(thread_id),
         }
+
+    def export_run_report(self, thread_id: str) -> dict[str, str]:
+        inspection = self.inspect_run(thread_id)
+        if not inspection:
+            raise ValueError(f"Run not found: {thread_id}")
+        paths = write_run_report(self._data_dir, inspection)
+        self._business_db.audits.log(
+            thread_id=thread_id,
+            node="runner",
+            action="report_exported",
+            detail=json.dumps(paths),
+        )
+        return paths
 
     def recover_unfinished(self) -> dict[str, Any]:
         recovered: list[dict[str, Any]] = []
@@ -198,14 +213,38 @@ class ThreadManager:
             self._business_db.work_orders.save(order)
             if order.order_id in active_order_ids:
                 self._business_db.work_orders.mark_dispatched(order.order_id)
+                self._business_db.audits.log(
+                    thread_id=thread_id,
+                    node="dispatch",
+                    action="worker_dispatched",
+                    task_id=order.task_id,
+                    order_id=order.order_id,
+                    detail=f"worker_type={order.worker_type}",
+                )
             if order.order_id in completed_order_ids:
                 self._business_db.work_orders.mark_completed(order.order_id)
+                self._business_db.audits.log(
+                    thread_id=thread_id,
+                    node="monitor",
+                    action="worker_completed",
+                    task_id=order.task_id,
+                    order_id=order.order_id,
+                    detail=f"worker_type={order.worker_type}",
+                )
 
         # Persist worker_results -> work_results table
         worker_results = result.get("worker_results", {})
         for order_id, wr_dict in worker_results.items():
             wr = WorkResult(**wr_dict)
             self._business_db.work_results.save(wr)
+            self._business_db.audits.log(
+                thread_id=thread_id,
+                node="skill",
+                action="skill_call_recorded",
+                task_id=wr.task_id,
+                order_id=order_id,
+                detail=f"worker_type={wr.worker_type} ok={wr.ok}",
+            )
             self._business_db.audits.log(
                 thread_id=thread_id,
                 node="runner",
@@ -246,6 +285,9 @@ class ThreadManager:
             action="persist_state",
             detail=f"status={parsed.status}",
         )
+
+        if parsed.status in {"completed", "blocked", "failed"}:
+            self.export_run_report(thread_id)
 
     def _persist_approval_decision(self, thread_id: str, resume_value: Any) -> None:
         if not isinstance(resume_value, dict) or "approved" not in resume_value:

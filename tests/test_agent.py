@@ -1,5 +1,6 @@
 import json
 import time
+from pathlib import Path
 
 from fastapi.testclient import TestClient
 
@@ -10,6 +11,7 @@ from app.config import get_settings
 from app.llm.deepseek import DeepSeekClient
 from app.main import create_app
 from app.skills import get_default_skill_registry
+from app.tools import get_default_tool_registry
 from app.tools.specs import ToolCallPlan, ToolSpec
 from app.workers import InlineWorkerClient, ThreadWorkerClient, WorkOrder, WorkResult, WorkerEventBus
 from app.workers.executor import execute_work_order
@@ -97,6 +99,55 @@ def test_llm_planner_uses_deepseek_response(tmp_path, monkeypatch) -> None:
     assert result.status == "completed"
     assert result.tasks[0]["tool_name"] == "echo"
     assert result.tasks[0]["result_summary"] == "planned by llm"
+
+
+def test_llm_planned_coder_task_waits_for_approval_then_runs(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("JARVIS_PLANNER_TYPE", "llm")
+    monkeypatch.setenv("JARVIS_DEEPSEEK_API_KEY", "test-key")
+    get_settings.cache_clear()
+
+    def fake_plan_tasks(self, *, instruction, tools):
+        return [
+            ToolCallPlan(
+                tool_name="delegate_to_claude_code",
+                tool_args={
+                    "instruction": "Modify project code safely.",
+                    "workdir": str(tmp_path),
+                },
+                title="Modify code",
+                description="Modify code through coder worker",
+                dod="Code change completed",
+            )
+        ]
+
+    class Completed:
+        returncode = 0
+        stdout = "code changed"
+        stderr = ""
+
+    monkeypatch.setattr("app.agent.nodes.DeepSeekClient.plan_tasks", fake_plan_tasks)
+    monkeypatch.setattr(
+        "app.agent.nodes.DeepSeekClient.assess_completion",
+        lambda self, *, task, result, can_retry: {
+            "decision": "success",
+            "summary": result["summary"],
+        },
+    )
+    monkeypatch.setattr("app.skills.coder.which", lambda provider: provider)
+    monkeypatch.setattr("app.skills.coder.subprocess.run", lambda *args, **kwargs: Completed())
+
+    runner = ThreadManager(tmp_path)
+    result = runner.run_event(build_user_event(instruction="Change GitHub code"))
+
+    assert result.status == "waiting_approval"
+    assert result.pending_approval_id is not None
+    assert result.tasks[0]["worker_type"] == "coder"
+
+    approved = runner.resume(result.thread_id, {"approved": True})
+
+    assert approved.status == "completed"
+    assert approved.tasks[0]["status"] == "success"
+    assert approved.tasks[0]["result_summary"] == "claude CLI exited with code 0."
 
 
 def test_deepseek_planner_sends_tools_and_parses_tool_calls(monkeypatch) -> None:
@@ -245,7 +296,70 @@ def test_skill_registry_exposes_default_skills() -> None:
 
     assert registry.get("echo").name == "echo"
     assert registry.get("shell").name == "shell"
+    assert registry.get("coder").name == "coder"
     assert registry.get("web_search").name == "web_search"
+
+
+def test_coder_worker_invokes_claude_with_publish_workflow_guidance(tmp_path, monkeypatch) -> None:
+    get_settings.cache_clear()
+    captured = {}
+
+    class Completed:
+        returncode = 0
+        stdout = "committed and pushed"
+        stderr = ""
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return Completed()
+
+    monkeypatch.setattr("app.skills.coder.which", lambda provider: f"C:/bin/{provider}.ps1")
+    monkeypatch.setattr("app.skills.coder.subprocess.run", fake_run)
+
+    result = execute_work_order(
+        WorkOrder(
+            order_id="coder-order-2",
+            task_id="coder-task-2",
+            ca_thread_id="thread-coder-2",
+            worker_type="coder",
+            action="run",
+            args={
+                "instruction": "Update README.md, commit with message docs: add readme, and push origin HEAD.",
+                "verification_cmd": "git status --short",
+            },
+            workdir=str(tmp_path),
+            reason="Code publish",
+        )
+    )
+
+    prompt = captured["kwargs"]["input"]
+    assert result.ok is True
+    assert captured["command"][:5] == [
+        "powershell",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+    ]
+    assert captured["command"][5] == "&"
+    assert "--allowedTools" in captured["command"]
+    assert "bypassPermissions" in captured["command"]
+    assert "If the task explicitly asks to commit" in prompt
+    assert "If the task explicitly asks to push" in prompt
+    assert "Run this verification command before finishing: git status --short" in prompt
+    assert "Update README.md" in prompt
+
+
+def test_tool_registry_prefers_coder_for_development_publish_workflows() -> None:
+    registry = get_default_tool_registry()
+
+    coder_tool = registry.get("delegate_to_claude_code")
+    shell_tool = registry.get("run_shell_command")
+
+    assert "git commit" in coder_tool.description
+    assert "git push" in coder_tool.description
+    assert "Do not use this for multi-step code editing" in shell_tool.description
 
 
 def test_tavily_search_requires_api_key(monkeypatch) -> None:
@@ -818,6 +932,15 @@ def test_business_db_persists_run_and_tasks(tmp_path, monkeypatch) -> None:
     audits = runner.db.audits.get_by_thread(result.thread_id)
     assert any(a["action"] == "persist_state" for a in audits)
     assert any(a["action"] == "worker_result_persisted" for a in audits)
+    assert any(a["action"] == "skill_call_recorded" for a in audits)
+    assert any(a["action"] == "worker_completed" for a in audits)
+
+    report_path = tmp_path / "reports" / f"{result.thread_id}.json"
+    note_path = tmp_path / "notes" / f"{result.thread_id}.md"
+    assert report_path.exists()
+    assert note_path.exists()
+    assert json.loads(report_path.read_text(encoding="utf-8"))["run"]["status"] == "completed"
+    assert "Echo test persist" in note_path.read_text(encoding="utf-8")
 
 
 def test_wait_approval_interrupt_and_approve(tmp_path, monkeypatch) -> None:
@@ -1040,6 +1163,93 @@ def test_agent_run_detail_api_returns_recovery_fields(tmp_path, monkeypatch) -> 
     assert len(body["approvals"]) == 1
 
     get_thread_manager.cache_clear()
+
+
+def test_agent_report_api_exports_files(tmp_path, monkeypatch) -> None:
+    from app.api.agent import get_thread_manager
+
+    monkeypatch.setenv("JARVIS_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("JARVIS_PLANNER_TYPE", "rule_based")
+    get_settings.cache_clear()
+    get_thread_manager.cache_clear()
+
+    client = TestClient(create_app())
+    response = client.post("/agent/run", json={"instruction": "Create report"})
+    assert response.status_code == 200
+    thread_id = response.json()["thread_id"]
+
+    report = client.post(f"/agent/runs/{thread_id}/report")
+
+    assert report.status_code == 200
+    paths = report.json()["paths"]
+    assert Path(paths["json"]).exists()
+    assert Path(paths["markdown"]).exists()
+
+    get_thread_manager.cache_clear()
+
+
+def test_startup_recovery_replays_persisted_worker_result(tmp_path, monkeypatch) -> None:
+    from app.api.agent import get_thread_manager
+
+    monkeypatch.setenv("JARVIS_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("JARVIS_PLANNER_TYPE", "rule_based")
+    monkeypatch.setenv("JARVIS_AUTO_RECOVER_ON_STARTUP", "true")
+    get_settings.cache_clear()
+    get_thread_manager.cache_clear()
+
+    class PendingWorkerClient:
+        def dispatch(self, order):
+            self.order = order
+            return order.order_id
+
+        def poll(self, order_id):
+            return None
+
+    pending_client = PendingWorkerClient()
+    monkeypatch.setattr("app.agent.nodes.get_worker_client", lambda: pending_client)
+
+    manager = ThreadManager(tmp_path)
+    result = manager.run_event(build_user_event(instruction="Recover on startup"))
+    order = manager.db.work_orders.get_by_thread(result.thread_id)[0]
+    manager.db.work_results.save(
+        WorkResult(
+            order_id=order["order_id"],
+            task_id=order["task_id"],
+            ca_thread_id=result.thread_id,
+            worker_type=order["worker_type"],
+            ok=True,
+            summary="Startup recovered worker result.",
+        )
+    )
+
+    get_thread_manager.cache_clear()
+    with TestClient(create_app()):
+        recovered = get_thread_manager().db.runs.get_by_thread(result.thread_id)
+
+    assert recovered is not None
+    assert recovered["status"] == "completed"
+    get_thread_manager.cache_clear()
+
+
+def test_cli_run_status_and_report(tmp_path, monkeypatch, capsys) -> None:
+    from app.cli import main as cli_main
+
+    monkeypatch.setenv("JARVIS_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("JARVIS_PLANNER_TYPE", "rule_based")
+    get_settings.cache_clear()
+
+    cli_main(["run", "CLI smoke test"])
+    run_output = json.loads(capsys.readouterr().out)
+    thread_id = run_output["thread_id"]
+    assert run_output["status"] == "completed"
+
+    cli_main(["status", thread_id])
+    status_output = json.loads(capsys.readouterr().out)
+    assert status_output["run"]["thread_id"] == thread_id
+
+    cli_main(["report", thread_id])
+    report_output = json.loads(capsys.readouterr().out)
+    assert Path(report_output["paths"]["json"]).exists()
 
 
 def test_thread_worker_client_runs_work_order_asynchronously(monkeypatch) -> None:

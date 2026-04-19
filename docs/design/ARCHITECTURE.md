@@ -176,7 +176,7 @@ Worker 类型：
 | Worker | 职责 | Skill 映射 | 并行度 |
 |--------|------|-----------|--------|
 | `ShellWorker` | 执行本地 shell 命令 | Shell Skill | 多实例 |
-| `CoderWorker` | 调用 Claude Code / Codex CLI 做代码任务 | Coder Skill | 单实例（资源锁限制） |
+| `CoderWorker` | 调用 Claude Code CLI 做代码任务 | Coder Skill | 单实例（资源锁限制） |
 | `ResearchWorker` | 读文件、查笔记、做调研 | File Skill + Obsidian Skill | 多实例 |
 | `ObsidianWorker` | 写入 Markdown 复盘 | Obsidian Skill | 单实例（避免写冲突） |
 
@@ -465,7 +465,7 @@ CA Agent 被唤醒，进入 ingest_event ──► aggregate
 | 业务数据库 | SQLite | 任务、锁、授权、审计、Worker 状态 |
 | Worker 执行 | ThreadPoolExecutor（Phase 2）/ asyncio（Phase 3） | 并行执行 |
 | 长期知识库 | Obsidian Markdown | Vault 目录由配置指定 |
-| 代码 Agent | Claude Code CLI / Codex CLI | 封装为 CoderWorker |
+| 代码 Agent | Claude Code CLI | 封装为 CoderWorker |
 | 通知入口 | 飞书 OpenAPI | 机器人 + 个人机器人 |
 
 ## 8. 架构风险

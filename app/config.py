@@ -16,6 +16,8 @@ class Settings(BaseSettings):
     planner_type: str = "llm"
     worker_mode: str = "inline"
     worker_max_workers: int = 4
+    auto_recover_on_startup: bool = True
+    coder_timeout_seconds: int = 1800
     deepseek_api_key: str | None = None
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_model: str = "deepseek-chat"

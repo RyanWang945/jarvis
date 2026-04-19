@@ -17,8 +17,17 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     settings = get_settings()
     dispatcher: DispatcherService | None = None
+    manager = get_thread_manager()
+    if settings.auto_recover_on_startup:
+        recovery = manager.recover_unfinished()
+        logger.info(
+            "startup recovery completed recovered=%s skipped=%s failed=%s",
+            len(recovery["recovered"]),
+            len(recovery["skipped"]),
+            len(recovery["failed"]),
+        )
     if settings.worker_mode == "thread":
-        dispatcher = DispatcherService(get_thread_manager())
+        dispatcher = DispatcherService(manager)
         dispatcher.start()
         app.state.dispatcher = dispatcher
     try:

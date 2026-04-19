@@ -84,7 +84,7 @@ result = client.poll(order.order_id)
 
 ### 状态
 
-最小闭环已完成。剩余工作是 Worker 回调恢复、服务启动恢复扫描，以及 CLI 授权入口。
+最小闭环已完成。Worker 回调恢复、服务启动恢复扫描和 CLI 授权入口已接入。剩余工作是补偿策略边界扩展和资源锁。
 
 ### 完成内容
 
@@ -106,7 +106,7 @@ result = client.poll(order.order_id)
 
 ### 状态
 
-基础 DB 和 Repository 已完成并接入 Runner 持久化。WorkOrder/WorkResult 的核心字段已覆盖，包括审批后的原始风险元数据和 artifacts。最小 Worker 回调补偿已接入 `ThreadManager.recover_unfinished()`。剩余工作是更细粒度审计、服务启动自动恢复，以及把 dispatch / Skill 调用点直接纳入审计。
+基础 DB 和 Repository 已完成并接入 Runner 持久化。WorkOrder/WorkResult 的核心字段已覆盖，包括审批后的原始风险元数据和 artifacts。最小 Worker 回调补偿已接入 `ThreadManager.recover_unfinished()`。服务启动自动恢复已接入 FastAPI lifespan，dispatch / monitor / Skill 结果已写入审计。剩余工作是补偿策略边界扩展。
 
 ### 完成内容
 
@@ -126,9 +126,9 @@ result = client.poll(order.order_id)
 
 ### 剩余待办
 
-- 服务启动时自动触发未完成 thread 扫描。
+- 服务启动时自动触发未完成 thread 扫描。（已完成）
 - 扩展 Worker 回调丢失补偿策略：超时、重复回调、多 Worker 部分完成。
-- 将 dispatch / Skill 调用点直接写入 audit，替代仅在 Runner 汇总写入。
+- 将 dispatch / Skill 调用点直接写入 audit，替代仅在 Runner 汇总写入。（已完成基础审计）
 
 ## P0：恢复查询与 Worker 结果补偿
 
@@ -138,7 +138,7 @@ result = client.poll(order.order_id)
 
 ### 状态
 
-最小闭环已完成。剩余工作是服务启动自动调用、补偿策略扩展，以及 CLI 查询入口。
+最小闭环已完成。服务启动自动调用和 CLI 查询入口已完成。剩余工作是补偿策略扩展。
 
 ### 完成内容
 

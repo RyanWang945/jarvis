@@ -83,7 +83,7 @@ v2.0 新增：
 | P1-M2-2 | 实现数据库初始化 | ThreadManager 初始化业务 DB | P0 | Done |
 | P1-M2-3 | 实现 Task Repository | 任务创建、更新、查询 | P0 | Done |
 | P1-M2-4 | 实现 WorkOrder/Result Repository | Worker 派发和结果记录 | P0 | Done |
-| P1-M2-5 | 实现 Audit Repository | Skill 调用和关键状态审计 | P0 | In Progress |
+| P1-M2-5 | 实现 Audit Repository | Skill 调用和关键状态审计 | P0 | Done |
 | P1-M2-6 | 接入 LangGraph SQLite checkpoint | 节点状态可恢复 | P0 | Done |
 
 验收标准：
@@ -136,7 +136,7 @@ v2.0 新增：
 | P4-M4-2 | 实现 `risk_gate` 节点 | 执行前风险判断 | P0 | In Progress |
 | P4-M4-3 | 实现 `interrupt()` 审批挂起 | 高危动作进入 `waiting_approval` | P0 | Done |
 | P4-M4-4 | 实现本地 `ApprovalRequest` | 授权请求生命周期 | P0 | Done |
-| P4-M4-5 | 实现授权 API/CLI | 本地允许或拒绝授权 | P0 | API Done / CLI Pending |
+| P4-M4-5 | 实现授权 API/CLI | 本地允许或拒绝授权 | P0 | Done |
 | P4-M4-6 | 实现 `Command(resume=...)` 恢复 | 授权后 Graph 继续 | P0 | Done |
 | P4-M4-7 | 实现拒绝后的阻塞状态 | 拒绝后不执行危险动作 | P0 | Done |
 
@@ -154,13 +154,13 @@ v2.0 新增：
 
 | 编号 | 任务 | 产出 | 优先级 | 状态 |
 | --- | --- | --- | --- | --- |
-| P1-M5-1 | 启动时扫描未完成 CA thread | 恢复入口 | P0 | In Progress |
+| P1-M5-1 | 启动时扫描未完成 CA thread | 恢复入口 | P0 | Done |
 | P1-M5-2 | 恢复 LangGraph checkpoint | 从最后成功节点继续 | P0 | Done |
 | P1-M5-3 | 处理等待授权任务 | 重启后仍能查询并授权 | P0 | Done |
 | P1-M5-4 | 补偿 Worker 回调丢失 | 扫描 `work_results` 表，合成事件注入 | P0 | In Progress |
-| P1-M5-5 | 实现任务状态查询 | API/CLI 返回任务摘要 | P0 | API Done / CLI Pending |
-| P1-M5-6 | 实现任务结果报告 | 本地 JSON/Markdown 报告 | P0 | Pending |
-| P1-M5-7 | 实现复盘模板 | 写入 `data/notes` 或 Obsidian Vault | P0 | Pending |
+| P1-M5-5 | 实现任务状态查询 | API/CLI 返回任务摘要 | P0 | Done |
+| P1-M5-6 | 实现任务结果报告 | 本地 JSON/Markdown 报告 | P0 | Done |
+| P1-M5-7 | 实现复盘模板 | 写入 `data/notes` 或 Obsidian Vault | P0 | Done |
 
 验收标准：
 
@@ -175,7 +175,7 @@ v2.0 新增：
 - `/agent/runs/{thread_id}` 已返回完整运行明细；`/agent/recover` 可触发恢复扫描。
 - 已支持重启后查询等待授权任务。
 - 已支持最小 Worker 结果补偿：`dispatched` WorkOrder 若已有 `work_results`，会合成 `worker_complete` / `worker_failed` resume graph。
-- 剩余工作：服务启动自动调用恢复扫描、补偿策略更细化、CLI 查询/授权、JSON/Markdown 报告。
+- 剩余工作：补偿策略更细化、重复回调/多 Worker 部分完成边界、Worker 超时取消。
 
 ---
 
@@ -235,9 +235,9 @@ v2.0 新增：
 
 | 编号 | 任务 | 产出 | 优先级 |
 | --- | --- | --- | --- |
-| P2-M8-1 | 定义 Coder Worker 接口 | 封装 Claude Code / Codex CLI | P0 |
+| P2-M8-1 | 定义 Coder Worker 接口 | 封装 Claude Code CLI | P0 | Done |
 | P2-M8-2 | 封装 Claude Code CLI | 可配置启用 | P1 |
-| P2-M8-3 | 封装 Codex CLI | 可配置启用 | P1 |
+| P2-M8-3 | 封装 Codex CLI | 已取消，统一使用 Claude Code | P1 | Cancelled |
 | P2-M8-4 | 限定工作目录 | 不允许越过资源边界写入 | P0 |
 | P2-M8-5 | 接入验证命令 | 修改后必须运行 DoD | P0 |
 | P2-M8-6 | 生成变更摘要 | 返回改动说明和验证结果 | P0 |
@@ -297,7 +297,7 @@ v2.0 新增：
 | Week 1 | P1-M1、P1-M2 | CA Agent 事件循环骨架、AgentState、Inline Worker、SQLite 任务状态 | P1-M2-6 checkpoint 可延后 |
 | Week 2 | P1-M3、P1-M4 | Skill 抽象为 Worker、interrupt 审批、Command resume | P1-M3-7 Obsidian Skill |
 | Week 3 | P1-M5、P2-M6 | 恢复与补偿、Thread Worker 并行、事件路由 | P2-M6-6 LLM aggregate |
-| Week 4 | P2-M7、P2-M8 | 资源锁、Coder Worker、测试与文档 | Codex CLI 可延后 |
+| Week 4 | P2-M7、P2-M8 | 资源锁、Coder Worker、测试与文档 | Claude Code-only |
 | Week 5+ | P3-M10、P3-M11 | 飞书集成、长期记忆 | 全部可按需拆分 |
 
 ## 5. 任务依赖

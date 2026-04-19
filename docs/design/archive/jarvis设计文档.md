@@ -155,7 +155,7 @@ created -> planning -> running -> verifying -> completed
 | Skill | 能力 | 风险控制 |
 | --- | --- | --- |
 | Shell Skill | 执行本地命令 | 工作目录、超时、输出截断、风险分级 |
-| Coder Skill | 调用 Claude Code / Codex 修改代码 | 限定仓库目录，变更后必须验证 |
+| Coder Skill | 调用 Claude Code 修改代码 | 限定仓库目录，变更后必须验证 |
 | GitHub Skill | Issue、PR、分支操作 | 写操作需记录审计，必要时授权 |
 | Obsidian Skill | 读写 Markdown 笔记 | 限定 Vault 目录 |
 | Feishu Skill | 消息、卡片、文件上传 | 失败重试和幂等发送 |
@@ -314,7 +314,7 @@ class ApprovalRequest(TypedDict):
 | 状态持久化 | SQLite + langgraph-checkpoint-sqlite |
 | 长期知识库 | Obsidian Markdown |
 | 向量检索 | ChromaDB，MVP 可暂缓 |
-| 代码 Agent | Claude Code CLI / Codex CLI |
+| 代码 Agent | Claude Code CLI |
 | 代码仓库 | Git CLI / GitHub API |
 | 通知入口 | 飞书 OpenAPI |
 
@@ -340,4 +340,3 @@ class ApprovalRequest(TypedDict):
 | 飞书回调丢失 | 授权任务长期挂起 | 支持状态查询、重新发送授权卡片 |
 | Token 膨胀 | 成本和稳定性问题 | 每轮任务后压缩摘要，原始日志落盘 |
 | 第三方 CLI 不稳定 | 任务失败或卡死 | 统一超时、重试、输出截断和失败归因 |
-

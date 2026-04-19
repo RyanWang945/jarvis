@@ -15,6 +15,7 @@ dependencies = [
 
 [project.scripts]
 jarvis = "app.main:main"
+jarvis-cli = "app.cli:main"
 
 [dependency-groups]
 dev = [

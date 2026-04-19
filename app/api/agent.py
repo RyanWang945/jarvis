@@ -109,6 +109,14 @@ def recover_runs() -> dict[str, Any]:
     return get_thread_manager().recover_unfinished()
 
 
+@router.post("/runs/{thread_id}/report")
+def export_run_report(thread_id: str) -> dict[str, Any]:
+    try:
+        return {"paths": get_thread_manager().export_run_report(thread_id)}
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 def _ensure_pending_approval(manager: ThreadManager, request: AgentApprovalRequest) -> None:
     pending = manager.db.approvals.get_pending_by_thread(request.thread_id)
     if not pending:

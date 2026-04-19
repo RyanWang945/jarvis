@@ -36,7 +36,11 @@ def get_default_tool_registry() -> ToolRegistry:
             ),
             ToolSpec(
                 name="run_shell_command",
-                description="Run a local shell command after Jarvis risk checks.",
+                description=(
+                    "Run a simple local shell command after Jarvis risk checks. "
+                    "Do not use this for multi-step code editing, git commit, or git push workflows; "
+                    "use delegate_to_claude_code for those."
+                ),
                 args_schema={
                     "type": "object",
                     "properties": {
@@ -71,13 +75,32 @@ def get_default_tool_registry() -> ToolRegistry:
             ),
             ToolSpec(
                 name="delegate_to_claude_code",
-                description="Delegate a code-editing task to the local Claude Code CLI.",
+                description=(
+                    "Delegate a repository development workflow to the local Claude Code CLI. "
+                    "Use this for code/file edits, README updates, tests, "
+                    "git status/diff review, git commit, and git push when the user explicitly asks "
+                    "to commit or push. The worker runs in the provided workdir and should complete "
+                    "the workflow end-to-end instead of asking the user to type shell commands."
+                ),
                 args_schema={
                     "type": "object",
                     "properties": {
-                        "instruction": {"type": "string"},
-                        "workdir": {"type": "string"},
-                        "verification_cmd": {"type": "string"},
+                        "instruction": {
+                            "type": "string",
+                            "description": (
+                                "Detailed development task for the coder worker, including whether "
+                                "to commit and/or push. Include file constraints and commit message "
+                                "requirements if provided by the user."
+                            ),
+                        },
+                        "workdir": {
+                            "type": "string",
+                            "description": "Absolute path to the target repository working directory.",
+                        },
+                        "verification_cmd": {
+                            "type": "string",
+                            "description": "Optional command the coder worker should run before finishing.",
+                        },
                     },
                     "required": ["instruction", "workdir"],
                 },

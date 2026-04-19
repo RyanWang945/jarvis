@@ -164,7 +164,7 @@ MVP 按阶段交付。Phase 1 先交付本地 CA Agent 事件循环和 Inline Wo
 | 编号 | 需求 | 优先级 | 验收标准 |
 | --- | --- | --- | --- |
 | F-3.1 | Shell Worker | P0 | 支持工作目录、超时、输出截断、退出码 |
-| F-3.2 | Coder Worker（Claude Code / Codex） | P0 | 通过子进程调用对应 CLI，限定仓库工作目录 |
+| F-3.2 | Coder Worker（Claude Code） | P0 | 通过子进程调用 Claude Code CLI，限定仓库工作目录 |
 | F-3.3 | Obsidian Worker | P0 | 可写入任务复盘 Markdown |
 | F-3.4 | Feishu Skill | P0 | 可发送文本消息和授权卡片（由 CA Agent 调用） |
 | F-3.5 | GitHub Worker | P1 | 支持查看 Issue、创建分支、提交 PR |
@@ -211,7 +211,7 @@ MVP 按阶段交付。Phase 1 先交付本地 CA Agent 事件循环和 Inline Wo
 | --- | --- | --- |
 | 1 | 运行平台 | MVP 优先 Windows，代码保持跨平台兼容性 |
 | 2 | 飞书接入 | 同时支持飞书机器人和个人机器人，通过配置切换 |
-| 3 | Coder Worker 默认 | 封装为两个独立 Worker（Claude Code / Codex），用户通过配置选择默认 |
+| 3 | Coder Worker 默认 | 统一使用 Claude Code，避免多 provider 配置导致误路由 |
 | 4 | Obsidian 命名 | 由 Agent 按需生成；每日工作日记采用 `YYYY-MM-DD 工作日记` 格式 |
 | 5 | 任务恢复写操作 | 恢复后遇到写操作或 `git push` 必须先飞书通知用户确认，不得自动 dispatch Worker |
 | 6 | 密钥管理 | 使用 `.env` 文件管理敏感配置，禁止提交到 GitHub |
