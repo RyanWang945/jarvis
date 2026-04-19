@@ -104,11 +104,40 @@ class WorkOrderRepository:
         )
         self._conn.commit()
 
+    def get_by_order(self, order_id: str) -> dict[str, Any] | None:
+        cursor = self._conn.execute(
+            "SELECT * FROM work_orders WHERE order_id = ?",
+            (order_id,),
+        )
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
     def get_by_thread(self, thread_id: str) -> list[dict[str, Any]]:
         cursor = self._conn.execute(
             "SELECT * FROM work_orders WHERE ca_thread_id = ? ORDER BY created_at",
             (thread_id,),
         )
+        return [dict(row) for row in cursor.fetchall()]
+
+    def list_incomplete(self, thread_id: str | None = None) -> list[dict[str, Any]]:
+        if thread_id:
+            cursor = self._conn.execute(
+                """
+                SELECT * FROM work_orders
+                WHERE ca_thread_id = ?
+                  AND status NOT IN ('completed')
+                ORDER BY created_at
+                """,
+                (thread_id,),
+            )
+        else:
+            cursor = self._conn.execute(
+                """
+                SELECT * FROM work_orders
+                WHERE status NOT IN ('completed')
+                ORDER BY created_at
+                """
+            )
         return [dict(row) for row in cursor.fetchall()]
 
 
@@ -154,6 +183,13 @@ class WorkResultRepository:
         row = cursor.fetchone()
         return dict(row) if row else None
 
+    def get_by_thread(self, thread_id: str) -> list[dict[str, Any]]:
+        cursor = self._conn.execute(
+            "SELECT * FROM work_results WHERE ca_thread_id = ? ORDER BY created_at",
+            (thread_id,),
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
 
 class ApprovalRepository:
     def __init__(self, conn: sqlite3.Connection) -> None:
@@ -198,6 +234,13 @@ class ApprovalRepository:
     def get_pending_by_thread(self, thread_id: str) -> list[dict[str, Any]]:
         cursor = self._conn.execute(
             "SELECT * FROM approvals WHERE thread_id = ? AND status = 'waiting' ORDER BY created_at",
+            (thread_id,),
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_by_thread(self, thread_id: str) -> list[dict[str, Any]]:
+        cursor = self._conn.execute(
+            "SELECT * FROM approvals WHERE thread_id = ? ORDER BY created_at",
             (thread_id,),
         )
         return [dict(row) for row in cursor.fetchall()]

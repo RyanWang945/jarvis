@@ -143,15 +143,15 @@ v2.0 新增：
 
 #### M5：恢复、查询与归档
 
-| 编号 | 任务 | 产出 | 优先级 |
-| --- | --- | --- | --- |
-| P1-M5-1 | 启动时扫描未完成 CA thread | 恢复入口 | P0 |
-| P1-M5-2 | 恢复 LangGraph checkpoint | 从最后成功节点继续 | P0 |
-| P1-M5-3 | 处理等待授权任务 | 重启后仍能查询并授权 | P0 |
-| P1-M5-4 | 补偿 Worker 回调丢失 | 扫描 `work_results` 表，合成事件注入 | P0 |
-| P1-M5-5 | 实现任务状态查询 | API/CLI 返回任务摘要 | P0 |
-| P1-M5-6 | 实现任务结果报告 | 本地 JSON/Markdown 报告 | P0 |
-| P1-M5-7 | 实现复盘模板 | 写入 `data/notes` 或 Obsidian Vault | P0 |
+| 编号 | 任务 | 产出 | 优先级 | 状态 |
+| --- | --- | --- | --- | --- |
+| P1-M5-1 | 启动时扫描未完成 CA thread | 恢复入口 | P0 | In Progress |
+| P1-M5-2 | 恢复 LangGraph checkpoint | 从最后成功节点继续 | P0 | Done |
+| P1-M5-3 | 处理等待授权任务 | 重启后仍能查询并授权 | P0 | Done |
+| P1-M5-4 | 补偿 Worker 回调丢失 | 扫描 `work_results` 表，合成事件注入 | P0 | In Progress |
+| P1-M5-5 | 实现任务状态查询 | API/CLI 返回任务摘要 | P0 | API Done / CLI Pending |
+| P1-M5-6 | 实现任务结果报告 | 本地 JSON/Markdown 报告 | P0 | Pending |
+| P1-M5-7 | 实现复盘模板 | 写入 `data/notes` 或 Obsidian Vault | P0 | Pending |
 
 验收标准：
 
@@ -159,6 +159,14 @@ v2.0 新增：
 - 等待授权任务不会丢失。
 - Worker 完成但回调丢失时可补偿恢复。
 - 完成任务能生成结构化报告和 Markdown 复盘。
+
+当前进展：
+
+- `ThreadManager.inspect_run()` 可返回 run、tasks、work_orders、work_results、approvals、audit_logs。
+- `/agent/runs/{thread_id}` 已返回完整运行明细；`/agent/recover` 可触发恢复扫描。
+- 已支持重启后查询等待授权任务。
+- 已支持最小 Worker 结果补偿：`dispatched` WorkOrder 若已有 `work_results`，会合成 `worker_complete` / `worker_failed` resume graph。
+- 剩余工作：服务启动自动调用恢复扫描、补偿策略更细化、CLI 查询/授权、JSON/Markdown 报告。
 
 ---
 

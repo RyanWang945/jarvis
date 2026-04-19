@@ -430,3 +430,105 @@ def test_work_result_repository_persists_artifacts(tmp_path, monkeypatch) -> Non
     row = runner.db.work_results.get_by_order("order-1")
     assert row is not None
     assert json.loads(row["artifacts"]) == ["report.md", "logs/output.txt"]
+
+
+def test_inspect_run_returns_orders_results_and_approval_history(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("JARVIS_PLANNER_TYPE", "rule_based")
+    get_settings.cache_clear()
+    runner = ThreadManager(tmp_path)
+    event = build_user_event(instruction="Push code", command="git push origin main")
+
+    result = runner.run_event(event)
+    assert result.status == "waiting_approval"
+
+    restarted = ThreadManager(tmp_path)
+    inspection = restarted.inspect_run(result.thread_id)
+
+    assert inspection is not None
+    assert inspection["run"]["status"] == "waiting_approval"
+    assert len(inspection["tasks"]) == 1
+    assert len(inspection["work_orders"]) == 1
+    assert inspection["work_orders"][0]["risk_level"] == "high"
+    assert inspection["work_results"] == []
+    assert len(inspection["approvals"]) == 1
+    assert inspection["approvals"][0]["status"] == "waiting"
+
+
+def test_recover_unfinished_replays_persisted_worker_result(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("JARVIS_PLANNER_TYPE", "rule_based")
+    get_settings.cache_clear()
+
+    class PendingWorkerClient:
+        def dispatch(self, order):
+            self.order = order
+            return order.order_id
+
+        def poll(self, order_id):
+            return None
+
+    pending_client = PendingWorkerClient()
+    monkeypatch.setattr("app.agent.nodes.get_inline_worker_client", lambda: pending_client)
+
+    runner = ThreadManager(tmp_path)
+    event = build_user_event(instruction="Recover worker result")
+    result = runner.run_event(event)
+
+    assert result.status == "monitoring"
+    order = runner.db.work_orders.get_by_thread(result.thread_id)[0]
+    assert order["status"] == "dispatched"
+
+    runner.db.work_results.save(
+        WorkResult(
+            order_id=order["order_id"],
+            task_id=order["task_id"],
+            ca_thread_id=result.thread_id,
+            worker_type=order["worker_type"],
+            ok=True,
+            summary="Recovered worker result.",
+        )
+    )
+
+    restarted = ThreadManager(tmp_path)
+    recovery = restarted.recover_unfinished()
+
+    assert recovery["failed"] == []
+    assert recovery["recovered"] == [
+        {
+            "thread_id": result.thread_id,
+            "order_id": order["order_id"],
+            "status": "completed",
+        }
+    ]
+    run = restarted.db.runs.get_by_thread(result.thread_id)
+    assert run is not None
+    assert run["status"] == "completed"
+    tasks = restarted.db.tasks.get_by_run(run["run_id"])
+    assert tasks[0]["status"] == "success"
+
+
+def test_agent_run_detail_api_returns_recovery_fields(tmp_path, monkeypatch) -> None:
+    from app.api.agent import get_thread_manager
+
+    monkeypatch.setenv("JARVIS_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("JARVIS_PLANNER_TYPE", "rule_based")
+    get_settings.cache_clear()
+    get_thread_manager.cache_clear()
+
+    client = TestClient(create_app())
+    response = client.post(
+        "/agent/run",
+        json={"instruction": "Push code", "command": "git push origin main"},
+    )
+    assert response.status_code == 200
+    thread_id = response.json()["thread_id"]
+
+    detail = client.get(f"/agent/runs/{thread_id}")
+
+    assert detail.status_code == 200
+    body = detail.json()
+    assert body["run"]["status"] == "waiting_approval"
+    assert len(body["work_orders"]) == 1
+    assert body["work_results"] == []
+    assert len(body["approvals"]) == 1
+
+    get_thread_manager.cache_clear()

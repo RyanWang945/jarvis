@@ -19,7 +19,7 @@
 
 仍未完成：
 
-- Worker 回调补偿。
+- Worker 回调补偿自动化和边界策略。
 - Thread Worker 并行执行。
 - 失败后的重新规划闭环。
 
@@ -32,6 +32,8 @@
 - 审批通过后复用原始 WorkOrder，保留 risk / verification / timeout。
 - `runs.thread_id` 去重更新，WorkResult artifacts 已落库。
 - Worker resume 已支持 `worker_failed` 事件归一化。
+- run inspection API 已返回 work_orders、work_results、approval history。
+- 已实现最小 Worker 回调补偿：扫描已落库 work_results 并 replay resume。
 
 ## P0：修复 dispatch / monitor 语义分离
 
@@ -104,7 +106,7 @@ result = client.poll(order.order_id)
 
 ### 状态
 
-基础 DB 和 Repository 已完成并接入 Runner 持久化。WorkOrder/WorkResult 的核心字段已覆盖，包括审批后的原始风险元数据和 artifacts。剩余工作是更细粒度审计、Worker 回调补偿，以及把 dispatch / Skill 调用点直接纳入审计。
+基础 DB 和 Repository 已完成并接入 Runner 持久化。WorkOrder/WorkResult 的核心字段已覆盖，包括审批后的原始风险元数据和 artifacts。最小 Worker 回调补偿已接入 `ThreadManager.recover_unfinished()`。剩余工作是更细粒度审计、服务启动自动恢复，以及把 dispatch / Skill 调用点直接纳入审计。
 
 ### 完成内容
 
@@ -124,9 +126,27 @@ result = client.poll(order.order_id)
 
 ### 剩余待办
 
-- 增加服务启动时未完成 thread 扫描。
-- 增加 Worker 回调丢失补偿。
+- 服务启动时自动触发未完成 thread 扫描。
+- 扩展 Worker 回调丢失补偿策略：超时、重复回调、多 Worker 部分完成。
 - 将 dispatch / Skill 调用点直接写入 audit，替代仅在 Runner 汇总写入。
+
+## P0：恢复查询与 Worker 结果补偿
+
+### 问题
+
+业务 DB 已有 run/task/order/result 数据，但查询 API 只返回部分状态；CA Agent 在 `monitoring` 中断后，如果 Worker 结果已落库但回调丢失，缺少恢复入口。
+
+### 状态
+
+最小闭环已完成。剩余工作是服务启动自动调用、补偿策略扩展，以及 CLI 查询入口。
+
+### 完成内容
+
+- `ThreadManager.inspect_run()` 返回 run、tasks、work_orders、work_results、approvals、audit_logs。
+- `/agent/runs/{thread_id}` 返回完整 run inspection，未找到时返回 404。
+- `ThreadManager.recover_unfinished()` 扫描未完成 runs，对 `dispatched` 且已有 `work_results` 的 WorkOrder 合成 `worker_complete` / `worker_failed` resume。
+- `/agent/recover` 提供手动恢复入口。
+- 增加测试覆盖重启后等待审批查询、API 运行明细查询、Worker result 补偿恢复。
 
 ## P0：审批后 WorkOrder 保真
 

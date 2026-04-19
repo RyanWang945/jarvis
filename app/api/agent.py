@@ -98,19 +98,15 @@ def list_runs() -> dict[str, Any]:
 
 @router.get("/runs/{thread_id}")
 def get_run(thread_id: str) -> dict[str, Any]:
-    db = get_thread_manager().db
-    run = db.runs.get_by_thread(thread_id)
+    run = get_thread_manager().inspect_run(thread_id)
     if not run:
-        return {"error": "Run not found"}
-    tasks = db.tasks.get_by_run(run["run_id"])
-    approvals = db.approvals.get_pending_by_thread(thread_id)
-    audits = db.audits.get_by_thread(thread_id)
-    return {
-        "run": run,
-        "tasks": tasks,
-        "approvals": approvals,
-        "audit_logs": audits,
-    }
+        raise HTTPException(status_code=404, detail="Run not found.")
+    return run
+
+
+@router.post("/recover")
+def recover_runs() -> dict[str, Any]:
+    return get_thread_manager().recover_unfinished()
 
 
 def _ensure_pending_approval(manager: ThreadManager, request: AgentApprovalRequest) -> None:

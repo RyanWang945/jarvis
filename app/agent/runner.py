@@ -1,3 +1,4 @@
+import json
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -73,6 +74,97 @@ class ThreadManager:
         self._persist_run_state(result, parsed, None)
 
         return parsed
+
+    def inspect_run(self, thread_id: str) -> dict[str, Any] | None:
+        run = self._business_db.runs.get_by_thread(thread_id)
+        if not run:
+            return None
+        return {
+            "run": run,
+            "tasks": self._business_db.tasks.get_by_run(run["run_id"]),
+            "work_orders": self._business_db.work_orders.get_by_thread(thread_id),
+            "work_results": self._business_db.work_results.get_by_thread(thread_id),
+            "approvals": self._business_db.approvals.get_by_thread(thread_id),
+            "audit_logs": self._business_db.audits.get_by_thread(thread_id),
+        }
+
+    def recover_unfinished(self) -> dict[str, Any]:
+        recovered: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        failed: list[dict[str, Any]] = []
+
+        for run in self._business_db.runs.list_unfinished():
+            thread_id = run["thread_id"]
+            if run["status"] == "waiting_approval":
+                skipped.append(
+                    {
+                        "thread_id": thread_id,
+                        "reason": "waiting_approval_requires_user_decision",
+                    }
+                )
+                continue
+
+            recoverable_results = self._recoverable_worker_results(thread_id)
+            if not recoverable_results:
+                skipped.append(
+                    {
+                        "thread_id": thread_id,
+                        "reason": "no_completed_worker_result_to_replay",
+                    }
+                )
+                continue
+
+            for worker_result in recoverable_results:
+                event_type = "worker_complete" if worker_result["ok"] else "worker_failed"
+                try:
+                    result = self.resume(
+                        thread_id,
+                        {"event_type": event_type, "payload": worker_result},
+                    )
+                except Exception as exc:  # pragma: no cover - defensive audit path
+                    failed.append(
+                        {
+                            "thread_id": thread_id,
+                            "order_id": worker_result["order_id"],
+                            "error": str(exc),
+                        }
+                    )
+                    self._business_db.audits.log(
+                        thread_id=thread_id,
+                        node="recovery",
+                        action="worker_result_replay_failed",
+                        task_id=worker_result.get("task_id"),
+                        order_id=worker_result["order_id"],
+                        detail=str(exc),
+                    )
+                    continue
+                recovered.append(
+                    {
+                        "thread_id": thread_id,
+                        "order_id": worker_result["order_id"],
+                        "status": result.status,
+                    }
+                )
+                self._business_db.audits.log(
+                    thread_id=thread_id,
+                    node="recovery",
+                    action="worker_result_replayed",
+                    task_id=worker_result.get("task_id"),
+                    order_id=worker_result["order_id"],
+                    detail=f"event_type={event_type}",
+                )
+
+        return {"recovered": recovered, "skipped": skipped, "failed": failed}
+
+    def _recoverable_worker_results(self, thread_id: str) -> list[dict[str, Any]]:
+        recoverable: list[dict[str, Any]] = []
+        for order in self._business_db.work_orders.list_incomplete(thread_id):
+            if order["status"] != "dispatched":
+                continue
+            result = self._business_db.work_results.get_by_order(order["order_id"])
+            if result:
+                recoverable.append(_worker_result_payload(result))
+        return recoverable
 
     def _persist_run_state(self, result: AgentState, parsed: AgentRunResult, instruction: str | None) -> None:
         thread_id = parsed.thread_id
@@ -196,3 +288,26 @@ class ThreadManager:
             tasks=[dict(task) for task in result.get("task_list", [])],
             pending_approval_id=pending_approval_id,
         )
+
+
+def _worker_result_payload(row: dict[str, Any]) -> dict[str, Any]:
+    artifacts = row.get("artifacts")
+    if isinstance(artifacts, str) and artifacts:
+        try:
+            artifacts_value = json.loads(artifacts)
+        except json.JSONDecodeError:
+            artifacts_value = []
+    else:
+        artifacts_value = []
+    return {
+        "order_id": row["order_id"],
+        "task_id": row["task_id"],
+        "ca_thread_id": row["ca_thread_id"],
+        "worker_type": row["worker_type"],
+        "ok": bool(row["ok"]),
+        "exit_code": row.get("exit_code"),
+        "stdout": row.get("stdout") or "",
+        "stderr": row.get("stderr") or "",
+        "artifacts": artifacts_value,
+        "summary": row.get("summary") or "",
+    }
