@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     log_dir: Path = Field(default=Path("logs"))
     data_dir: Path = Field(default=Path("data"))
     planner_type: str = "llm"
+    llm_provider: str = "deepseek"
+    llm_timeout_seconds: float = 60.0
     worker_mode: str = "inline"
     worker_max_workers: int = 4
     auto_recover_on_startup: bool = True
@@ -21,7 +23,13 @@ class Settings(BaseSettings):
     deepseek_api_key: str | None = None
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_model: str = "deepseek-chat"
-    deepseek_timeout_seconds: float = 60.0
+    deepseek_timeout_seconds: float | None = None
+    kimi_api_key: str | None = None
+    kimi_base_url: str = "https://api.moonshot.cn/v1"
+    kimi_model: str = "moonshot-v1-8k"
+    gemini_api_key: str | None = None
+    gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai"
+    gemini_model: str = "gemini-2.5-flash"
     tavily_api_key: str | None = None
     tavily_base_url: str = "https://api.tavily.com"
     feishu_app_id: str | None = None

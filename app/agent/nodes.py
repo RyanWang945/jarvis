@@ -9,7 +9,7 @@ from langgraph.types import interrupt
 
 from app.agent.state import AgentState, PendingAction, RiskLevel, Task
 from app.config import get_settings
-from app.llm.deepseek import DeepSeekClient
+from app.llm.jarvis import get_jarvis_llm
 from app.tools import get_default_tool_registry
 from app.tools.specs import ToolCallPlan
 from app.workers import WorkOrder, WorkResult, get_worker_client
@@ -467,16 +467,11 @@ def _assess_task_completion_semantically(
     if result is None:
         return CompletionAssessment("blocked", "Worker result missing.")
     settings = get_settings()
-    if settings.planner_type != "llm" or not settings.deepseek_api_key:
+    if settings.planner_type != "llm":
         return CompletionAssessment("success", result.summary)
 
     try:
-        assessment = DeepSeekClient(
-            api_key=settings.deepseek_api_key,
-            base_url=settings.deepseek_base_url,
-            model=settings.deepseek_model,
-            timeout_seconds=settings.deepseek_timeout_seconds,
-        ).assess_completion(
+        assessment = get_jarvis_llm().assess_completion(
             task=_task_assessment_payload(task),
             result=result.model_dump(),
             can_retry=_can_retry(task),
@@ -648,21 +643,13 @@ def _planned_tool_calls(state: AgentState) -> list[ToolCallPlan]:
     settings = get_settings()
     if settings.planner_type != "llm":
         return _rule_based_tool_calls(state)
-    if not settings.deepseek_api_key:
-        raise ValueError("JARVIS_DEEPSEEK_API_KEY is required when JARVIS_PLANNER_TYPE=llm.")
 
     payload = _payload(state)
     instruction = str(payload.get("instruction") or "")
     replan_context = _replan_context(state)
     if replan_context:
         instruction = f"{instruction}\n\n{replan_context}"
-    client = DeepSeekClient(
-        api_key=settings.deepseek_api_key,
-        base_url=settings.deepseek_base_url,
-        model=settings.deepseek_model,
-        timeout_seconds=settings.deepseek_timeout_seconds,
-    )
-    return client.plan_tasks(
+    return get_jarvis_llm().plan_tasks(
         instruction=_planner_instruction(payload, instruction),
         tools=get_default_tool_registry().list(exposed_to_llm=True),
     )

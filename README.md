@@ -33,11 +33,19 @@ JARVIS_LOG_LEVEL=INFO
 JARVIS_LOG_DIR=logs
 JARVIS_DATA_DIR=data
 JARVIS_PLANNER_TYPE=llm
+JARVIS_LLM_PROVIDER=deepseek
+JARVIS_LLM_TIMEOUT_SECONDS=60
 JARVIS_WORKER_MODE=inline
 JARVIS_WORKER_MAX_WORKERS=4
 JARVIS_DEEPSEEK_API_KEY=sk-...
 JARVIS_DEEPSEEK_BASE_URL=https://api.deepseek.com
 JARVIS_DEEPSEEK_MODEL=deepseek-chat
+JARVIS_KIMI_API_KEY=sk-...
+JARVIS_KIMI_BASE_URL=https://api.moonshot.cn/v1
+JARVIS_KIMI_MODEL=moonshot-v1-8k
+JARVIS_GEMINI_API_KEY=...
+JARVIS_GEMINI_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai
+JARVIS_GEMINI_MODEL=gemini-2.5-flash
 JARVIS_TAVILY_API_KEY=tvly-...
 JARVIS_OBSIDIAN_VAULT_PATH=E:\path\to\vault
 ```
@@ -51,7 +59,7 @@ Invoke-RestMethod http://127.0.0.1:8000/agent/run `
   -Body '{"instruction":"运行测试并总结结果","workdir":"E:\\pythonProject\\jarvis"}'
 ```
 
-`JARVIS_PLANNER_TYPE=llm` uses DeepSeek tool calling for planning. `rule_based` is only a local fallback for tests or offline debugging.
+`JARVIS_PLANNER_TYPE=llm` uses the configured OpenAI-compatible chat provider for planning and completion assessment. Set `JARVIS_LLM_PROVIDER` to `deepseek`, `kimi`, or `gemini`; `rule_based` is only a local fallback for tests or offline debugging.
 
 `JARVIS_WORKER_MODE=thread` enables the experimental threaded worker client and starts the in-process dispatcher that resumes agent threads when workers finish.
 

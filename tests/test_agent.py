@@ -9,6 +9,7 @@ from app.agent.dispatcher import DispatcherService
 from app.agent.runner import ThreadManager
 from app.config import get_settings
 from app.llm.deepseek import DeepSeekClient
+from app.llm.jarvis import get_jarvis_llm
 from app.main import create_app
 from app.skills import get_default_skill_registry
 from app.tools import get_default_tool_registry
@@ -103,6 +104,7 @@ def test_llm_planner_uses_deepseek_response(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("JARVIS_PLANNER_TYPE", "llm")
     monkeypatch.setenv("JARVIS_DEEPSEEK_API_KEY", "test-key")
     get_settings.cache_clear()
+    get_jarvis_llm.cache_clear()
 
     def fake_plan_tasks(self, *, instruction, tools):
         return [
@@ -115,7 +117,7 @@ def test_llm_planner_uses_deepseek_response(tmp_path, monkeypatch) -> None:
             )
         ]
 
-    monkeypatch.setattr("app.agent.nodes.DeepSeekClient.plan_tasks", fake_plan_tasks)
+    monkeypatch.setattr("app.llm.jarvis.JarvisLLM.plan_tasks", fake_plan_tasks)
     runner = ThreadManager(tmp_path)
     event = build_user_event(instruction="Plan this with DeepSeek")
 
@@ -130,6 +132,7 @@ def test_llm_planned_coder_task_waits_for_approval_then_runs(tmp_path, monkeypat
     monkeypatch.setenv("JARVIS_PLANNER_TYPE", "llm")
     monkeypatch.setenv("JARVIS_DEEPSEEK_API_KEY", "test-key")
     get_settings.cache_clear()
+    get_jarvis_llm.cache_clear()
 
     def fake_plan_tasks(self, *, instruction, tools):
         return [
@@ -150,9 +153,9 @@ def test_llm_planned_coder_task_waits_for_approval_then_runs(tmp_path, monkeypat
         stdout = "code changed"
         stderr = ""
 
-    monkeypatch.setattr("app.agent.nodes.DeepSeekClient.plan_tasks", fake_plan_tasks)
+    monkeypatch.setattr("app.llm.jarvis.JarvisLLM.plan_tasks", fake_plan_tasks)
     monkeypatch.setattr(
-        "app.agent.nodes.DeepSeekClient.assess_completion",
+        "app.llm.jarvis.JarvisLLM.assess_completion",
         lambda self, *, task, result, can_retry: {
             "decision": "success",
             "summary": result["summary"],
@@ -205,7 +208,7 @@ def test_deepseek_planner_sends_tools_and_parses_tool_calls(monkeypatch) -> None
         captured_payload.update(kwargs["json"])
         return FakeResponse()
 
-    monkeypatch.setattr("app.llm.deepseek.httpx.post", fake_post)
+    monkeypatch.setattr("app.llm.client.httpx.post", fake_post)
 
     client = DeepSeekClient(api_key="test-key")
     plans = client.plan_tasks(
@@ -253,7 +256,7 @@ def test_deepseek_completion_assessment_parses_json(monkeypatch) -> None:
         captured_payload.update(kwargs["json"])
         return FakeResponse()
 
-    monkeypatch.setattr("app.llm.deepseek.httpx.post", fake_post)
+    monkeypatch.setattr("app.llm.client.httpx.post", fake_post)
 
     client = DeepSeekClient(api_key="test-key")
     assessment = client.assess_completion(
@@ -282,7 +285,7 @@ def test_deepseek_completion_assessment_allows_replan(monkeypatch) -> None:
                 ]
             }
 
-    monkeypatch.setattr("app.llm.deepseek.httpx.post", lambda *args, **kwargs: FakeResponse())
+    monkeypatch.setattr("app.llm.client.httpx.post", lambda *args, **kwargs: FakeResponse())
 
     client = DeepSeekClient(api_key="test-key")
     assessment = client.assess_completion(
@@ -292,6 +295,108 @@ def test_deepseek_completion_assessment_allows_replan(monkeypatch) -> None:
     )
 
     assert assessment == {"decision": "replan", "summary": "Need a different tool."}
+
+
+def test_jarvis_llm_factory_supports_kimi_provider(monkeypatch) -> None:
+    captured_payload = {}
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "type": "function",
+                                    "function": {
+                                        "name": "echo",
+                                        "arguments": '{"text": "planned by kimi"}',
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+
+    def fake_post(*args, **kwargs):
+        captured_payload["url"] = args[0]
+        captured_payload["headers"] = kwargs["headers"]
+        captured_payload["json"] = kwargs["json"]
+        return FakeResponse()
+
+    monkeypatch.setenv("JARVIS_LLM_PROVIDER", "kimi")
+    monkeypatch.setenv("JARVIS_KIMI_API_KEY", "kimi-key")
+    monkeypatch.setenv("JARVIS_KIMI_MODEL", "moonshot-test")
+    get_settings.cache_clear()
+    get_jarvis_llm.cache_clear()
+    monkeypatch.setattr("app.llm.client.httpx.post", fake_post)
+
+    plans = get_jarvis_llm().plan_tasks(
+        instruction="Plan with Kimi",
+        tools=[
+            ToolSpec(
+                name="echo",
+                description="Echo text",
+                args_schema={
+                    "type": "object",
+                    "properties": {"text": {"type": "string"}},
+                    "required": ["text"],
+                },
+                skill="echo",
+                action="echo",
+                exposed_to_llm=True,
+            )
+        ],
+    )
+
+    assert captured_payload["url"] == "https://api.moonshot.cn/v1/chat/completions"
+    assert captured_payload["headers"]["Authorization"] == "Bearer kimi-key"
+    assert captured_payload["json"]["model"] == "moonshot-test"
+    assert plans == [ToolCallPlan(tool_name="echo", tool_args={"text": "planned by kimi"})]
+
+
+def test_jarvis_llm_factory_supports_gemini_provider(monkeypatch) -> None:
+    monkeypatch.setenv("JARVIS_LLM_PROVIDER", "gemini")
+    monkeypatch.setenv("JARVIS_GEMINI_API_KEY", "gemini-key")
+    monkeypatch.setenv("JARVIS_GEMINI_MODEL", "gemini-test")
+    get_settings.cache_clear()
+    get_jarvis_llm.cache_clear()
+
+    llm = get_jarvis_llm()
+
+    assert llm is get_jarvis_llm()
+
+
+def test_jarvis_llm_factory_keeps_legacy_deepseek_timeout(monkeypatch) -> None:
+    captured_payload = {}
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {"choices": [{"message": {"content": '{"tasks": []}'}}]}
+
+    def fake_post(*args, **kwargs):
+        captured_payload["timeout"] = kwargs["timeout"]
+        return FakeResponse()
+
+    monkeypatch.setenv("JARVIS_LLM_PROVIDER", "deepseek")
+    monkeypatch.setenv("JARVIS_DEEPSEEK_API_KEY", "deepseek-key")
+    monkeypatch.setenv("JARVIS_DEEPSEEK_TIMEOUT_SECONDS", "123")
+    get_settings.cache_clear()
+    get_jarvis_llm.cache_clear()
+    monkeypatch.setattr("app.llm.client.httpx.post", fake_post)
+
+    plans = get_jarvis_llm().plan_tasks(instruction="No-op", tools=[])
+
+    assert plans == []
+    assert captured_payload["timeout"] == 123
 
 
 def test_inline_worker_runs_shell_work_order(tmp_path) -> None:
@@ -721,11 +826,12 @@ def test_aggregate_llm_assessment_can_fail_non_objective_success(monkeypatch) ->
     monkeypatch.setenv("JARVIS_PLANNER_TYPE", "llm")
     monkeypatch.setenv("JARVIS_DEEPSEEK_API_KEY", "test-key")
     get_settings.cache_clear()
+    get_jarvis_llm.cache_clear()
 
     def fake_assess_completion(self, *, task, result, can_retry):
         return {"decision": "failed", "summary": "LLM says DoD was not met."}
 
-    monkeypatch.setattr("app.agent.nodes.DeepSeekClient.assess_completion", fake_assess_completion)
+    monkeypatch.setattr("app.llm.jarvis.JarvisLLM.assess_completion", fake_assess_completion)
 
     event = build_user_event(instruction="Assess narrative result")
     state = initial_state(event, thread_id="thread-assess-2")
@@ -772,11 +878,12 @@ def test_aggregate_llm_assessment_can_trigger_replan(monkeypatch) -> None:
     monkeypatch.setenv("JARVIS_PLANNER_TYPE", "llm")
     monkeypatch.setenv("JARVIS_DEEPSEEK_API_KEY", "test-key")
     get_settings.cache_clear()
+    get_jarvis_llm.cache_clear()
 
     def fake_assess_completion(self, *, task, result, can_retry):
         return {"decision": "replan", "summary": "Need a different approach."}
 
-    monkeypatch.setattr("app.agent.nodes.DeepSeekClient.assess_completion", fake_assess_completion)
+    monkeypatch.setattr("app.llm.jarvis.JarvisLLM.assess_completion", fake_assess_completion)
 
     event = build_user_event(instruction="Assess narrative result")
     state = initial_state(event, thread_id="thread-replan-1")
@@ -871,6 +978,7 @@ def test_llm_replan_context_is_sent_to_planner(monkeypatch) -> None:
     monkeypatch.setenv("JARVIS_PLANNER_TYPE", "llm")
     monkeypatch.setenv("JARVIS_DEEPSEEK_API_KEY", "test-key")
     get_settings.cache_clear()
+    get_jarvis_llm.cache_clear()
 
     captured = {}
 
@@ -878,7 +986,7 @@ def test_llm_replan_context_is_sent_to_planner(monkeypatch) -> None:
         captured["instruction"] = instruction
         return [ToolCallPlan(tool_name="echo", tool_args={"text": "new plan"})]
 
-    monkeypatch.setattr("app.agent.nodes.DeepSeekClient.plan_tasks", fake_plan_tasks)
+    monkeypatch.setattr("app.llm.jarvis.JarvisLLM.plan_tasks", fake_plan_tasks)
 
     event = build_user_event(instruction="Create a new plan")
     state = initial_state(event, thread_id="thread-replan-context")
