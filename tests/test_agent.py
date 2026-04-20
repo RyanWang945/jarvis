@@ -814,6 +814,113 @@ def test_aggregate_llm_assessment_can_fail_non_objective_success(monkeypatch) ->
     assert update["task_list"][0]["result_summary"] == "LLM says DoD was not met."
 
 
+def test_aggregate_does_not_use_completion_assessor_for_external_skill(monkeypatch) -> None:
+    from app.agent.nodes import aggregate
+    from app.agent.state import initial_state
+
+    monkeypatch.setenv("JARVIS_PLANNER_TYPE", "llm")
+    monkeypatch.setenv("JARVIS_DEEPSEEK_API_KEY", "test-key")
+    get_settings.cache_clear()
+    get_jarvis_llm.cache_clear()
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("external skill success should be handled by summarize")
+
+    monkeypatch.setattr("app.agent.nodes._assess_task_completion_semantically", fail_if_called)
+
+    state = initial_state(build_user_event(instruction="Search and cite URLs"), thread_id="thread-search-assess")
+    state["task_list"] = [
+        {
+            "id": "task-search",
+            "title": "Search and cite URLs",
+            "description": "Search and cite URLs",
+            "status": "running",
+            "resource_key": None,
+            "dod": "Return 3 source URLs.",
+            "verification_cmd": None,
+            "tool_name": "tavily_search",
+            "tool_args": {"query": "Tavily API docs"},
+            "worker_type": "tavily-search",
+            "order_id": "order-search",
+            "retry_count": 0,
+            "max_retries": 0,
+            "result_summary": None,
+        }
+    ]
+    state["worker_results"] = {
+        "order-search": WorkResult(
+            order_id="order-search",
+            task_id="task-search",
+            ca_thread_id="thread-search-assess",
+            worker_type="tavily-search",
+            ok=True,
+            stdout='{"results":[{"url":"https://docs.tavily.com"}]}',
+            summary="Tavily search completed.",
+        ).model_dump()
+    }
+
+    update = aggregate(state)
+
+    assert update["next_node"] == "summarize"
+    assert update["task_list"][0]["status"] == "success"
+    assert update["task_list"][0]["result_summary"] == "Tavily search completed."
+
+
+def test_summarize_llm_synthesizes_user_facing_answer(monkeypatch) -> None:
+    from app.agent.nodes import summarize
+    from app.agent.state import initial_state
+
+    monkeypatch.setenv("JARVIS_PLANNER_TYPE", "llm")
+    monkeypatch.setenv("JARVIS_DEEPSEEK_API_KEY", "test-key")
+    get_settings.cache_clear()
+    get_jarvis_llm.cache_clear()
+
+    def fake_synthesize(self, *, instruction, tasks, worker_results):
+        assert instruction == "Return 3 URLs and one sentence."
+        assert tasks[0]["tool_name"] == "tavily_search"
+        assert "https://docs.tavily.com" in worker_results[0]["stdout"]
+        return "Tavily /search returns ranked web results.\n\n1. https://docs.tavily.com"
+
+    monkeypatch.setattr("app.llm.jarvis.JarvisLLM.synthesize_final_answer", fake_synthesize)
+
+    state = initial_state(build_user_event(instruction="Return 3 URLs and one sentence."), thread_id="thread-summary")
+    state["task_list"] = [
+        {
+            "id": "task-search",
+            "title": "Return 3 URLs and one sentence.",
+            "description": "Return 3 URLs and one sentence.",
+            "status": "success",
+            "resource_key": None,
+            "dod": "Return 3 URLs and one sentence.",
+            "verification_cmd": None,
+            "tool_name": "tavily_search",
+            "tool_args": {"query": "Tavily API docs"},
+            "worker_type": "tavily-search",
+            "order_id": "order-search",
+            "retry_count": 0,
+            "max_retries": 0,
+            "result_summary": "Tavily search completed.",
+        }
+    ]
+    state["worker_results"] = {
+        "order-search": WorkResult(
+            order_id="order-search",
+            task_id="task-search",
+            ca_thread_id="thread-summary",
+            worker_type="tavily-search",
+            ok=True,
+            stdout='{"results":[{"url":"https://docs.tavily.com"}]}',
+            summary="Tavily search completed.",
+        ).model_dump()
+    }
+
+    update = summarize(state)
+
+    assert update["status"] == "completed"
+    assert update["final_summary"].startswith("Tavily /search")
+    assert "https://docs.tavily.com" in update["final_summary"]
+
+
 def test_aggregate_llm_assessment_can_trigger_replan(monkeypatch) -> None:
     from app.agent.nodes import aggregate
     from app.agent.state import initial_state

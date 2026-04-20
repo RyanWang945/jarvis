@@ -80,6 +80,41 @@ class JarvisLLM:
         )
         return _completion_assessment_from_message(message, can_retry=can_retry)
 
+    def synthesize_final_answer(
+        self,
+        *,
+        instruction: str,
+        tasks: list[dict[str, Any]],
+        worker_results: list[dict[str, Any]],
+    ) -> str:
+        message = self._chat.chat(
+            [
+                LLMMessage(
+                    role="system",
+                    content=(
+                        "You are Jarvis Final Answer Synthesizer. Produce the final answer for the user, "
+                        "not a status report about workers. Follow the user's original instruction exactly. "
+                        "Use worker stdout/stderr as source data. Preserve requested URLs, citations, lists, "
+                        "and output format when they are present in worker output. If the worker output is "
+                        "insufficient, say what is missing concisely."
+                    ),
+                ),
+                LLMMessage(
+                    role="user",
+                    content=json.dumps(
+                        {
+                            "instruction": instruction,
+                            "tasks": tasks,
+                            "worker_results": worker_results,
+                        },
+                        ensure_ascii=False,
+                    ),
+                ),
+            ],
+        )
+        content = message.get("content")
+        return str(content).strip() if content else ""
+
 
 @lru_cache
 def get_jarvis_llm() -> JarvisLLM:

@@ -25,6 +25,12 @@ jarvis:
             enum:
               - basic
               - advanced
+          format:
+            type: string
+            enum:
+              - raw
+              - brave
+              - md
         required:
           - query
       skill: tavily-search

@@ -384,6 +384,10 @@ def route_after_wait_approval(state: AgentState) -> str:
 
 
 def summarize(state: AgentState) -> dict[str, Any]:
+    final_answer = _synthesize_final_answer(state)
+    if final_answer:
+        return {"status": "completed", "final_summary": final_answer}
+
     tasks = state["task_list"]
     successful = sum(1 for task in tasks if task["status"] == "success")
     failed = sum(1 for task in tasks if task["status"] in {"failed", "blocked"})
@@ -497,6 +501,8 @@ def _is_objective_success(task: Task) -> bool:
         marker in dod for marker in ("completed", "success", "passed", "exited")
     ):
         return True
+    if worker_type and worker_type != "coder":
+        return True
     return False
 
 
@@ -511,6 +517,79 @@ def _task_assessment_payload(task: Task) -> dict[str, Any]:
         "retry_count": task.get("retry_count"),
         "max_retries": task.get("max_retries"),
     }
+
+
+def _synthesize_final_answer(state: AgentState) -> str | None:
+    settings = get_settings()
+    if settings.planner_type != "llm":
+        return None
+
+    payload = _payload(state)
+    instruction = str(payload.get("instruction") or "")
+    if not instruction:
+        return None
+
+    worker_results = _final_answer_worker_results(state)
+    if not worker_results:
+        return None
+
+    try:
+        answer = get_jarvis_llm().synthesize_final_answer(
+            instruction=instruction,
+            tasks=_final_answer_tasks(state),
+            worker_results=worker_results,
+        )
+    except Exception:
+        return None
+    return answer or None
+
+
+def _final_answer_tasks(state: AgentState) -> list[dict[str, Any]]:
+    tasks: list[dict[str, Any]] = []
+    for task in state.get("task_list", []):
+        tasks.append(
+            {
+                "title": task.get("title"),
+                "description": task.get("description"),
+                "status": task.get("status"),
+                "dod": task.get("dod"),
+                "tool_name": task.get("tool_name"),
+                "worker_type": task.get("worker_type"),
+                "tool_args": task.get("tool_args"),
+                "result_summary": task.get("result_summary"),
+                "order_id": task.get("order_id"),
+            }
+        )
+    return tasks
+
+
+def _final_answer_worker_results(state: AgentState) -> list[dict[str, Any]]:
+    worker_results = state.get("worker_results", {})
+    results: list[dict[str, Any]] = []
+    for task in state.get("task_list", []):
+        order_id = task.get("order_id")
+        if not order_id or order_id not in worker_results:
+            continue
+        result = WorkResult(**worker_results[order_id])
+        results.append(
+            {
+                "order_id": result.order_id,
+                "task_id": result.task_id,
+                "worker_type": result.worker_type,
+                "ok": result.ok,
+                "summary": result.summary,
+                "stdout": _truncate_for_final_answer(result.stdout),
+                "stderr": _truncate_for_final_answer(result.stderr, limit=2000),
+                "artifacts": result.artifacts,
+            }
+        )
+    return results
+
+
+def _truncate_for_final_answer(value: str, *, limit: int = 12000) -> str:
+    if len(value) <= limit:
+        return value
+    return value[:limit] + "\n...[truncated]"
 
 
 def _retry_task(
