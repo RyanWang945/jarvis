@@ -36,7 +36,7 @@ def execute_work_order(order: WorkOrder, skill_registry: SkillRegistry | None = 
                     action="verify",
                     workdir=order.workdir,
                     args={"command": order.verification_cmd},
-                    risk_level="low",
+                    risk_level=order.risk_level,
                     timeout_seconds=order.timeout_seconds,
                 )
             )

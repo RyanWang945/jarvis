@@ -90,7 +90,6 @@ def strategize(state: AgentState) -> dict[str, Any]:
         command = _clean_optional(tool_args.get("command"))
         if tool.skill == "claude_code":
             command = _clean_optional(tool_args.get("instruction"))
-        risk_level = _highest_risk(tool.risk_level, _classify_risk(command))
         worker_type = tool.worker_type
         workdir = _clean_optional(tool_args.get("workdir"))
         verification_cmd = (
@@ -98,6 +97,7 @@ def strategize(state: AgentState) -> dict[str, Any]:
             or _clean_optional(tool_args.get("verification_cmd"))
             or _clean_optional(payload.get("verification_cmd"))
         )
+        risk_level = _work_order_risk(tool.risk_level, command=command, verification_cmd=verification_cmd)
 
         task: Task = {
             "id": task_id,
@@ -802,6 +802,11 @@ def _classify_risk(command: str | None) -> RiskLevel:
     return "low"
 
 
+def _work_order_risk(base_risk: RiskLevel, *, command: str | None, verification_cmd: str | None) -> RiskLevel:
+    risk = _highest_risk(base_risk, _classify_risk(command))
+    return _highest_risk(risk, _classify_risk(verification_cmd))
+
+
 def _highest_risk(left: RiskLevel, right: RiskLevel) -> RiskLevel:
     order: dict[RiskLevel, int] = {"low": 0, "medium": 1, "high": 2, "critical": 3}
     return left if order[left] >= order[right] else right
@@ -922,9 +927,7 @@ def _rule_based_tool_calls(state: AgentState) -> list[ToolCallPlan]:
 
 
 def _pending_action_from_order(order: WorkOrder) -> PendingAction:
-    command = _clean_optional(order.args.get("command"))
-    if order.worker_type == "coder":
-        command = _clean_optional(order.args.get("instruction"))
+    command = _approval_command_summary(order)
     return {
         "action_id": str(uuid4()),
         "kind": order.worker_type,
@@ -938,6 +941,19 @@ def _pending_action_from_order(order: WorkOrder) -> PendingAction:
         "status": "waiting_approval",
         "order_id": order.order_id,
     }
+
+
+def _approval_command_summary(order: WorkOrder) -> str | None:
+    commands: list[str] = []
+    command = _clean_optional(order.args.get("command"))
+    if order.worker_type == "coder":
+        command = _clean_optional(order.args.get("instruction"))
+    if command:
+        commands.append(command)
+    verification_cmd = _clean_optional(order.verification_cmd)
+    if verification_cmd:
+        commands.append(f"verification: {verification_cmd}")
+    return "\n".join(commands) if commands else None
 
 
 def _normalize_worker_event_payload(

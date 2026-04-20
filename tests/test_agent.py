@@ -1214,6 +1214,31 @@ def test_wait_approval_interrupt_and_reject(tmp_path, monkeypatch) -> None:
     assert runner.db.approvals.get_pending_by_thread(result.thread_id) == []
 
 
+def test_high_risk_verification_cmd_requires_approval(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("JARVIS_PLANNER_TYPE", "rule_based")
+    get_settings.cache_clear()
+    runner = ThreadManager(tmp_path)
+    event = build_user_event(
+        instruction="Echo then verify with a dangerous command",
+        verification_cmd="git push origin main",
+    )
+
+    result = runner.run_event(event)
+
+    assert result.status == "waiting_approval"
+    assert result.pending_approval_id is not None
+    assert result.tasks[0]["worker_type"] == "echo"
+    assert result.tasks[0]["verification_cmd"] == "git push origin main"
+    orders = runner.db.work_orders.get_by_thread(result.thread_id)
+    assert len(orders) == 1
+    assert orders[0]["risk_level"] == "high"
+    assert orders[0]["verification_cmd"] == "git push origin main"
+    approvals = runner.db.approvals.get_by_thread(result.thread_id)
+    assert len(approvals) == 1
+    assert approvals[0]["risk_level"] == "high"
+    assert "verification: git push origin main" in approvals[0]["command"]
+
+
 def test_business_db_persists_run_and_tasks(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("JARVIS_PLANNER_TYPE", "rule_based")
     get_settings.cache_clear()
