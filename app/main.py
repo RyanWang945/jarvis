@@ -9,6 +9,7 @@ from app.api.agent import get_thread_manager
 from app.api.routes import router
 from app.config import get_settings
 from app.logging_config import configure_logging
+from app.skills.bootstrap import bootstrap_registries
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +19,9 @@ async def lifespan(app: FastAPI):
     settings = get_settings()
     dispatcher: DispatcherService | None = None
     manager = get_thread_manager()
+    registries = bootstrap_registries(force=True)
+    app.state.skill_registry = registries.skill_registry
+    app.state.tool_registry = registries.tool_registry
     if settings.auto_recover_on_startup:
         recovery = manager.recover_unfinished()
         logger.info(

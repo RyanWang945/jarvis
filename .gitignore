@@ -9,6 +9,7 @@ wheels/
 
 # IDE files
 .idea/
+.DS_Store
 
 # Virtual environments
 .venv
@@ -16,4 +17,9 @@ wheels/
 # Local configuration and runtime data
 .env
 logs/
-data/
+data/*
+!data/skills/
+!data/skills/**
+data/skills/**/.DS_Store
+data/skills/**/__pycache__/
+data/skills/**/*.py[oc]

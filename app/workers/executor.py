@@ -1,11 +1,13 @@
 from app.skills import ShellSkill, get_default_skill_registry
 from app.skills.base import SkillRequest
+from app.skills.registry import SkillRegistry
 from app.workers.base import WorkOrder, WorkResult
 
 
-def execute_work_order(order: WorkOrder) -> WorkResult:
+def execute_work_order(order: WorkOrder, skill_registry: SkillRegistry | None = None) -> WorkResult:
+    registry = skill_registry or get_default_skill_registry()
     try:
-        skill = get_default_skill_registry().get(order.worker_type)
+        skill = registry.get(order.worker_type)
     except ValueError:
         result = WorkResult(
             order_id=order.order_id,

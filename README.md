@@ -63,4 +63,4 @@ Invoke-RestMethod http://127.0.0.1:8000/agent/run `
 
 `JARVIS_WORKER_MODE=thread` enables the experimental threaded worker client and starts the in-process dispatcher that resumes agent threads when workers finish.
 
-`JARVIS_TAVILY_API_KEY` enables the `web_search` tool backed by Tavily.
+`JARVIS_TAVILY_API_KEY` enables the external `tavily_search` skill when installed under `data/skills/`.

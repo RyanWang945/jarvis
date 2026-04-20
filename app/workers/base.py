@@ -3,7 +3,7 @@ from typing import Any, Literal, Protocol
 from pydantic import BaseModel, Field
 
 RiskLevel = Literal["low", "medium", "high", "critical"]
-WorkerType = Literal["echo", "shell", "coder", "file", "obsidian", "github", "web_search"]
+WorkerType = str
 
 
 class WorkOrder(BaseModel):

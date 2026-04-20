@@ -208,6 +208,7 @@ dependencies = [
     { name = "langgraph" },
     { name = "langgraph-checkpoint-sqlite" },
     { name = "pydantic-settings" },
+    { name = "pyyaml" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 
@@ -224,6 +225,7 @@ requires-dist = [
     { name = "langgraph", specifier = ">=1.1.8" },
     { name = "langgraph-checkpoint-sqlite", specifier = ">=3.0.3" },
     { name = "pydantic-settings", specifier = ">=2.7.0" },
+    { name = "pyyaml", specifier = ">=6.0.3" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.34.0" },
 ]
 

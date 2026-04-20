@@ -1,0 +1,40 @@
+name: tavily-search
+description: Web search via Tavily API using the bundled OpenClaw script.
+version: 0.1.0
+capabilities:
+  - tavily_search
+jarvis:
+  module: skill
+  class_name: TavilySearchSkill
+  tools:
+    - name: tavily_search
+      description: Search the web through Tavily and return titles, URLs, and snippets.
+      args_schema:
+        type: object
+        properties:
+          query:
+            type: string
+          max_results:
+            type: integer
+            minimum: 1
+            maximum: 10
+          include_answer:
+            type: boolean
+          search_depth:
+            type: string
+            enum:
+              - basic
+              - advanced
+          format:
+            type: string
+            enum:
+              - raw
+              - brave
+              - md
+        required:
+          - query
+      skill: tavily-search
+      worker_type: tavily-search
+      action: search
+      risk_level: low
+      exposed_to_llm: true

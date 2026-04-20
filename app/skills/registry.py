@@ -1,10 +1,4 @@
-from functools import lru_cache
-
 from app.skills.base import Skill
-from app.skills.coder import CoderSkill
-from app.skills.echo import EchoSkill
-from app.skills.shell import ShellSkill
-from app.skills.tavily import TavilySearchSkill
 
 
 class SkillRegistry:
@@ -21,13 +15,7 @@ class SkillRegistry:
         return list(self._skills.values())
 
 
-@lru_cache
 def get_default_skill_registry() -> SkillRegistry:
-    return SkillRegistry(
-        [
-            EchoSkill(),
-            ShellSkill(),
-            CoderSkill(),
-            TavilySearchSkill(),
-        ]
-    )
+    from app.skills.bootstrap import get_skill_registry
+
+    return get_skill_registry()

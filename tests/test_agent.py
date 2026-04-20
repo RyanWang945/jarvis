@@ -11,6 +11,7 @@ from app.config import get_settings
 from app.llm.deepseek import DeepSeekClient
 from app.llm.jarvis import get_jarvis_llm
 from app.main import create_app
+from app.skills.bootstrap import bootstrap_registries, reset_registries_for_tests
 from app.skills import get_default_skill_registry
 from app.tools import get_default_tool_registry
 from app.tools.specs import ToolCallPlan, ToolSpec
@@ -427,7 +428,12 @@ def test_skill_registry_exposes_default_skills() -> None:
     assert registry.get("echo").name == "echo"
     assert registry.get("shell").name == "shell"
     assert registry.get("coder").name == "coder"
-    assert registry.get("web_search").name == "web_search"
+    try:
+        registry.get("web_search")
+    except ValueError as exc:
+        assert "unknown skill" in str(exc)
+    else:
+        raise AssertionError("web_search should not be registered as a built-in skill")
 
 
 def test_coder_worker_invokes_claude_with_publish_workflow_guidance(tmp_path, monkeypatch) -> None:
@@ -508,78 +514,15 @@ def test_tool_registry_prefers_coder_for_development_publish_workflows() -> None
     assert "Do not use this for multi-step code editing" in shell_tool.description
 
 
-def test_tavily_search_requires_api_key(monkeypatch) -> None:
-    monkeypatch.delenv("JARVIS_TAVILY_API_KEY", raising=False)
-    get_settings.cache_clear()
+def test_builtin_web_search_tool_is_not_registered() -> None:
+    registry = get_default_tool_registry()
 
-    result = execute_work_order(
-        WorkOrder(
-            order_id="search-order-1",
-            task_id="search-task-1",
-            ca_thread_id="thread-search-1",
-            worker_type="web_search",
-            action="search",
-            args={"query": "latest Python release"},
-            reason="Search web",
-        )
-    )
-
-    assert result.ok is False
-    assert "Tavily API key" in result.summary
-
-
-def test_tavily_search_normalizes_response(monkeypatch) -> None:
-    monkeypatch.setenv("JARVIS_TAVILY_API_KEY", "test-key")
-    get_settings.cache_clear()
-
-    captured = {}
-
-    class FakeResponse:
-        def raise_for_status(self) -> None:
-            return None
-
-        def json(self) -> dict:
-            return {
-                "query": "latest Python release",
-                "answer": "Python 3.14",
-                "results": [
-                    {
-                        "title": "Python Downloads",
-                        "url": "https://www.python.org/downloads/",
-                        "content": "Download Python",
-                        "score": 0.9,
-                        "raw_content": "ignored",
-                    }
-                ],
-            }
-
-    def fake_post(*args, **kwargs):
-        captured["url"] = args[0]
-        captured["headers"] = kwargs["headers"]
-        captured["json"] = kwargs["json"]
-        return FakeResponse()
-
-    monkeypatch.setattr("app.skills.tavily.httpx.post", fake_post)
-
-    result = execute_work_order(
-        WorkOrder(
-            order_id="search-order-2",
-            task_id="search-task-2",
-            ca_thread_id="thread-search-2",
-            worker_type="web_search",
-            action="search",
-            args={"query": "latest Python release", "max_results": 20},
-            reason="Search web",
-        )
-    )
-
-    body = json.loads(result.stdout)
-    assert result.ok is True
-    assert captured["url"] == "https://api.tavily.com/search"
-    assert captured["headers"]["Authorization"] == "Bearer test-key"
-    assert captured["json"]["max_results"] == 8
-    assert body["answer"] == "Python 3.14"
-    assert body["results"][0]["url"] == "https://www.python.org/downloads/"
+    try:
+        registry.get("web_search")
+    except ValueError as exc:
+        assert "unknown tool" in str(exc)
+    else:
+        raise AssertionError("web_search should not be registered as a built-in tool")
 
 
 def test_dispatch_creates_active_workers_and_monitor_collects_results(monkeypatch) -> None:
@@ -1488,3 +1431,143 @@ def test_dispatcher_resumes_thread_after_worker_completion(tmp_path, monkeypatch
     assert run["status"] == "completed"
     tasks = manager.db.tasks.get_by_run(run["run_id"])
     assert tasks[0]["status"] == "success"
+
+
+def test_external_manifest_skill_registers_tool_and_executes(tmp_path) -> None:
+    skills_root = tmp_path / "skills"
+    package = skills_root / "uuid_generator"
+    package.mkdir(parents=True)
+    (package / "manifest.yaml").write_text(
+        """
+name: uuid_generator
+description: Generate UUID values.
+jarvis:
+  module: skill
+  class_name: UuidSkill
+  tools:
+    - name: generate_uuid
+      description: Generate a UUID.
+      args_schema:
+        type: object
+        properties: {}
+      skill: uuid_generator
+      worker_type: uuid_generator
+      action: generate
+      risk_level: low
+      exposed_to_llm: true
+""",
+        encoding="utf-8",
+    )
+    (package / "skill.py").write_text(
+        """
+from app.skills.base import SkillResult
+
+
+class UuidSkill:
+    name = "uuid_generator"
+
+    def run(self, request):
+        return SkillResult(ok=True, exit_code=0, stdout="fixed-uuid", summary="generated uuid")
+""",
+        encoding="utf-8",
+    )
+
+    reset_registries_for_tests()
+    try:
+        registries = bootstrap_registries(external_paths=[skills_root], force=True)
+
+        tool = registries.tool_registry.get("generate_uuid")
+        assert tool.worker_type == "uuid_generator"
+        assert tool.exposed_to_llm is True
+
+        result = execute_work_order(
+            WorkOrder(
+                order_id="uuid-order-1",
+                task_id="uuid-task-1",
+                ca_thread_id="uuid-thread-1",
+                worker_type="uuid_generator",
+                action="generate",
+                args={},
+                reason="Generate UUID",
+            ),
+            skill_registry=registries.skill_registry,
+        )
+
+        assert result.ok is True
+        assert result.stdout == "fixed-uuid"
+    finally:
+        reset_registries_for_tests()
+
+
+def test_invalid_external_skill_package_is_skipped(tmp_path, caplog) -> None:
+    skills_root = tmp_path / "skills"
+    package = skills_root / "broken"
+    package.mkdir(parents=True)
+    (package / "manifest.yaml").write_text("name: broken\njarvis:\n  class_name: MissingSkill\n", encoding="utf-8")
+
+    reset_registries_for_tests()
+    try:
+        registries = bootstrap_registries(external_paths=[skills_root], force=True)
+
+        assert registries.tool_registry.get("echo").name == "echo"
+        assert "skipping invalid skill package" in caplog.text
+    finally:
+        reset_registries_for_tests()
+
+
+def test_external_skill_md_frontmatter_registers_tool(tmp_path) -> None:
+    skills_root = tmp_path / "skills"
+    package = skills_root / "note_echo"
+    package.mkdir(parents=True)
+    (package / "SKILL.md").write_text(
+        """---
+name: note_echo
+description: Echo notes.
+metadata:
+  jarvis:
+    module: skill
+    class_name: NoteEchoSkill
+    tools:
+      - name: note_echo
+        description: Echo a note.
+        args_schema:
+          type: object
+          properties:
+            text:
+              type: string
+          required:
+            - text
+        action: echo
+        exposed_to_llm: true
+---
+
+Use this skill to echo note text.
+""",
+        encoding="utf-8",
+    )
+    (package / "skill.py").write_text(
+        """
+from app.skills.base import SkillResult
+
+
+class NoteEchoSkill:
+    name = "note_echo"
+
+    def run(self, request):
+        text = str(request.args.get("text", ""))
+        return SkillResult(ok=True, exit_code=0, stdout=text, summary=text)
+""",
+        encoding="utf-8",
+    )
+
+    reset_registries_for_tests()
+    try:
+        registries = bootstrap_registries(external_paths=[skills_root], force=True)
+
+        tool = registries.tool_registry.get("note_echo")
+
+        assert tool.skill == "note_echo"
+        assert tool.worker_type == "note_echo"
+        assert tool.exposed_to_llm is True
+    finally:
+        reset_registries_for_tests()

@@ -90,7 +90,7 @@ def strategize(state: AgentState) -> dict[str, Any]:
         if tool.skill == "claude_code":
             command = _clean_optional(tool_args.get("instruction"))
         risk_level = _highest_risk(tool.risk_level, _classify_risk(command))
-        worker_type = _tool_to_worker_type(tool_name)
+        worker_type = tool.worker_type
         workdir = _clean_optional(tool_args.get("workdir"))
         verification_cmd = (
             _clean_optional(item.verification_cmd)
@@ -682,16 +682,6 @@ def _rule_based_tool_calls(state: AgentState) -> list[ToolCallPlan]:
             max_retries=int(payload.get("max_retries") or 0),
         )
     ]
-
-
-def _tool_to_worker_type(tool_name: str) -> str:
-    if tool_name in {"run_shell_command", "run_tests"}:
-        return "shell"
-    if tool_name == "delegate_to_claude_code":
-        return "coder"
-    if tool_name == "web_search":
-        return "web_search"
-    return "echo"
 
 
 def _pending_action_from_order(order: WorkOrder) -> PendingAction:
