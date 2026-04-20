@@ -638,6 +638,10 @@ def _fallback_search_answer(*, instruction: str, stdout: str) -> str | None:
     answer = parsed.get("answer")
     if answer:
         lines.extend(["", str(answer).strip()])
+    else:
+        summary = _summary_from_search_items(parsed["results"])
+        if summary:
+            lines.extend(["", "摘要：", summary])
 
     lines.extend(["", "来源："])
     for index, item in enumerate(parsed["results"][:5], start=1):
@@ -655,17 +659,82 @@ def _fallback_search_answer(*, instruction: str, stdout: str) -> str | None:
 
 
 def _fallback_text_answer(*, instruction: str, stdout: str) -> str | None:
-    urls = _extract_urls_from_text(stdout)
+    items = _parse_text_search_items(stdout)
+    urls = [item["url"] for item in items if item.get("url")]
     if not urls:
         return None
 
-    lines = [f"根据搜索结果，{instruction}：", "", "来源："]
-    for index, url in enumerate(urls[:5], start=1):
-        lines.append(f"{index}. {url}")
-    excerpt = _first_useful_excerpt(stdout)
-    if excerpt:
-        lines.extend(["", "摘要片段：", excerpt])
+    lines = [f"根据搜索结果，{instruction}："]
+    summary = _summary_from_search_items(items)
+    if summary:
+        lines.extend(["", "摘要：", summary])
+
+    lines.extend(["", "来源："])
+    for index, item in enumerate(items[:5], start=1):
+        title = item.get("title") or "Untitled"
+        url = item.get("url") or ""
+        lines.append(f"{index}. {title}")
+        if url:
+            lines.append(f"   {url}")
     return "\n".join(lines).strip()
+
+
+def _summary_from_search_items(items: list[Any]) -> str | None:
+    snippets: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        snippet = str(item.get("snippet") or item.get("content") or "").strip()
+        if not snippet:
+            continue
+        snippets.append(_truncate_for_final_answer(_clean_search_snippet(snippet), limit=260))
+        if len(snippets) >= 3:
+            break
+    if not snippets:
+        return None
+    return "\n".join(f"- {snippet}" for snippet in snippets)
+
+
+def _clean_search_snippet(snippet: str) -> str:
+    cleaned = re.sub(r"\s+", " ", snippet).strip()
+    return cleaned
+
+
+def _parse_text_search_items(text: str) -> list[dict[str, str]]:
+    items: list[dict[str, str]] = []
+    current: dict[str, str] | None = None
+    has_url = False
+
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if not stripped:
+            continue
+        title_match = re.match(r"^\d+\.\s+(.+)$", line)
+        if title_match:
+            if current:
+                items.append(current)
+            current = {"title": title_match.group(1).strip(), "url": "", "snippet": ""}
+            has_url = False
+            continue
+        if stripped.startswith(("http://", "https://")):
+            if current is None:
+                current = {"title": "", "url": "", "snippet": ""}
+            current["url"] = stripped
+            has_url = True
+            continue
+        if current is not None and (stripped.startswith("- ") or has_url):
+            if current is None:
+                current = {"title": "", "url": "", "snippet": ""}
+            snippet = stripped[2:].strip() if stripped.startswith("- ") else stripped
+            current["snippet"] = f"{current.get('snippet', '')} {snippet}".strip()
+
+    if current:
+        items.append(current)
+
+    if items:
+        return items
+    return [{"title": "", "url": url, "snippet": ""} for url in _extract_urls_from_text(text)]
 
 
 def _extract_urls_from_text(text: str) -> list[str]:
@@ -675,19 +744,6 @@ def _extract_urls_from_text(text: str) -> list[str]:
         if url not in urls:
             urls.append(url)
     return urls
-
-
-def _first_useful_excerpt(text: str) -> str | None:
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith(("http://", "https://")):
-            continue
-        if len(stripped) < 20:
-            continue
-        return _truncate_for_final_answer(stripped, limit=300)
-    return None
-
-
 def _truncate_for_final_answer(value: str, *, limit: int = 12000) -> str:
     if len(value) <= limit:
         return value

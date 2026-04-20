@@ -34,6 +34,76 @@
 - Worker resume 已支持 `worker_failed` 事件归一化。
 - run inspection API 已返回 work_orders、work_results、approval history。
 - 已实现最小 Worker 回调补偿：扫描已落库 work_results 并 replay resume。
+- 已实现外部 Skill bootstrap/loader，支持 `manifest.yaml` 与 `SKILL.md` frontmatter。
+- 已移除内置 `web_search`，搜索能力统一由外部 `tavily_search` skill 提供。
+- `summarize` 已接入 final answer synthesis，避免只返回 Worker 状态摘要。
+- 搜索类 final answer 已增加 fallback：LLM 合成被内容风控拒绝时，仍可从 Worker stdout 提取摘要片段与来源 URL。
+
+## 当前最高优先级风险（2026-04-20）
+
+### P0：`verification_cmd` 风险审批绕过
+
+问题：
+
+- `strategize` 当前只基于主命令或 coder instruction 计算风险。
+- `execute_work_order()` 在主 Skill 成功后直接用 `ShellSkill` 执行 `verification_cmd`，并传入 `risk_level="low"`。
+- `ShellSkill` 使用 `shell=True`，没有二次风险检查。
+
+风险：
+
+- 低风险工具可以附带高危 verification command，绕过 dispatch 阶段的 approval。
+
+建议：
+
+- `verification_cmd` 必须纳入 `_classify_risk()`。
+- 高危 verification 需要走同一套 approval。
+- 或者将 verification 限制为白名单命令。
+
+### P0：外部 Skill/Tool 名称覆盖
+
+问题：
+
+- bootstrap 先加载内置，再加载外部包。
+- `SkillRegistry` / `ToolRegistry` 当前用 dict 按 name 建表，重复名称会被后者覆盖。
+
+风险：
+
+- 外部包可覆盖 `run_shell_command`、`delegate_to_claude_code`、`echo` 等内置工具，改变风险等级或执行行为。
+
+建议：
+
+- 注册表构造时默认拒绝重复 `skill.name` 和 `tool.name`。
+- 仅在显式开发配置 `allow_skill_override` 下允许覆盖，并写审计日志。
+
+### P0：搜索结果 prompt injection
+
+问题：
+
+- 搜索结果来自不可信网页，进入 final answer synthesis。
+- 当前已开始压缩 stdout，但仍需要更明确的不可信数据边界和结构化输入策略。
+
+风险：
+
+- 网页 snippet 中可能包含“忽略之前指令”“泄露密钥”“执行命令”等注入内容，影响最终回答模型。
+
+建议：
+
+- final answer prompt 明确 worker output 是 untrusted data。
+- 搜索结果只传 `title/url/snippet`，限制长度和字段。
+- 禁止 final answer synthesis 根据 worker output 发起新工具调用或执行任何命令。
+
+### P1：搜索 fallback 摘要质量
+
+问题：
+
+- 当 DeepSeek 返回 `Content Exists Risk` 等错误时，fallback 会从 JSON/Markdown/plain text 提取 URL 和摘要片段。
+- 当前 fallback 是确定性降级策略，能保证有结果，但摘要仍偏机械，不能完全替代 LLM 总结。
+
+建议：
+
+- 优先让搜索 worker 输出稳定 JSON，避免 planner 控制内部 `format`。
+- fallback 先输出 top snippets 的简洁汇总，再列来源 URL。
+- 后续可引入本地规则摘要器，避免依赖 DeepSeek 风控。
 
 ## P0：修复 dispatch / monitor 语义分离
 

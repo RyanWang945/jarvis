@@ -113,7 +113,7 @@ v2.0 新增：
 | P1-M3-6 | 实现 `ShellWorker` | 封装 Shell Skill 为 Worker | P0 |
 | P1-M3-7 | 实现 Obsidian/File Skill | 写入本地 Markdown 复盘 | P1 |
 | P1-M3-8 | 实现 Skill Registry | 新 Skill 可注册接入，不改 Worker executor | P0 | Done |
-| P1-M3-9 | 实现 Tavily Search Skill | `web_search` 工具 | P1 | Done |
+| P1-M3-9 | 实现 Tavily Search Skill | 外部 `tavily_search` 工具 | P1 | Done |
 | P1-M3-10 | 实现 Image Generation Skill | 画图工具，产物写入 artifacts | P1 | Pending |
 
 验收标准：
@@ -125,7 +125,9 @@ v2.0 新增：
 当前进展：
 
 - 已新增 `SkillRegistry`，`execute_work_order()` 通过 skill 名分发，避免继续在 executor 中手写 if/elif。
-- 已接入 Tavily `web_search` skill，配置项为 `JARVIS_TAVILY_API_KEY`。
+- 已新增外部 Skill bootstrap/loader，支持 `data/skills/`、`~/.jarvis/skills/`、`JARVIS_SKILL_PATH`。
+- 已接入外部 Tavily `tavily_search` skill，配置项为 `JARVIS_TAVILY_API_KEY`。
+- 内置 `web_search` 已移除，搜索能力统一走外部 skill 包。
 - 后续画图工具应按同一模式实现 `ImageGenerationSkill`，图片写入 `data/artifacts/images/...`，路径放入 `SkillResult.artifacts`。
 
 #### M4：风险分级与本地授权（LangGraph 1.0+ interrupt）
@@ -210,7 +212,9 @@ v2.0 新增：
 - FastAPI 在 `JARVIS_WORKER_MODE=thread` 时会随 lifespan 启停 DispatcherService。
 - aggregate 已接入规则优先的 LLM completion assessment：确定性规则先判断，非客观成功任务才调用 DeepSeek 判断 DoD 是否满足。
 - LLM assessment 可返回 `replan`，aggregate 会保留旧任务历史并回到 `strategize` 追加新任务。
-- 剩余工作：Worker 超时取消、把 replan 的失败上下文更完整地传给 LLM planner，以及进入 M7 资源锁。
+- summarize 已接入 LLM final answer synthesis：基于用户原始指令、task 和 worker stdout/stderr 生成面向用户的最终回答，而不是仅返回任务状态摘要。
+- 搜索类任务已增加 final answer fallback：当 DeepSeek 因内容风控等原因拒绝合成时，从搜索结果 JSON/Markdown/plain text 中提取摘要片段和来源 URL。
+- 剩余工作：Worker 超时取消、把 replan 的失败上下文更完整地传给 LLM planner、搜索 fallback 的摘要质量优化，以及进入 M7 资源锁。
 
 #### M7：资源锁与会话调度
 

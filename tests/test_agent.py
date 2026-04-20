@@ -982,6 +982,8 @@ def test_summarize_falls_back_to_search_results_when_llm_rejects(monkeypatch) ->
     assert update["status"] == "completed"
     assert "https://example.com/profile" in update["final_summary"]
     assert "Profile snippet" in update["final_summary"]
+    assert "摘要：" in update["final_summary"]
+    assert update["final_summary"].index("摘要：") < update["final_summary"].index("来源：")
 
 
 def test_summarize_falls_back_to_urls_from_text_when_llm_rejects(monkeypatch) -> None:
@@ -1034,6 +1036,8 @@ def test_summarize_falls_back_to_urls_from_text_when_llm_rejects(monkeypatch) ->
     assert update["status"] == "completed"
     assert "https://example.com/profile" in update["final_summary"]
     assert "Profile text snippet" in update["final_summary"]
+    assert "摘要：" in update["final_summary"]
+    assert update["final_summary"].index("摘要：") < update["final_summary"].index("来源：")
 
 
 def test_aggregate_llm_assessment_can_trigger_replan(monkeypatch) -> None:

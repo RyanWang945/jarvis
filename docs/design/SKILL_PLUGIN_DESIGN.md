@@ -1,9 +1,43 @@
 # Skill 插件系统设计文档
 
-**状态：** 草案
+**状态：** 已部分落地，继续硬化
 **作者：** Claude（架构评审）
 **日期：** 2026-04-20
 **范围：** 外部 Skill 的发现、加载、注册与生命周期管理
+
+---
+
+## 0. 当前进展（2026-04-20）
+
+已落地：
+
+- `ToolSpec` 已增加 `worker_type`，`strategize` 直接使用 `tool.worker_type`，不再依赖 `_tool_to_worker_type()` 硬编码映射。
+- 新增 `bootstrap_registries()`，统一加载内置 Skill/ToolSpec 与外部 Skill 包。
+- `get_default_skill_registry()` / `get_default_tool_registry()` 仍保留为兼容入口，但已代理到 bootstrap 后的全局注册表。
+- 新增外部 Skill loader，支持扫描：
+  - `data/skills/`
+  - `~/.jarvis/skills/`
+  - `JARVIS_SKILL_PATH`
+- 外部 Skill 包支持：
+  - `manifest.yaml`
+  - `SKILL.md` YAML frontmatter + `metadata.jarvis`
+- 损坏的 Skill 包会 warning 后跳过，不影响内置能力和其他包。
+- 已接入外部 Tavily search 包：`data/skills/openclaw-tavily-search-0.1.0/`，对 LLM 暴露 `tavily_search`。
+- 内置 `web_search` 已移除，搜索能力统一由外部 `tavily_search` 提供。
+- 已验证 DeepSeek planner 能从工具列表中选择 `tavily_search`，并完成真实 Tavily API 搜索。
+
+与原草案的差异：
+
+- 外部包不仅支持 `manifest.yaml`，也支持 Agent Skills 风格的 `SKILL.md`。
+- 当前未引入热重载，新增/删除外部 Skill 仍需重启或强制重新 bootstrap。
+- 当前外部 Skill 是本地 Python 动态 import，等价于信任本地代码执行，尚未实现沙箱。
+
+当前暴露的问题：
+
+- 注册表现在仍允许外部 Skill/Tool 与内置名称冲突并覆盖，需要改为默认拒绝重复名称。
+- `verification_cmd` 当前执行路径需要纳入风险检查，避免绕过审批。
+- 搜索结果进入 final answer synthesis 前需要结构化压缩和 prompt injection 防护。
+- 搜索类 fallback 已具备 URL 抽取和摘要片段输出，但仍需要更稳定的摘要策略。
 
 ---
 
