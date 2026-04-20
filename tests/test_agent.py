@@ -921,6 +921,121 @@ def test_summarize_llm_synthesizes_user_facing_answer(monkeypatch) -> None:
     assert "https://docs.tavily.com" in update["final_summary"]
 
 
+def test_summarize_falls_back_to_search_results_when_llm_rejects(monkeypatch) -> None:
+    from app.agent.nodes import summarize
+    from app.agent.state import initial_state
+
+    monkeypatch.setenv("JARVIS_PLANNER_TYPE", "llm")
+    monkeypatch.setenv("JARVIS_DEEPSEEK_API_KEY", "test-key")
+    get_settings.cache_clear()
+    get_jarvis_llm.cache_clear()
+
+    def fake_synthesize(self, *, instruction, tasks, worker_results):
+        raise RuntimeError("Content Exists Risk")
+
+    monkeypatch.setattr("app.llm.jarvis.JarvisLLM.synthesize_final_answer", fake_synthesize)
+
+    state = initial_state(build_user_event(instruction="查查某人的简介"), thread_id="thread-summary-fallback")
+    state["task_list"] = [
+        {
+            "id": "task-search",
+            "title": "查查某人的简介",
+            "description": "查查某人的简介",
+            "status": "success",
+            "resource_key": None,
+            "dod": "Return a profile.",
+            "verification_cmd": None,
+            "tool_name": "tavily_search",
+            "tool_args": {"query": "某人 简介"},
+            "worker_type": "tavily-search",
+            "order_id": "order-search",
+            "retry_count": 0,
+            "max_retries": 0,
+            "result_summary": "Tavily search completed.",
+        }
+    ]
+    state["worker_results"] = {
+        "order-search": WorkResult(
+            order_id="order-search",
+            task_id="task-search",
+            ca_thread_id="thread-summary-fallback",
+            worker_type="tavily-search",
+            ok=True,
+            stdout=json.dumps(
+                {
+                    "query": "某人 简介",
+                    "results": [
+                        {
+                            "title": "Profile Source",
+                            "url": "https://example.com/profile",
+                            "snippet": "Profile snippet",
+                        }
+                    ],
+                }
+            ),
+            summary="Tavily search completed.",
+        ).model_dump()
+    }
+
+    update = summarize(state)
+
+    assert update["status"] == "completed"
+    assert "https://example.com/profile" in update["final_summary"]
+    assert "Profile snippet" in update["final_summary"]
+
+
+def test_summarize_falls_back_to_urls_from_text_when_llm_rejects(monkeypatch) -> None:
+    from app.agent.nodes import summarize
+    from app.agent.state import initial_state
+
+    monkeypatch.setenv("JARVIS_PLANNER_TYPE", "llm")
+    monkeypatch.setenv("JARVIS_DEEPSEEK_API_KEY", "test-key")
+    get_settings.cache_clear()
+    get_jarvis_llm.cache_clear()
+
+    def fake_synthesize(self, *, instruction, tasks, worker_results):
+        raise RuntimeError("Content Exists Risk")
+
+    monkeypatch.setattr("app.llm.jarvis.JarvisLLM.synthesize_final_answer", fake_synthesize)
+
+    state = initial_state(build_user_event(instruction="查查某人的简介"), thread_id="thread-summary-text-fallback")
+    state["task_list"] = [
+        {
+            "id": "task-search",
+            "title": "查查某人的简介",
+            "description": "查查某人的简介",
+            "status": "success",
+            "resource_key": None,
+            "dod": "Return a profile.",
+            "verification_cmd": None,
+            "tool_name": "tavily_search",
+            "tool_args": {"query": "某人 简介", "format": "md"},
+            "worker_type": "tavily-search",
+            "order_id": "order-search",
+            "retry_count": 0,
+            "max_retries": 0,
+            "result_summary": "Tavily search completed.",
+        }
+    ]
+    state["worker_results"] = {
+        "order-search": WorkResult(
+            order_id="order-search",
+            task_id="task-search",
+            ca_thread_id="thread-summary-text-fallback",
+            worker_type="tavily-search",
+            ok=True,
+            stdout="1. Profile Source\n   https://example.com/profile\n   - Profile text snippet",
+            summary="Tavily search completed.",
+        ).model_dump()
+    }
+
+    update = summarize(state)
+
+    assert update["status"] == "completed"
+    assert "https://example.com/profile" in update["final_summary"]
+    assert "Profile text snippet" in update["final_summary"]
+
+
 def test_aggregate_llm_assessment_can_trigger_replan(monkeypatch) -> None:
     from app.agent.nodes import aggregate
     from app.agent.state import initial_state

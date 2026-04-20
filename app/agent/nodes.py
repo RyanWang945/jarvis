@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -540,7 +541,7 @@ def _synthesize_final_answer(state: AgentState) -> str | None:
             worker_results=worker_results,
         )
     except Exception:
-        return None
+        return _fallback_final_answer(instruction=instruction, worker_results=worker_results)
     return answer or None
 
 
@@ -578,12 +579,113 @@ def _final_answer_worker_results(state: AgentState) -> list[dict[str, Any]]:
                 "worker_type": result.worker_type,
                 "ok": result.ok,
                 "summary": result.summary,
-                "stdout": _truncate_for_final_answer(result.stdout),
+                "stdout": _compact_stdout_for_final_answer(result.stdout),
                 "stderr": _truncate_for_final_answer(result.stderr, limit=2000),
                 "artifacts": result.artifacts,
             }
         )
     return results
+
+
+def _compact_stdout_for_final_answer(stdout: str) -> str:
+    try:
+        parsed = json.loads(stdout)
+    except json.JSONDecodeError:
+        return _truncate_for_final_answer(stdout)
+    if not isinstance(parsed, dict):
+        return _truncate_for_final_answer(stdout)
+
+    results = parsed.get("results")
+    if not isinstance(results, list):
+        return _truncate_for_final_answer(stdout)
+
+    compact: dict[str, Any] = {
+        "query": parsed.get("query"),
+        "answer": parsed.get("answer"),
+        "results": [],
+    }
+    for item in results[:5]:
+        if not isinstance(item, dict):
+            continue
+        snippet = item.get("snippet") or item.get("content") or ""
+        compact["results"].append(
+            {
+                "title": item.get("title"),
+                "url": item.get("url"),
+                "snippet": _truncate_for_final_answer(str(snippet), limit=700),
+            }
+        )
+    return json.dumps(compact, ensure_ascii=False)
+
+
+def _fallback_final_answer(*, instruction: str, worker_results: list[dict[str, Any]]) -> str | None:
+    for result in worker_results:
+        answer = _fallback_search_answer(instruction=instruction, stdout=str(result.get("stdout") or ""))
+        if answer:
+            return answer
+    return None
+
+
+def _fallback_search_answer(*, instruction: str, stdout: str) -> str | None:
+    try:
+        parsed = json.loads(stdout)
+    except json.JSONDecodeError:
+        return _fallback_text_answer(instruction=instruction, stdout=stdout)
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("results"), list):
+        return None
+
+    lines = [f"根据搜索结果，{instruction}："]
+    answer = parsed.get("answer")
+    if answer:
+        lines.extend(["", str(answer).strip()])
+
+    lines.extend(["", "来源："])
+    for index, item in enumerate(parsed["results"][:5], start=1):
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or "Untitled").strip()
+        url = str(item.get("url") or "").strip()
+        snippet = str(item.get("snippet") or item.get("content") or "").strip()
+        lines.append(f"{index}. {title}")
+        if url:
+            lines.append(f"   {url}")
+        if snippet:
+            lines.append(f"   {_truncate_for_final_answer(snippet, limit=280)}")
+    return "\n".join(lines).strip()
+
+
+def _fallback_text_answer(*, instruction: str, stdout: str) -> str | None:
+    urls = _extract_urls_from_text(stdout)
+    if not urls:
+        return None
+
+    lines = [f"根据搜索结果，{instruction}：", "", "来源："]
+    for index, url in enumerate(urls[:5], start=1):
+        lines.append(f"{index}. {url}")
+    excerpt = _first_useful_excerpt(stdout)
+    if excerpt:
+        lines.extend(["", "摘要片段：", excerpt])
+    return "\n".join(lines).strip()
+
+
+def _extract_urls_from_text(text: str) -> list[str]:
+    urls: list[str] = []
+    for match in re.finditer(r"https?://[^\s)>\"]+", text):
+        url = match.group(0).rstrip(".,;]")
+        if url not in urls:
+            urls.append(url)
+    return urls
+
+
+def _first_useful_excerpt(text: str) -> str | None:
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("http://", "https://")):
+            continue
+        if len(stripped) < 20:
+            continue
+        return _truncate_for_final_answer(stripped, limit=300)
+    return None
 
 
 def _truncate_for_final_answer(value: str, *, limit: int = 12000) -> str:
