@@ -16,6 +16,15 @@ TaskStatus = Literal[
 RiskLevel = Literal["low", "medium", "high", "critical"]
 ActionKind = Literal["echo", "shell", "coder", "file", "obsidian", "github"]
 ActionStatus = Literal["ready", "waiting_approval", "approved", "rejected"]
+IntentKind = Literal[
+    "code_write",
+    "code_review",
+    "search_summary",
+    "explicit_shell",
+    "test_only",
+    "simple_chat",
+    "unknown",
+]
 AgentRunStatus = Literal[
     "created",
     "contextualizing",
@@ -64,6 +73,16 @@ class PendingAction(TypedDict):
     order_id: str | None
 
 
+class IntentDecision(TypedDict):
+    kind: IntentKind
+    confidence: float
+    confidence_source: str
+    reason: str
+    allowed_tools: list[str]
+    requires_workdir: bool
+    plan_steps: list[dict[str, Any]]
+
+
 class AgentState(TypedDict):
     thread_id: str
     messages: Annotated[list[Any], add_messages]
@@ -81,6 +100,10 @@ class AgentState(TypedDict):
     pending_approval_id: str | None
     error_count: int
     last_error: str | None
+    intent: IntentDecision | None
+    allowed_tools: list[str]
+    plan_steps: list[dict[str, Any]]
+    failure_kind: str | None
     context_summary: str | None
     final_summary: str | None
     next_node: str | None
@@ -104,6 +127,10 @@ def initial_state(event: AgentEvent, thread_id: str) -> AgentState:
         "pending_approval_id": None,
         "error_count": 0,
         "last_error": None,
+        "intent": None,
+        "allowed_tools": [],
+        "plan_steps": [],
+        "failure_kind": None,
         "context_summary": None,
         "final_summary": None,
         "next_node": None,

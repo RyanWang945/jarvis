@@ -8,7 +8,7 @@ from uuid import uuid4
 
 from langgraph.types import interrupt
 
-from app.agent.state import AgentState, PendingAction, RiskLevel, Task
+from app.agent.state import AgentState, IntentDecision, PendingAction, RiskLevel, Task
 from app.config import get_settings
 from app.llm.jarvis import get_jarvis_llm
 from app.tools import get_default_tool_registry
@@ -52,6 +52,16 @@ def contextualize(state: AgentState) -> dict[str, Any]:
         "status": "contextualizing",
         "resource_key": payload.get("resource_key") or payload.get("workdir"),
         "context_summary": str(payload.get("instruction") or ""),
+    }
+
+
+def classify_intent(state: AgentState) -> dict[str, Any]:
+    decision = _classify_intent(state)
+    return {
+        "status": "planning",
+        "intent": decision,
+        "allowed_tools": decision["allowed_tools"],
+        "plan_steps": decision["plan_steps"],
     }
 
 
@@ -899,9 +909,19 @@ def _planned_tool_calls(state: AgentState) -> list[ToolCallPlan]:
     replan_context = _replan_context(state)
     if replan_context:
         instruction = f"{instruction}\n\n{replan_context}"
+    allowed_tools = state.get("allowed_tools", [])
+    intent_kinds = [state["intent"]["kind"]] if state.get("intent") else None
+    tools = get_default_tool_registry().list(
+        exposed_to_llm=True,
+        intent_kinds=intent_kinds,
+    )
+    if allowed_tools:
+        tools = [tool for tool in tools if tool.name in set(allowed_tools)]
+    if not tools:
+        tools = get_default_tool_registry().list(exposed_to_llm=True)
     return get_jarvis_llm().plan_tasks(
         instruction=_planner_instruction(payload, instruction),
-        tools=get_default_tool_registry().list(exposed_to_llm=True),
+        tools=tools,
     )
 
 
@@ -909,6 +929,31 @@ def _rule_based_tool_calls(state: AgentState) -> list[ToolCallPlan]:
     payload = _payload(state)
     instruction = str(payload.get("instruction") or "Run local agent task.")
     command = _clean_optional(payload.get("command"))
+    intent = state.get("intent") or {}
+    if intent.get("kind") == "code_write":
+        workdir = _clean_optional(payload.get("workdir"))
+        return [
+            ToolCallPlan(
+                tool_name="delegate_to_claude_code",
+                tool_args={"instruction": instruction, "workdir": workdir},
+                title=_title_from_instruction(instruction, None),
+                description=instruction,
+                dod=str(payload.get("dod") or "Code change completed successfully."),
+                verification_cmd=_clean_optional(payload.get("verification_cmd")),
+                max_retries=int(payload.get("max_retries") or 0),
+            )
+        ]
+    if intent.get("kind") == "search_summary":
+        return [
+            ToolCallPlan(
+                tool_name="tavily_search",
+                tool_args={"query": instruction, "max_results": 5, "include_answer": True},
+                title=_title_from_instruction(instruction, None),
+                description=instruction,
+                dod=str(payload.get("dod") or "Search summary returned with sources."),
+                max_retries=int(payload.get("max_retries") or 0),
+            )
+        ]
     if command:
         return [
             ToolCallPlan(
@@ -932,6 +977,122 @@ def _rule_based_tool_calls(state: AgentState) -> list[ToolCallPlan]:
             max_retries=int(payload.get("max_retries") or 0),
         )
     ]
+
+
+def _classify_intent(state: AgentState) -> IntentDecision:
+    payload = _payload(state)
+    instruction = str(payload.get("instruction") or "")
+    command = _clean_optional(payload.get("command"))
+    workdir = _clean_optional(payload.get("workdir"))
+
+    if command:
+        return _intent_decision(
+            "explicit_shell",
+            confidence=1.0,
+            reason="User supplied an explicit shell command.",
+            allowed_tools=["run_shell_command", "run_tests"],
+            requires_workdir=False,
+        )
+
+    if workdir and _looks_like_code_write(instruction):
+        return _intent_decision(
+            "code_write",
+            confidence=0.95,
+            reason="Instruction asks to create or modify code/files inside a repository.",
+            allowed_tools=["delegate_to_claude_code"],
+            requires_workdir=True,
+        )
+
+    if _looks_like_search_summary(instruction):
+        return _intent_decision(
+            "search_summary",
+            confidence=0.9,
+            reason="Instruction asks to search or summarize external information.",
+            allowed_tools=["tavily_search"],
+            requires_workdir=False,
+        )
+
+    return _intent_decision(
+        "simple_chat",
+        confidence=0.75,
+        reason="No repository edit, explicit shell command, or search request detected.",
+        allowed_tools=["echo"],
+        requires_workdir=False,
+    )
+
+
+def _intent_decision(
+    kind: str,
+    *,
+    confidence: float,
+    reason: str,
+    allowed_tools: list[str],
+    requires_workdir: bool,
+) -> IntentDecision:
+    return {
+        "kind": kind,  # type: ignore[typeddict-item]
+        "confidence": confidence,
+        "confidence_source": "rule",
+        "reason": reason,
+        "allowed_tools": allowed_tools,
+        "requires_workdir": requires_workdir,
+        "plan_steps": [
+            {
+                "kind": kind,
+                "allowed_tools": allowed_tools,
+                "reason": reason,
+            }
+        ],
+    }
+
+
+def _looks_like_code_write(instruction: str) -> bool:
+    text = instruction.lower()
+    action_terms = [
+        "写",
+        "新增",
+        "修改",
+        "实现",
+        "修复",
+        "生成",
+        "创建",
+        "add",
+        "create",
+        "modify",
+        "implement",
+        "fix",
+    ]
+    object_terms = [
+        "脚本",
+        "代码",
+        "文件",
+        "feature",
+        "commit",
+        "push",
+        "script",
+        "file",
+        "code",
+    ]
+    return any(term in text for term in action_terms) and any(term in text for term in object_terms)
+
+
+def _looks_like_search_summary(instruction: str) -> bool:
+    text = instruction.lower()
+    search_terms = [
+        "搜索",
+        "查一下",
+        "查找",
+        "调研",
+        "带来源",
+        "引用",
+        "search",
+        "research",
+        "sources",
+        "citations",
+        "latest",
+    ]
+    code_context_terms = ["test 失败", "报错", "bug", "代码", "workdir"]
+    return any(term in text for term in search_terms) and not any(term in text for term in code_context_terms)
 
 
 def _pending_action_from_order(order: WorkOrder) -> PendingAction:

@@ -108,6 +108,7 @@ def _load_builtin_tools() -> list[ToolSpec]:
             action="echo",
             risk_level="low",
             exposed_to_llm=True,
+            intent_kinds=["simple_chat"],
         ),
         ToolSpec(
             name="run_shell_command",
@@ -129,6 +130,8 @@ def _load_builtin_tools() -> list[ToolSpec]:
             action="run",
             risk_level="medium",
             exposed_to_llm=True,
+            intent_kinds=["explicit_shell"],
+            requires_explicit_user_command=True,
         ),
         ToolSpec(
             name="run_tests",
@@ -149,6 +152,8 @@ def _load_builtin_tools() -> list[ToolSpec]:
             action="run",
             risk_level="low",
             exposed_to_llm=True,
+            intent_kinds=["test_only", "explicit_shell"],
+            requires_explicit_user_command=True,
         ),
         ToolSpec(
             name="delegate_to_claude_code",
@@ -186,5 +191,8 @@ def _load_builtin_tools() -> list[ToolSpec]:
             action="run",
             risk_level="high",
             exposed_to_llm=True,
+            intent_kinds=["code_write", "code_review"],
+            can_modify_files=True,
+            requires_workdir=True,
         ),
     ]

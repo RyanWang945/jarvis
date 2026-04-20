@@ -87,6 +87,64 @@ def test_graph_runner_blocks_high_risk_shell_task_for_approval(tmp_path, monkeyp
     assert result.tasks[0]["status"] == "waiting"
 
 
+def test_llm_code_write_intent_exposes_only_coder_tool(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("JARVIS_PLANNER_TYPE", "llm")
+    monkeypatch.setenv("JARVIS_DEEPSEEK_API_KEY", "test-key")
+    get_settings.cache_clear()
+    get_jarvis_llm.cache_clear()
+
+    captured_tools = []
+
+    def fake_plan_tasks(self, *, instruction, tools):
+        captured_tools.extend(tool.name for tool in tools)
+        return [
+            ToolCallPlan(
+                tool_name="delegate_to_claude_code",
+                tool_args={
+                    "instruction": instruction,
+                    "workdir": str(tmp_path),
+                },
+                title="Add quicksort script",
+                description="Create a Python quicksort script.",
+                dod="Script exists.",
+            )
+        ]
+
+    monkeypatch.setattr("app.llm.jarvis.JarvisLLM.plan_tasks", fake_plan_tasks)
+
+    runner = ThreadManager(tmp_path)
+    result = runner.run_event(
+        build_user_event(
+            instruction="在nltk项目中写一个快排的脚本，用python就可以",
+            workdir=str(tmp_path),
+        )
+    )
+
+    assert result.status == "waiting_approval"
+    assert captured_tools == ["delegate_to_claude_code"]
+    assert result.tasks[0]["tool_name"] == "delegate_to_claude_code"
+    inspection = runner.inspect_run(result.thread_id)
+    assert inspection is not None
+    assert any(audit["action"] == "intent_classified" for audit in inspection["audit_logs"])
+
+
+def test_rule_based_code_write_intent_routes_to_coder(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("JARVIS_PLANNER_TYPE", "rule_based")
+    get_settings.cache_clear()
+
+    runner = ThreadManager(tmp_path)
+    result = runner.run_event(
+        build_user_event(
+            instruction="在nltk项目中写一个快排的脚本，用python就可以",
+            workdir=str(tmp_path),
+        )
+    )
+
+    assert result.status == "waiting_approval"
+    assert result.tasks[0]["tool_name"] == "delegate_to_claude_code"
+    assert result.tasks[0]["worker_type"] == "coder"
+
+
 def test_agent_run_api_completes_task(monkeypatch) -> None:
     monkeypatch.setenv("JARVIS_PLANNER_TYPE", "rule_based")
     get_settings.cache_clear()

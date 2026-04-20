@@ -1,4 +1,4 @@
-from app.tools.specs import ToolSpec
+from app.tools.specs import IntentKind, ToolSpec
 
 
 class ToolRegistry:
@@ -15,11 +15,19 @@ class ToolRegistry:
         except KeyError as exc:
             raise ValueError(f"unknown tool: {name}") from exc
 
-    def list(self, *, exposed_to_llm: bool | None = None) -> list[ToolSpec]:
+    def list(
+        self,
+        *,
+        exposed_to_llm: bool | None = None,
+        intent_kinds: list[IntentKind] | None = None,
+    ) -> list[ToolSpec]:
         tools = list(self._tools.values())
-        if exposed_to_llm is None:
-            return tools
-        return [tool for tool in tools if tool.exposed_to_llm is exposed_to_llm]
+        if exposed_to_llm is not None:
+            tools = [tool for tool in tools if tool.exposed_to_llm is exposed_to_llm]
+        if intent_kinds is not None:
+            intent_set = set(intent_kinds)
+            tools = [tool for tool in tools if intent_set.intersection(tool.intent_kinds)]
+        return tools
 
 
 def get_default_tool_registry() -> ToolRegistry:

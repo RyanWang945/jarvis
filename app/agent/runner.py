@@ -256,6 +256,15 @@ class ThreadManager:
         for task in result.get("task_list", []):
             self._business_db.tasks.save(dict(task), run_id)
 
+        intent = result.get("intent")
+        if intent:
+            self._business_db.audits.log(
+                thread_id=thread_id,
+                node="classify_intent",
+                action="intent_classified",
+                detail=json.dumps(intent, ensure_ascii=False),
+            )
+
         # Persist work orders and their latest lifecycle status.
         active_order_ids = set(result.get("active_workers", {}).values())
         completed_order_ids = set(result.get("worker_results", {}).keys())

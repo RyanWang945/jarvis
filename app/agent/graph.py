@@ -3,6 +3,7 @@ from langgraph.graph import END, START, StateGraph
 from app.agent.nodes import (
     aggregate,
     blocked,
+    classify_intent,
     contextualize,
     dispatch,
     ingest_event,
@@ -23,6 +24,7 @@ def build_agent_graph(checkpointer=None):
     graph = StateGraph(AgentState)
     graph.add_node("ingest_event", ingest_event)
     graph.add_node("contextualize", contextualize)
+    graph.add_node("classify_intent", classify_intent)
     graph.add_node("strategize", strategize)
     graph.add_node("dispatch", dispatch)
     graph.add_node("monitor", monitor)
@@ -33,7 +35,8 @@ def build_agent_graph(checkpointer=None):
 
     graph.add_edge(START, "ingest_event")
     graph.add_edge("ingest_event", "contextualize")
-    graph.add_edge("contextualize", "strategize")
+    graph.add_edge("contextualize", "classify_intent")
+    graph.add_edge("classify_intent", "strategize")
     graph.add_conditional_edges(
         "strategize",
         route_after_strategize,
