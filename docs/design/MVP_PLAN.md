@@ -218,13 +218,13 @@ v2.0 新增：
 
 #### M7：资源锁与会话调度
 
-| 编号 | 任务 | 产出 | 优先级 |
-| --- | --- | --- | --- |
-| P2-M7-1 | 定义 `resource_key` 规则 | 目录、仓库、文件等资源标识 | P0 |
-| P2-M7-2 | 实现 Resource Lock Repository | 加锁、释放、查询 | P0 |
-| P2-M7-3 | 实现 Worker 锁继承 | Worker 可继承 CA thread 的锁 | P0 |
+| 编号 | 任务 | 产出 | 优先级 | 状态 |
+| --- | --- | --- | --- | --- |
+| P2-M7-1 | 定义 `resource_key` 规则 | 目录、仓库、文件等资源标识 | P0 | Done（基础规则） |
+| P2-M7-2 | 实现 Resource Lock Repository | 加锁、释放、查询 | P0 | Done |
+| P2-M7-3 | 实现 Worker 锁继承 | Worker 可继承 CA thread 的锁 | P0 | Done（thread 级锁） |
 | P2-M7-4 | 实现 Session Dispatcher | 输入事件映射到 thread_id，Worker 回调路由 | P0 |
-| P2-M7-5 | 实现同资源写任务串行 | 防止同仓库并发写 | P0 |
+| P2-M7-5 | 实现同资源写任务串行 | 防止同仓库并发写 | P0 | In Progress（冲突拦截已完成，排队待做） |
 | P2-M7-6 | 实现任务取消释放锁 | 取消后清理资源占用 | P1 |
 | P2-M7-7 | 实现同资源追加事件 | 追加到已有 thread 的任务队列 | P1 |
 
@@ -234,6 +234,14 @@ v2.0 新增：
 - 不同资源可创建独立 CA thread，Worker 并行执行。
 - Worker 继承 CA thread 锁后无需重复申请。
 - 任务完成、失败或取消后释放锁。
+
+当前进展：
+
+- 已新增 `resource_locks` 业务表和 `ResourceLockRepository`，支持按 `resource_key` 获取、查询和释放锁。
+- `ThreadManager.run_event()` 会在 run 启动时按显式 `resource_key` 或 `workdir` 获取 thread 级资源锁。
+- 同资源已有未完成 run 持锁时，新 run 会被阻止进入执行，避免 Thread Worker 并发写同一资源。
+- run 进入 `completed`、`blocked` 或 `failed` 后会释放该 thread 持有的资源锁。
+- 剩余工作：把冲突策略从“直接 blocked”升级为“排队/追加到已有 thread”，并补任务取消释放锁。
 
 #### M8：Coder Worker 桥接
 

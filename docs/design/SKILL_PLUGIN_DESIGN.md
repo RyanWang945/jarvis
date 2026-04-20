@@ -34,9 +34,9 @@
 
 当前暴露的问题：
 
-- 注册表现在仍允许外部 Skill/Tool 与内置名称冲突并覆盖，需要改为默认拒绝重复名称。
-- `verification_cmd` 当前执行路径需要纳入风险检查，避免绕过审批。
-- 搜索结果进入 final answer synthesis 前需要结构化压缩和 prompt injection 防护。
+- 外部 Skill/Tool 与内置名称冲突覆盖已修复：bootstrap 默认跳过重复注册包，注册表也拒绝重复名称。
+- `verification_cmd` 风险绕过已修复：高危 verification command 已纳入 WorkOrder 风险计算并触发审批。
+- 搜索结果进入 final answer synthesis 前已有基础结构化压缩和 prompt injection 防护。
 - 搜索类 fallback 已具备 URL 抽取和摘要片段输出，但仍需要更稳定的摘要策略。
 
 ---

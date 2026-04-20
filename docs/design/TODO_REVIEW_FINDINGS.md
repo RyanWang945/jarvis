@@ -41,7 +41,7 @@
 
 ## 当前最高优先级风险（2026-04-20）
 
-### P0：`verification_cmd` 风险审批绕过
+### P0：`verification_cmd` 风险审批绕过（已完成）
 
 问题：
 
@@ -59,7 +59,12 @@
 - 高危 verification 需要走同一套 approval。
 - 或者将 verification 限制为白名单命令。
 
-### P0：外部 Skill/Tool 名称覆盖
+状态：
+
+- 已完成。`strategize` 已将 `verification_cmd` 纳入 `_work_order_risk()`，高危 verification 会触发同一套 approval。
+- 已增加测试覆盖 `verification_cmd="git push origin main"` 时低风险主任务仍进入审批。
+
+### P0：外部 Skill/Tool 名称覆盖（已完成）
 
 问题：
 
@@ -75,7 +80,12 @@
 - 注册表构造时默认拒绝重复 `skill.name` 和 `tool.name`。
 - 仅在显式开发配置 `allow_skill_override` 下允许覆盖，并写审计日志。
 
-### P0：搜索结果 prompt injection
+状态：
+
+- 已完成基础防护。`SkillRegistry` / `ToolRegistry` 默认拒绝重复名称，bootstrap 对外部重复注册包 warning 后跳过。
+- 已增加测试覆盖外部 Skill/Tool 不能覆盖内置 `echo`。
+
+### P0：搜索结果 prompt injection（基础防护已完成）
 
 问题：
 
@@ -91,6 +101,11 @@
 - final answer prompt 明确 worker output 是 untrusted data。
 - 搜索结果只传 `title/url/snippet`，限制长度和字段。
 - 禁止 final answer synthesis 根据 worker output 发起新工具调用或执行任何命令。
+
+状态：
+
+- 已完成基础防护。final answer synthesis prompt 已明确 worker output 是 untrusted data，搜索 stdout 已压缩为 `title/url/snippet` 结构并限制长度。
+- 剩余工作：fallback 摘要质量仍可继续优化；长期方案可引入更稳定的本地规则摘要器。
 
 ### P1：搜索 fallback 摘要质量
 

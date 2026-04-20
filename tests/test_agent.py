@@ -1480,6 +1480,82 @@ def test_recover_unfinished_replays_persisted_worker_result(tmp_path, monkeypatc
     assert tasks[0]["status"] == "success"
 
 
+def test_resource_lock_is_released_after_completed_run(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("JARVIS_PLANNER_TYPE", "rule_based")
+    get_settings.cache_clear()
+    runner = ThreadManager(tmp_path)
+
+    result = runner.run_event(
+        build_user_event(
+            instruction="Echo with resource lock",
+            resource_key="repo-a",
+        )
+    )
+
+    assert result.status == "completed"
+    assert runner.db.resource_locks.get("repo-a") is None
+    audits = runner.db.audits.get_by_thread(result.thread_id)
+    assert any(a["action"] == "resource_lock_acquired" for a in audits)
+    assert any(a["action"] == "resource_lock_released" for a in audits)
+
+
+def test_resource_lock_blocks_same_resource_until_owner_finishes(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("JARVIS_PLANNER_TYPE", "rule_based")
+    get_settings.cache_clear()
+
+    class PendingWorkerClient:
+        def dispatch(self, order):
+            self.order = order
+            return order.order_id
+
+        def poll(self, order_id):
+            return None
+
+    pending_client = PendingWorkerClient()
+    monkeypatch.setattr("app.agent.nodes.get_worker_client", lambda: pending_client)
+
+    runner = ThreadManager(tmp_path)
+    first = runner.run_event(
+        build_user_event(
+            instruction="Hold resource lock",
+            resource_key="repo-a",
+        )
+    )
+
+    assert first.status == "monitoring"
+    lock = runner.db.resource_locks.get("repo-a")
+    assert lock is not None
+    assert lock["owner_thread_id"] == first.thread_id
+
+    second = runner.run_event(
+        build_user_event(
+            instruction="Try same resource",
+            resource_key="repo-a",
+        )
+    )
+
+    assert second.status == "blocked"
+    assert "Resource is locked" in (second.summary or "")
+    assert runner.db.resource_locks.get("repo-a")["owner_thread_id"] == first.thread_id
+
+    order = runner.db.work_orders.get_by_thread(first.thread_id)[0]
+    runner.db.work_results.save(
+        WorkResult(
+            order_id=order["order_id"],
+            task_id=order["task_id"],
+            ca_thread_id=first.thread_id,
+            worker_type=order["worker_type"],
+            ok=True,
+            summary="Resource owner completed.",
+        )
+    )
+    recovery = runner.recover_unfinished()
+
+    assert recovery["failed"] == []
+    assert recovery["recovered"][0]["thread_id"] == first.thread_id
+    assert runner.db.resource_locks.get("repo-a") is None
+
+
 def test_agent_run_detail_api_returns_recovery_fields(tmp_path, monkeypatch) -> None:
     from app.api.agent import get_thread_manager
 
@@ -1593,6 +1669,369 @@ def test_cli_run_status_and_report(tmp_path, monkeypatch, capsys) -> None:
     cli_main(["report", thread_id])
     report_output = json.loads(capsys.readouterr().out)
     assert Path(report_output["paths"]["json"]).exists()
+
+
+def test_cli_mixed_risk_plan_waits_before_dispatching_any_worker(tmp_path, monkeypatch, capsys) -> None:
+    from app.cli import main as cli_main
+    from app.skills.base import SkillResult
+    from app.skills.shell import ShellSkill
+
+    monkeypatch.setenv("JARVIS_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("JARVIS_PLANNER_TYPE", "llm")
+    monkeypatch.setenv("JARVIS_DEEPSEEK_API_KEY", "test-key")
+    get_settings.cache_clear()
+    get_jarvis_llm.cache_clear()
+
+    def fake_plan_tasks(self, *, instruction, tools):
+        return [
+            ToolCallPlan(
+                tool_name="echo",
+                tool_args={"text": "safe preparation"},
+                title="Safe preparation",
+                description="Prepare safe context",
+                dod="Echo completed.",
+            ),
+            ToolCallPlan(
+                tool_name="run_shell_command",
+                tool_args={"command": "git push origin main"},
+                title="Publish changes",
+                description="Push changes",
+                dod="Push completed.",
+            ),
+        ]
+
+    shell_calls = []
+
+    def fake_shell_run(self, request):
+        shell_calls.append(request)
+        return SkillResult(ok=True, exit_code=0, stdout="pushed", summary="Mock push ok.")
+
+    monkeypatch.setattr("app.llm.jarvis.JarvisLLM.plan_tasks", fake_plan_tasks)
+    monkeypatch.setattr(ShellSkill, "run", fake_shell_run)
+
+    cli_main(["run", "Prepare and publish", "--thread-id", "cli-mixed-risk"])
+    run_output = json.loads(capsys.readouterr().out)
+
+    assert run_output["status"] == "waiting_approval"
+    assert run_output["pending_approval_id"] is not None
+    assert shell_calls == []
+
+    cli_main(["status", "cli-mixed-risk"])
+    status_output = json.loads(capsys.readouterr().out)
+    assert len(status_output["work_orders"]) == 2
+    assert status_output["work_results"] == []
+    assert len(status_output["approvals"]) == 1
+
+    cli_main(
+        [
+            "approve",
+            "cli-mixed-risk",
+            "--approval-id",
+            run_output["pending_approval_id"],
+        ]
+    )
+    approved_output = json.loads(capsys.readouterr().out)
+
+    assert approved_output["status"] == "completed"
+    assert [task["status"] for task in approved_output["tasks"]] == ["success", "success"]
+    assert [call.args["command"] for call in shell_calls] == ["git push origin main"]
+
+
+def test_cli_resource_lock_conflict_status_recover_flow(tmp_path, monkeypatch, capsys) -> None:
+    from app.cli import main as cli_main
+
+    monkeypatch.setenv("JARVIS_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("JARVIS_PLANNER_TYPE", "rule_based")
+    get_settings.cache_clear()
+
+    class PendingWorkerClient:
+        def dispatch(self, order):
+            return order.order_id
+
+        def poll(self, order_id):
+            return None
+
+    monkeypatch.setattr("app.agent.nodes.get_worker_client", lambda: PendingWorkerClient())
+
+    cli_main(["run", "Hold repo lock", "--thread-id", "cli-lock-owner", "--resource-key", "repo-a"])
+    first_output = json.loads(capsys.readouterr().out)
+    assert first_output["status"] == "monitoring"
+
+    cli_main(["run", "Try same repo", "--thread-id", "cli-lock-contender", "--resource-key", "repo-a"])
+    second_output = json.loads(capsys.readouterr().out)
+    assert second_output["status"] == "blocked"
+    assert "Resource is locked" in second_output["summary"]
+
+    cli_main(["status", "cli-lock-owner"])
+    status_output = json.loads(capsys.readouterr().out)
+    assert status_output["run"]["status"] == "monitoring"
+    assert status_output["resource_locks"][0]["resource_key"] == "repo-a"
+    order = status_output["work_orders"][0]
+
+    manager = ThreadManager(tmp_path)
+    manager.db.work_results.save(
+        WorkResult(
+            order_id=order["order_id"],
+            task_id=order["task_id"],
+            ca_thread_id="cli-lock-owner",
+            worker_type=order["worker_type"],
+            ok=True,
+            summary="CLI recovered result.",
+        )
+    )
+
+    cli_main(["recover"])
+    recover_output = json.loads(capsys.readouterr().out)
+    assert recover_output["failed"] == []
+    assert recover_output["recovered"][0]["thread_id"] == "cli-lock-owner"
+
+    cli_main(["status", "cli-lock-owner"])
+    recovered_status = json.loads(capsys.readouterr().out)
+    assert recovered_status["run"]["status"] == "completed"
+    assert recovered_status["resource_locks"] == []
+
+
+def test_cli_complex_coder_feature_task_against_real_nltk_workspace(tmp_path, monkeypatch, capsys) -> None:
+    from app.cli import main as cli_main
+
+    repo = Path("data/workspaces/nltk").resolve()
+    assert (repo / ".git").is_dir()
+    assert (repo / "README.md").is_file()
+    feature_path = repo / "FEATURE.md"
+    if feature_path.exists():
+        feature_path.unlink()
+
+    monkeypatch.setenv("JARVIS_DATA_DIR", str(tmp_path / "jarvis-data"))
+    monkeypatch.setenv("JARVIS_PLANNER_TYPE", "llm")
+    monkeypatch.setenv("JARVIS_DEEPSEEK_API_KEY", "test-key")
+    get_settings.cache_clear()
+    get_jarvis_llm.cache_clear()
+
+    def fake_plan_tasks(self, *, instruction, tools):
+        return [
+            ToolCallPlan(
+                tool_name="delegate_to_claude_code",
+                tool_args={
+                    "instruction": (
+                        "Add a small FEATURE.md document describing a greetings feature, "
+                        "then inspect git diff. Do not push."
+                    ),
+                    "workdir": str(repo),
+                    "verification_cmd": "git status --short",
+                },
+                title="Add greetings feature docs",
+                description="Modify the GitHub test repository.",
+                dod="FEATURE.md exists and git status was inspected.",
+            )
+        ]
+
+    class Completed:
+        def __init__(self, *, returncode: int = 0, stdout: str = "", stderr: str = "") -> None:
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    claude_prompts = []
+
+    def fake_run(command, **kwargs):
+        if isinstance(command, str):
+            return Completed(stdout=" M FEATURE.md\n")
+        if command[0] != "git":
+            claude_prompts.append(kwargs["input"])
+            assert Path(kwargs["cwd"]).resolve() == repo
+            feature_path.write_text(
+                "# Greetings Feature\n\nAdds a documented greeting workflow.\n",
+                encoding="utf-8",
+            )
+            return Completed(stdout="created FEATURE.md")
+        if command[-1] == "--branch":
+            return Completed(stdout="## main...origin/main\n M FEATURE.md\n")
+        if command[-1] == "--show-current":
+            return Completed(stdout="main\n")
+        if command[-2:] == ["--short", "HEAD"]:
+            return Completed(stdout="abc1234\n")
+        if command[-1] == "--pretty=%s":
+            return Completed(stdout="docs: add greetings feature\n")
+        if command[-2:] == ["get-url", "origin"]:
+            return Completed(stdout="git@github.com:RyanWang945/nltk.git\n")
+        return Completed()
+
+    monkeypatch.setattr("app.skills.coder.which", lambda provider: f"C:/bin/{provider}.ps1")
+    monkeypatch.setattr("app.skills.coder.subprocess.run", fake_run)
+    monkeypatch.setattr("app.llm.jarvis.JarvisLLM.plan_tasks", fake_plan_tasks)
+    monkeypatch.setattr(
+        "app.llm.jarvis.JarvisLLM.assess_completion",
+        lambda self, *, task, result, can_retry: {
+            "decision": "success",
+            "summary": "Feature document was created and postflight diagnostics were collected.",
+        },
+    )
+
+    cli_main(
+        [
+            "run",
+            "在测试 GitHub 项目里增加 greetings feature 文档并验证",
+            "--thread-id",
+            "cli-feature-repo",
+            "--workdir",
+            str(repo),
+        ]
+    )
+    run_output = json.loads(capsys.readouterr().out)
+
+    assert run_output["status"] == "waiting_approval"
+    assert run_output["pending_approval_id"] is not None
+    assert not feature_path.exists()
+
+    cli_main(
+        [
+            "approve",
+            "cli-feature-repo",
+            "--approval-id",
+            run_output["pending_approval_id"],
+        ]
+    )
+    approved_output = json.loads(capsys.readouterr().out)
+
+    assert approved_output["status"] == "completed"
+    assert feature_path.exists()
+    assert "Greetings Feature" in feature_path.read_text(encoding="utf-8")
+    assert "Run this verification command before finishing: git status --short" in claude_prompts[0]
+    assert "Do not push" in claude_prompts[0]
+    assert approved_output["tasks"][0]["worker_type"] == "coder"
+
+    cli_main(["status", "cli-feature-repo"])
+    status_output = json.loads(capsys.readouterr().out)
+    assert status_output["run"]["status"] == "completed"
+    assert status_output["work_results"][0]["worker_type"] == "coder"
+    assert "git@github.com:RyanWang945/nltk.git" in status_output["work_results"][0]["stdout"]
+    assert "git_commit:abc1234" in json.loads(status_output["work_results"][0]["artifacts"])
+    assert status_output["resource_locks"] == []
+
+
+def test_cli_search_then_summarize_with_sources(tmp_path, monkeypatch, capsys) -> None:
+    from app.cli import main as cli_main
+
+    monkeypatch.setenv("JARVIS_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("JARVIS_PLANNER_TYPE", "llm")
+    monkeypatch.setenv("JARVIS_DEEPSEEK_API_KEY", "test-key")
+    get_settings.cache_clear()
+    get_jarvis_llm.cache_clear()
+    reset_registries_for_tests()
+
+    package = tmp_path / "skills" / "fake_tavily"
+    package.mkdir(parents=True)
+    (package / "manifest.yaml").write_text(
+        """
+name: fake-tavily
+description: Fake Tavily search for CLI complex tests.
+jarvis:
+  module: skill
+  class_name: FakeTavilySkill
+  tools:
+    - name: tavily_search
+      description: Search the web through Tavily and return titles, URLs, and snippets.
+      args_schema:
+        type: object
+        properties:
+          query:
+            type: string
+          max_results:
+            type: integer
+          include_answer:
+            type: boolean
+        required:
+          - query
+      skill: fake-tavily
+      worker_type: fake-tavily
+      action: search
+      risk_level: low
+      exposed_to_llm: true
+""",
+        encoding="utf-8",
+    )
+    (package / "skill.py").write_text(
+        """
+import json
+
+from app.skills.base import SkillResult
+
+
+class FakeTavilySkill:
+    name = "fake-tavily"
+
+    def run(self, request):
+        return SkillResult(
+            ok=True,
+            exit_code=0,
+            stdout=json.dumps(
+                {
+                    "query": request.args["query"],
+                    "answer": "interrupt pauses graph execution; Command resume continues it.",
+                    "results": [
+                        {
+                            "title": "Human-in-the-loop",
+                            "url": "https://langchain-ai.github.io/langgraph/concepts/human_in_the_loop/",
+                            "snippet": "interrupt can pause graph execution for human input.",
+                        },
+                        {
+                            "title": "Persistence",
+                            "url": "https://langchain-ai.github.io/langgraph/concepts/persistence/",
+                            "snippet": "Checkpointing stores graph state for later continuation.",
+                        },
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            summary="Tavily search completed for: LangGraph interrupt Command resume",
+        )
+""",
+        encoding="utf-8",
+    )
+
+    def fake_plan_tasks(self, *, instruction, tools):
+        tool_names = {tool.name for tool in tools}
+        assert "tavily_search" in tool_names
+        return [
+            ToolCallPlan(
+                tool_name="tavily_search",
+                tool_args={
+                    "query": "LangGraph interrupt Command resume",
+                    "max_results": 3,
+                    "include_answer": True,
+                },
+                title="Search LangGraph resume docs",
+                description="Find sources and summarize them.",
+                dod="Return a concise summary with source URLs.",
+            )
+        ]
+
+    def fake_synthesize(self, *, instruction, tasks, worker_results):
+        stdout = worker_results[0]["stdout"]
+        assert "https://langchain-ai.github.io/langgraph" in stdout
+        return (
+            "LangGraph supports pausing execution with interrupt and continuing with Command resume.\n\n"
+            "来源：\n"
+            "1. https://langchain-ai.github.io/langgraph/concepts/human_in_the_loop/"
+        )
+
+    monkeypatch.setattr("app.llm.jarvis.JarvisLLM.plan_tasks", fake_plan_tasks)
+    monkeypatch.setattr("app.llm.jarvis.JarvisLLM.synthesize_final_answer", fake_synthesize)
+
+    try:
+        cli_main(["run", "搜索 LangGraph interrupt/resume 并总结，带来源", "--thread-id", "cli-search-summary"])
+        output = json.loads(capsys.readouterr().out)
+
+        assert output["status"] == "completed"
+        assert "Command resume" in output["summary"]
+        assert "https://langchain-ai.github.io/langgraph/concepts/human_in_the_loop/" in output["summary"]
+
+        cli_main(["status", "cli-search-summary"])
+        status_output = json.loads(capsys.readouterr().out)
+        assert status_output["work_orders"][0]["worker_type"] == "fake-tavily"
+        assert status_output["work_results"][0]["ok"] == 1
+    finally:
+        reset_registries_for_tests()
 
 
 def test_thread_worker_client_runs_work_order_asynchronously(monkeypatch) -> None:

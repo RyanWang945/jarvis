@@ -3,6 +3,7 @@ from app.persistence.repositories import (
     ApprovalRepository,
     AuditRepository,
     BusinessDB,
+    ResourceLockRepository,
     RunRepository,
     TaskRepository,
     WorkOrderRepository,
@@ -19,5 +20,6 @@ __all__ = [
     "WorkResultRepository",
     "ApprovalRepository",
     "AuditRepository",
+    "ResourceLockRepository",
     "get_business_db",
 ]

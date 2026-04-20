@@ -322,6 +322,65 @@ class RunRepository:
         return [dict(row) for row in cursor.fetchall()]
 
 
+class ResourceLockRepository:
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def acquire(self, *, resource_key: str, owner_thread_id: str) -> bool:
+        existing = self.get(resource_key)
+        if existing and existing["owner_thread_id"] != owner_thread_id:
+            return False
+        if existing:
+            self._conn.execute(
+                """
+                UPDATE resource_locks
+                SET status = 'held',
+                    updated_at = datetime('now')
+                WHERE resource_key = ? AND owner_thread_id = ?
+                """,
+                (resource_key, owner_thread_id),
+            )
+        else:
+            self._conn.execute(
+                """
+                INSERT INTO resource_locks (resource_key, owner_thread_id, status)
+                VALUES (?, ?, 'held')
+                """,
+                (resource_key, owner_thread_id),
+            )
+        self._conn.commit()
+        return True
+
+    def release_by_thread(self, owner_thread_id: str) -> int:
+        cursor = self._conn.execute(
+            "DELETE FROM resource_locks WHERE owner_thread_id = ?",
+            (owner_thread_id,),
+        )
+        self._conn.commit()
+        return cursor.rowcount
+
+    def get(self, resource_key: str) -> dict[str, Any] | None:
+        cursor = self._conn.execute(
+            "SELECT * FROM resource_locks WHERE resource_key = ?",
+            (resource_key,),
+        )
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+    def get_by_thread(self, owner_thread_id: str) -> list[dict[str, Any]]:
+        cursor = self._conn.execute(
+            "SELECT * FROM resource_locks WHERE owner_thread_id = ? ORDER BY acquired_at",
+            (owner_thread_id,),
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+    def list(self) -> list[dict[str, Any]]:
+        cursor = self._conn.execute(
+            "SELECT * FROM resource_locks ORDER BY acquired_at",
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+
 @dataclass(frozen=True)
 class BusinessDB:
     conn: sqlite3.Connection
@@ -331,6 +390,7 @@ class BusinessDB:
     work_results: WorkResultRepository
     approvals: ApprovalRepository
     audits: AuditRepository
+    resource_locks: ResourceLockRepository
 
 
 def get_business_db(db_path: Any) -> BusinessDB:
@@ -345,4 +405,5 @@ def get_business_db(db_path: Any) -> BusinessDB:
         work_results=WorkResultRepository(conn),
         approvals=ApprovalRepository(conn),
         audits=AuditRepository(conn),
+        resource_locks=ResourceLockRepository(conn),
     )

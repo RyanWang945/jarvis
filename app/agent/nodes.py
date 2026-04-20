@@ -172,11 +172,16 @@ def dispatch(state: AgentState) -> dict[str, Any]:
             return {
                 "status": "waiting_approval",
                 "task_list": task_list,
+                "work_orders": work_orders,
+                "active_workers": active_workers,
                 "current_task_id": order.task_id,
                 "pending_action": _pending_action_from_order(order),
                 "pending_approval_id": str(uuid4()),
                 "next_node": "wait_approval",
             }
+
+    for order_dict in state.get("dispatch_queue", []):
+        order = WorkOrder(**order_dict)
 
         client.dispatch(order)
         active_workers[order.task_id] = order.order_id
@@ -355,9 +360,12 @@ def wait_approval(state: AgentState) -> dict[str, Any]:
                 if t["id"] == state.get("current_task_id"):
                     t["order_id"] = order_id
                 updated_tasks.append(t)
+            dispatch_queue = list(state.get("dispatch_queue", []))
+            if not any(item.get("order_id") == order_id for item in dispatch_queue):
+                dispatch_queue.append(order_dump)
             return {
                 "task_list": updated_tasks,
-                "dispatch_queue": [order_dump],
+                "dispatch_queue": dispatch_queue,
                 "work_orders": work_orders,
                 "approved_order_ids": list(approved_order_ids),
                 "pending_action": None,

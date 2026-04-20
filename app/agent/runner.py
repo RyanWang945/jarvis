@@ -57,8 +57,57 @@ class ThreadManager:
                 "status": "created",
                 "instruction": instruction,
             })
+            resource_key = _resource_key_from_event(event)
+            if resource_key and not self._business_db.resource_locks.acquire(
+                resource_key=resource_key,
+                owner_thread_id=thread_id,
+            ):
+                owner = self._business_db.resource_locks.get(resource_key)
+                summary = (
+                    f"Resource is locked by thread {owner['owner_thread_id']}."
+                    if owner
+                    else "Resource is locked by another thread."
+                )
+                self._business_db.runs.save({
+                    "run_id": str(uuid4()),
+                    "thread_id": thread_id,
+                    "status": "blocked",
+                    "instruction": instruction,
+                    "summary": summary,
+                })
+                self._business_db.audits.log(
+                    thread_id=thread_id,
+                    node="resource_lock",
+                    action="resource_lock_conflict",
+                    detail=f"resource_key={resource_key}",
+                )
+                return AgentRunResult(
+                    thread_id=thread_id,
+                    status="blocked",
+                    summary=summary,
+                    tasks=[],
+                    pending_approval_id=None,
+                )
+            if resource_key:
+                self._business_db.audits.log(
+                    thread_id=thread_id,
+                    node="resource_lock",
+                    action="resource_lock_acquired",
+                    detail=f"resource_key={resource_key}",
+                )
 
-            result: AgentState = self._graph.invoke(state, config=config)
+            try:
+                result: AgentState = self._graph.invoke(state, config=config)
+            except Exception:
+                if resource_key:
+                    self._business_db.resource_locks.release_by_thread(thread_id)
+                    self._business_db.audits.log(
+                        thread_id=thread_id,
+                        node="resource_lock",
+                        action="resource_lock_released_after_error",
+                        detail=f"resource_key={resource_key}",
+                    )
+                raise
             parsed = self._parse_result(result)
 
             # Persist business state
@@ -93,6 +142,7 @@ class ThreadManager:
             "work_results": self._business_db.work_results.get_by_thread(thread_id),
             "approvals": self._business_db.approvals.get_by_thread(thread_id),
             "audit_logs": self._business_db.audits.get_by_thread(thread_id),
+            "resource_locks": self._business_db.resource_locks.get_by_thread(thread_id),
         }
 
     def export_run_report(self, thread_id: str) -> dict[str, str]:
@@ -289,6 +339,14 @@ class ThreadManager:
 
         if parsed.status in {"completed", "blocked", "failed"}:
             self.export_run_report(thread_id)
+            released = self._business_db.resource_locks.release_by_thread(thread_id)
+            if released:
+                self._business_db.audits.log(
+                    thread_id=thread_id,
+                    node="resource_lock",
+                    action="resource_lock_released",
+                    detail=f"released={released}",
+                )
 
     def _persist_approval_decision(self, thread_id: str, resume_value: Any) -> None:
         if not isinstance(resume_value, dict) or "approved" not in resume_value:
@@ -376,6 +434,25 @@ def _worker_result_payload(row: dict[str, Any]) -> dict[str, Any]:
         "artifacts": artifacts_value,
         "summary": row.get("summary") or "",
     }
+
+
+def _resource_key_from_event(event: AgentEvent) -> str | None:
+    payload = event.payload if isinstance(event.payload, dict) else {}
+    explicit_key = payload.get("resource_key")
+    if explicit_key is not None:
+        value = str(explicit_key).strip()
+        return value or None
+
+    workdir = payload.get("workdir")
+    if workdir is None:
+        return None
+    value = str(workdir).strip()
+    if not value:
+        return None
+    try:
+        return str(Path(value).resolve())
+    except OSError:
+        return value
 
 
 def _parse_artifacts(value: Any) -> list[str]:

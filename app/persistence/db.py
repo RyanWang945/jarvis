@@ -90,6 +90,14 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS resource_locks (
+    resource_key TEXT PRIMARY KEY,
+    owner_thread_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'held',
+    acquired_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 """
 
 
