@@ -3,7 +3,11 @@ from app.skills.base import Skill
 
 class SkillRegistry:
     def __init__(self, skills: list[Skill]) -> None:
-        self._skills = {skill.name: skill for skill in skills}
+        self._skills: dict[str, Skill] = {}
+        for skill in skills:
+            if skill.name in self._skills:
+                raise ValueError(f"duplicate skill: {skill.name}")
+            self._skills[skill.name] = skill
 
     def get(self, name: str) -> Skill:
         try:

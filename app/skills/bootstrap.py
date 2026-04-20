@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,6 +13,8 @@ from app.skills.registry import SkillRegistry
 from app.skills.shell import ShellSkill
 from app.tools.registry import ToolRegistry
 from app.tools.specs import ToolSpec
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -31,12 +34,26 @@ def bootstrap_registries(*, external_paths: list[Path] | None = None, force: boo
     settings = get_settings()
     skills: list[Skill] = _load_builtin_skills()
     tools = _load_builtin_tools()
+    skill_names = {skill.name for skill in skills}
+    tool_names = {tool.name for tool in tools}
 
     loader = SkillPackageLoader.from_default_paths(data_dir=settings.data_dir, extra_paths=external_paths)
     for package in loader.load():
+        duplicate_skill = package.skill is not None and package.skill.name in skill_names
+        duplicate_tools = _duplicate_tool_names(package.tools, existing=tool_names)
+        if duplicate_skill or duplicate_tools:
+            logger.warning(
+                "skipping skill package with duplicate registrations path=%s skill=%s tools=%s",
+                package.path,
+                package.skill.name if package.skill is not None else None,
+                duplicate_tools,
+            )
+            continue
         if package.skill is not None:
             skills.append(package.skill)
+            skill_names.add(package.skill.name)
         tools.extend(package.tools)
+        tool_names.update(tool.name for tool in package.tools)
 
     _registries = Registries(
         skill_registry=SkillRegistry(skills),
@@ -56,6 +73,16 @@ def get_tool_registry() -> ToolRegistry:
 def reset_registries_for_tests() -> None:
     global _registries
     _registries = None
+
+
+def _duplicate_tool_names(tools: list[ToolSpec], *, existing: set[str]) -> list[str]:
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    for tool in tools:
+        if tool.name in existing or tool.name in seen:
+            duplicates.append(tool.name)
+        seen.add(tool.name)
+    return duplicates
 
 
 def _load_builtin_skills() -> list[Skill]:

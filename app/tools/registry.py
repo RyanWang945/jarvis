@@ -3,7 +3,11 @@ from app.tools.specs import ToolSpec
 
 class ToolRegistry:
     def __init__(self, tools: list[ToolSpec]) -> None:
-        self._tools = {tool.name: tool for tool in tools}
+        self._tools: dict[str, ToolSpec] = {}
+        for tool in tools:
+            if tool.name in self._tools:
+                raise ValueError(f"duplicate tool: {tool.name}")
+            self._tools[tool.name] = tool
 
     def get(self, name: str) -> ToolSpec:
         try:
