@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -73,7 +74,7 @@ class TavilySearchSkill:
             exit_code=completed.returncode,
             stdout=completed.stdout,
             stderr=completed.stderr,
-            summary=_summary(completed.returncode, query),
+            summary=_summary(completed.returncode, query, completed.stdout),
         )
 
 
@@ -85,7 +86,29 @@ def _bounded_int(value: object, *, default: int, minimum: int, maximum: int) -> 
     return max(minimum, min(maximum, parsed))
 
 
-def _summary(returncode: int, query: str) -> str:
+def _summary(returncode: int, query: str, stdout: str) -> str:
     if returncode == 0:
+        urls = _extract_urls(stdout)
+        if urls:
+            return f"Tavily search completed for: {query}. Source URLs: {', '.join(urls[:3])}"
         return f"Tavily search completed for: {query}"
     return f"Tavily search failed for: {query}"
+
+
+def _extract_urls(stdout: str) -> list[str]:
+    try:
+        parsed = json.loads(stdout)
+    except json.JSONDecodeError:
+        return [
+            line.strip()
+            for line in stdout.splitlines()
+            if line.strip().startswith(("http://", "https://"))
+        ]
+    results = parsed.get("results") if isinstance(parsed, dict) else None
+    if not isinstance(results, list):
+        return []
+    urls: list[str] = []
+    for item in results:
+        if isinstance(item, dict) and item.get("url"):
+            urls.append(str(item["url"]))
+    return urls
