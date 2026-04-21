@@ -162,6 +162,96 @@ def test_llm_planner_cannot_route_code_write_to_shell(tmp_path, monkeypatch) -> 
     assert "disallowed capability 'run_shell_command'" in (result.summary or "")
 
 
+def test_numbered_work_order_constraint_creates_sequential_work_plan(tmp_path, monkeypatch) -> None:
+    from app.agent.nodes import aggregate, classify_intent, strategize
+    from app.agent.state import initial_state
+
+    monkeypatch.setenv("JARVIS_PLANNER_TYPE", "rule_based")
+    get_settings.cache_clear()
+
+    state = initial_state(
+        build_user_event(
+            instruction=(
+                "在这个仓库完成 capability routing 验收，不要提交，不要 push。\n"
+                "请拆成多个 work order 执行：\n"
+                "1. 审查当前 routing 实现。\n"
+                "2. 做一个小而安全的测试改进。\n"
+                "3. 运行相关 pytest。\n"
+                "4. 总结改动和设计债务。"
+            ),
+            workdir=str(tmp_path),
+        ),
+        thread_id="thread-work-plan",
+    )
+    state.update(classify_intent(state))
+
+    assert state["work_plan"] is not None
+    assert len(state["work_plan"]["steps"]) == 4
+    assert [step["status"] for step in state["work_plan"]["steps"]] == ["pending"] * 4
+
+    update = strategize(state)
+
+    assert update["next_node"] == "dispatch"
+    assert len(update["task_list"]) == 1
+    assert update["task_list"][0]["plan_step_id"] == "step-1"
+    assert update["task_list"][0]["tool_name"] == "coder.claude_code"
+    assert update["work_plan"]["steps"][0]["status"] == "running"
+    assert update["work_plan"]["steps"][1]["status"] == "pending"
+
+    aggregate_state = dict(state)
+    aggregate_state.update(update)
+    order_id = update["task_list"][0]["order_id"]
+    aggregate_state["worker_results"] = {
+        order_id: WorkResult(
+            order_id=order_id,
+            task_id=update["task_list"][0]["id"],
+            ca_thread_id="thread-work-plan",
+            worker_type="coder",
+            ok=True,
+            summary="step one reviewed routing",
+        ).model_dump()
+    }
+    aggregated = aggregate(aggregate_state)
+
+    assert aggregated["next_node"] == "strategize"
+    assert aggregated["work_plan"]["steps"][0]["status"] == "success"
+    assert aggregated["work_plan"]["steps"][1]["status"] == "pending"
+
+    next_state = dict(aggregate_state)
+    next_state.update(aggregated)
+    next_update = strategize(next_state)
+
+    assert next_update["next_node"] == "dispatch"
+    assert len(next_update["task_list"]) == 2
+    assert next_update["task_list"][0]["status"] == "success"
+    assert next_update["task_list"][1]["plan_step_id"] == "step-2"
+    assert next_update["work_plan"]["steps"][0]["status"] == "success"
+    assert next_update["work_plan"]["steps"][1]["status"] == "running"
+
+    second_aggregate_state = dict(next_state)
+    second_aggregate_state.update(next_update)
+    second_order_id = next_update["task_list"][1]["order_id"]
+    second_aggregate_state["worker_results"] = {
+        second_order_id: WorkResult(
+            order_id=second_order_id,
+            task_id=next_update["task_list"][1]["id"],
+            ca_thread_id="thread-work-plan",
+            worker_type="coder",
+            ok=True,
+            summary="step two added a focused test",
+        ).model_dump()
+    }
+    second_aggregated = aggregate(second_aggregate_state)
+
+    assert second_aggregated["next_node"] == "strategize"
+    assert second_aggregated["task_list"][0]["status"] == "success"
+    assert second_aggregated["task_list"][0]["result_summary"] == "step one reviewed routing"
+    assert second_aggregated["task_list"][1]["status"] == "success"
+    assert second_aggregated["work_plan"]["steps"][0]["status"] == "success"
+    assert second_aggregated["work_plan"]["steps"][1]["status"] == "success"
+    assert second_aggregated["work_plan"]["steps"][2]["status"] == "pending"
+
+
 def test_rule_based_code_write_intent_routes_to_coder(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("JARVIS_PLANNER_TYPE", "rule_based")
     get_settings.cache_clear()

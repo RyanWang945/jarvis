@@ -44,3 +44,4 @@ class ToolCallPlan(BaseModel):
     dod: str | None = None
     verification_cmd: str | None = None
     max_retries: int = 0
+    plan_step_id: str | None = None

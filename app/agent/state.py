@@ -85,6 +85,24 @@ class IntentDecision(TypedDict):
     plan_steps: list[dict[str, Any]]
 
 
+class PlanStep(TypedDict):
+    id: str
+    title: str
+    instruction: str
+    capability_name: str
+    status: str
+    order_id: str | None
+    result_summary: str | None
+
+
+class WorkPlan(TypedDict):
+    id: str
+    goal: str
+    status: str
+    requires_multiple_work_orders: bool
+    steps: list[PlanStep]
+
+
 class AgentState(TypedDict):
     thread_id: str
     messages: Annotated[list[Any], add_messages]
@@ -103,6 +121,7 @@ class AgentState(TypedDict):
     error_count: int
     last_error: str | None
     intent: IntentDecision | None
+    work_plan: WorkPlan | None
     allowed_tools: list[str]
     plan_steps: list[dict[str, Any]]
     failure_kind: str | None
@@ -130,6 +149,7 @@ def initial_state(event: AgentEvent, thread_id: str) -> AgentState:
         "error_count": 0,
         "last_error": None,
         "intent": None,
+        "work_plan": None,
         "allowed_tools": [],
         "plan_steps": [],
         "failure_kind": None,

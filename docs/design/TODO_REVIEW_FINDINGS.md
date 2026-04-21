@@ -42,6 +42,37 @@
 
 ## 当前最高优先级风险（2026-04-20）
 
+### P0：显式多 WorkOrder 编排约束未被执行（MVP 已修复）
+
+问题：
+
+- 真实 E2E 中，用户明确要求“请拆成多个 work order 执行”，并列出 4 个步骤。
+- CA Agent 只生成了 1 个 `coder.claude_code` work order。
+- 该 work order 只完成审查，没有执行“小改进”和“pytest 验证”。
+- `aggregate` 因 worker ok 直接 completed。
+- final summary 把“建议的改进”写成“已完成改进”，存在事实夸大。
+
+风险：
+
+- 用户的编排约束没有被 CA Agent 当成硬约束。
+- 多步骤任务可能只完成第一步就被标记完成。
+- 最终回答可能误导用户，以为未执行的代码修改和测试已经完成。
+
+建议：
+
+- 新增 `OrchestrationConstraints`，识别“多个 work order / 分多步 / 先...再... / numbered steps”等显式约束。
+- `strategize` 必须验证 planner 输出是否满足 required steps；不满足时应重规划或 blocked。
+- `aggregate` 必须检查 required steps 完成情况，不能只根据第一个 worker ok 判断整个任务 completed。
+- final synthesis 输入应包含 required steps 与 completed steps，并禁止把 worker 建议当作事实。
+
+状态：
+
+- 已实现 WorkPlan MVP：numbered steps 会生成顺序 WorkPlan；每次只 dispatch 一个 pending step；step 成功后 `aggregate` 回到 `strategize` 继续下一步。
+- 已修复第二步聚合回归：后续 step 聚合时不会重新评估已 success 的历史 task。
+- 已记录回归测试：`test_numbered_work_order_constraint_creates_sequential_work_plan`，覆盖 step-1 成功后继续 step-2，以及 step-2 聚合时 step-1 保持 success。
+- 已通过真实 E2E：4 个 numbered steps 顺序生成 4 个 `coder.claude_code` work order，逐步审批后最终 completed。
+- 剩余工作：把 WorkPlan 暴露到 API/CLI status、持久化到业务 DB、增强 final synthesis 对 completed/pending steps 的事实约束。
+
 ### P0：`verification_cmd` 风险审批绕过（已完成）
 
 问题：

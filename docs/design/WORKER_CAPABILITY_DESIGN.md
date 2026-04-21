@@ -678,13 +678,107 @@ data/coder-skills/
 
 ## 10. 推荐下一步工作
 
-1. 修现有 routing 安全边界：manifest metadata 透传、禁止全工具 fallback、`strategize()` 二次校验。
-2. 为 `WorkOrder` 增加 nullable `capability_name` 和 `provider`，并补持久化字段。
-3. 新增 `CapabilityRegistry` 草图，先从现有 built-in tools 生成 capability，并生成 ToolSpec 兼容视图。
-4. 清理 `_classify_intent()`、`_rule_based_tool_calls()`、`_is_objective_success()` 中的硬编码 tool name。
-5. 将 `tavily_search` 迁移为内置 `SearchWorker(provider=tavily)`。
-6. 将 Claude Code worker 升级为 dedicated CoderWorker，并引入 coder skill 注入目录。
-7. 将 `SKILL_PLUGIN_DESIGN.md` 中的动态 import 方案降级为兼容层。
+1. 实现 WorkPlan MVP：当用户显式要求“多个 work order / 分多步 / 先...再...”时，CA Agent 生成可持久追踪的 plan，而不是只把该要求放进 prompt。
+2. 修 final synthesis / completion assessment 的夸大风险：必须区分 worker 已完成的事实、worker 建议的后续改进、用户原始 DoD 尚未完成的部分。
+3. 清理 `_classify_intent()`、`_rule_based_tool_calls()`、`_is_objective_success()` 中残留的硬编码 tool name。
+4. 将 Claude Code worker 升级为 dedicated CoderWorker，并引入 coder skill 注入目录。
+5. 将 `SKILL_PLUGIN_DESIGN.md` 中的动态 import 方案降级为兼容层。
+
+### 10.1 WorkPlan MVP
+
+目标：
+
+```text
+User instruction
+    -> IntentDecision
+    -> WorkPlan
+    -> one ready PlanStep at a time
+    -> WorkOrder
+    -> WorkerResult
+    -> mark PlanStep success/failed
+    -> continue until all required steps complete
+```
+
+新增最小结构：
+
+```python
+class WorkPlan(TypedDict):
+    id: str
+    goal: str
+    status: Literal["planned", "running", "completed", "blocked"]
+    requires_multiple_work_orders: bool
+    steps: list[PlanStep]
+
+
+class PlanStep(TypedDict):
+    id: str
+    title: str
+    instruction: str
+    capability_name: str
+    status: Literal["pending", "running", "success", "failed", "blocked"]
+    order_id: str | None
+    result_summary: str | None
+```
+
+MVP 约束：
+
+- 只做顺序步骤，不做并行 DAG。
+- 第一步先支持 numbered list：`1. ...`、`2. ...`、`3. ...`。
+- 如果主 intent 是 `code_write`，默认每个 step 都使用 `coder.claude_code`，后续再细分 search/test/shell。
+- `strategize()` 一次只把第一个 pending step 转成 WorkOrder。
+- `aggregate()` 成功后标记当前 step success；如果还有 pending step，回到 `strategize()`，不能直接 completed。
+- 所有 required steps success 后才进入 `summarize()`。
+- final answer 必须基于 WorkPlan step statuses，不能把 pending/建议项写成已完成。
+
+这个 MVP 解决的是 CA Agent 的编排职责，不要求 Claude Code 自己在一次 worker 调用里完成所有步骤。多 work order 可以先是多次调用同一个 `coder.claude_code` capability。
+
+### 10.2 真实 E2E 发现：显式多 WorkOrder 约束未被执行
+
+日期：2026-04-21
+
+真实任务：
+
+```text
+在当前 Jarvis 仓库里完成一次 capability routing 验收改进，不要提交，不要 push。
+请拆成多个 work order 执行：
+1. 审查当前 capability / skill / tool routing 相关实现。
+2. 基于审查结果做一个小而安全的代码改进。
+3. 运行相关 pytest 验证。
+4. 最后总结改了哪些文件、测试结果、还有哪些设计债务。
+```
+
+实际行为：
+
+- CA Agent 正确识别为 `code_write`。
+- Planner 只生成了 1 个 `coder.claude_code` work order。
+- 该 work order 只做审查，不修改代码、不运行 pytest。
+- `aggregate` 因 worker ok 直接进入 completed。
+- final summary 将“建议的改进”表述成“已完成改进”，存在夸大风险。
+
+结论：
+
+```text
+用户显式编排约束目前只是 prompt text，没有成为 CA Agent 的硬约束。
+```
+
+验收标准：
+
+- 当用户明确写“拆成多个 work order”且列出 numbered steps 时，CA Agent 至少应生成对应数量的 plan steps，或明确 blocked 说明无法遵守。
+- 如果 planner 只返回 1 个 work order，`strategize` 或 `aggregate` 不应静默 completed。
+- 完成判断必须覆盖所有 required steps，而不是只看第一个 worker result。
+- final answer 必须只陈述已完成事实，不得把 worker 的建议当作已执行变更。
+
+相关测试：
+
+- `test_numbered_work_order_constraint_creates_sequential_work_plan` 覆盖 WorkPlan MVP：numbered steps 会生成顺序 WorkPlan，第一步完成后 `aggregate` 回到 `strategize` 继续下一步，而不是直接 completed；第二步聚合时，第一步历史 success task 不会因为缺少本轮 worker result 被重新判定为 blocked。
+
+真实 E2E 结果：
+
+- 日期：2026-04-21
+- thread：`workplan-e2e-2`
+- 任务：4 个 numbered steps，要求顺序拆成多个 work order。
+- 结果：系统顺序生成 4 个 `coder.claude_code` work order，每步 approval 后继续下一步，最终 completed。
+- 临时仓库验证：`hello.py` 被创建为 untracked 文件，内容为 `print("hello workplan")`；未 commit，未 push。
 
 ## 11. 完成定义
 

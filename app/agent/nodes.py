@@ -8,7 +8,7 @@ from uuid import uuid4
 
 from langgraph.types import interrupt
 
-from app.agent.state import AgentState, IntentDecision, PendingAction, RiskLevel, Task
+from app.agent.state import AgentState, IntentDecision, PendingAction, PlanStep, RiskLevel, Task, WorkPlan
 from app.config import get_settings
 from app.llm.jarvis import get_jarvis_llm
 from app.tools import get_default_capability_registry, get_default_tool_registry
@@ -57,9 +57,11 @@ def contextualize(state: AgentState) -> dict[str, Any]:
 
 def classify_intent(state: AgentState) -> dict[str, Any]:
     decision = _classify_intent(state)
+    work_plan = _build_work_plan(state, decision)
     return {
         "status": "planning",
         "intent": decision,
+        "work_plan": work_plan,
         "allowed_tools": decision["allowed_tools"],
         "plan_steps": decision["plan_steps"],
     }
@@ -141,6 +143,8 @@ def strategize(state: AgentState) -> dict[str, Any]:
             "max_retries": int(item.max_retries or 0),
             "result_summary": None,
         }
+        if item.plan_step_id:
+            task["plan_step_id"] = item.plan_step_id  # type: ignore[typeddict-unknown-key]
         order = WorkOrder(
             order_id=order_id,
             task_id=task_id,
@@ -158,6 +162,14 @@ def strategize(state: AgentState) -> dict[str, Any]:
         )
         tasks.append(task)
         order_dump = order.model_dump()
+        if item.plan_step_id:
+            work_plan = _mark_plan_step_running(
+                state.get("work_plan"),
+                step_id=item.plan_step_id,
+                order_id=order_id,
+            )
+        else:
+            work_plan = state.get("work_plan")
         dispatch_queue.append(order_dump)
         work_orders[order.order_id] = order_dump
 
@@ -169,6 +181,7 @@ def strategize(state: AgentState) -> dict[str, Any]:
         "task_list": previous_tasks + tasks,
         "dispatch_queue": dispatch_queue,
         "work_orders": work_orders,
+        "work_plan": work_plan if "work_plan" in locals() else state.get("work_plan"),
         "approved_order_ids": state.get("approved_order_ids", []),
         "active_workers": {},
         "worker_results": {},
@@ -286,18 +299,31 @@ def route_after_monitor(state: AgentState) -> str:
 def aggregate(state: AgentState) -> dict[str, Any]:
     worker_results = state.get("worker_results", {})
     work_orders = dict(state.get("work_orders", {}))
+    work_plan = state.get("work_plan")
     tasks: list[Task] = []
     failed = False
     needs_replan = False
     dispatch_queue: list[dict[str, Any]] = []
     for task in state["task_list"]:
         updated = task.copy()
+        if updated.get("status") in {"success", "failed", "blocked", "cancelled"}:
+            if updated.get("status") in {"failed", "blocked"}:
+                failed = True
+            tasks.append(updated)
+            continue
+
         order_id = updated.get("order_id")
         result = WorkResult(**worker_results[order_id]) if order_id and order_id in worker_results else None
         assessment = _assess_task_completion(updated, result)
         if assessment.decision == "success":
             updated["status"] = "success"
             updated["result_summary"] = assessment.summary
+            work_plan = _mark_plan_step_finished(
+                work_plan,
+                step_id=updated.get("plan_step_id"),  # type: ignore[typeddict-item]
+                status="success",
+                result_summary=assessment.summary,
+            )
         elif assessment.decision == "retry":
             retry = _retry_task(
                 updated,
@@ -314,6 +340,12 @@ def aggregate(state: AgentState) -> dict[str, Any]:
         else:
             updated["status"] = "blocked" if assessment.decision == "blocked" else "failed"
             updated["result_summary"] = assessment.summary
+            work_plan = _mark_plan_step_finished(
+                work_plan,
+                step_id=updated.get("plan_step_id"),  # type: ignore[typeddict-item]
+                status=updated["status"],
+                result_summary=assessment.summary,
+            )
             failed = True
         tasks.append(updated)
 
@@ -323,15 +355,31 @@ def aggregate(state: AgentState) -> dict[str, Any]:
             "task_list": tasks,
             "dispatch_queue": dispatch_queue,
             "work_orders": work_orders,
+            "work_plan": work_plan,
             "active_workers": {},
             "next_node": "dispatch",
         }
+
+    if work_plan and _next_pending_plan_step(work_plan) and not failed:
+        return {
+            "status": "strategizing",
+            "task_list": tasks,
+            "work_orders": work_orders,
+            "work_plan": work_plan,
+            "active_workers": {},
+            "next_node": "strategize",
+        }
+
+    if work_plan and not _next_pending_plan_step(work_plan) and not failed:
+        work_plan = dict(work_plan)
+        work_plan["status"] = "completed"
 
     if needs_replan and not failed:
         return {
             "status": "strategizing",
             "task_list": tasks,
             "work_orders": work_orders,
+            "work_plan": work_plan,
             "active_workers": {},
             "worker_results": {},
             "last_error": "Replanning after completion assessment.",
@@ -341,6 +389,7 @@ def aggregate(state: AgentState) -> dict[str, Any]:
     return {
         "status": "failed" if failed else "running",
         "task_list": tasks,
+        "work_plan": work_plan,
         "next_node": "blocked" if failed else "summarize",
     }
 
@@ -922,6 +971,13 @@ def _replan_context(state: AgentState) -> str | None:
 
 
 def _planned_tool_calls(state: AgentState) -> list[ToolCallPlan]:
+    work_plan = state.get("work_plan")
+    if work_plan:
+        step = _next_pending_plan_step(work_plan)
+        if step is None:
+            return []
+        return [_tool_call_from_plan_step(state, step)]
+
     settings = get_settings()
     if settings.planner_type != "llm":
         return _rule_based_tool_calls(state)
@@ -1054,6 +1110,155 @@ def _classify_intent(state: AgentState) -> IntentDecision:
         allowed_tools=_allowed_tools_for_intent("simple_chat"),
         requires_workdir=False,
     )
+
+
+def _build_work_plan(state: AgentState, decision: IntentDecision) -> WorkPlan | None:
+    payload = _payload(state)
+    instruction = str(payload.get("instruction") or "")
+    steps = _extract_numbered_steps(instruction)
+    if len(steps) < 2 or not _requires_multiple_work_orders(instruction):
+        return None
+
+    capability_name = _default_tool_name_for_intent(decision["kind"]) or (
+        decision["allowed_tools"][0] if decision["allowed_tools"] else "answer.echo"
+    )
+    plan_steps: list[PlanStep] = []
+    for index, step_text in enumerate(steps, start=1):
+        plan_steps.append(
+            {
+                "id": f"step-{index}",
+                "title": step_text[:120],
+                "instruction": _plan_step_instruction(
+                    goal=instruction,
+                    step_text=step_text,
+                    index=index,
+                    total=len(steps),
+                ),
+                "capability_name": capability_name,
+                "status": "pending",
+                "order_id": None,
+                "result_summary": None,
+            }
+        )
+    return {
+        "id": str(uuid4()),
+        "goal": instruction,
+        "status": "planned",
+        "requires_multiple_work_orders": True,
+        "steps": plan_steps,
+    }
+
+
+def _extract_numbered_steps(instruction: str) -> list[str]:
+    steps: list[str] = []
+    for line in instruction.splitlines():
+        match = re.match(r"^\s*\d+[\.\)、)]\s*(.+?)\s*$", line)
+        if match:
+            steps.append(match.group(1).strip())
+    return steps
+
+
+def _requires_multiple_work_orders(instruction: str) -> bool:
+    text = instruction.lower()
+    markers = [
+        "多个 work order",
+        "多 work order",
+        "work orders",
+        "分多个",
+        "分多步",
+        "拆成多个",
+        "先",
+        "再",
+        "最后",
+    ]
+    return any(marker in text for marker in markers)
+
+
+def _plan_step_instruction(*, goal: str, step_text: str, index: int, total: int) -> str:
+    return "\n".join(
+        [
+            f"This is Jarvis WorkPlan step {index} of {total}.",
+            "Execute only this step. Do not perform later steps unless explicitly included in this step.",
+            "",
+            "Overall user goal and constraints:",
+            goal,
+            "",
+            "Current step:",
+            step_text,
+        ]
+    )
+
+
+def _next_pending_plan_step(work_plan: WorkPlan | None) -> PlanStep | None:
+    if not work_plan:
+        return None
+    for step in work_plan.get("steps", []):
+        if step.get("status") == "pending":
+            return step
+    return None
+
+
+def _tool_call_from_plan_step(state: AgentState, step: PlanStep) -> ToolCallPlan:
+    payload = _payload(state)
+    workdir = _clean_optional(payload.get("workdir"))
+    tool_args: dict[str, Any]
+    if step["capability_name"] == "coder.claude_code":
+        tool_args = {"instruction": step["instruction"], "workdir": workdir}
+    elif step["capability_name"] == "search.tavily":
+        tool_args = {"query": step["instruction"], "max_results": 5, "include_answer": True}
+    elif step["capability_name"] in {"shell.command", "shell.test"}:
+        tool_args = {"command": _clean_optional(payload.get("command")) or step["instruction"]}
+    else:
+        tool_args = {"text": step["instruction"]}
+    return ToolCallPlan(
+        tool_name=step["capability_name"],
+        tool_args=tool_args,
+        title=step["title"],
+        description=step["instruction"],
+        dod=f"WorkPlan step {step['id']} completed successfully.",
+        verification_cmd=_clean_optional(payload.get("verification_cmd")),
+        max_retries=int(payload.get("max_retries") or 0),
+        plan_step_id=step["id"],
+    )
+
+
+def _mark_plan_step_running(work_plan: WorkPlan | None, *, step_id: str, order_id: str) -> WorkPlan | None:
+    if not work_plan:
+        return None
+    updated = dict(work_plan)
+    steps: list[PlanStep] = []
+    for step in work_plan["steps"]:
+        item = dict(step)
+        if item["id"] == step_id:
+            item["status"] = "running"
+            item["order_id"] = order_id
+        steps.append(item)  # type: ignore[arg-type]
+    updated["steps"] = steps
+    updated["status"] = "running"
+    return updated  # type: ignore[return-value]
+
+
+def _mark_plan_step_finished(
+    work_plan: WorkPlan | None,
+    *,
+    step_id: object,
+    status: str,
+    result_summary: str,
+) -> WorkPlan | None:
+    if not work_plan or not isinstance(step_id, str):
+        return work_plan
+    updated = dict(work_plan)
+    steps: list[PlanStep] = []
+    for step in work_plan["steps"]:
+        item = dict(step)
+        if item["id"] == step_id:
+            item["status"] = status
+            item["result_summary"] = result_summary
+        steps.append(item)  # type: ignore[arg-type]
+    updated["steps"] = steps
+    if status in {"failed", "blocked"}:
+        updated["status"] = "blocked"
+    return updated  # type: ignore[return-value]
 
 
 def _intent_decision(
