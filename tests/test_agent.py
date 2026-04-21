@@ -2,6 +2,7 @@ import json
 import time
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.agent.events import build_user_event
@@ -13,7 +14,7 @@ from app.llm.jarvis import get_jarvis_llm
 from app.main import create_app
 from app.skills.bootstrap import bootstrap_registries, reset_registries_for_tests
 from app.skills import get_default_skill_registry
-from app.tools import get_default_tool_registry
+from app.tools import get_default_capability_registry, get_default_tool_registry
 from app.tools.specs import ToolCallPlan, ToolSpec
 from app.workers import InlineWorkerClient, ThreadWorkerClient, WorkOrder, WorkResult, WorkerEventBus
 from app.workers.executor import execute_work_order
@@ -122,10 +123,43 @@ def test_llm_code_write_intent_exposes_only_coder_tool(tmp_path, monkeypatch) ->
 
     assert result.status == "waiting_approval"
     assert captured_tools == ["delegate_to_claude_code"]
-    assert result.tasks[0]["tool_name"] == "delegate_to_claude_code"
+    assert result.tasks[0]["tool_name"] == "coder.claude_code"
     inspection = runner.inspect_run(result.thread_id)
     assert inspection is not None
     assert any(audit["action"] == "intent_classified" for audit in inspection["audit_logs"])
+
+
+def test_llm_planner_cannot_route_code_write_to_shell(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("JARVIS_PLANNER_TYPE", "llm")
+    monkeypatch.setenv("JARVIS_DEEPSEEK_API_KEY", "test-key")
+    get_settings.cache_clear()
+    get_jarvis_llm.cache_clear()
+
+    def fake_plan_tasks(self, *, instruction, tools):
+        assert [tool.name for tool in tools] == ["delegate_to_claude_code"]
+        return [
+            ToolCallPlan(
+                tool_name="run_shell_command",
+                tool_args={"command": "pwd"},
+                title="Wrong shell route",
+                description="Planner selected a disallowed tool.",
+                dod="Should not execute.",
+            )
+        ]
+
+    monkeypatch.setattr("app.llm.jarvis.JarvisLLM.plan_tasks", fake_plan_tasks)
+
+    runner = ThreadManager(tmp_path)
+    result = runner.run_event(
+        build_user_event(
+            instruction="在nltk项目中写一个快排的脚本，用python就可以",
+            workdir=str(tmp_path),
+        )
+    )
+
+    assert result.status == "blocked"
+    assert result.tasks == []
+    assert "disallowed capability 'run_shell_command'" in (result.summary or "")
 
 
 def test_rule_based_code_write_intent_routes_to_coder(tmp_path, monkeypatch) -> None:
@@ -141,7 +175,7 @@ def test_rule_based_code_write_intent_routes_to_coder(tmp_path, monkeypatch) -> 
     )
 
     assert result.status == "waiting_approval"
-    assert result.tasks[0]["tool_name"] == "delegate_to_claude_code"
+    assert result.tasks[0]["tool_name"] == "coder.claude_code"
     assert result.tasks[0]["worker_type"] == "coder"
 
 
@@ -183,7 +217,7 @@ def test_llm_planner_uses_deepseek_response(tmp_path, monkeypatch) -> None:
     result = runner.run_event(event)
 
     assert result.status == "completed"
-    assert result.tasks[0]["tool_name"] == "echo"
+    assert result.tasks[0]["tool_name"] == "answer.echo"
     assert result.tasks[0]["result_summary"] == "planned by llm"
 
 
@@ -224,7 +258,7 @@ def test_llm_planned_coder_task_waits_for_approval_then_runs(tmp_path, monkeypat
     monkeypatch.setattr("app.skills.coder.subprocess.run", lambda *args, **kwargs: Completed())
 
     runner = ThreadManager(tmp_path)
-    result = runner.run_event(build_user_event(instruction="Change GitHub code"))
+    result = runner.run_event(build_user_event(instruction="Modify GitHub code", workdir=str(tmp_path)))
 
     assert result.status == "waiting_approval"
     assert result.pending_approval_id is not None
@@ -570,6 +604,80 @@ def test_tool_registry_prefers_coder_for_development_publish_workflows() -> None
     assert "git commit" in coder_tool.description
     assert "git push" in coder_tool.description
     assert "Do not use this for multi-step code editing" in shell_tool.description
+
+
+def test_capability_registry_exposes_intent_defaults() -> None:
+    registry = get_default_capability_registry()
+    coder = registry.get("delegate_to_claude_code")
+
+    assert registry.default_name_for_intent("code_write") == "coder.claude_code"
+    assert registry.default_name_for_intent("explicit_shell") == "shell.command"
+    assert registry.default_name_for_intent("simple_chat") == "answer.echo"
+    assert "coder.claude_code" in registry.names_for_intent("code_review")
+    assert coder.name == "coder.claude_code"
+    assert coder.llm_tool_name == "delegate_to_claude_code"
+    assert registry.resolve_name("delegate_to_claude_code") == "coder.claude_code"
+
+
+def test_capability_registry_uses_external_manifest_capability_name(tmp_path) -> None:
+    skills_root = tmp_path / "skills"
+    package = skills_root / "external_search"
+    package.mkdir(parents=True)
+    (package / "manifest.yaml").write_text(
+        """
+name: external-search
+description: External search provider.
+jarvis:
+  module: skill
+  class_name: ExternalSearchSkill
+  tools:
+    - name: external_search
+      capability_name: search.external
+      description: Search with an external provider.
+      args_schema:
+        type: object
+        properties:
+          query:
+            type: string
+        required:
+          - query
+      skill: external-search
+      worker_type: external-search
+      action: search
+      risk_level: low
+      exposed_to_llm: true
+      intent_kinds:
+        - search_summary
+""",
+        encoding="utf-8",
+    )
+    (package / "skill.py").write_text(
+        """
+from app.skills.base import SkillResult
+
+
+class ExternalSearchSkill:
+    name = "external-search"
+
+    def run(self, request):
+        return SkillResult(ok=True, exit_code=0, stdout="[]", summary="searched")
+""",
+        encoding="utf-8",
+    )
+
+    reset_registries_for_tests()
+    try:
+        registries = bootstrap_registries(external_paths=[skills_root], force=True)
+        registry = get_default_capability_registry()
+        capability = registry.get("external_search")
+
+        assert registries.tool_registry.get("external_search").capability_name == "search.external"
+        assert capability.name == "search.external"
+        assert capability.llm_tool_name == "external_search"
+        assert registry.resolve_name("external_search") == "search.external"
+        assert "search.external" in registry.names_for_intent("search_summary")
+    finally:
+        reset_registries_for_tests()
 
 
 def test_builtin_web_search_tool_is_not_registered() -> None:
@@ -1323,6 +1431,8 @@ def test_business_db_persists_run_and_tasks(tmp_path, monkeypatch) -> None:
     assert len(orders) == 1
     assert orders[0]["status"] == "completed"
     assert orders[0]["worker_type"] == "echo"
+    assert orders[0]["capability_name"] == "answer.echo"
+    assert orders[0]["provider"] == "echo"
 
     work_result = runner.db.work_results.get_by_order(orders[0]["order_id"])
     assert work_result is not None
@@ -1729,7 +1839,7 @@ def test_cli_run_status_and_report(tmp_path, monkeypatch, capsys) -> None:
     assert Path(report_output["paths"]["json"]).exists()
 
 
-def test_cli_mixed_risk_plan_waits_before_dispatching_any_worker(tmp_path, monkeypatch, capsys) -> None:
+def test_cli_plan_rejects_shell_without_explicit_command(tmp_path, monkeypatch, capsys) -> None:
     from app.cli import main as cli_main
     from app.skills.base import SkillResult
     from app.skills.shell import ShellSkill
@@ -1770,29 +1880,10 @@ def test_cli_mixed_risk_plan_waits_before_dispatching_any_worker(tmp_path, monke
     cli_main(["run", "Prepare and publish", "--thread-id", "cli-mixed-risk"])
     run_output = json.loads(capsys.readouterr().out)
 
-    assert run_output["status"] == "waiting_approval"
-    assert run_output["pending_approval_id"] is not None
+    assert run_output["status"] == "blocked"
+    assert run_output["pending_approval_id"] is None
+    assert "disallowed capability 'run_shell_command'" in run_output["summary"]
     assert shell_calls == []
-
-    cli_main(["status", "cli-mixed-risk"])
-    status_output = json.loads(capsys.readouterr().out)
-    assert len(status_output["work_orders"]) == 2
-    assert status_output["work_results"] == []
-    assert len(status_output["approvals"]) == 1
-
-    cli_main(
-        [
-            "approve",
-            "cli-mixed-risk",
-            "--approval-id",
-            run_output["pending_approval_id"],
-        ]
-    )
-    approved_output = json.loads(capsys.readouterr().out)
-
-    assert approved_output["status"] == "completed"
-    assert [task["status"] for task in approved_output["tasks"]] == ["success", "success"]
-    assert [call.args["command"] for call in shell_calls] == ["git push origin main"]
 
 
 def test_cli_resource_lock_conflict_status_recover_flow(tmp_path, monkeypatch, capsys) -> None:
@@ -1853,8 +1944,8 @@ def test_cli_complex_coder_feature_task_against_real_nltk_workspace(tmp_path, mo
     from app.cli import main as cli_main
 
     repo = Path("data/workspaces/nltk").resolve()
-    assert (repo / ".git").is_dir()
-    assert (repo / "README.md").is_file()
+    if not (repo / ".git").is_dir() or not (repo / "README.md").is_file():
+        pytest.skip("live nltk workspace is not available under data/workspaces/nltk")
     feature_path = repo / "FEATURE.md"
     if feature_path.exists():
         feature_path.unlink()
@@ -1988,6 +2079,7 @@ jarvis:
   class_name: FakeTavilySkill
   tools:
     - name: tavily_search
+      capability_name: search.tavily
       description: Search the web through Tavily and return titles, URLs, and snippets.
       args_schema:
         type: object
@@ -2005,6 +2097,8 @@ jarvis:
       action: search
       risk_level: low
       exposed_to_llm: true
+      intent_kinds:
+        - search_summary
 """,
         encoding="utf-8",
     )
@@ -2194,6 +2288,7 @@ jarvis:
   class_name: UuidSkill
   tools:
     - name: generate_uuid
+      capability_name: utility.uuid.generate
       description: Generate a UUID.
       args_schema:
         type: object
@@ -2203,6 +2298,11 @@ jarvis:
       action: generate
       risk_level: low
       exposed_to_llm: true
+      intent_kinds:
+        - simple_chat
+      requires_explicit_user_command: true
+      can_modify_files: true
+      requires_workdir: true
 """,
         encoding="utf-8",
     )
@@ -2225,8 +2325,13 @@ class UuidSkill:
         registries = bootstrap_registries(external_paths=[skills_root], force=True)
 
         tool = registries.tool_registry.get("generate_uuid")
+        assert tool.capability_name == "utility.uuid.generate"
         assert tool.worker_type == "uuid_generator"
         assert tool.exposed_to_llm is True
+        assert tool.intent_kinds == ["simple_chat"]
+        assert tool.requires_explicit_user_command is True
+        assert tool.can_modify_files is True
+        assert tool.requires_workdir is True
 
         result = execute_work_order(
             WorkOrder(

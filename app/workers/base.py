@@ -10,7 +10,9 @@ class WorkOrder(BaseModel):
     order_id: str
     task_id: str
     ca_thread_id: str
+    capability_name: str | None = None
     worker_type: WorkerType
+    provider: str | None = None
     action: str
     args: dict[str, Any] = Field(default_factory=dict)
     workdir: str | None = None

@@ -62,11 +62,13 @@ class WorkOrderRepository:
         self._conn.execute(
             """
             INSERT INTO work_orders (
-                order_id, task_id, ca_thread_id, worker_type, action,
+                order_id, task_id, ca_thread_id, capability_name, worker_type, provider, action,
                 args, workdir, risk_level, reason, verification_cmd, timeout_seconds
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(order_id) DO UPDATE SET
+                capability_name=excluded.capability_name,
                 worker_type=excluded.worker_type,
+                provider=excluded.provider,
                 action=excluded.action,
                 args=excluded.args,
                 workdir=excluded.workdir,
@@ -78,7 +80,9 @@ class WorkOrderRepository:
                 order.order_id,
                 order.task_id,
                 order.ca_thread_id,
+                order.capability_name,
                 order.worker_type,
+                order.provider,
                 order.action,
                 json.dumps(order.args),
                 order.workdir,

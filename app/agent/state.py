@@ -61,8 +61,10 @@ class Task(TypedDict):
 
 class PendingAction(TypedDict):
     action_id: str
+    capability_name: str | None
     kind: ActionKind
     skill: str
+    provider: str | None
     action: str
     args: dict[str, Any]
     command: str | None

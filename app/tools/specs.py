@@ -16,6 +16,7 @@ IntentKind = Literal[
 
 class ToolSpec(BaseModel):
     name: str
+    capability_name: str | None = None
     description: str
     args_schema: dict[str, Any] = Field(default_factory=dict)
     skill: str

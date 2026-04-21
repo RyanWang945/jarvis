@@ -1,11 +1,14 @@
-# Skill 插件系统设计文档
+# Skill 插件系统设计文档（2026-04-20，2026-04-21 更新）
 
-**状态：** 已部分落地，继续硬化
+**状态：** 历史方案；已被 `WORKER_CAPABILITY_DESIGN.md` 取代为未来主扩展模型，当前仅作为兼容层说明
 **作者：** Claude（架构评审）
 **日期：** 2026-04-20
+**更新日期：** 2026-04-21
 **范围：** 外部 Skill 的发现、加载、注册与生命周期管理
 
 ---
+
+> 说明：本文描述的是“Jarvis 作为通用 Python Skill 插件运行时”的阶段性方案。2026-04-21 后，新的主设计转向 Worker Capability：Jarvis 顶层调度稳定 worker 能力，代码相关 skill 注入给 Claude Code，通用 Python Skill 动态 import 降级为 trusted-local / experimental 兼容机制。
 
 ## 0. 当前进展（2026-04-20）
 

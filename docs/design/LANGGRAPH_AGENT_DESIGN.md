@@ -1,7 +1,8 @@
-# Jarvis LangGraph Agent 设计文档
+# Jarvis LangGraph Agent 设计文档（2026-04-21）
 
 版本：v2.0
 状态：CA Agent + Worker 架构，LangGraph 1.0+ 适配
+日期：2026-04-21
 目标：定义 Jarvis 本地 Long-run Agent 的 LangGraph 核心设计，适配 CA+Worker 分离架构，充分利用 LangGraph 1.0+ 的 `interrupt`、`Command` 和流式执行能力。
 
 ## 1. 设计目标

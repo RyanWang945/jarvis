@@ -1,8 +1,9 @@
-# Review TODOs
+# Review TODOs（2026-04-21）
 
 版本：v2.0 baseline 后续修复清单
 来源：Claude Code review + 本地复核
 状态：部分完成，剩余项继续跟踪
+日期：2026-04-21
 
 ## 当前基线说明
 

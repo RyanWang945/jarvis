@@ -2,11 +2,12 @@ from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
 
-from app.tools.specs import RiskLevel
+from app.tools.specs import IntentKind, RiskLevel
 
 
 class SkillToolManifest(BaseModel):
     name: str
+    capability_name: str | None = None
     description: str
     args_schema: dict[str, Any] = Field(default_factory=dict)
     skill: str | None = None
@@ -14,6 +15,10 @@ class SkillToolManifest(BaseModel):
     action: str
     risk_level: RiskLevel = "low"
     exposed_to_llm: bool = False
+    intent_kinds: list[IntentKind] = Field(default_factory=list)
+    requires_explicit_user_command: bool = False
+    can_modify_files: bool = False
+    requires_workdir: bool = False
 
     @model_validator(mode="after")
     def default_skill_and_worker(self) -> "SkillToolManifest":

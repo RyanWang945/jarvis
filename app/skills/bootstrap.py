@@ -97,6 +97,7 @@ def _load_builtin_tools() -> list[ToolSpec]:
     return [
         ToolSpec(
             name="echo",
+            capability_name="answer.echo",
             description="Echo the task instruction without external side effects.",
             args_schema={
                 "type": "object",
@@ -112,6 +113,7 @@ def _load_builtin_tools() -> list[ToolSpec]:
         ),
         ToolSpec(
             name="run_shell_command",
+            capability_name="shell.command",
             description=(
                 "Run a simple local shell command after Jarvis risk checks. "
                 "Do not use this for multi-step code editing, git commit, or git push workflows; "
@@ -135,6 +137,7 @@ def _load_builtin_tools() -> list[ToolSpec]:
         ),
         ToolSpec(
             name="run_tests",
+            capability_name="shell.test",
             description="Run a configured project test command.",
             args_schema={
                 "type": "object",
@@ -157,6 +160,7 @@ def _load_builtin_tools() -> list[ToolSpec]:
         ),
         ToolSpec(
             name="delegate_to_claude_code",
+            capability_name="coder.claude_code",
             description=(
                 "Delegate a repository development workflow to the local Claude Code CLI. "
                 "Use this for code/file edits, README updates, tests, "

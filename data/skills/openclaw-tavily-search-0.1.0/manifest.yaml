@@ -8,6 +8,7 @@ jarvis:
   class_name: TavilySearchSkill
   tools:
     - name: tavily_search
+      capability_name: search.tavily
       description: Search the web through Tavily and return titles, URLs, and snippets.
       args_schema:
         type: object
@@ -32,3 +33,5 @@ jarvis:
       action: search
       risk_level: low
       exposed_to_llm: true
+      intent_kinds:
+        - search_summary

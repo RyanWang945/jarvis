@@ -71,6 +71,7 @@ class SkillPackageLoader:
         tools = [
             ToolSpec(
                 name=tool.name,
+                capability_name=tool.capability_name,
                 description=tool.description,
                 args_schema=tool.args_schema,
                 skill=tool.skill or manifest.name,
@@ -78,6 +79,10 @@ class SkillPackageLoader:
                 action=tool.action,
                 risk_level=tool.risk_level,
                 exposed_to_llm=tool.exposed_to_llm,
+                intent_kinds=tool.intent_kinds,
+                requires_explicit_user_command=tool.requires_explicit_user_command,
+                can_modify_files=tool.can_modify_files,
+                requires_workdir=tool.requires_workdir,
             )
             for tool in (manifest.jarvis.tools if manifest.jarvis else [])
         ]

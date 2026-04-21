@@ -1,7 +1,8 @@
-# Jarvis MVP 开发计划
+# Jarvis MVP 开发计划（2026-04-21）
 
 版本：v2.0
 状态：CA Agent + Worker 架构，分阶段实施
+日期：2026-04-21
 目标：先交付一个可本地运行、支持 CA Agent 事件循环、Worker 抽象、状态持久化、风险拦截的 Jarvis Agent。飞书接入后置到集成阶段。
 
 ## 1. 路线调整说明

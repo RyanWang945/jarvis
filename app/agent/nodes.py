@@ -11,8 +11,8 @@ from langgraph.types import interrupt
 from app.agent.state import AgentState, IntentDecision, PendingAction, RiskLevel, Task
 from app.config import get_settings
 from app.llm.jarvis import get_jarvis_llm
-from app.tools import get_default_tool_registry
-from app.tools.specs import ToolCallPlan
+from app.tools import get_default_capability_registry, get_default_tool_registry
+from app.tools.specs import IntentKind, ToolCallPlan
 from app.workers import WorkOrder, WorkResult, get_worker_client
 
 HIGH_RISK_PATTERNS = [
@@ -77,19 +77,35 @@ def strategize(state: AgentState) -> dict[str, Any]:
 
     payload = _payload(state)
     instruction = str(payload.get("instruction") or "")
-    registry = get_default_tool_registry()
+    capability_registry = get_default_capability_registry()
+    allowed_tool_set = set(state.get("allowed_tools", []))
     previous_tasks = [task.copy() for task in state.get("task_list", [])]
     tasks: list[Task] = []
     dispatch_queue: list[dict[str, Any]] = []
     work_orders: dict[str, dict[str, Any]] = dict(state.get("work_orders", {}))
 
     for item in planned_calls:
-        tool_name = item.tool_name or "echo"
+        requested_tool_name = item.tool_name or "answer.echo"
         try:
-            tool = registry.get(tool_name)
+            capability = capability_registry.get(requested_tool_name)
         except ValueError:
-            tool_name = "echo"
-            tool = registry.get(tool_name)
+            return {
+                "status": "failed",
+                "last_error": f"Planner selected unknown capability '{requested_tool_name}'.",
+                "next_node": "blocked",
+            }
+        tool_name = capability.name
+        if allowed_tool_set and tool_name not in allowed_tool_set:
+            return {
+                "status": "failed",
+                "last_error": (
+                    f"Planner selected disallowed capability '{requested_tool_name}' "
+                    f"(resolved to '{tool_name}'). Allowed capabilities for this intent: "
+                    f"{sorted(allowed_tool_set)}."
+                ),
+                "next_node": "blocked",
+            }
+        tool = capability.to_tool_spec()
 
         task_id = str(uuid4())
         order_id = str(uuid4())
@@ -98,7 +114,7 @@ def strategize(state: AgentState) -> dict[str, Any]:
             tool_args["workdir"] = payload["workdir"]
 
         command = _clean_optional(tool_args.get("command"))
-        if tool.skill == "claude_code":
+        if tool.worker_type == "coder":
             command = _clean_optional(tool_args.get("instruction"))
         worker_type = tool.worker_type
         workdir = _clean_optional(tool_args.get("workdir"))
@@ -129,7 +145,9 @@ def strategize(state: AgentState) -> dict[str, Any]:
             order_id=order_id,
             task_id=task_id,
             ca_thread_id=state["thread_id"],
+            capability_name=capability.name,
             worker_type=worker_type,
+            provider=tool.skill,
             action=tool.action,
             args=tool_args,
             workdir=workdir,
@@ -354,7 +372,9 @@ def wait_approval(state: AgentState) -> dict[str, Any]:
                     order_id=order_id,
                     task_id=state.get("current_task_id", ""),
                     ca_thread_id=state["thread_id"],
+                    capability_name=pending.get("capability_name"),
                     worker_type=pending["kind"],
+                    provider=pending.get("provider") or pending["skill"],
                     action=pending["action"],
                     args=pending["args"],
                     workdir=pending["workdir"],
@@ -514,7 +534,7 @@ def _is_objective_success(task: Task) -> bool:
     tool_name = task.get("tool_name")
     worker_type = task.get("worker_type")
     dod = (task.get("dod") or "").lower()
-    if tool_name in {"run_shell_command", "run_tests", "echo"}:
+    if tool_name in {"shell.command", "shell.test", "answer.echo", "run_shell_command", "run_tests", "echo"}:
         return True
     if worker_type in {"shell", "echo"} and any(
         marker in dod for marker in ("completed", "success", "passed", "exited")
@@ -798,7 +818,9 @@ def _retry_task(
             order_id=order_id,
             task_id=updated["id"],
             ca_thread_id=ca_thread_id,
+            capability_name=updated.get("tool_name"),
             worker_type=updated.get("worker_type") or "echo",
+            provider=updated.get("worker_type") or "echo",
             action="echo",
             args=updated.get("tool_args", {}),
             risk_level="low",
@@ -847,7 +869,7 @@ def _title_from_tool_call(tool_name: str, tool_args: dict[str, Any], instruction
     command = _clean_optional(tool_args.get("command"))
     if command:
         return f"Run command: {command[:80]}"
-    if tool_name == "delegate_to_claude_code":
+    if tool_name in {"coder.claude_code", "delegate_to_claude_code"}:
         delegated = _clean_optional(tool_args.get("instruction"))
         return f"Delegate code task: {delegated[:80]}" if delegated else "Delegate code task"
     return instruction[:80] or f"Use tool: {tool_name}"
@@ -911,14 +933,24 @@ def _planned_tool_calls(state: AgentState) -> list[ToolCallPlan]:
         instruction = f"{instruction}\n\n{replan_context}"
     allowed_tools = state.get("allowed_tools", [])
     intent_kinds = [state["intent"]["kind"]] if state.get("intent") else None
-    tools = get_default_tool_registry().list(
+    capability_registry = get_default_capability_registry()
+    capabilities = capability_registry.list(
         exposed_to_llm=True,
         intent_kinds=intent_kinds,
     )
     if allowed_tools:
-        tools = [tool for tool in tools if tool.name in set(allowed_tools)]
+        tools = [
+            capability.to_tool_spec()
+            for capability in capabilities
+            if capability.name in set(allowed_tools)
+        ]
+    else:
+        tools = [capability.to_tool_spec() for capability in capabilities]
     if not tools:
-        tools = get_default_tool_registry().list(exposed_to_llm=True)
+        raise ValueError(
+            f"No exposed tools are eligible for intent {intent_kinds or ['unknown']} "
+            f"and allowed tools {allowed_tools or ['<none>']}."
+        )
     return get_jarvis_llm().plan_tasks(
         instruction=_planner_instruction(payload, instruction),
         tools=tools,
@@ -932,9 +964,10 @@ def _rule_based_tool_calls(state: AgentState) -> list[ToolCallPlan]:
     intent = state.get("intent") or {}
     if intent.get("kind") == "code_write":
         workdir = _clean_optional(payload.get("workdir"))
+        tool_name = _default_tool_name_for_intent("code_write") or "delegate_to_claude_code"
         return [
             ToolCallPlan(
-                tool_name="delegate_to_claude_code",
+                tool_name=tool_name,
                 tool_args={"instruction": instruction, "workdir": workdir},
                 title=_title_from_instruction(instruction, None),
                 description=instruction,
@@ -944,9 +977,10 @@ def _rule_based_tool_calls(state: AgentState) -> list[ToolCallPlan]:
             )
         ]
     if intent.get("kind") == "search_summary":
+        tool_name = _default_tool_name_for_intent("search_summary") or "tavily_search"
         return [
             ToolCallPlan(
-                tool_name="tavily_search",
+                tool_name=tool_name,
                 tool_args={"query": instruction, "max_results": 5, "include_answer": True},
                 title=_title_from_instruction(instruction, None),
                 description=instruction,
@@ -955,9 +989,10 @@ def _rule_based_tool_calls(state: AgentState) -> list[ToolCallPlan]:
             )
         ]
     if command:
+        tool_name = _default_tool_name_for_intent("explicit_shell") or "run_shell_command"
         return [
             ToolCallPlan(
-                tool_name="run_shell_command",
+                tool_name=tool_name,
                 tool_args={"command": command},
                 title=_title_from_instruction(instruction, command),
                 description=instruction,
@@ -968,7 +1003,7 @@ def _rule_based_tool_calls(state: AgentState) -> list[ToolCallPlan]:
         ]
     return [
         ToolCallPlan(
-            tool_name="echo",
+            tool_name=_default_tool_name_for_intent("simple_chat") or "echo",
             tool_args={"text": instruction},
             title=instruction[:80] or "Agent task",
             description=instruction,
@@ -990,7 +1025,7 @@ def _classify_intent(state: AgentState) -> IntentDecision:
             "explicit_shell",
             confidence=1.0,
             reason="User supplied an explicit shell command.",
-            allowed_tools=["run_shell_command", "run_tests"],
+            allowed_tools=_allowed_tools_for_intent("explicit_shell"),
             requires_workdir=False,
         )
 
@@ -999,7 +1034,7 @@ def _classify_intent(state: AgentState) -> IntentDecision:
             "code_write",
             confidence=0.95,
             reason="Instruction asks to create or modify code/files inside a repository.",
-            allowed_tools=["delegate_to_claude_code"],
+            allowed_tools=_allowed_tools_for_intent("code_write"),
             requires_workdir=True,
         )
 
@@ -1008,7 +1043,7 @@ def _classify_intent(state: AgentState) -> IntentDecision:
             "search_summary",
             confidence=0.9,
             reason="Instruction asks to search or summarize external information.",
-            allowed_tools=["tavily_search"],
+            allowed_tools=_allowed_tools_for_intent("search_summary"),
             requires_workdir=False,
         )
 
@@ -1016,7 +1051,7 @@ def _classify_intent(state: AgentState) -> IntentDecision:
         "simple_chat",
         confidence=0.75,
         reason="No repository edit, explicit shell command, or search request detected.",
-        allowed_tools=["echo"],
+        allowed_tools=_allowed_tools_for_intent("simple_chat"),
         requires_workdir=False,
     )
 
@@ -1044,6 +1079,14 @@ def _intent_decision(
             }
         ],
     }
+
+
+def _allowed_tools_for_intent(intent_kind: IntentKind) -> list[str]:
+    return get_default_capability_registry().names_for_intent(intent_kind)
+
+
+def _default_tool_name_for_intent(intent_kind: IntentKind) -> str | None:
+    return get_default_capability_registry().default_name_for_intent(intent_kind)
 
 
 def _looks_like_code_write(instruction: str) -> bool:
@@ -1099,8 +1142,10 @@ def _pending_action_from_order(order: WorkOrder) -> PendingAction:
     command = _approval_command_summary(order)
     return {
         "action_id": str(uuid4()),
+        "capability_name": order.capability_name,
         "kind": order.worker_type,
         "skill": order.worker_type,
+        "provider": order.provider,
         "action": order.action,
         "args": order.args,
         "command": command,

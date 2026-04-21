@@ -36,7 +36,9 @@ CREATE TABLE IF NOT EXISTS work_orders (
     order_id TEXT PRIMARY KEY,
     task_id TEXT NOT NULL,
     ca_thread_id TEXT NOT NULL,
+    capability_name TEXT,
     worker_type TEXT NOT NULL,
+    provider TEXT,
     action TEXT NOT NULL,
     args TEXT,
     workdir TEXT,
@@ -105,6 +107,8 @@ def init_business_db(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path), check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    _ensure_column(conn, "work_orders", "capability_name", "TEXT")
+    _ensure_column(conn, "work_orders", "provider", "TEXT")
     _ensure_column(conn, "work_results", "artifacts", "TEXT")
     _dedupe_runs(conn)
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_thread_id ON runs(thread_id)")
