@@ -7,9 +7,11 @@ from fastapi import FastAPI, Request
 from app.agent.dispatcher import DispatcherService
 from app.api.agent import get_thread_manager
 from app.api.routes import router
+from app.channels.feishu import build_feishu_channel
 from app.config import get_settings
 from app.logging_config import configure_logging
 from app.skills.bootstrap import bootstrap_registries
+from app.skills.feishu import set_active_channel
 
 logger = logging.getLogger(__name__)
 
@@ -34,9 +36,18 @@ async def lifespan(app: FastAPI):
         dispatcher = DispatcherService(manager)
         dispatcher.start()
         app.state.dispatcher = dispatcher
+
+    # Start Feishu persistent WebSocket channel
+    feishu_channel = build_feishu_channel(manager)
+    if feishu_channel is not None:
+        set_active_channel(feishu_channel)
+        feishu_channel.start()
+        app.state.feishu_channel = feishu_channel
     try:
         yield
     finally:
+        if feishu_channel is not None:
+            feishu_channel.stop()
         if dispatcher:
             dispatcher.stop()
 

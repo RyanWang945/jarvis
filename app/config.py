@@ -34,6 +34,7 @@ class Settings(BaseSettings):
     tavily_base_url: str = "https://api.tavily.com"
     feishu_app_id: str | None = None
     feishu_app_secret: str | None = None
+    feishu_bot_name: str = "Jarvis"
     obsidian_vault_path: Path | None = None
 
     model_config = SettingsConfigDict(

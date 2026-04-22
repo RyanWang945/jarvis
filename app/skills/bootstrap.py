@@ -8,6 +8,7 @@ from app.config import get_settings
 from app.skills.base import Skill
 from app.skills.coder import CoderSkill
 from app.skills.echo import EchoSkill
+from app.skills.feishu import FeishuMessageSkill
 from app.skills.loader import SkillPackageLoader
 from app.skills.registry import SkillRegistry
 from app.skills.shell import ShellSkill
@@ -90,6 +91,7 @@ def _load_builtin_skills() -> list[Skill]:
         EchoSkill(),
         ShellSkill(),
         CoderSkill(),
+        FeishuMessageSkill(),
     ]
 
 
@@ -198,5 +200,34 @@ def _load_builtin_tools() -> list[ToolSpec]:
             intent_kinds=["code_write", "code_review"],
             can_modify_files=True,
             requires_workdir=True,
+        ),
+        ToolSpec(
+            name="send_feishu_message",
+            capability_name="feishu_message.send",
+            description=(
+                "Send a text message to a Feishu user or group chat. "
+                "Use this to proactively notify the user of task completion, "
+                "ask clarifying questions, or deliver summaries."
+            ),
+            args_schema={
+                "type": "object",
+                "properties": {
+                    "receive_id": {
+                        "type": "string",
+                        "description": "The open_id of the user or chat_id of the group to send to.",
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "The plain text message content to send.",
+                    },
+                },
+                "required": ["receive_id", "text"],
+            },
+            skill="feishu_message",
+            worker_type="feishu",
+            action="send",
+            risk_level="low",
+            exposed_to_llm=True,
+            intent_kinds=["simple_chat"],
         ),
     ]
