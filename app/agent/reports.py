@@ -64,6 +64,26 @@ def _render_markdown(report: dict[str, Any]) -> str:
             ]
         )
 
+    planner_logs = [
+        audit
+        for audit in report["audit_logs"]
+        if audit.get("action") in {"candidate_tools_selected", "planner_raw_output", "work_plan_snapshot"}
+    ]
+    if planner_logs:
+        lines.extend(["", "## Planner"])
+        for audit in planner_logs:
+            detail = (audit.get("detail") or "").strip()
+            lines.extend(
+                [
+                    "",
+                    f"### {audit.get('action')}",
+                    "",
+                    "```json",
+                    detail[:4000],
+                    "```",
+                ]
+            )
+
     lines.extend(["", "## Work Results"])
     for result in report["work_results"]:
         lines.extend(

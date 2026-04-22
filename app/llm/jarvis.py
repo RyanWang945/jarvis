@@ -6,7 +6,7 @@ from typing import Any
 
 from app.config import get_settings
 from app.llm.client import ChatClient, LLMMessage, parse_json_content
-from app.tools.specs import ToolCallPlan, ToolSpec
+from app.tools.specs import PlannerDecision, ToolCallPlan, ToolSpec
 
 
 class JarvisLLM:
@@ -14,20 +14,40 @@ class JarvisLLM:
         self._chat = chat_client
 
     def plan_tasks(self, *, instruction: str, tools: list[ToolSpec]) -> list[ToolCallPlan]:
+        return self.plan_decision(instruction=instruction, tools=tools).tool_calls
+
+    def plan_decision(self, *, instruction: str, tools: list[ToolSpec]) -> PlannerDecision:
+        if type(self).plan_tasks is not _ORIGINAL_PLAN_TASKS:
+            return PlannerDecision(tool_calls=self.plan_tasks(instruction=instruction, tools=tools))
         message = self._chat.chat(
             [
                 LLMMessage(
                     role="system",
                     content=(
                         "You are Jarvis Planner. Convert the user's instruction into one or more "
-                        "tool calls. Choose the most appropriate provided tool yourself. Do not ask "
-                        "the user to select a tool. Prefer the lowest-risk tool that can complete "
-                        "the task, and rely on Jarvis risk checks for unsafe local actions."
+                        "tool calls from the candidate tools provided to you. Choose the most "
+                        "appropriate tool yourself; do not ask the user to select a tool. "
+                        "Use search tools for information gathering. Use the coder tool for "
+                        "repository file edits, code review, README/doc updates inside a repo, "
+                        "and commit or push workflows explicitly requested by the user. Use test "
+                        "tools for known low-risk test commands. Use shell.command only when the "
+                        "caller supplied the exact command; do not invent shell commands for code "
+                        "editing. Prefer the lowest-risk candidate tool that can complete the task, "
+                        "and rely on Jarvis risk checks for unsafe local actions. If the request "
+                        "cannot be planned without missing user input, return JSON with "
+                        "needs_clarification=true and a clarification_question."
                     ),
                 ),
                 LLMMessage(
                     role="user",
-                    content=f"Instruction:\n{instruction}",
+                    content=(
+                        f"Instruction:\n{instruction}\n\n"
+                        "When not using function calls, return JSON with this schema: "
+                        '{"confidence": 0.0-1.0, "needs_clarification": boolean, '
+                        '"clarification_question": string|null, "tasks": ['
+                        '{"tool_name": string, "tool_args": object, "title": string, '
+                        '"description": string, "dod": string}]}'
+                    ),
                 ),
             ],
             tools=[_tool_to_chat_tool(tool) for tool in tools],
@@ -35,8 +55,8 @@ class JarvisLLM:
         )
         plans = _tool_calls_from_message(message)
         if plans:
-            return plans
-        return _legacy_json_plans(message)
+            return PlannerDecision(tool_calls=plans, raw_output=_raw_output(message))
+        return _legacy_json_decision(message)
 
     def assess_completion(
         self,
@@ -116,6 +136,9 @@ class JarvisLLM:
         )
         content = message.get("content")
         return str(content).strip() if content else ""
+
+
+_ORIGINAL_PLAN_TASKS = JarvisLLM.plan_tasks
 
 
 @lru_cache
@@ -207,11 +230,13 @@ def _tool_calls_from_message(message: dict[str, Any]) -> list[ToolCallPlan]:
     return plans
 
 
-def _legacy_json_plans(message: dict[str, Any]) -> list[ToolCallPlan]:
+def _legacy_json_decision(message: dict[str, Any]) -> PlannerDecision:
     body = parse_json_content(message)
+    if not body:
+        return PlannerDecision(raw_output=_raw_output(message))
     tasks = body.get("tasks", [])
     if not isinstance(tasks, list):
-        return []
+        tasks = []
 
     plans: list[ToolCallPlan] = []
     for item in tasks:
@@ -232,7 +257,25 @@ def _legacy_json_plans(message: dict[str, Any]) -> list[ToolCallPlan]:
                 max_retries=int(item.get("max_retries") or 0),
             )
         )
-    return plans
+    return PlannerDecision(
+        confidence=_clean_confidence(body.get("confidence")),
+        needs_clarification=bool(body.get("needs_clarification") or False),
+        clarification_question=_clean_string(body.get("clarification_question")),
+        tool_calls=plans,
+        raw_output=body,
+    )
+
+
+def _raw_output(message: dict[str, Any]) -> dict[str, Any]:
+    return json.loads(json.dumps(message, ensure_ascii=False, default=str))
+
+
+def _clean_confidence(value: object) -> float:
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        return 1.0
+    return max(0.0, min(1.0, confidence))
 
 
 def _completion_assessment_from_message(message: dict[str, Any], *, can_retry: bool) -> dict[str, str]:

@@ -121,9 +121,12 @@ class AgentState(TypedDict):
     error_count: int
     last_error: str | None
     intent: IntentDecision | None
+    observation_intent: IntentDecision | None
     work_plan: WorkPlan | None
     allowed_tools: list[str]
+    candidate_tools: list[str]
     plan_steps: list[dict[str, Any]]
+    planner_raw_output: dict[str, Any] | None
     failure_kind: str | None
     context_summary: str | None
     final_summary: str | None
@@ -149,9 +152,12 @@ def initial_state(event: AgentEvent, thread_id: str) -> AgentState:
         "error_count": 0,
         "last_error": None,
         "intent": None,
+        "observation_intent": None,
         "work_plan": None,
         "allowed_tools": [],
+        "candidate_tools": [],
         "plan_steps": [],
+        "planner_raw_output": None,
         "failure_kind": None,
         "context_summary": None,
         "final_summary": None,

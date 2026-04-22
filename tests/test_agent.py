@@ -15,7 +15,7 @@ from app.main import create_app
 from app.skills.bootstrap import bootstrap_registries, reset_registries_for_tests
 from app.skills import get_default_skill_registry
 from app.tools import get_default_capability_registry, get_default_tool_registry
-from app.tools.specs import ToolCallPlan, ToolSpec
+from app.tools.specs import PlannerDecision, ToolCallPlan, ToolSpec
 from app.workers import InlineWorkerClient, ThreadWorkerClient, WorkOrder, WorkResult, WorkerEventBus
 from app.workers.executor import execute_work_order
 
@@ -88,7 +88,7 @@ def test_graph_runner_blocks_high_risk_shell_task_for_approval(tmp_path, monkeyp
     assert result.tasks[0]["status"] == "waiting"
 
 
-def test_llm_code_write_intent_exposes_only_coder_tool(tmp_path, monkeypatch) -> None:
+def test_llm_code_write_intent_exposes_coder_but_not_general_shell(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("JARVIS_PLANNER_TYPE", "llm")
     monkeypatch.setenv("JARVIS_DEEPSEEK_API_KEY", "test-key")
     get_settings.cache_clear()
@@ -122,7 +122,8 @@ def test_llm_code_write_intent_exposes_only_coder_tool(tmp_path, monkeypatch) ->
     )
 
     assert result.status == "waiting_approval"
-    assert captured_tools == ["delegate_to_claude_code"]
+    assert "delegate_to_claude_code" in captured_tools
+    assert "run_shell_command" not in captured_tools
     assert result.tasks[0]["tool_name"] == "coder.claude_code"
     inspection = runner.inspect_run(result.thread_id)
     assert inspection is not None
@@ -136,7 +137,8 @@ def test_llm_planner_cannot_route_code_write_to_shell(tmp_path, monkeypatch) -> 
     get_jarvis_llm.cache_clear()
 
     def fake_plan_tasks(self, *, instruction, tools):
-        assert [tool.name for tool in tools] == ["delegate_to_claude_code"]
+        assert "delegate_to_claude_code" in [tool.name for tool in tools]
+        assert "run_shell_command" not in [tool.name for tool in tools]
         return [
             ToolCallPlan(
                 tool_name="run_shell_command",
@@ -159,7 +161,40 @@ def test_llm_planner_cannot_route_code_write_to_shell(tmp_path, monkeypatch) -> 
 
     assert result.status == "blocked"
     assert result.tasks == []
-    assert "disallowed capability 'run_shell_command'" in (result.summary or "")
+    assert "ineligible capability 'run_shell_command'" in (result.summary or "")
+    assert "explicit caller command" in (result.summary or "")
+
+
+def test_llm_compound_search_and_code_request_exposes_both_candidates(tmp_path, monkeypatch) -> None:
+    from app.agent.nodes import _planned_tool_calls, classify_intent
+    from app.agent.state import initial_state
+
+    monkeypatch.setenv("JARVIS_PLANNER_TYPE", "llm")
+    monkeypatch.setenv("JARVIS_DEEPSEEK_API_KEY", "test-key")
+    get_settings.cache_clear()
+    get_jarvis_llm.cache_clear()
+
+    captured_tools = []
+
+    def fake_plan_tasks(self, *, instruction, tools):
+        captured_tools.extend(tool.name for tool in tools)
+        return [ToolCallPlan(tool_name="echo", tool_args={"text": "planned"})]
+
+    monkeypatch.setattr("app.llm.jarvis.JarvisLLM.plan_tasks", fake_plan_tasks)
+
+    state = initial_state(
+        build_user_event(
+            instruction="搜索 LangGraph checkpointer 最新文档，并在仓库里新增一个示例代码文件",
+            workdir=str(tmp_path),
+        ),
+        thread_id="compound-candidates",
+    )
+    state.update(classify_intent(state))
+    _planned_tool_calls(state)
+
+    assert "tavily_search" in captured_tools
+    assert "delegate_to_claude_code" in captured_tools
+    assert "run_shell_command" not in captured_tools
 
 
 def test_numbered_work_order_constraint_creates_sequential_work_plan(tmp_path, monkeypatch) -> None:
@@ -250,6 +285,61 @@ def test_numbered_work_order_constraint_creates_sequential_work_plan(tmp_path, m
     assert second_aggregated["work_plan"]["steps"][0]["status"] == "success"
     assert second_aggregated["work_plan"]["steps"][1]["status"] == "success"
     assert second_aggregated["work_plan"]["steps"][2]["status"] == "pending"
+
+
+def test_llm_work_plan_step_uses_planner_selected_capability(tmp_path, monkeypatch) -> None:
+    from app.agent.nodes import classify_intent, strategize
+    from app.agent.state import initial_state
+
+    monkeypatch.setenv("JARVIS_PLANNER_TYPE", "llm")
+    monkeypatch.setenv("JARVIS_DEEPSEEK_API_KEY", "test-key")
+    get_settings.cache_clear()
+    get_jarvis_llm.cache_clear()
+
+    captured = {}
+
+    def fake_plan_decision(self, *, instruction, tools):
+        captured["instruction"] = instruction
+        captured["tools"] = [tool.name for tool in tools]
+        return PlannerDecision(
+            tool_calls=[
+                ToolCallPlan(
+                    tool_name="tavily_search",
+                    tool_args={"query": "LangGraph checkpointer", "max_results": 3},
+                    title="Search docs",
+                    description="Search current docs.",
+                    dod="Sources returned.",
+                )
+            ]
+        )
+
+    monkeypatch.setattr("app.llm.jarvis.JarvisLLM.plan_decision", fake_plan_decision)
+
+    state = initial_state(
+        build_user_event(
+            instruction=(
+                "请拆成多个 work order 执行：\n"
+                "1. 搜索 LangGraph checkpointer 最新文档。\n"
+                "2. 在仓库里新增一个示例代码文件。"
+            ),
+            workdir=str(tmp_path),
+        ),
+        thread_id="thread-llm-workplan",
+    )
+    state.update(classify_intent(state))
+
+    assert state["work_plan"] is not None
+    assert [step["capability_name"] for step in state["work_plan"]["steps"]] == ["__planner__", "__planner__"]
+
+    update = strategize(state)
+
+    assert update["next_node"] == "dispatch"
+    assert update["task_list"][0]["plan_step_id"] == "step-1"
+    assert update["task_list"][0]["tool_name"] == "search.tavily"
+    assert update["work_plan"]["steps"][0]["capability_name"] == "search.tavily"
+    assert "tavily_search" in captured["tools"]
+    assert "delegate_to_claude_code" in captured["tools"]
+    assert "Current step:\n搜索 LangGraph checkpointer 最新文档。" in captured["instruction"]
 
 
 def test_rule_based_code_write_intent_routes_to_coder(tmp_path, monkeypatch) -> None:
@@ -415,6 +505,89 @@ def test_deepseek_planner_sends_tools_and_parses_tool_calls(monkeypatch) -> None
     assert captured_payload["tool_choice"] == "auto"
     assert captured_payload["tools"][0]["function"]["name"] == "echo"
     assert plans == [ToolCallPlan(tool_name="echo", tool_args={"text": "selected by model"})]
+
+
+def test_jarvis_planner_decision_parses_clarification_json(monkeypatch) -> None:
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "confidence": 0.42,
+                                    "needs_clarification": True,
+                                    "clarification_question": "Which Feishu group should I send to?",
+                                    "tasks": [],
+                                }
+                            )
+                        }
+                    }
+                ]
+            }
+
+    monkeypatch.setattr("app.llm.client.httpx.post", lambda *args, **kwargs: FakeResponse())
+
+    decision = DeepSeekClient(api_key="test-key").plan_decision(instruction="Send it", tools=[])
+
+    assert decision.confidence == 0.42
+    assert decision.needs_clarification is True
+    assert decision.clarification_question == "Which Feishu group should I send to?"
+    assert decision.tool_calls == []
+    assert decision.raw_output is not None
+
+
+def test_strategize_blocks_when_planner_needs_clarification(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("JARVIS_PLANNER_TYPE", "llm")
+    monkeypatch.setenv("JARVIS_DEEPSEEK_API_KEY", "test-key")
+    get_settings.cache_clear()
+    get_jarvis_llm.cache_clear()
+
+    def fake_plan_decision(self, *, instruction, tools):
+        return PlannerDecision(
+            confidence=0.4,
+            needs_clarification=True,
+            clarification_question="Which file should I update?",
+            raw_output={"needs_clarification": True},
+        )
+
+    monkeypatch.setattr("app.llm.jarvis.JarvisLLM.plan_decision", fake_plan_decision)
+
+    runner = ThreadManager(tmp_path)
+    result = runner.run_event(build_user_event(instruction="Update that file", workdir=str(tmp_path)))
+
+    assert result.status == "blocked"
+    assert result.tasks == []
+    assert result.summary == "Which file should I update?"
+
+
+def test_report_includes_planner_audit_details(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("JARVIS_PLANNER_TYPE", "llm")
+    monkeypatch.setenv("JARVIS_DEEPSEEK_API_KEY", "test-key")
+    get_settings.cache_clear()
+    get_jarvis_llm.cache_clear()
+
+    def fake_plan_decision(self, *, instruction, tools):
+        return PlannerDecision(
+            tool_calls=[ToolCallPlan(tool_name="echo", tool_args={"text": "planner report"})],
+            raw_output={"planner": "raw"},
+        )
+
+    monkeypatch.setattr("app.llm.jarvis.JarvisLLM.plan_decision", fake_plan_decision)
+
+    runner = ThreadManager(tmp_path)
+    result = runner.run_event(build_user_event(instruction="Plan an echo response"))
+    paths = runner.export_run_report(result.thread_id)
+
+    report = json.loads(Path(paths["json"]).read_text(encoding="utf-8"))
+    audit_actions = [audit["action"] for audit in report["audit_logs"]]
+    assert "candidate_tools_selected" in audit_actions
+    assert "planner_raw_output" in audit_actions
+    assert "planner_raw_output" in Path(paths["markdown"]).read_text(encoding="utf-8")
 
 
 def test_deepseek_completion_assessment_parses_json(monkeypatch) -> None:
@@ -633,6 +806,10 @@ def test_coder_worker_invokes_claude_with_publish_workflow_guidance(tmp_path, mo
             return _completed(stdout="committed and pushed")
         if command[-1] == "--branch":
             return _completed(stdout="## main...origin/main\n")
+        if command[-1] == "--porcelain":
+            return _completed(stdout=" M README.md\n?? docs/new.md\n")
+        if command[-1] == "--stat":
+            return _completed(stdout=" README.md | 2 ++\n docs/new.md | 1 +\n 2 files changed, 3 insertions(+)\n")
         if command[-1] == "--show-current":
             return _completed(stdout="main\n")
         if command[-2:] == ["--short", "HEAD"]:
@@ -679,10 +856,31 @@ def test_coder_worker_invokes_claude_with_publish_workflow_guidance(tmp_path, mo
     assert "Run this verification command before finishing: git status --short" in prompt
     assert "Update README.md" in prompt
     assert "JARVIS_POSTFLIGHT" in result.stdout
+    assert '"files_modified": [' in result.stdout
+    assert '"README.md"' in result.stdout
+    assert '"docs/new.md"' in result.stdout
+    assert "2 files changed, 3 insertions" in result.stdout
     assert "Removed stale .git/index.lock." in result.stdout
     assert not stale_lock.exists()
     assert "git_commit:abc1234" in result.artifacts
     assert "git_upstream:synced" in result.artifacts
+    assert "git_file:README.md" in result.artifacts
+    assert "git_file:docs/new.md" in result.artifacts
+
+
+def test_coder_postflight_parses_modified_files() -> None:
+    from app.skills.coder import _modified_files_from_status
+
+    assert _modified_files_from_status(
+        "\n".join(
+            [
+                " M README.md",
+                "A  docs/new.md",
+                "R  old.py -> new.py",
+                "?? scratch.txt",
+            ]
+        )
+    ) == ["README.md", "docs/new.md", "new.py", "scratch.txt"]
 
 
 def test_tool_registry_prefers_coder_for_development_publish_workflows() -> None:
@@ -1972,7 +2170,8 @@ def test_cli_plan_rejects_shell_without_explicit_command(tmp_path, monkeypatch, 
 
     assert run_output["status"] == "blocked"
     assert run_output["pending_approval_id"] is None
-    assert "disallowed capability 'run_shell_command'" in run_output["summary"]
+    assert "ineligible capability 'run_shell_command'" in run_output["summary"]
+    assert "explicit caller command" in run_output["summary"]
     assert shell_calls == []
 
 

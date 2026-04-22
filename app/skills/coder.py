@@ -144,6 +144,8 @@ def _prepare_workspace(workdir: Path) -> list[str]:
 
 def _collect_postflight(workdir: Path) -> dict[str, object]:
     status = _run_git(workdir, "status", "--short", "--branch")
+    porcelain_status = _run_git(workdir, "status", "--porcelain")
+    diff_stat = _run_git(workdir, "diff", "--stat")
     branch = _run_git(workdir, "branch", "--show-current")
     commit_hash = _run_git(workdir, "rev-parse", "--short", "HEAD")
     commit_subject = _run_git(workdir, "log", "-1", "--pretty=%s")
@@ -160,6 +162,9 @@ def _collect_postflight(workdir: Path) -> dict[str, object]:
         "origin": remote["stdout"].strip(),
         "working_tree_clean": _is_working_tree_clean(status_stdout),
         "synced_with_upstream": _is_synced_with_upstream(status_stdout),
+        "files_modified": _modified_files_from_status(str(porcelain_status["stdout"])),
+        "diff_stat": str(diff_stat["stdout"]).strip(),
+        "diff_stat_stderr": str(diff_stat["stderr"]).strip(),
         "status_stderr": status["stderr"].strip(),
     }
 
@@ -196,7 +201,32 @@ def _postflight_artifacts(postflight: dict[str, object]) -> list[str]:
         artifacts.append("git_worktree:dirty")
     if postflight.get("synced_with_upstream"):
         artifacts.append("git_upstream:synced")
+    for path in postflight.get("files_modified") or []:
+        artifacts.append(f"git_file:{path}")
     return artifacts
+
+
+def _modified_files_from_status(status_stdout: str) -> list[str]:
+    files: list[str] = []
+    seen: set[str] = set()
+    for raw_line in status_stdout.splitlines():
+        line = raw_line.rstrip()
+        if len(line) < 4:
+            continue
+        path = _status_path(line)
+        if path and path not in seen:
+            files.append(path)
+            seen.add(path)
+    return files
+
+
+def _status_path(line: str) -> str | None:
+    value = line[3:].strip()
+    if not value:
+        return None
+    if " -> " in value:
+        value = value.rsplit(" -> ", 1)[1]
+    return value.strip('"') or None
 
 
 def _is_working_tree_clean(status_stdout: str) -> bool:

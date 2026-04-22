@@ -46,9 +46,14 @@ def _classify_intent(state: AgentState) -> IntentDecision:
 
 ## 2. 设计目标
 
-将 `strategize` 升级为**端到端 LLM 规划节点**，由它直接根据用户输入、历史上下文、全部可用工具做决策。`classify_intent` 不再限制工具视野，仅保留为轻量快速路由。
+将 `strategize` 升级为**端到端 LLM 规划节点**，由它根据用户输入、历史上下文和候选能力集合做决策。`classify_intent` 不再用单一意图白名单决定工具视野，仅保留为观测标签和轻量快速路由。
 
-同时明确 Claude Code 的定位：它是 jarvis 工具生态中的一个**深度代码执行器**，不是同级大脑。jarvis 负责"什么时候调什么"，Claude Code 负责"复杂多文件代码重构"这一细分场景。
+这里不能简单地把所有工具无条件暴露给 LLM。历史上 `allowed_tools` 的存在，是为了防止 planner 把代码修改任务错误路由到通用 shell。升级后的边界应是：
+
+- **宽进**：候选工具集合可以覆盖复合意图，例如搜索 + 代码修改。
+- **严出**：`strategize` 在生成 WorkOrder 前必须执行 deterministic eligibility guard，校验 workdir、显式命令、文件修改权限和风险等级。
+
+同时明确 Claude Code 的定位：它是 jarvis 工具生态中的一个**代码执行器**，不是同级大脑。jarvis 负责"什么时候调什么"，Claude Code 负责仓库文件编辑、代码审查、提交推送等需要代码上下文的执行场景。
 
 为后续接入公司平台（飞书、飞书文档等）预留扩展位，这些平台能力以标准工具形式注册，由 `strategize` 统一调度。
 
@@ -61,7 +66,7 @@ def _classify_intent(state: AgentState) -> IntentDecision:
 ingest_event -> contextualize -> classify_intent(规则) -> strategize(受限LLM) -> dispatch
 
 改造后：
-ingest_event -> contextualize -> [classify_intent(可选/快速路径)] -> strategize(端到端LLM) -> dispatch
+ingest_event -> contextualize -> classify_intent(观测/快速路径) -> strategize(候选能力 + LLM) -> dispatch
 ```
 
 `classify_intent` 职责降级：
@@ -70,7 +75,7 @@ ingest_event -> contextualize -> [classify_intent(可选/快速路径)] -> strat
 |------|------|
 | 输入以 `/` 开头 | 解析为 Slash 命令，直接路由，不走 LLM |
 | 输入包含 `--command` 等显式参数 | 规则快速决策，减少 token 消耗 |
-| 其他所有请求 | **不做工具过滤**，只将分类结果作为 `observation_label` 写入 state，用于日志和报表 |
+| 其他所有请求 | 不再产出硬白名单，只将分类结果作为 `observation_intent` 写入 state，用于日志、报表和候选召回 |
 
 ### 3.2 strategize 节点升级
 
@@ -78,17 +83,20 @@ ingest_event -> contextualize -> [classify_intent(可选/快速路径)] -> strat
 - `messages`：完整对话历史
 - `instruction`：当前用户指令
 - `context`：workdir、git 状态、resource_key 等
-- `all_tools`：**全部可用工具描述**（不再过滤）
+- `candidate_tools`：由 capability metadata、上下文和轻量规则召回的候选工具
 
 **LLM Prompt 核心结构**：
 ```text
 You are Jarvis, a planning agent. Based on the user's request and available tools,
 output a sequence of tool calls to fulfill the request.
 
-Available tools:
-- coder: Deep code refactoring via Claude Code CLI. Use ONLY when task involves
-  multi-file edits, complex refactoring, or requires deep codebase understanding.
-- shell: Execute shell commands. Use for simple builds, tests, single-file ops.
+Candidate tools:
+- coder: Repository development worker via Claude Code CLI. Use for file edits,
+  repository review, commits/pushes explicitly requested by the user, or workflows
+  that need codebase understanding.
+- shell.test: Run known low-risk test commands such as pytest.
+- shell.command: Execute an explicit command supplied by the caller. Do not invent
+  shell commands for code editing.
 - search: Web or local search. Use for information gathering.
 - feishu_message: Send message to Feishu user/group.
 - feishu_doc: Read/write Feishu documents.
@@ -97,7 +105,9 @@ Available tools:
 Rules:
 - Break complex requests into atomic steps.
 - Prefer specialized tools over general ones (e.g., use shell for "pytest", not coder).
-- Use coder only when file editing scope > 1 file or requires semantic understanding.
+- Use coder for repository file edits, even if the edit is small, when semantic
+  repository context matters.
+- Use shell.command only when the user supplied the exact command.
 - If the request is ambiguous, set needs_clarification=true.
 ```
 
@@ -125,14 +135,25 @@ Rules:
 ```
 
 **内部处理**：
-1. `strategize` 调用 `get_jarvis_llm().plan_tasks(...)` 获取规划
-2. 校验每个 `capability_name` 是否在注册表中
-3. 为每个 step 生成 `Task` + `WorkOrder`，写入 `dispatch_queue`
-4. 设置 `next_node` = `dispatch`（正常）或 `blocked`（校验失败）
+1. `strategize` 调用 `select_candidate_capabilities(state)` 召回候选能力
+2. `strategize` 调用 `get_jarvis_llm().plan_tasks(...)` 获取规划
+3. 校验每个 `capability_name` 是否在注册表中，并执行 eligibility guard
+4. 为每个 step 生成 `Task` + `WorkOrder`，写入 `dispatch_queue`
+5. 设置 `next_node` = `dispatch`（正常）或 `blocked`（校验失败）
 
-### 3.3 工具选择策略（当前全量，未来 RAG）
+### 3.3 工具选择策略（当前候选召回，未来 RAG）
 
-**当前阶段**：jarvis 工具数量极少（coder、shell、search、answer_echo 等），`strategize` 直接将**全部工具描述**放入 prompt 即可。此阶段无需复杂检索，简单直接，延迟最低。
+**当前阶段**：jarvis 工具数量极少（coder、shell、search、answer_echo 等），但仍不应无条件暴露通用 shell。当前采用轻量候选召回：
+
+| Capability | 候选条件 | 执行期 guard |
+|------------|----------|--------------|
+| `answer.echo` | 总是候选 | 无副作用 |
+| `search.tavily` | 搜索/调研/带来源语义命中；复合任务可与 coder 同时候选 | capability 必须存在且 exposed |
+| `coder.claude_code` | 有 `workdir` 且涉及仓库、文件、代码、commit/push、审查或多步骤工作 | 必须有 workdir；高危操作仍走 approval |
+| `shell.test` | 测试语义命中，或显式命令是受控测试命令 | 只能执行 schema 允许的测试命令 |
+| `shell.command` | 用户显式传入 `--command` 或等价结构化命令参数 | 必须有 caller supplied command；planner 不能凭空生成 |
+
+此阶段无需复杂检索，但 `strategize` 的接口应接收“候选工具列表”，而不是依赖全量工具或单一 intent 白名单。
 
 **未来扩展讨论**：当接入飞书、飞书文档、公司内部平台后，工具数量可能达到 20-50 个甚至更多。此时全量放入 prompt 会导致：
 - Token 成本激增
@@ -163,11 +184,11 @@ strategize LLM（只看到这 8-10 个工具）
 **实施建议**：
 | 工具数量 | 策略 |
 |---------|------|
-| ≤ 15 个 | 全量放入 prompt（当前做法） |
+| ≤ 15 个 | 轻量候选召回 + eligibility guard（当前做法） |
 | 15-50 个 | RAG 召回 Top 8 |
 | > 50 个 | 层级分类 + RAG 召回 |
 
-此方案作为预留设计，当前版本暂不需要实现，但 `strategize` 的接口应支持传入 "候选工具列表" 而非强制全量，以便未来无缝切换。
+此方案作为预留设计，当前版本暂不需要实现，但 `strategize` 的接口已经应支持传入 "候选工具列表"，以便未来无缝切换。
 
 ### 3.4 混合路由策略
 
@@ -196,6 +217,18 @@ return {
 
 用户通过 API/CLI 回复后，新消息追加到 `messages`，重新进入 `strategize`。
 
+### 3.6 WorkPlan 顺序编排
+
+当用户明确要求“拆成多个 work order”并提供 numbered steps 时，Jarvis 保留 WorkPlan 作为硬约束：
+
+- `classify_intent` 只负责识别 numbered steps 并创建顺序 WorkPlan。
+- `planner_type=rule_based` 时，每个 step 沿用主 intent 的默认 capability，保持稳定降级行为。
+- `planner_type=llm` 时，每个 step 初始标记为 `__planner__`；执行到该 pending step 时，`strategize` 只把当前 step 和候选工具交给 LLM，让 LLM 为该 step 选择一个 capability。
+- `strategize` 每次只把一个 pending step 转成 WorkOrder；`aggregate` 标记成功后再回到 `strategize` 处理下一个 step。
+- 如果单个 step 的 planner 结果需要澄清、置信度过低、没有工具调用或选择了不合规工具，该 run 进入 `blocked`，不会静默跳过 required step。
+
+这样可以同时满足两件事：用户显式要求的步骤数量不会被 planner 压缩成一个大任务；每个 step 又可以独立选择 search、coder、shell.test、平台工具等不同 capability。
+
 ## 4. 工具层级与 Claude Code 定位
 
 ### 4.1 工具分级
@@ -204,30 +237,45 @@ return {
 |------|---------|---------|------|
 | **通用轻量工具** | `shell.command`, `shell.test`, `search.web`, `answer.echo` | 单步命令、信息查询、简单回复 | jarvis 自有 worker |
 | **平台集成工具** | `feishu_message.send`, `feishu_doc.read`, `feishu_doc.write` | 跨系统交互 | jarvis 自有 worker |
-| **深度代码工具** | `coder` (Claude Code CLI) | 多文件重构、复杂语义编辑 | 外包给 Claude Code |
+| **代码执行工具** | `coder` (Claude Code CLI) | 仓库文件编辑、代码审查、commit/push workflow、复杂语义编辑 | 外包给 Claude Code |
 
 ### 4.2 Claude Code 调用原则
 
 `strategize` 的 prompt 中必须明确约束：
 
 ```
-Use coder ONLY when:
-- Task requires editing 2+ files
-- Task requires understanding cross-file relationships
-- Task is a complex refactoring (rename, extract interface, etc.)
+Use coder when:
+- Task requires editing repository files
+- Task requires understanding file relationships or existing code
+- Task is a code review, refactor, README/doc update inside a repo, or commit/push workflow
 - User explicitly asks for "deep refactor" or "help me redesign"
 
 Use shell instead when:
-- Running tests, lint, build
-- Single file read/write with clear scope
-- Git operations that don't need semantic understanding
+- Running known test/lint/build commands through shell.test
+- Executing an exact command supplied by the caller through shell.command
+
+Do not use shell.command to invent file-editing commands.
 ```
 
-**目的**：防止"写个 hello world"也走 Claude Code，造成成本和延迟浪费。
+**目的**：防止代码任务被错误路由到 shell，同时避免"跑 pytest"这类受控验证任务都走 Claude Code。
 
 ### 4.3 可观测性增强
 
-Claude Code 当前输出是纯文本 stdout。要求 `coder` skill 在调用时追加结构化输出参数：
+Claude Code 当前输出是纯文本 stdout。当前 `coder` skill 已经追加 `[JARVIS_POSTFLIGHT]`，由 Jarvis 自己采集 git status、branch、commit 等信息。后续应优先增强这个 deterministic postflight，而不是完全依赖 Claude 文本自报。
+
+建议增强字段：
+
+```json
+[JARVIS_POSTFLIGHT]
+{
+  "files_modified": ["src/main.py", "src/utils.py"],
+  "diff_stat": "...",
+  "commit": "abc1234",
+  "working_tree_clean": false
+}
+```
+
+可选地，如果 Claude Code CLI 支持结构化输出，可追加：
 
 ```python
 command = provider_command + [
@@ -237,7 +285,7 @@ command = provider_command + [
 ]
 ```
 
-同时在 prompt 中要求 Claude Code 在回复末尾附加：
+同时在 prompt 中要求 Claude Code 在回复末尾附加弱信号：
 
 ```json
 [JARVIS_STRUCT]
@@ -249,7 +297,7 @@ command = provider_command + [
 }
 ```
 
-`aggregate` 节点解析该 JSON，替代当前的纯文本解析。
+`aggregate` 节点解析这些结构化片段时，应优先信任 Jarvis postflight，Claude 末尾 JSON 只作为测试命令和人工摘要的补充。
 
 ## 5. 公司平台接入预留（飞书/飞书文档）
 
@@ -297,16 +345,19 @@ Claude Code 不参与此流程，因为不涉及代码编辑。
 
 | 字段 | 变更 |
 |------|------|
-| `intent` | 保留但仅作标签，不参与路由 |
-| `allowed_tools` | **废弃**，strategize 直接读取全部工具 |
+| `intent` | 保留但仅作观测标签，不直接决定最终工具 |
+| `allowed_tools` | 降级为兼容字段；不再作为 LLM planner 的硬白名单 |
 | `plan_steps` | 由 `strategize` LLM 直接生成，不再由 `classify_intent` 产出 |
 
 新增：
 
 | 字段 | 说明 |
 |------|------|
-| `planner_raw_output` | LLM 原始 JSON，用于调试和审计 |
 | `observation_intent` | `classify_intent` 的输出标签（只读） |
+| `candidate_tools` | 本轮传给 planner 的候选 capability 名称 |
+| `planner_raw_output` | LLM 原始 JSON，用于调试和审计 |
+
+这些字段会写入 audit log，并出现在 JSON/Markdown report 中，便于离线分析 planner 误选、候选召回缺失和 WorkPlan 执行偏差。
 
 ## 7. 降级与容错
 
@@ -320,31 +371,56 @@ Claude Code 不参与此流程，因为不涉及代码编辑。
 
 ## 8. 实施路径
 
-**Phase 1：解耦 classify_intent**
-- 移除 `allowed_tools` 过滤逻辑
-- `classify_intent` 仅保留 Slash 命令和显式参数路由
+### 8.1 当前实现状态
+
+截至 2026-04-22，已落地：
+
+| 阶段 | 状态 | 说明 |
+|------|------|------|
+| Phase 1：解耦 classify_intent | Done | `strategize` 不再用 `allowed_tools` 作为 LLM 硬白名单；改为候选 capability 召回 + eligibility guard。 |
+| Phase 2：strategize Prompt / PlannerDecision | Done | `JarvisLLM.plan_decision()` 已接入；`plan_tasks()` 保持兼容；支持 confidence、clarification、raw output。 |
+| Phase 2：LLM WorkPlan step capability | Done | LLM 模式下 numbered WorkPlan step 初始为 `__planner__`，执行到该 step 时由 planner 单独选择 capability。 |
+| Phase 3：Claude Code postflight | Partial | `coder` 已输出 `[JARVIS_POSTFLIGHT]`，包含 `files_modified`、`diff_stat`、commit、branch、worktree 状态；尚未解析 Claude 自报的 `[JARVIS_STRUCT]`。 |
+| Phase 4：平台工具注册 | Not started | 飞书消息、飞书文档等 skill 尚未实现。 |
+| Phase 5：监控与调优 | Partial | `candidate_tools`、`planner_raw_output`、`work_plan_snapshot` 已进入 audit log 和 JSON/Markdown report；尚未实现缓存和离线分析任务。 |
+
+当前测试结果：
+
+```text
+uv run pytest -q
+69 passed, 1 skipped
+```
+
+### 8.2 后续实施项
+
+**Phase 1：解耦 classify_intent（Done）**
+- 移除 `strategize` 中基于 `allowed_tools` 的硬白名单过滤
+- 新增候选 capability 召回函数
+- 新增执行期 eligibility guard，保留 shell/coder 安全边界
 - 验证现有测试用例不挂
 
-**Phase 2：strategize Prompt 升级**
-- 重写 `plan_tasks` prompt，暴露全部工具
+**Phase 2：strategize Prompt 升级（Done）**
+- 重写 `plan_tasks` prompt，暴露候选工具
 - 引入复合意图和 step-by-step 规划
-- 输出格式改为结构化 JSON
+- 输出格式演进为 `PlannerDecision`，承载 confidence、clarification 和 raw output
+- LLM WorkPlan step 逐步选择 capability，而不是全部继承主 intent
 
-**Phase 3：Claude Code 约束**
+**Phase 3：Claude Code 约束（Partial）**
 - 在 prompt 中增加 coder 使用边界
-- `coder` skill 增加结构化输出要求
+- `coder` skill 增加 deterministic postflight：`files_modified`、`diff_stat`、commit、branch、worktree 状态
+- 后续：如果 Claude Code CLI 支持稳定 JSON 输出，再解析 `[JARVIS_STRUCT]` 作为补充信号
 - 统计 coder 调用频率，验证是否过度使用
 
-**Phase 4：平台工具注册**
+**Phase 4：平台工具注册（Not started）**
 - 实现 `feishu_message`、`feishu_doc` 等 skill
 - 注册到 capability_registry
 - 编写多步骤编排测试用例
 
-**Phase 5：监控与调优**
-- 收集 `planner_raw_output` 做离线分析
+**Phase 5：监控与调优（Partial）**
+- 收集 `planner_raw_output` 做离线分析（audit/report 已记录，离线分析任务未实现）
 - 根据误调工具的案例微调 prompt
 - 优化缓存命中率
 
 ---
 
-**核心原则**：jarvis 的价值是**编排**——知道什么时候调 Claude Code 改代码，什么时候调 shell 跑命令，什么时候调飞书发消息。`strategize` 升级后，LLM 成为这个编排大脑，而不再是受规则束缚的有限规划器。
+**核心原则**：jarvis 的价值是**编排**——知道什么时候调 Claude Code 改代码，什么时候调 shell 跑受控命令，什么时候调搜索或飞书。`strategize` 升级后，LLM 成为编排大脑；规则层降级为候选召回和安全资格校验，而不是用单一 intent 白名单束缚 planner。

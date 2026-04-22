@@ -11,8 +11,8 @@ from langgraph.types import interrupt
 from app.agent.state import AgentState, IntentDecision, PendingAction, PlanStep, RiskLevel, Task, WorkPlan
 from app.config import get_settings
 from app.llm.jarvis import get_jarvis_llm
-from app.tools import get_default_capability_registry, get_default_tool_registry
-from app.tools.specs import IntentKind, ToolCallPlan
+from app.tools import WorkerCapability, get_default_capability_registry, get_default_tool_registry
+from app.tools.specs import IntentKind, PlannerDecision, ToolCallPlan
 from app.workers import WorkOrder, WorkResult, get_worker_client
 
 HIGH_RISK_PATTERNS = [
@@ -61,6 +61,7 @@ def classify_intent(state: AgentState) -> dict[str, Any]:
     return {
         "status": "planning",
         "intent": decision,
+        "observation_intent": decision,
         "work_plan": work_plan,
         "allowed_tools": decision["allowed_tools"],
         "plan_steps": decision["plan_steps"],
@@ -69,18 +70,31 @@ def classify_intent(state: AgentState) -> dict[str, Any]:
 
 def strategize(state: AgentState) -> dict[str, Any]:
     try:
-        planned_calls = _planned_tool_calls(state)
+        planner_decision = _planned_decision(state)
     except Exception as exc:
         return {
             "status": "failed",
             "last_error": f"Strategize failed: {exc}",
             "next_node": "blocked",
         }
+    if planner_decision.needs_clarification or planner_decision.confidence < 0.7:
+        clarification = (
+            planner_decision.clarification_question
+            or "I need more information before I can plan this request."
+        )
+        return {
+            "status": "blocked",
+            "final_summary": clarification,
+            "last_error": clarification,
+            "planner_raw_output": planner_decision.raw_output,
+            "next_node": "blocked",
+        }
+    planned_calls = planner_decision.tool_calls
 
     payload = _payload(state)
     instruction = str(payload.get("instruction") or "")
     capability_registry = get_default_capability_registry()
-    allowed_tool_set = set(state.get("allowed_tools", []))
+    candidate_tools = [capability.name for capability in _candidate_capabilities_for_state(state)]
     previous_tasks = [task.copy() for task in state.get("task_list", [])]
     tasks: list[Task] = []
     dispatch_queue: list[dict[str, Any]] = []
@@ -97,13 +111,25 @@ def strategize(state: AgentState) -> dict[str, Any]:
                 "next_node": "blocked",
             }
         tool_name = capability.name
-        if allowed_tool_set and tool_name not in allowed_tool_set:
+        tool_args = dict(item.tool_args) if isinstance(item.tool_args, dict) else {}
+        if payload.get("workdir") and "workdir" not in tool_args:
+            tool_args["workdir"] = payload["workdir"]
+        if capability.name == "shell.command" and payload.get("command") and "command" not in tool_args:
+            tool_args["command"] = payload["command"]
+        if capability.name == "shell.test" and "command" not in tool_args:
+            payload_command = _clean_optional(payload.get("command"))
+            tool_args["command"] = (
+                payload_command
+                if payload_command and _is_allowed_test_command(payload_command)
+                else "uv run pytest"
+            )
+        eligibility_error = _capability_eligibility_error(capability, state, tool_args)
+        if eligibility_error:
             return {
                 "status": "failed",
                 "last_error": (
-                    f"Planner selected disallowed capability '{requested_tool_name}' "
-                    f"(resolved to '{tool_name}'). Allowed capabilities for this intent: "
-                    f"{sorted(allowed_tool_set)}."
+                    f"Planner selected ineligible capability '{requested_tool_name}' "
+                    f"(resolved to '{tool_name}'): {eligibility_error}"
                 ),
                 "next_node": "blocked",
             }
@@ -111,9 +137,6 @@ def strategize(state: AgentState) -> dict[str, Any]:
 
         task_id = str(uuid4())
         order_id = str(uuid4())
-        tool_args = item.tool_args if isinstance(item.tool_args, dict) else {}
-        if payload.get("workdir") and "workdir" not in tool_args:
-            tool_args["workdir"] = payload["workdir"]
 
         command = _clean_optional(tool_args.get("command"))
         if tool.worker_type == "coder":
@@ -167,6 +190,7 @@ def strategize(state: AgentState) -> dict[str, Any]:
                 state.get("work_plan"),
                 step_id=item.plan_step_id,
                 order_id=order_id,
+                capability_name=capability.name,
             )
         else:
             work_plan = state.get("work_plan")
@@ -174,7 +198,12 @@ def strategize(state: AgentState) -> dict[str, Any]:
         work_orders[order.order_id] = order_dump
 
     if not tasks:
-        return {"status": "failed", "last_error": "Strategize produced no work orders.", "next_node": "blocked"}
+        return {
+            "status": "failed",
+            "last_error": "Strategize produced no work orders.",
+            "planner_raw_output": planner_decision.raw_output,
+            "next_node": "blocked",
+        }
 
     return {
         "status": "strategizing",
@@ -182,6 +211,8 @@ def strategize(state: AgentState) -> dict[str, Any]:
         "dispatch_queue": dispatch_queue,
         "work_orders": work_orders,
         "work_plan": work_plan if "work_plan" in locals() else state.get("work_plan"),
+        "candidate_tools": candidate_tools,
+        "planner_raw_output": planner_decision.raw_output,
         "approved_order_ids": state.get("approved_order_ids", []),
         "active_workers": {},
         "worker_results": {},
@@ -971,46 +1002,124 @@ def _replan_context(state: AgentState) -> str | None:
 
 
 def _planned_tool_calls(state: AgentState) -> list[ToolCallPlan]:
+    return _planned_decision(state).tool_calls
+
+
+def _planned_decision(state: AgentState) -> PlannerDecision:
     work_plan = state.get("work_plan")
     if work_plan:
         step = _next_pending_plan_step(work_plan)
         if step is None:
-            return []
-        return [_tool_call_from_plan_step(state, step)]
+            return PlannerDecision()
+        if step["capability_name"] == "__planner__":
+            payload = _payload(state)
+            tools = [
+                capability.to_tool_spec()
+                for capability in _candidate_capabilities_for_state(state, instruction_override=step["instruction"])
+            ]
+            if not tools:
+                raise ValueError(f"No exposed tools are eligible for WorkPlan step {step['id']}.")
+            decision = get_jarvis_llm().plan_decision(
+                instruction=_planner_instruction(payload, step["instruction"]),
+                tools=tools,
+            )
+            decision.tool_calls = _normalize_plan_step_tool_calls(decision.tool_calls, step_id=step["id"])
+            return decision
+        return PlannerDecision(tool_calls=[_tool_call_from_plan_step(state, step)])
 
     settings = get_settings()
     if settings.planner_type != "llm":
-        return _rule_based_tool_calls(state)
+        return PlannerDecision(tool_calls=_rule_based_tool_calls(state))
 
     payload = _payload(state)
     instruction = str(payload.get("instruction") or "")
     replan_context = _replan_context(state)
     if replan_context:
         instruction = f"{instruction}\n\n{replan_context}"
-    allowed_tools = state.get("allowed_tools", [])
-    intent_kinds = [state["intent"]["kind"]] if state.get("intent") else None
-    capability_registry = get_default_capability_registry()
-    capabilities = capability_registry.list(
-        exposed_to_llm=True,
-        intent_kinds=intent_kinds,
-    )
-    if allowed_tools:
-        tools = [
-            capability.to_tool_spec()
-            for capability in capabilities
-            if capability.name in set(allowed_tools)
-        ]
-    else:
-        tools = [capability.to_tool_spec() for capability in capabilities]
+    tools = [capability.to_tool_spec() for capability in _candidate_capabilities_for_state(state)]
     if not tools:
-        raise ValueError(
-            f"No exposed tools are eligible for intent {intent_kinds or ['unknown']} "
-            f"and allowed tools {allowed_tools or ['<none>']}."
-        )
-    return get_jarvis_llm().plan_tasks(
+        raise ValueError("No exposed tools are eligible for the current request.")
+    return get_jarvis_llm().plan_decision(
         instruction=_planner_instruction(payload, instruction),
         tools=tools,
     )
+
+
+def _candidate_capabilities_for_state(
+    state: AgentState,
+    *,
+    instruction_override: str | None = None,
+) -> list[WorkerCapability]:
+    payload = _payload(state)
+    instruction = instruction_override if instruction_override is not None else str(payload.get("instruction") or "")
+    command = _clean_optional(payload.get("command"))
+    workdir = _clean_optional(payload.get("workdir"))
+    capabilities = get_default_capability_registry().list(exposed_to_llm=True)
+    by_name = {capability.name: capability for capability in capabilities}
+    selected: set[str] = set()
+
+    def add(name: str) -> None:
+        if name in by_name:
+            selected.add(name)
+
+    add("answer.echo")
+    if _looks_like_search_request(instruction):
+        add("search.tavily")
+    if command:
+        add("shell.command")
+        if _is_allowed_test_command(command):
+            add("shell.test")
+    if _looks_like_test_request(instruction):
+        add("shell.test")
+    if workdir and (
+        _looks_like_code_write(instruction)
+        or _looks_like_code_review(instruction)
+        or _requires_multiple_work_orders(instruction)
+    ):
+        add("coder.claude_code")
+
+    return [capability for capability in capabilities if capability.name in selected]
+
+
+def _normalize_plan_step_tool_calls(tool_calls: list[ToolCallPlan], *, step_id: str) -> list[ToolCallPlan]:
+    if not tool_calls:
+        return []
+    first = tool_calls[0].model_copy()
+    first.plan_step_id = step_id
+    return [first]
+
+
+def _capability_eligibility_error(
+    capability: WorkerCapability,
+    state: AgentState,
+    tool_args: dict[str, Any],
+) -> str | None:
+    payload = _payload(state)
+    instruction = str(payload.get("instruction") or "")
+    caller_command = _clean_optional(payload.get("command"))
+    requested_command = _clean_optional(tool_args.get("command"))
+    workdir = _clean_optional(tool_args.get("workdir")) or _clean_optional(payload.get("workdir"))
+
+    if capability.requires_workdir and not workdir:
+        return "capability requires a workdir."
+    if capability.can_modify_files and not workdir:
+        return "file-modifying capability requires a workdir."
+    if capability.name == "shell.command":
+        if not caller_command:
+            return "shell.command requires an explicit caller command."
+        if requested_command and requested_command != caller_command:
+            return "shell.command must execute the exact explicit caller command."
+    if capability.name == "answer.echo" and _requires_external_capability(instruction, workdir=workdir):
+        return "answer.echo cannot satisfy a request that requires an external capability."
+    if capability.name == "shell.test":
+        if requested_command and not _is_allowed_test_command(requested_command):
+            return "shell.test can only run configured low-risk test commands."
+        if not caller_command and not _looks_like_test_request(instruction):
+            return "shell.test requires a test request or explicit caller command."
+    if capability.requires_explicit_user_command and capability.name not in {"shell.test"}:
+        if not caller_command:
+            return f"{capability.name} requires an explicit caller command."
+    return None
 
 
 def _rule_based_tool_calls(state: AgentState) -> list[ToolCallPlan]:
@@ -1119,8 +1228,9 @@ def _build_work_plan(state: AgentState, decision: IntentDecision) -> WorkPlan | 
     if len(steps) < 2 or not _requires_multiple_work_orders(instruction):
         return None
 
-    capability_name = _default_tool_name_for_intent(decision["kind"]) or (
-        decision["allowed_tools"][0] if decision["allowed_tools"] else "answer.echo"
+    capability_name = "__planner__" if get_settings().planner_type == "llm" else (
+        _default_tool_name_for_intent(decision["kind"])
+        or (decision["allowed_tools"][0] if decision["allowed_tools"] else "answer.echo")
     )
     plan_steps: list[PlanStep] = []
     for index, step_text in enumerate(steps, start=1):
@@ -1222,7 +1332,13 @@ def _tool_call_from_plan_step(state: AgentState, step: PlanStep) -> ToolCallPlan
     )
 
 
-def _mark_plan_step_running(work_plan: WorkPlan | None, *, step_id: str, order_id: str) -> WorkPlan | None:
+def _mark_plan_step_running(
+    work_plan: WorkPlan | None,
+    *,
+    step_id: str,
+    order_id: str,
+    capability_name: str | None = None,
+) -> WorkPlan | None:
     if not work_plan:
         return None
     updated = dict(work_plan)
@@ -1232,6 +1348,8 @@ def _mark_plan_step_running(work_plan: WorkPlan | None, *, step_id: str, order_i
         if item["id"] == step_id:
             item["status"] = "running"
             item["order_id"] = order_id
+            if capability_name:
+                item["capability_name"] = capability_name
         steps.append(item)  # type: ignore[arg-type]
     updated["steps"] = steps
     updated["status"] = "running"
@@ -1298,6 +1416,8 @@ def _looks_like_code_write(instruction: str) -> bool:
     text = instruction.lower()
     action_terms = [
         "写",
+        "加",
+        "增加",
         "新增",
         "修改",
         "实现",
@@ -1314,6 +1434,7 @@ def _looks_like_code_write(instruction: str) -> bool:
         "脚本",
         "代码",
         "文件",
+        "功能",
         "feature",
         "commit",
         "push",
@@ -1325,6 +1446,10 @@ def _looks_like_code_write(instruction: str) -> bool:
 
 
 def _looks_like_search_summary(instruction: str) -> bool:
+    return _looks_like_search_request(instruction) and not _looks_like_code_context(instruction)
+
+
+def _looks_like_search_request(instruction: str) -> bool:
     text = instruction.lower()
     search_terms = [
         "搜索",
@@ -1339,8 +1464,61 @@ def _looks_like_search_summary(instruction: str) -> bool:
         "citations",
         "latest",
     ]
+    return any(term in text for term in search_terms)
+
+
+def _requires_external_capability(instruction: str, *, workdir: str | None) -> bool:
+    if _looks_like_search_request(instruction) or _looks_like_test_request(instruction):
+        return True
+    return bool(
+        workdir
+        and (
+            _looks_like_code_write(instruction)
+            or _looks_like_code_review(instruction)
+            or _requires_multiple_work_orders(instruction)
+        )
+    )
+
+
+def _looks_like_code_context(instruction: str) -> bool:
+    text = instruction.lower()
     code_context_terms = ["test 失败", "报错", "bug", "代码", "workdir"]
-    return any(term in text for term in search_terms) and not any(term in text for term in code_context_terms)
+    return any(term in text for term in code_context_terms)
+
+
+def _looks_like_code_review(instruction: str) -> bool:
+    text = instruction.lower()
+    review_terms = [
+        "审查",
+        "检查",
+        "review",
+        "diff",
+        "git status",
+        "设计债务",
+        "仓库",
+        "repo",
+        "repository",
+    ]
+    return any(term in text for term in review_terms)
+
+
+def _looks_like_test_request(instruction: str) -> bool:
+    text = instruction.lower()
+    test_terms = [
+        "跑测试",
+        "运行测试",
+        "执行测试",
+        "pytest",
+        "run tests",
+        "run test",
+        "test suite",
+        "测试",
+    ]
+    return any(term in text for term in test_terms)
+
+
+def _is_allowed_test_command(command: str) -> bool:
+    return command.strip() in {"uv run pytest", "pytest"}
 
 
 def _pending_action_from_order(order: WorkOrder) -> PendingAction:

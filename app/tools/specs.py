@@ -45,3 +45,11 @@ class ToolCallPlan(BaseModel):
     verification_cmd: str | None = None
     max_retries: int = 0
     plan_step_id: str | None = None
+
+
+class PlannerDecision(BaseModel):
+    confidence: float = 1.0
+    needs_clarification: bool = False
+    clarification_question: str | None = None
+    tool_calls: list[ToolCallPlan] = Field(default_factory=list)
+    raw_output: dict[str, Any] | None = None

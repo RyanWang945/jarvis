@@ -264,6 +264,30 @@ class ThreadManager:
                 action="intent_classified",
                 detail=json.dumps(intent, ensure_ascii=False),
             )
+        candidate_tools = result.get("candidate_tools")
+        if candidate_tools:
+            self._business_db.audits.log(
+                thread_id=thread_id,
+                node="strategize",
+                action="candidate_tools_selected",
+                detail=json.dumps(candidate_tools, ensure_ascii=False),
+            )
+        planner_raw_output = result.get("planner_raw_output")
+        if planner_raw_output:
+            self._business_db.audits.log(
+                thread_id=thread_id,
+                node="strategize",
+                action="planner_raw_output",
+                detail=json.dumps(planner_raw_output, ensure_ascii=False, default=str),
+            )
+        work_plan = result.get("work_plan")
+        if work_plan:
+            self._business_db.audits.log(
+                thread_id=thread_id,
+                node="strategize",
+                action="work_plan_snapshot",
+                detail=json.dumps(work_plan, ensure_ascii=False, default=str),
+            )
 
         # Persist work orders and their latest lifecycle status.
         active_order_ids = set(result.get("active_workers", {}).values())
