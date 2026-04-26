@@ -4,7 +4,7 @@ import logging
 from threading import Event, Thread
 
 from app.agent.runner import ThreadManager
-from app.workers.events import WorkerEventBus, get_worker_event_bus
+from app.workers.events import WorkerEvent, WorkerEventBus, get_worker_event_bus
 
 logger = logging.getLogger(__name__)
 
@@ -36,32 +36,67 @@ class DispatcherService:
             self._thread = None
 
     def drain_once(self) -> int:
-        processed = 0
+        events: list[WorkerEvent] = []
         while True:
             event = self._event_bus.get(timeout=0)
             if event is None:
-                return processed
-            self._handle_event(event.event_type, event.payload)
-            processed += 1
+                self._handle_events(events)
+                return len(events)
+            events.append(event)
 
     def _run(self) -> None:
         while not self._stop.is_set():
             event = self._event_bus.get(timeout=self._poll_timeout_seconds)
             if event is None:
                 continue
-            self._handle_event(event.event_type, event.payload)
+            events = [event]
+            while True:
+                next_event = self._event_bus.get(timeout=0)
+                if next_event is None:
+                    break
+                events.append(next_event)
+            self._handle_events(events)
 
     def _handle_event(self, event_type: str, payload: dict) -> None:
-        thread_id = payload.get("ca_thread_id")
-        order_id = payload.get("order_id")
-        if not thread_id:
-            logger.warning("worker event missing ca_thread_id order_id=%s", order_id)
-            return
-        try:
-            self._thread_manager.resume(
+        self._handle_events([WorkerEvent(event_type=event_type, payload=payload)])
+
+    def _handle_events(self, events: list[WorkerEvent]) -> None:
+        events_by_thread: dict[str, list[WorkerEvent]] = {}
+        for event in events:
+            thread_id = event.payload.get("ca_thread_id")
+            order_id = event.payload.get("order_id")
+            if not thread_id:
+                logger.warning("worker event missing ca_thread_id order_id=%s", order_id)
+                continue
+            events_by_thread.setdefault(thread_id, []).append(event)
+
+        for thread_id, thread_events in events_by_thread.items():
+            if len(thread_events) == 1:
+                event = thread_events[0]
+                self._resume_thread(
+                    thread_id,
+                    {"event_type": event.event_type, "payload": event.payload},
+                    order_id=event.payload.get("order_id"),
+                )
+                continue
+            self._resume_thread(
                 thread_id,
-                {"event_type": event_type, "payload": payload},
+                {
+                    "events": [
+                        {"event_type": event.event_type, "payload": event.payload}
+                        for event in thread_events
+                    ],
+                },
+                order_id=",".join(
+                    str(event.payload.get("order_id"))
+                    for event in thread_events
+                    if event.payload.get("order_id")
+                ),
             )
+
+    def _resume_thread(self, thread_id: str, resume_value: dict, *, order_id: object) -> None:
+        try:
+            self._thread_manager.resume(thread_id, resume_value)
         except Exception:
             logger.exception(
                 "failed to dispatch worker event thread_id=%s order_id=%s",

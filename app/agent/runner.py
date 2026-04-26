@@ -11,6 +11,7 @@ from langgraph.types import Command
 
 from app.agent.events import AgentEvent
 from app.agent.graph import build_agent_graph
+from app.agent.interrupts import parse_interrupt_result
 from app.agent.reports import write_run_report
 from app.agent.state import AgentState, initial_state
 from app.persistence import get_business_db, BusinessDB
@@ -189,7 +190,7 @@ class ThreadManager:
                 try:
                     result = self.resume(
                         thread_id,
-                        {"event_type": event_type, "payload": worker_result},
+                        {"event_type": event_type, "payload": worker_result, "recovered": True},
                     )
                 except Exception as exc:  # pragma: no cover - defensive audit path
                     failed.append(
@@ -432,17 +433,11 @@ class ThreadManager:
         summary = result.get("final_summary")
         pending_approval_id = result.get("pending_approval_id")
 
-        # Handle interrupt: graph returns __interrupt__ when paused
-        if "__interrupt__" in result:
-            interrupts = result["__interrupt__"]
-            interrupt_info = interrupts[0] if interrupts else None
-            if interrupt_info and isinstance(interrupt_info.value, dict):
-                if interrupt_info.value.get("type") == "approval_required":
-                    status = "waiting_approval"
-                    summary = "Waiting for approval"
-                elif interrupt_info.value.get("type") == "wait_workers":
-                    status = "monitoring"
-                    summary = "Waiting for workers"
+        parsed_interrupt = parse_interrupt_result(result)
+        if parsed_interrupt:
+            status = parsed_interrupt["status"]
+            summary = parsed_interrupt["summary"]
+            pending_approval_id = parsed_interrupt.get("pending_approval_id", pending_approval_id)
 
         return AgentRunResult(
             thread_id=thread_id,

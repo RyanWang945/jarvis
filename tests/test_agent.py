@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from langgraph.types import Command
 
 from app.agent.events import build_user_event
 from app.agent.dispatcher import DispatcherService
@@ -25,6 +26,14 @@ class _completed:
         self.returncode = returncode
         self.stdout = stdout
         self.stderr = stderr
+
+
+def _command_update(command: Command) -> dict:
+    return command.update or {}
+
+
+def _command_goto(command: Command) -> str:
+    return command.goto
 
 
 def test_graph_runner_completes_echo_task(tmp_path, monkeypatch) -> None:
@@ -224,9 +233,10 @@ def test_numbered_work_order_constraint_creates_sequential_work_plan(tmp_path, m
     assert len(state["work_plan"]["steps"]) == 4
     assert [step["status"] for step in state["work_plan"]["steps"]] == ["pending"] * 4
 
-    update = strategize(state)
+    command = strategize(state)
+    update = _command_update(command)
 
-    assert update["next_node"] == "dispatch"
+    assert _command_goto(command) == "risk_gate"
     assert len(update["task_list"]) == 1
     assert update["task_list"][0]["plan_step_id"] == "step-1"
     assert update["task_list"][0]["tool_name"] == "coder.claude_code"
@@ -246,17 +256,25 @@ def test_numbered_work_order_constraint_creates_sequential_work_plan(tmp_path, m
             summary="step one reviewed routing",
         ).model_dump()
     }
-    aggregated = aggregate(aggregate_state)
+    aggregate_command = aggregate(aggregate_state)
+    aggregate_update = _command_update(aggregate_command)
+    assert _command_goto(aggregate_command) == "verify"
+    verify_state = dict(aggregate_state)
+    verify_state.update(aggregate_update)
+    from app.agent.nodes import verify
+    verify_command = verify(verify_state)
+    aggregated = _command_update(verify_command)
 
-    assert aggregated["next_node"] == "strategize"
+    assert _command_goto(verify_command) == "strategize"
     assert aggregated["work_plan"]["steps"][0]["status"] == "success"
     assert aggregated["work_plan"]["steps"][1]["status"] == "pending"
 
     next_state = dict(aggregate_state)
     next_state.update(aggregated)
-    next_update = strategize(next_state)
+    next_command = strategize(next_state)
+    next_update = _command_update(next_command)
 
-    assert next_update["next_node"] == "dispatch"
+    assert _command_goto(next_command) == "risk_gate"
     assert len(next_update["task_list"]) == 2
     assert next_update["task_list"][0]["status"] == "success"
     assert next_update["task_list"][1]["plan_step_id"] == "step-2"
@@ -276,9 +294,15 @@ def test_numbered_work_order_constraint_creates_sequential_work_plan(tmp_path, m
             summary="step two added a focused test",
         ).model_dump()
     }
-    second_aggregated = aggregate(second_aggregate_state)
+    second_aggregate_command = aggregate(second_aggregate_state)
+    second_aggregate_update = _command_update(second_aggregate_command)
+    assert _command_goto(second_aggregate_command) == "verify"
+    second_verify_state = dict(second_aggregate_state)
+    second_verify_state.update(second_aggregate_update)
+    second_verify_command = verify(second_verify_state)
+    second_aggregated = _command_update(second_verify_command)
 
-    assert second_aggregated["next_node"] == "strategize"
+    assert _command_goto(second_verify_command) == "strategize"
     assert second_aggregated["task_list"][0]["status"] == "success"
     assert second_aggregated["task_list"][0]["result_summary"] == "step one reviewed routing"
     assert second_aggregated["task_list"][1]["status"] == "success"
@@ -331,9 +355,10 @@ def test_llm_work_plan_step_uses_planner_selected_capability(tmp_path, monkeypat
     assert state["work_plan"] is not None
     assert [step["capability_name"] for step in state["work_plan"]["steps"]] == ["__planner__", "__planner__"]
 
-    update = strategize(state)
+    command = strategize(state)
+    update = _command_update(command)
 
-    assert update["next_node"] == "dispatch"
+    assert _command_goto(command) == "risk_gate"
     assert update["task_list"][0]["plan_step_id"] == "step-1"
     assert update["task_list"][0]["tool_name"] == "search.tavily"
     assert update["work_plan"]["steps"][0]["capability_name"] == "search.tavily"
@@ -541,7 +566,7 @@ def test_jarvis_planner_decision_parses_clarification_json(monkeypatch) -> None:
     assert decision.raw_output is not None
 
 
-def test_strategize_blocks_when_planner_needs_clarification(tmp_path, monkeypatch) -> None:
+def test_strategize_waits_for_clarification_when_planner_needs_it(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("JARVIS_PLANNER_TYPE", "llm")
     monkeypatch.setenv("JARVIS_DEEPSEEK_API_KEY", "test-key")
     get_settings.cache_clear()
@@ -560,7 +585,7 @@ def test_strategize_blocks_when_planner_needs_clarification(tmp_path, monkeypatc
     runner = ThreadManager(tmp_path)
     result = runner.run_event(build_user_event(instruction="Update that file", workdir=str(tmp_path)))
 
-    assert result.status == "blocked"
+    assert result.status == "waiting_clarification"
     assert result.tasks == []
     assert result.summary == "Which file should I update?"
 
@@ -1022,7 +1047,9 @@ def test_dispatch_creates_active_workers_and_monitor_collects_results(monkeypatc
     ]
 
     # dispatch only starts workers, does not poll results
-    dispatch_update = dispatch(state)
+    dispatch_command = dispatch(state)
+    dispatch_update = _command_update(dispatch_command)
+    assert _command_goto(dispatch_command) == "monitor"
     assert dispatch_update["active_workers"] == {"task-1": "order-1"}
     assert "worker_results" not in dispatch_update or not dispatch_update.get("worker_results")
 
@@ -1030,10 +1057,11 @@ def test_dispatch_creates_active_workers_and_monitor_collects_results(monkeypatc
     state.update(dispatch_update)
 
     # monitor collects results and drains active_workers
-    monitor_update = monitor(state)
+    monitor_command = monitor(state)
+    monitor_update = _command_update(monitor_command)
     assert "order-1" in monitor_update["worker_results"]
     assert monitor_update["active_workers"] == {}
-    assert monitor_update["next_node"] == "aggregate"
+    assert _command_goto(monitor_command) == "aggregate"
 
 
 def test_monitor_waits_again_when_resume_leaves_active_workers(monkeypatch) -> None:
@@ -1059,10 +1087,11 @@ def test_monitor_waits_again_when_resume_leaves_active_workers(monkeypatch) -> N
     state = initial_state(event, thread_id="test-1")
     state["active_workers"] = {"task-1": "order-1", "task-2": "order-2"}
 
-    monitor_update = monitor(state)
+    monitor_command = monitor(state)
+    monitor_update = _command_update(monitor_command)
 
     assert monitor_update["active_workers"] == {"task-2": "order-2"}
-    assert monitor_update["next_node"] == "monitor"
+    assert _command_goto(monitor_command) == "monitor"
 
 
 def test_aggregate_retries_failed_task_until_max_retries() -> None:
@@ -1110,9 +1139,10 @@ def test_aggregate_retries_failed_task_until_max_retries() -> None:
         ).model_dump()
     }
 
-    update = aggregate(state)
+    command = aggregate(state)
+    update = _command_update(command)
 
-    assert update["next_node"] == "dispatch"
+    assert _command_goto(command) == "risk_gate"
     assert update["task_list"][0]["status"] == "pending"
     assert update["task_list"][0]["retry_count"] == 1
     assert update["task_list"][0]["order_id"] != "order-1"
@@ -1155,15 +1185,16 @@ def test_aggregate_blocks_failed_task_after_retry_budget_exhausted() -> None:
         ).model_dump()
     }
 
-    update = aggregate(state)
+    command = aggregate(state)
+    update = _command_update(command)
 
-    assert update["next_node"] == "blocked"
+    assert _command_goto(command) == "blocked"
     assert update["task_list"][0]["status"] == "failed"
     assert update["task_list"][0]["result_summary"] == "second attempt failed"
 
 
 def test_aggregate_uses_semantic_assessment_only_for_non_objective_success(monkeypatch) -> None:
-    from app.agent.nodes import CompletionAssessment, aggregate
+    from app.agent.nodes import CompletionAssessment, aggregate, verify
     from app.agent.state import initial_state
 
     calls = []
@@ -1173,7 +1204,7 @@ def test_aggregate_uses_semantic_assessment_only_for_non_objective_success(monke
         return CompletionAssessment("success", "semantic success")
 
     monkeypatch.setattr(
-        "app.agent.nodes._assess_task_completion_semantically",
+        "app.agent.verification.assess_task_completion_semantically",
         fake_semantic_assessment,
     )
 
@@ -1208,16 +1239,21 @@ def test_aggregate_uses_semantic_assessment_only_for_non_objective_success(monke
         ).model_dump()
     }
 
-    update = aggregate(state)
+    aggregate_command = aggregate(state)
+    aggregate_update = _command_update(aggregate_command)
+    verify_state = dict(state)
+    verify_state.update(aggregate_update)
+    command = verify(verify_state)
+    update = _command_update(command)
 
     assert len(calls) == 1
-    assert update["next_node"] == "summarize"
+    assert _command_goto(command) == "summarize"
     assert update["task_list"][0]["status"] == "success"
     assert update["task_list"][0]["result_summary"] == "semantic success"
 
 
 def test_aggregate_llm_assessment_can_fail_non_objective_success(monkeypatch) -> None:
-    from app.agent.nodes import aggregate
+    from app.agent.nodes import aggregate, verify
     from app.agent.state import initial_state
 
     monkeypatch.setenv("JARVIS_PLANNER_TYPE", "llm")
@@ -1261,15 +1297,20 @@ def test_aggregate_llm_assessment_can_fail_non_objective_success(monkeypatch) ->
         ).model_dump()
     }
 
-    update = aggregate(state)
+    aggregate_command = aggregate(state)
+    aggregate_update = _command_update(aggregate_command)
+    verify_state = dict(state)
+    verify_state.update(aggregate_update)
+    command = verify(verify_state)
+    update = _command_update(command)
 
-    assert update["next_node"] == "blocked"
+    assert _command_goto(command) == "blocked"
     assert update["task_list"][0]["status"] == "failed"
     assert update["task_list"][0]["result_summary"] == "LLM says DoD was not met."
 
 
 def test_aggregate_does_not_use_completion_assessor_for_external_skill(monkeypatch) -> None:
-    from app.agent.nodes import aggregate
+    from app.agent.nodes import aggregate, verify
     from app.agent.state import initial_state
 
     monkeypatch.setenv("JARVIS_PLANNER_TYPE", "llm")
@@ -1280,7 +1321,7 @@ def test_aggregate_does_not_use_completion_assessor_for_external_skill(monkeypat
     def fail_if_called(*args, **kwargs):
         raise AssertionError("external skill success should be handled by summarize")
 
-    monkeypatch.setattr("app.agent.nodes._assess_task_completion_semantically", fail_if_called)
+    monkeypatch.setattr("app.agent.verification.assess_task_completion_semantically", fail_if_called)
 
     state = initial_state(build_user_event(instruction="Search and cite URLs"), thread_id="thread-search-assess")
     state["task_list"] = [
@@ -1313,9 +1354,14 @@ def test_aggregate_does_not_use_completion_assessor_for_external_skill(monkeypat
         ).model_dump()
     }
 
-    update = aggregate(state)
+    aggregate_command = aggregate(state)
+    aggregate_update = _command_update(aggregate_command)
+    verify_state = dict(state)
+    verify_state.update(aggregate_update)
+    command = verify(verify_state)
+    update = _command_update(command)
 
-    assert update["next_node"] == "summarize"
+    assert _command_goto(command) == "summarize"
     assert update["task_list"][0]["status"] == "success"
     assert update["task_list"][0]["result_summary"] == "Tavily search completed."
 
@@ -1539,9 +1585,16 @@ def test_aggregate_llm_assessment_can_trigger_replan(monkeypatch) -> None:
         ).model_dump()
     }
 
-    update = aggregate(state)
+    from app.agent.nodes import verify
 
-    assert update["next_node"] == "strategize"
+    aggregate_command = aggregate(state)
+    aggregate_update = _command_update(aggregate_command)
+    verify_state = dict(state)
+    verify_state.update(aggregate_update)
+    command = verify(verify_state)
+    update = _command_update(command)
+
+    assert _command_goto(command) == "strategize"
     assert update["task_list"][0]["status"] == "cancelled"
     assert update["task_list"][0]["result_summary"] == "Replanning: Need a different approach."
 
@@ -1585,9 +1638,10 @@ def test_strategize_appends_replanned_tasks_without_overwriting_history(monkeypa
         ).model_dump()
     }
 
-    update = strategize(state)
+    command = strategize(state)
+    update = _command_update(command)
 
-    assert update["next_node"] == "dispatch"
+    assert _command_goto(command) == "risk_gate"
     assert len(update["task_list"]) == 2
     assert update["task_list"][0]["id"] == "old-task"
     assert update["task_list"][1]["id"] != "old-task"
@@ -1691,6 +1745,52 @@ def test_high_risk_verification_cmd_requires_approval(tmp_path, monkeypatch) -> 
     assert len(approvals) == 1
     assert approvals[0]["risk_level"] == "high"
     assert "verification: git push origin main" in approvals[0]["command"]
+
+
+def test_recovered_write_order_reenters_approval_gate() -> None:
+    from app.agent.nodes import risk_gate
+    from app.agent.state import initial_state
+
+    state = initial_state(build_user_event(instruction="Recover write retry"), thread_id="recover-write")
+    state["recovered_resume"] = True
+    state["task_list"] = [
+        {
+            "id": "task-1",
+            "title": "Write file",
+            "description": "Write a file after recovery",
+            "status": "pending",
+            "resource_key": None,
+            "dod": "File written.",
+            "verification_cmd": None,
+            "tool_name": "shell.command",
+            "tool_args": {"command": "Set-Content note.txt recovered"},
+            "worker_type": "shell",
+            "order_id": "order-1",
+            "retry_count": 1,
+            "max_retries": 2,
+            "result_summary": None,
+        }
+    ]
+    state["dispatch_queue"] = [
+        WorkOrder(
+            order_id="order-1",
+            task_id="task-1",
+            ca_thread_id="recover-write",
+            capability_name="shell.command",
+            worker_type="shell",
+            action="run",
+            args={"command": "Set-Content note.txt recovered"},
+            risk_level="low",
+            reason="Recovered write retry",
+        ).model_dump()
+    ]
+
+    command = risk_gate(state)
+    update = _command_update(command)
+
+    assert _command_goto(command) == "wait_approval"
+    assert update["status"] == "waiting_approval"
+    assert update["pending_action"]["order_id"] == "order-1"
 
 
 def test_business_db_persists_run_and_tasks(tmp_path, monkeypatch) -> None:

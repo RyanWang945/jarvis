@@ -1,0 +1,2 @@
+"""Independent knowledge base module."""
+

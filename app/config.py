@@ -13,6 +13,20 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     log_dir: Path = Field(default=Path("logs"))
     data_dir: Path = Field(default=Path("data"))
+    knowledge_db_path: Path | None = None
+    knowledge_default_language: str = "zh"
+    knowledge_default_chunk_profile: str = "medium_overlap_v1"
+    dashscope_api_key: str | None = None
+    dashscope_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    dashscope_embedding_model: str = "text-embedding-v4"
+    dashscope_embedding_batch_size: int = 8
+    dashscope_embedding_max_workers: int = 2
+    opensearch_base_url: str = "http://127.0.0.1:9200"
+    opensearch_username: str | None = None
+    opensearch_password: str | None = None
+    opensearch_index_prefix: str = "kb_wikipedia"
+    opensearch_bulk_batch_size: int = 100
+    opensearch_bulk_max_retries: int = 4
     planner_type: str = "llm"
     llm_provider: str = "deepseek"
     llm_timeout_seconds: float = 60.0

@@ -7,6 +7,7 @@ from app.agent.events import AgentEvent
 TaskStatus = Literal[
     "pending",
     "running",
+    "verifying",
     "waiting",
     "success",
     "failed",
@@ -35,6 +36,7 @@ AgentRunStatus = Literal[
     "running",
     "verifying",
     "waiting_approval",
+    "waiting_clarification",
     "blocked",
     "completed",
     "failed",
@@ -118,6 +120,8 @@ class AgentState(TypedDict):
     active_workers: dict[str, str]
     worker_results: dict[str, dict[str, Any]]
     pending_approval_id: str | None
+    pending_clarification: str | None
+    recovered_resume: bool
     error_count: int
     last_error: str | None
     intent: IntentDecision | None
@@ -130,7 +134,6 @@ class AgentState(TypedDict):
     failure_kind: str | None
     context_summary: str | None
     final_summary: str | None
-    next_node: str | None
 
 
 def initial_state(event: AgentEvent, thread_id: str) -> AgentState:
@@ -149,6 +152,8 @@ def initial_state(event: AgentEvent, thread_id: str) -> AgentState:
         "active_workers": {},
         "worker_results": {},
         "pending_approval_id": None,
+        "pending_clarification": None,
+        "recovered_resume": False,
         "error_count": 0,
         "last_error": None,
         "intent": None,
@@ -161,5 +166,4 @@ def initial_state(event: AgentEvent, thread_id: str) -> AgentState:
         "failure_kind": None,
         "context_summary": None,
         "final_summary": None,
-        "next_node": None,
     }

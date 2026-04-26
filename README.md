@@ -32,11 +32,24 @@ JARVIS_PORT=8000
 JARVIS_LOG_LEVEL=INFO
 JARVIS_LOG_DIR=logs
 JARVIS_DATA_DIR=data
+JARVIS_KNOWLEDGE_DEFAULT_LANGUAGE=zh
+JARVIS_KNOWLEDGE_DEFAULT_CHUNK_PROFILE=medium_overlap_v1
 JARVIS_PLANNER_TYPE=llm
 JARVIS_LLM_PROVIDER=deepseek
 JARVIS_LLM_TIMEOUT_SECONDS=60
 JARVIS_WORKER_MODE=inline
 JARVIS_WORKER_MAX_WORKERS=4
+JARVIS_DASHSCOPE_API_KEY=sk-...
+JARVIS_DASHSCOPE_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+JARVIS_DASHSCOPE_EMBEDDING_MODEL=text-embedding-v4
+JARVIS_DASHSCOPE_EMBEDDING_BATCH_SIZE=8
+JARVIS_DASHSCOPE_EMBEDDING_MAX_WORKERS=2
+JARVIS_OPENSEARCH_BASE_URL=http://127.0.0.1:9200
+JARVIS_OPENSEARCH_USERNAME=
+JARVIS_OPENSEARCH_PASSWORD=
+JARVIS_OPENSEARCH_INDEX_PREFIX=kb_wikipedia
+JARVIS_OPENSEARCH_BULK_BATCH_SIZE=100
+JARVIS_OPENSEARCH_BULK_MAX_RETRIES=4
 JARVIS_DEEPSEEK_API_KEY=sk-...
 JARVIS_DEEPSEEK_BASE_URL=https://api.deepseek.com
 JARVIS_DEEPSEEK_MODEL=deepseek-chat
@@ -64,3 +77,7 @@ Invoke-RestMethod http://127.0.0.1:8000/agent/run `
 `JARVIS_WORKER_MODE=thread` enables the experimental threaded worker client and starts the in-process dispatcher that resumes agent threads when workers finish.
 
 `JARVIS_TAVILY_API_KEY` enables the external `tavily_search` skill when installed under `data/skills/`.
+
+`JARVIS_DASHSCOPE_API_KEY` and the related DashScope settings are reserved for the knowledge base embedding pipeline. The default model is `text-embedding-v4` and the default base URL is the Beijing region endpoint.
+
+`JARVIS_OPENSEARCH_*` settings are reserved for the knowledge base index and search pipeline. The default OpenSearch endpoint is `http://127.0.0.1:9200`.
