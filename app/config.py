@@ -13,6 +13,8 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     log_dir: Path = Field(default=Path("logs"))
     data_dir: Path = Field(default=Path("data"))
+    sec_pdf_dir: Path | None = None
+    sec_raw_parse_dir: Path | None = None
     knowledge_db_path: Path | None = None
     knowledge_default_language: str = "zh"
     knowledge_default_chunk_profile: str = "medium_overlap_v1"
@@ -21,6 +23,12 @@ class Settings(BaseSettings):
     dashscope_embedding_model: str = "text-embedding-v4"
     dashscope_embedding_batch_size: int = 8
     dashscope_embedding_max_workers: int = 2
+    aliyun_opensearch_api_key: str | None = None
+    aliyun_opensearch_endpoint: str | None = None
+    aliyun_opensearch_workspace: str = "default"
+    aliyun_opensearch_document_analyze_service_id: str = "ops-document-analyze-002"
+    aliyun_opensearch_document_analyze_image_storage: str = "base64"
+    aliyun_opensearch_document_analyze_enable_semantic: bool = True
     opensearch_base_url: str = "http://127.0.0.1:9200"
     opensearch_username: str | None = None
     opensearch_password: str | None = None
@@ -36,7 +44,7 @@ class Settings(BaseSettings):
     coder_timeout_seconds: int = 1800
     deepseek_api_key: str | None = None
     deepseek_base_url: str = "https://api.deepseek.com"
-    deepseek_model: str = "deepseek-chat"
+    deepseek_model: str = "deepseek-v4-pro"
     deepseek_timeout_seconds: float | None = None
     kimi_api_key: str | None = None
     kimi_base_url: str = "https://api.moonshot.cn/v1"

@@ -118,12 +118,23 @@ class DocumentRepository:
         ).fetchone()
         return dict(row) if row else None
 
-    def list_by_source(self, source_id: str, *, limit: int | None = None) -> list[dict[str, Any]]:
+    def list_by_source(
+        self,
+        source_id: str,
+        *,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
         sql = "SELECT * FROM kb_documents WHERE source_id = ? ORDER BY created_at, doc_id"
         params: list[Any] = [source_id]
         if limit is not None:
             sql += " LIMIT ?"
             params.append(limit)
+        if offset:
+            if limit is None:
+                sql += " LIMIT -1"
+            sql += " OFFSET ?"
+            params.append(offset)
         rows = self._conn.execute(sql, params).fetchall()
         return [dict(row) for row in rows]
 

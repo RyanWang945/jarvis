@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
-from app.knowledge_base.embedding import DashScopeEmbeddingClient
+from app.knowledge_base.embedding import DashScopeEmbeddingClient, EmbeddingBatchResult, EmbeddingVector
 from app.knowledge_base.repositories import KnowledgeBaseDB
 from app.knowledge_base.search import OpenSearchClient, SearchHit, combine_hybrid_hits
 
@@ -19,6 +19,8 @@ class IndexResult:
 
 
 class KnowledgeBaseIndexService:
+    _document_batch_size = 100
+
     def __init__(
         self,
         *,
@@ -37,63 +39,140 @@ class KnowledgeBaseIndexService:
         chunk_profile_id: str,
         top_limit: int | None = None,
     ) -> IndexResult:
-        documents = self._db.documents.list_by_source(source_id, limit=top_limit)
-        if not documents:
-            raise ValueError(f"No documents found for source: {source_id}")
-        chunks: list[dict] = []
-        for document in documents:
-            chunks.extend(
-                self._db.chunks.list_by_document(
-                    document["doc_id"],
+        offset = 0
+        indexed_chunks = 0
+        embedding_model: str | None = None
+        index_name: str | None = None
+        index_ensured = False
+        documents_found = False
+
+        while True:
+            limit = self._document_batch_size
+            if top_limit is not None:
+                remaining = top_limit - offset
+                if remaining <= 0:
+                    break
+                limit = min(limit, remaining)
+            documents = self._db.documents.list_by_source(
+                source_id,
+                limit=limit,
+                offset=offset,
+            )
+            if not documents:
+                break
+            documents_found = True
+            offset += len(documents)
+
+            chunks: list[dict] = []
+            for document in documents:
+                chunks.extend(
+                    self._db.chunks.list_by_document(
+                        document["doc_id"],
+                        chunk_profile_id=chunk_profile_id,
+                    )
+                )
+            if not chunks:
+                continue
+
+            embedding_result = self._embed_missing_chunks(chunks)
+            embeddings_by_chunk_id: dict[str, list[float]] = {}
+            for chunk, vector in zip(chunks, embedding_result.vectors, strict=True):
+                embeddings_by_chunk_id[chunk["chunk_id"]] = vector.embedding
+
+            if index_name is None:
+                first_document = documents[0]
+                index_name = self._opensearch_client.index_name(
+                    language=first_document["language"],
                     chunk_profile_id=chunk_profile_id,
                 )
-            )
-        if not chunks:
-            raise ValueError("No chunks found to index")
-
-        texts = [chunk["normalized_content"] for chunk in chunks]
-        embedding_result = self._embedding_client.embed_texts(texts)
-        embeddings_by_chunk_id: dict[str, list[float]] = {}
-        for chunk, vector in zip(chunks, embedding_result.vectors, strict=True):
-            embeddings_by_chunk_id[chunk["chunk_id"]] = vector.embedding
-            self._db.chunk_embeddings.save(
-                {
-                    "chunk_id": chunk["chunk_id"],
-                    "embedding_model": embedding_result.model,
-                    "embedding_dim": embedding_result.dimensions,
-                    "embedding_json": vector.embedding,
-                    "text_hash": chunk["content_hash"],
-                }
-            )
-
-        first_document = documents[0]
-        index_name = self._opensearch_client.index_name(
-            language=first_document["language"],
-            chunk_profile_id=chunk_profile_id,
-        )
-        self._opensearch_client.ensure_index(
-            index_name=index_name,
-            embedding_dim=embedding_result.dimensions,
-        )
-        self._opensearch_client.bulk_index(
-            index_name=index_name,
-            documents=[
-                _build_index_document(
-                    document=_document_map(documents, chunk["doc_id"]),
-                    chunk=chunk,
-                    embedding=embeddings_by_chunk_id[chunk["chunk_id"]],
-                    embedding_model=embedding_result.model,
+            if not index_ensured:
+                self._opensearch_client.ensure_index(
+                    index_name=index_name,
+                    embedding_dim=embedding_result.dimensions,
                 )
-                for chunk in chunks
-            ],
-        )
+                index_ensured = True
+            self._opensearch_client.bulk_index(
+                index_name=index_name,
+                documents=[
+                    _build_index_document(
+                        document=_document_map(documents, chunk["doc_id"]),
+                        chunk=chunk,
+                        embedding=embeddings_by_chunk_id[chunk["chunk_id"]],
+                        embedding_model=embedding_result.model,
+                    )
+                    for chunk in chunks
+                ],
+            )
+            indexed_chunks += len(chunks)
+            embedding_model = embedding_result.model
+
+        if not documents_found:
+            raise ValueError(f"No documents found for source: {source_id}")
+        if indexed_chunks == 0:
+            raise ValueError("No chunks found to index")
+        if index_name is None or embedding_model is None:
+            raise ValueError("Indexing did not produce an index name or embedding model")
         return IndexResult(
             index_name=index_name,
             source_id=source_id,
             chunk_profile_id=chunk_profile_id,
-            indexed_chunks=len(chunks),
-            embedded_chunks=len(chunks),
-            embedding_model=embedding_result.model,
+            indexed_chunks=indexed_chunks,
+            embedded_chunks=indexed_chunks,
+            embedding_model=embedding_model,
+        )
+
+    def _embed_missing_chunks(self, chunks: list[dict]) -> EmbeddingBatchResult:
+        stored_embeddings = {
+            embedding["chunk_id"]: embedding
+            for embedding in self._db.chunk_embeddings.list_by_chunk_ids(
+                [chunk["chunk_id"] for chunk in chunks]
+            )
+        }
+        vectors_by_position: dict[int, EmbeddingVector] = {}
+        missing_positions: list[int] = []
+        missing_texts: list[str] = []
+        model: str | None = None
+        dimensions: int | None = None
+
+        for index, chunk in enumerate(chunks):
+            stored = stored_embeddings.get(chunk["chunk_id"])
+            if stored and stored["text_hash"] == chunk["content_hash"]:
+                embedding = json.loads(stored["embedding_json"])
+                vectors_by_position[index] = EmbeddingVector(index=index, embedding=embedding)
+                model = model or stored["embedding_model"]
+                dimensions = dimensions or stored["embedding_dim"]
+                continue
+            missing_positions.append(index)
+            missing_texts.append(chunk["normalized_content"])
+
+        if missing_texts:
+            embedded = self._embedding_client.embed_texts(missing_texts)
+            model = embedded.model
+            dimensions = embedded.dimensions
+            for vector in embedded.vectors:
+                chunk_index = missing_positions[vector.index]
+                chunk = chunks[chunk_index]
+                vectors_by_position[chunk_index] = EmbeddingVector(
+                    index=chunk_index,
+                    embedding=vector.embedding,
+                )
+                self._db.chunk_embeddings.save(
+                    {
+                        "chunk_id": chunk["chunk_id"],
+                        "embedding_model": embedded.model,
+                        "embedding_dim": embedded.dimensions,
+                        "embedding_json": vector.embedding,
+                        "text_hash": chunk["content_hash"],
+                    }
+                )
+
+        if model is None or dimensions is None:
+            raise ValueError("No embeddings found or generated")
+
+        return EmbeddingBatchResult(
+            model=model,
+            dimensions=dimensions,
+            vectors=[vectors_by_position[index] for index in range(len(chunks))],
         )
 
     def search(

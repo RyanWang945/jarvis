@@ -6,7 +6,9 @@ from app.knowledge_base.embedding import DashScopeEmbeddingClient
 from app.knowledge_base.eval import EvalDatasetResult, EvalRunSummary, KnowledgeBaseEvaluationService
 from app.knowledge_base.ingest import IngestResult, WikipediaIngestService
 from app.knowledge_base.indexing import IndexResult, KnowledgeBaseIndexService
+from app.knowledge_base.parsers.alibaba_pdf import AlibabaDocumentAnalyzeClient
 from app.knowledge_base.repositories import KnowledgeBaseDB, get_knowledge_base_db
+from app.knowledge_base.sec_parse import SecParseBatchResult, SecFilingParseService
 from app.knowledge_base.search import OpenSearchClient, SearchHit
 
 
@@ -23,6 +25,8 @@ class KnowledgeBaseService:
         self._settings = settings
         self._db_path = self._resolve_db_path(settings)
         self._db: KnowledgeBaseDB = get_knowledge_base_db(self._db_path)
+        self._embedding_client_instance: DashScopeEmbeddingClient | None = None
+        self._opensearch_client_instance: OpenSearchClient | None = None
 
     @property
     def db_path(self) -> Path:
@@ -157,6 +161,30 @@ class KnowledgeBaseService:
         )
         return service.get_run_summary(eval_run_id)
 
+    def parse_sec_pdfs(
+        self,
+        *,
+        input_dir: str | None = None,
+        output_dir: str | None = None,
+        file_names: list[str] | None = None,
+        force: bool = False,
+        poll_interval_seconds: float = 3.0,
+        timeout_seconds: float = 600.0,
+        limit: int | None = None,
+    ) -> SecParseBatchResult:
+        service = SecFilingParseService(
+            client=self._document_analyze_client(),
+            input_dir=self._resolve_sec_pdf_dir(input_dir),
+            output_dir=self._resolve_sec_raw_parse_dir(output_dir),
+        )
+        return service.parse_directory(
+            force=force,
+            poll_interval_seconds=poll_interval_seconds,
+            timeout_seconds=timeout_seconds,
+            limit=limit,
+            file_names=file_names,
+        )
+
     @staticmethod
     def _resolve_db_path(settings: Settings) -> Path:
         if settings.knowledge_db_path is not None:
@@ -164,22 +192,54 @@ class KnowledgeBaseService:
         return settings.data_dir / "knowledge.db"
 
     def _embedding_client(self) -> DashScopeEmbeddingClient:
-        if not self._settings.dashscope_api_key:
-            raise ValueError("JARVIS_DASHSCOPE_API_KEY is required for embeddings")
-        return DashScopeEmbeddingClient(
-            api_key=self._settings.dashscope_api_key,
-            base_url=self._settings.dashscope_base_url,
-            model=self._settings.dashscope_embedding_model,
-            batch_size=self._settings.dashscope_embedding_batch_size,
-            max_workers=self._settings.dashscope_embedding_max_workers,
-        )
+        if self._embedding_client_instance is None:
+            if not self._settings.dashscope_api_key:
+                raise ValueError("JARVIS_DASHSCOPE_API_KEY is required for embeddings")
+            self._embedding_client_instance = DashScopeEmbeddingClient(
+                api_key=self._settings.dashscope_api_key,
+                base_url=self._settings.dashscope_base_url,
+                model=self._settings.dashscope_embedding_model,
+                batch_size=self._settings.dashscope_embedding_batch_size,
+                max_workers=self._settings.dashscope_embedding_max_workers,
+            )
+        return self._embedding_client_instance
 
     def _opensearch_client(self) -> OpenSearchClient:
-        return OpenSearchClient(
-            base_url=self._settings.opensearch_base_url,
-            index_prefix=self._settings.opensearch_index_prefix,
-            username=self._settings.opensearch_username,
-            password=self._settings.opensearch_password,
-            bulk_batch_size=self._settings.opensearch_bulk_batch_size,
-            bulk_max_retries=self._settings.opensearch_bulk_max_retries,
+        if self._opensearch_client_instance is None:
+            self._opensearch_client_instance = OpenSearchClient(
+                base_url=self._settings.opensearch_base_url,
+                index_prefix=self._settings.opensearch_index_prefix,
+                username=self._settings.opensearch_username,
+                password=self._settings.opensearch_password,
+                bulk_batch_size=self._settings.opensearch_bulk_batch_size,
+                bulk_max_retries=self._settings.opensearch_bulk_max_retries,
+            )
+        return self._opensearch_client_instance
+
+    def _document_analyze_client(self) -> AlibabaDocumentAnalyzeClient:
+        if not self._settings.aliyun_opensearch_api_key:
+            raise ValueError("JARVIS_ALIYUN_OPENSEARCH_API_KEY is required for SEC PDF parsing")
+        if not self._settings.aliyun_opensearch_endpoint:
+            raise ValueError("JARVIS_ALIYUN_OPENSEARCH_ENDPOINT is required for SEC PDF parsing")
+        return AlibabaDocumentAnalyzeClient(
+            api_key=self._settings.aliyun_opensearch_api_key,
+            endpoint=self._settings.aliyun_opensearch_endpoint,
+            workspace=self._settings.aliyun_opensearch_workspace,
+            service_id=self._settings.aliyun_opensearch_document_analyze_service_id,
+            image_storage=self._settings.aliyun_opensearch_document_analyze_image_storage,
+            enable_semantic=self._settings.aliyun_opensearch_document_analyze_enable_semantic,
         )
+
+    def _resolve_sec_pdf_dir(self, input_dir: str | None) -> Path:
+        if input_dir:
+            return Path(input_dir)
+        if self._settings.sec_pdf_dir is not None:
+            return self._settings.sec_pdf_dir
+        return self._settings.data_dir / "sec-pdf"
+
+    def _resolve_sec_raw_parse_dir(self, output_dir: str | None) -> Path:
+        if output_dir:
+            return Path(output_dir)
+        if self._settings.sec_raw_parse_dir is not None:
+            return self._settings.sec_raw_parse_dir
+        return self._settings.data_dir / "sec-pdf" / "aliyun-raw"

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -179,17 +180,17 @@ class WikipediaIngestService:
         )
 
 
-def _iterate_wikipedia_records(file_path: Path, *, limit_n: int | None) -> list[dict]:
-    records: list[dict] = []
+def _iterate_wikipedia_records(file_path: Path, *, limit_n: int | None) -> Iterator[dict]:
+    records_seen = 0
     with file_path.open("r", encoding="utf-8") as handle:
         for line in handle:
             content = line.strip()
             if not content:
                 continue
-            records.append(json.loads(content))
-            if limit_n is not None and len(records) >= limit_n:
+            yield json.loads(content)
+            records_seen += 1
+            if limit_n is not None and records_seen >= limit_n:
                 break
-    return records
 
 
 def _build_document(

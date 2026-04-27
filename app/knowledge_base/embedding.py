@@ -39,6 +39,7 @@ class DashScopeEmbeddingClient:
         self._max_workers = max_workers
         self._timeout_seconds = timeout_seconds
         self._http_client = http_client
+        self._owned_client: httpx.Client | None = None
 
     def embed_texts(self, texts: list[str]) -> EmbeddingBatchResult:
         if not texts:
@@ -115,4 +116,6 @@ class DashScopeEmbeddingClient:
     def _client(self) -> httpx.Client:
         if self._http_client is not None:
             return self._http_client
-        return httpx.Client(timeout=self._timeout_seconds, trust_env=False)
+        if self._owned_client is None:
+            self._owned_client = httpx.Client(timeout=self._timeout_seconds, trust_env=False)
+        return self._owned_client

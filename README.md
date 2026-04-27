@@ -44,6 +44,12 @@ JARVIS_DASHSCOPE_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 JARVIS_DASHSCOPE_EMBEDDING_MODEL=text-embedding-v4
 JARVIS_DASHSCOPE_EMBEDDING_BATCH_SIZE=8
 JARVIS_DASHSCOPE_EMBEDDING_MAX_WORKERS=2
+JARVIS_ALIYUN_OPENSEARCH_API_KEY=OS-...
+JARVIS_ALIYUN_OPENSEARCH_ENDPOINT=https://***.opensearch.aliyuncs.com
+JARVIS_ALIYUN_OPENSEARCH_WORKSPACE=default
+JARVIS_ALIYUN_OPENSEARCH_DOCUMENT_ANALYZE_SERVICE_ID=ops-document-analyze-002
+JARVIS_ALIYUN_OPENSEARCH_DOCUMENT_ANALYZE_IMAGE_STORAGE=base64
+JARVIS_ALIYUN_OPENSEARCH_DOCUMENT_ANALYZE_ENABLE_SEMANTIC=true
 JARVIS_OPENSEARCH_BASE_URL=http://127.0.0.1:9200
 JARVIS_OPENSEARCH_USERNAME=
 JARVIS_OPENSEARCH_PASSWORD=
@@ -52,7 +58,7 @@ JARVIS_OPENSEARCH_BULK_BATCH_SIZE=100
 JARVIS_OPENSEARCH_BULK_MAX_RETRIES=4
 JARVIS_DEEPSEEK_API_KEY=sk-...
 JARVIS_DEEPSEEK_BASE_URL=https://api.deepseek.com
-JARVIS_DEEPSEEK_MODEL=deepseek-chat
+JARVIS_DEEPSEEK_MODEL=deepseek-v4-pro
 JARVIS_KIMI_API_KEY=sk-...
 JARVIS_KIMI_BASE_URL=https://api.moonshot.cn/v1
 JARVIS_KIMI_MODEL=moonshot-v1-8k
@@ -79,5 +85,7 @@ Invoke-RestMethod http://127.0.0.1:8000/agent/run `
 `JARVIS_TAVILY_API_KEY` enables the external `tavily_search` skill when installed under `data/skills/`.
 
 `JARVIS_DASHSCOPE_API_KEY` and the related DashScope settings are reserved for the knowledge base embedding pipeline. The default model is `text-embedding-v4` and the default base URL is the Beijing region endpoint.
+
+`JARVIS_ALIYUN_OPENSEARCH_*` settings are reserved for SEC PDF document parsing through Alibaba Cloud AI Search Open Platform. The current implementation targets the async document analyze API with `ops-document-analyze-002`.
 
 `JARVIS_OPENSEARCH_*` settings are reserved for the knowledge base index and search pipeline. The default OpenSearch endpoint is `http://127.0.0.1:9200`.

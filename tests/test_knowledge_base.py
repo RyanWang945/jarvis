@@ -6,9 +6,11 @@ from httpx import Request, Response
 from app.config import get_settings
 from app.knowledge_base.chunking import chunk_text
 from app.knowledge_base.embedding import DashScopeEmbeddingClient
-from app.knowledge_base.eval import KnowledgeBaseEvaluationService
+from app.knowledge_base.eval import GeneratedQuery, KnowledgeBaseEvaluationService
 from app.knowledge_base.indexing import KnowledgeBaseIndexService
+from app.knowledge_base.parsers.alibaba_pdf import AlibabaDocumentAnalyzeClient
 from app.knowledge_base.repositories import get_knowledge_base_db
+from app.knowledge_base.sec_parse import SecFilingParseService
 from app.knowledge_base.search import OpenSearchClient, combine_hybrid_hits
 from app.main import create_app
 
@@ -182,6 +184,46 @@ def test_ingest_wikipedia_creates_documents_and_chunks(tmp_path) -> None:
     assert chunks[0]["normalized_content"]
 
 
+def test_ingest_wikipedia_continues_existing_source(tmp_path) -> None:
+    sample_path = tmp_path / "sample.jsonl"
+    records = [
+        {
+            "id": str(index),
+            "url": f"https://example.com/{index}",
+            "title": f"title-{index}",
+            "text": f"content-{index}",
+        }
+        for index in range(1, 4)
+    ]
+    sample_path.write_text(
+        "\n".join(json.dumps(record, ensure_ascii=False) for record in records),
+        encoding="utf-8",
+    )
+
+    from app.knowledge_base.service import KnowledgeBaseService
+
+    service = KnowledgeBaseService(get_settings().model_copy(update={"data_dir": tmp_path}))
+
+    first = service.ingest_wikipedia(
+        file_path=str(sample_path),
+        source_id="wikipedia_resume_test",
+        limit_n=2,
+    )
+    resumed = service.ingest_wikipedia(
+        file_path=str(sample_path),
+        source_id="wikipedia_resume_test",
+        limit_n=3,
+    )
+
+    documents = service.db.documents.list_by_source("wikipedia_resume_test")
+
+    assert first.documents_inserted == 2
+    assert resumed.documents_seen == 3
+    assert resumed.documents_skipped == 2
+    assert resumed.documents_inserted == 1
+    assert len(documents) == 3
+
+
 def test_knowledge_base_ingest_route_runs_end_to_end(tmp_path, monkeypatch) -> None:
     sample_path = tmp_path / "sample.jsonl"
     sample_path.write_text(
@@ -324,6 +366,102 @@ def test_index_service_embeds_and_indexes_chunks(tmp_path) -> None:
     assert any(path.endswith("/_bulk") for path in indexed_requests)
 
 
+def test_index_service_reuses_existing_chunk_embeddings(tmp_path) -> None:
+    db = get_knowledge_base_db(tmp_path / "knowledge.db")
+    db.sources.save(
+        {
+            "source_id": "wikipedia_zh_sample",
+            "name": "wikipedia",
+            "language": "zh",
+            "dataset_version": "sample",
+            "file_path": str(tmp_path / "sample.jsonl"),
+            "description": "sample",
+        }
+    )
+    db.documents.save(
+        {
+            "doc_id": "wikipedia_zh_sample:13",
+            "source_id": "wikipedia_zh_sample",
+            "external_id": "13",
+            "title": "数学",
+            "url": "https://zh.wikipedia.org/wiki/%E6%95%B0%E5%AD%A6",
+            "text": "数学是研究数量、结构与变化的学科。",
+            "text_hash": "doc-hash",
+            "char_count": 18,
+            "language": "zh",
+            "metadata_json": None,
+            "ingest_job_id": "job-1",
+        }
+    )
+    db.chunks.save(
+        {
+            "chunk_id": "wikipedia_zh_sample:13:chunk:0000",
+            "doc_id": "wikipedia_zh_sample:13",
+            "chunk_profile_id": "medium_overlap_v1",
+            "chunk_index": 0,
+            "chunker_version": "v1",
+            "section_path": None,
+            "raw_content": "数学是研究数量、结构与变化的学科。",
+            "normalized_content": "数学是研究数量、结构与变化的学科。",
+            "content_hash": "chunk-hash",
+            "char_start": 0,
+            "char_end": 18,
+            "char_count": 18,
+            "token_estimate": 18,
+            "overlap_prev_chars": 0,
+            "metadata_json": None,
+        }
+    )
+    db.chunk_embeddings.save(
+        {
+            "chunk_id": "wikipedia_zh_sample:13:chunk:0000",
+            "embedding_model": "text-embedding-v4",
+            "embedding_dim": 3,
+            "embedding_json": [0.1, 0.2, 0.3],
+            "text_hash": "chunk-hash",
+        }
+    )
+
+    def embedding_handler(request: Request) -> Response:
+        raise AssertionError("existing embedding should be reused")
+
+    indexed_payloads: list[str] = []
+
+    def search_handler(request: Request) -> Response:
+        if request.method == "PUT":
+            return Response(200, json={"acknowledged": True})
+        if request.url.path.endswith("/_bulk"):
+            indexed_payloads.append(request.content.decode("utf-8"))
+            return Response(200, json={"errors": False, "items": []})
+        if request.url.path.endswith("/_refresh"):
+            return Response(200, json={"_shards": {"total": 1, "successful": 1, "failed": 0}})
+        raise AssertionError(request.url.path)
+
+    service = KnowledgeBaseIndexService(
+        db=db,
+        embedding_client=DashScopeEmbeddingClient(
+            api_key="test",
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+            model="text-embedding-v4",
+            http_client=MockHttpxClient(embedding_handler),
+        ),
+        opensearch_client=OpenSearchClient(
+            base_url="http://127.0.0.1:9200",
+            index_prefix="kb_wikipedia",
+            http_client=MockHttpxClient(search_handler),
+        ),
+    )
+
+    result = service.index_source(
+        source_id="wikipedia_zh_sample",
+        chunk_profile_id="medium_overlap_v1",
+    )
+
+    assert result.indexed_chunks == 1
+    assert result.embedded_chunks == 1
+    assert '"embedding": [0.1, 0.2, 0.3]' in indexed_payloads[0]
+
+
 def test_hybrid_search_combines_bm25_and_vector_scores() -> None:
     bm25_hits = [
         type("Hit", (), {"chunk_id": "c1", "doc_id": "d1", "score": 10.0, "source": {"chunk_id": "c1", "doc_id": "d1"}})(),
@@ -341,6 +479,23 @@ def test_hybrid_search_combines_bm25_and_vector_scores() -> None:
     )
 
     assert [hit.chunk_id for hit in hits] == ["c2", "c1", "c3"]
+
+
+def test_opensearch_client_reuses_owned_http_client() -> None:
+    client = OpenSearchClient(
+        base_url="http://127.0.0.1:9200",
+        index_prefix="kb_wikipedia",
+    )
+
+    assert client._client is client._client
+
+
+def test_knowledge_base_service_caches_opensearch_client(tmp_path) -> None:
+    from app.knowledge_base.service import KnowledgeBaseService
+
+    service = KnowledgeBaseService(get_settings().model_copy(update={"data_dir": tmp_path}))
+
+    assert service._opensearch_client() is service._opensearch_client()
 
 
 def test_search_route_returns_hits(tmp_path, monkeypatch) -> None:
@@ -443,8 +598,14 @@ def test_eval_dataset_generation_and_run_with_heuristic(tmp_path) -> None:
         }
     )
 
-    class FakeKBService:
-        def search(self, **kwargs):
+    settings = get_settings().model_copy(update={"data_dir": tmp_path})
+    service = KnowledgeBaseEvaluationService(settings=settings, db=db, kb_service=object())
+
+    class FakeOpenSearchClient:
+        def index_name(self, *, language: str, chunk_profile_id: str) -> str:
+            return f"kb_wikipedia_{language}_{chunk_profile_id}"
+
+        def bm25_search(self, *, index_name: str, query: str, top_k: int):
             return [
                 type(
                     "Hit",
@@ -458,8 +619,7 @@ def test_eval_dataset_generation_and_run_with_heuristic(tmp_path) -> None:
                 )()
             ]
 
-    settings = get_settings().model_copy(update={"data_dir": tmp_path})
-    service = KnowledgeBaseEvaluationService(settings=settings, db=db, kb_service=FakeKBService())
+    service._opensearch_client_instance = FakeOpenSearchClient()
     dataset = service.generate_dataset(
         source_id="src1",
         chunk_profile_id="medium_overlap_v1",
@@ -482,6 +642,342 @@ def test_eval_dataset_generation_and_run_with_heuristic(tmp_path) -> None:
     assert summary.chunk_hit_rate == 1.0
 
 
+def test_eval_dataset_generation_persists_multiple_queries(tmp_path) -> None:
+    db = get_knowledge_base_db(tmp_path / "knowledge.db")
+    db.sources.save(
+        {
+            "source_id": "src1",
+            "name": "wikipedia",
+            "language": "zh",
+            "dataset_version": "sample",
+            "file_path": "sample.jsonl",
+            "description": "sample",
+        }
+    )
+    for index in range(2):
+        doc_id = f"src1:{index}"
+        chunk_id = f"{doc_id}:chunk:0000"
+        db.documents.save(
+            {
+                "doc_id": doc_id,
+                "source_id": "src1",
+                "external_id": str(index),
+                "title": f"title-{index}",
+                "url": f"https://example.com/{index}",
+                "text": f"content-{index}",
+                "text_hash": f"doc-hash-{index}",
+                "char_count": 9,
+                "language": "zh",
+                "metadata_json": None,
+                "ingest_job_id": "job-1",
+            }
+        )
+        db.chunks.save(
+            {
+                "chunk_id": chunk_id,
+                "doc_id": doc_id,
+                "chunk_profile_id": "medium_overlap_v1",
+                "chunk_index": 0,
+                "chunker_version": "v1",
+                "section_path": None,
+                "raw_content": f"chunk-{index}",
+                "normalized_content": f"chunk-{index}",
+                "content_hash": f"chunk-hash-{index}",
+                "char_start": 0,
+                "char_end": 7,
+                "char_count": 7,
+                "token_estimate": 7,
+                "overlap_prev_chars": 0,
+                "metadata_json": None,
+            }
+        )
+
+    service = KnowledgeBaseEvaluationService(
+        settings=get_settings().model_copy(update={"data_dir": tmp_path}),
+        db=db,
+        kb_service=object(),
+    )
+
+    class FakeGenerator:
+        def generate(self, *, document, chunk, mode):
+            return GeneratedQuery(
+                query_text=f"q:{document['title']}:{chunk['chunk_id']}",
+                query_type="fact",
+                difficulty="easy",
+                gold_answer=document["title"],
+                generated_by=f"fake:{mode}",
+            )
+
+    service._generator = FakeGenerator()
+
+    dataset = service.generate_dataset(
+        source_id="src1",
+        chunk_profile_id="medium_overlap_v1",
+        generation_mode="llm",
+        max_documents=2,
+        chunks_per_document=1,
+    )
+
+    queries = db.eval_queries.list_by_dataset(dataset.dataset_id)
+
+    assert dataset.generated_queries == 2
+    assert len(queries) == 2
+    assert {query["generated_by"] for query in queries} == {"fake:llm"}
+
+
+def test_alibaba_document_analyze_client_creates_async_task_from_local_pdf(tmp_path) -> None:
+    pdf_path = tmp_path / "sample.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4 sample")
+    captured_requests: list[dict] = []
+
+    def handler(request: Request) -> Response:
+        captured_requests.append(
+            {
+                "method": request.method,
+                "url": str(request.url),
+                "headers": dict(request.headers),
+                "json": json.loads(request.content.decode("utf-8")),
+            }
+        )
+        return Response(
+            200,
+            json={
+                "request_id": "req-1",
+                "latency": 5,
+                "result": {"task_id": "task-123"},
+            },
+        )
+
+    client = AlibabaDocumentAnalyzeClient(
+        api_key="OS-test",
+        endpoint="https://example.opensearch.aliyuncs.com",
+        workspace="default",
+        service_id="ops-document-analyze-002",
+        http_client=MockHttpxClient(handler),
+    )
+
+    task = client.create_async_task_from_file(pdf_path)
+
+    assert task.task_id == "task-123"
+    assert captured_requests[0]["method"] == "POST"
+    assert captured_requests[0]["url"].endswith(
+        "/v3/openapi/workspaces/default/document-analyze/ops-document-analyze-002/async"
+    )
+    assert captured_requests[0]["headers"]["authorization"] == "Bearer OS-test"
+    assert captured_requests[0]["json"]["service_id"] == "ops-document-analyze-002"
+    assert captured_requests[0]["json"]["document"]["file_name"] == "sample.pdf"
+    assert captured_requests[0]["json"]["document"]["file_type"] == "pdf"
+    assert captured_requests[0]["json"]["strategy"]["enable_semantic"] is True
+    assert captured_requests[0]["json"]["document"]["content"]
+    assert task.raw_response["result"]["task_id"] == "task-123"
+
+
+def test_alibaba_document_analyze_client_reads_async_task_status() -> None:
+    captured_requests: list[dict] = []
+
+    def handler(request: Request) -> Response:
+        captured_requests.append(
+            {
+                "method": request.method,
+                "url": str(request.url),
+            }
+        )
+        return Response(
+            200,
+            json={
+                "request_id": "req-2",
+                "latency": 9,
+                "result": {
+                    "task_id": "task-456",
+                    "status": "SUCCESS",
+                    "data": {
+                        "content": "# Title\n\nBody",
+                        "content_type": "markdown",
+                        "page_num": 15,
+                    },
+                },
+                "usage": {
+                    "token_count": 100,
+                    "table_count": 2,
+                    "image_count": 1,
+                },
+            },
+        )
+
+    client = AlibabaDocumentAnalyzeClient(
+        api_key="OS-test",
+        endpoint="https://example.opensearch.aliyuncs.com",
+        service_id="ops-document-analyze-002",
+        http_client=MockHttpxClient(handler),
+    )
+
+    result = client.get_async_task("task-456")
+
+    assert result.task_id == "task-456"
+    assert result.status == "SUCCESS"
+    assert result.content_type == "markdown"
+    assert result.page_num == 15
+    assert result.usage["table_count"] == 2
+    assert "task_id=task-456" in captured_requests[0]["url"]
+    assert result.raw_response["result"]["status"] == "SUCCESS"
+
+
+def test_alibaba_document_analyze_client_requires_exactly_one_document_input() -> None:
+    client = AlibabaDocumentAnalyzeClient(
+        api_key="OS-test",
+        endpoint="https://example.opensearch.aliyuncs.com",
+    )
+
+    try:
+        client.create_async_task(document_url="https://example.com/a.pdf", file_content_base64="abc")
+    except ValueError as exc:
+        assert "Exactly one" in str(exc)
+    else:
+        raise AssertionError("expected create_async_task to reject multiple document inputs")
+
+
+def test_alibaba_document_analyze_client_requires_file_name_for_base64_upload() -> None:
+    client = AlibabaDocumentAnalyzeClient(
+        api_key="OS-test",
+        endpoint="https://example.opensearch.aliyuncs.com",
+    )
+
+    try:
+        client.create_async_task(file_content_base64="abc")
+    except ValueError as exc:
+        assert "file_name is required" in str(exc)
+    else:
+        raise AssertionError("expected create_async_task to require file_name for base64 upload")
+
+
+def test_alibaba_document_analyze_client_rejects_oversized_base64_payload() -> None:
+    client = AlibabaDocumentAnalyzeClient(
+        api_key="OS-test",
+        endpoint="https://example.opensearch.aliyuncs.com",
+    )
+
+    try:
+        client._validate_request_size("a" * (8 * 1024 * 1024))
+    except ValueError as exc:
+        assert "8MB" in str(exc)
+    else:
+        raise AssertionError("expected oversized base64 payload to be rejected")
+
+
+def test_sec_filing_parse_service_writes_raw_parse_json(tmp_path) -> None:
+    input_dir = tmp_path / "sec-pdf"
+    output_dir = tmp_path / "sec-raw"
+    input_dir.mkdir()
+    pdf_path = input_dir / "3M_2023Q2_10Q.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4 sample")
+
+    class FakeClient:
+        def create_async_task_from_file(self, file_path):
+            return type(
+                "Task",
+                (),
+                {
+                    "task_id": "task-1",
+                    "request_id": "req-1",
+                    "latency_ms": 1,
+                    "raw_response": {"result": {"task_id": "task-1"}},
+                },
+            )()
+
+        def get_async_task(self, task_id):
+            return type(
+                "Result",
+                (),
+                {
+                    "task_id": task_id,
+                    "status": "SUCCESS",
+                    "content": "# Filing\n\nBody",
+                    "content_type": "markdown",
+                    "page_num": 9,
+                    "error": None,
+                    "usage": {"token_count": 123},
+                    "request_id": "req-2",
+                    "latency_ms": 2,
+                    "raw_response": {
+                        "result": {
+                            "task_id": task_id,
+                            "status": "SUCCESS",
+                            "data": {"content_type": "markdown", "page_num": 9},
+                        }
+                    },
+                },
+            )()
+
+    service = SecFilingParseService(
+        client=FakeClient(),
+        input_dir=input_dir,
+        output_dir=output_dir,
+    )
+
+    result = service.parse_directory()
+
+    assert result.files_total == 1
+    assert result.parsed == 1
+    assert result.failed == 0
+    output_path = output_dir / "3M_2023Q2_10Q.aliyun.json"
+    assert output_path.exists()
+    saved = json.loads(output_path.read_text(encoding="utf-8"))
+    assert saved["task_id"] == "task-1"
+    assert saved["final_task_response"]["result"]["status"] == "SUCCESS"
+
+
+def test_sec_parse_route_returns_batch_summary(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("JARVIS_DATA_DIR", str(tmp_path))
+    get_settings.cache_clear()
+    from app.knowledge_base.api import get_knowledge_base_service
+
+    class FakeService:
+        def parse_sec_pdfs(self, **kwargs):
+            return type(
+                "Result",
+                (),
+                {
+                    "input_dir": str(tmp_path / "sec-pdf"),
+                    "output_dir": str(tmp_path / "sec-pdf" / "aliyun-raw"),
+                    "files_total": 1,
+                    "parsed": 1,
+                    "skipped": 0,
+                    "failed": 0,
+                    "items": [
+                        type(
+                            "Item",
+                            (),
+                            {
+                                "source_file": str(tmp_path / "sec-pdf" / "3M_2023Q2_10Q.pdf"),
+                                "output_file": str(tmp_path / "sec-pdf" / "aliyun-raw" / "3M_2023Q2_10Q.aliyun.json"),
+                                "task_id": "task-1",
+                                "status": "SUCCESS",
+                                "page_num": 9,
+                                "skipped": False,
+                            },
+                        )()
+                    ],
+                },
+            )()
+
+    get_knowledge_base_service.cache_clear()
+    app = create_app()
+    import app.knowledge_base.api as kb_api
+
+    original = kb_api.get_knowledge_base_service
+    kb_api.get_knowledge_base_service = lambda: FakeService()
+    try:
+        client = TestClient(app)
+        response = client.post("/kb/sec/parse", json={"limit": 1})
+        assert response.status_code == 200
+        body = response.json()
+        assert body["parsed"] == 1
+        assert body["items"][0]["status"] == "SUCCESS"
+    finally:
+        kb_api.get_knowledge_base_service = original
+        get_settings.cache_clear()
+
+
 class MockHttpxClient:
     def __init__(self, handler):
         import httpx
@@ -490,6 +986,9 @@ class MockHttpxClient:
 
     def post(self, *args, **kwargs):
         return self._client.post(*args, **kwargs)
+
+    def get(self, *args, **kwargs):
+        return self._client.get(*args, **kwargs)
 
     def put(self, *args, **kwargs):
         return self._client.put(*args, **kwargs)

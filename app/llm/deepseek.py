@@ -8,7 +8,7 @@ class DeepSeekClient(JarvisLLM):
         *,
         api_key: str,
         base_url: str = "https://api.deepseek.com",
-        model: str = "deepseek-chat",
+        model: str = "deepseek-v4-pro",
         timeout_seconds: float = 180.0,
     ) -> None:
         super().__init__(

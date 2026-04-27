@@ -115,6 +115,35 @@ class KnowledgeBaseEvalRunResponse(BaseModel):
     avg_latency_ms: int
 
 
+class KnowledgeBaseSecParseRequest(BaseModel):
+    input_dir: str | None = None
+    output_dir: str | None = None
+    file_names: list[str] | None = None
+    force: bool = False
+    poll_interval_seconds: float = Field(default=3.0, gt=0)
+    timeout_seconds: float = Field(default=600.0, gt=0)
+    limit: int | None = Field(default=None, ge=1)
+
+
+class KnowledgeBaseSecParseItemResponse(BaseModel):
+    source_file: str
+    output_file: str
+    task_id: str | None
+    status: str
+    page_num: int | None
+    skipped: bool
+
+
+class KnowledgeBaseSecParseResponse(BaseModel):
+    input_dir: str
+    output_dir: str
+    files_total: int
+    parsed: int
+    skipped: int
+    failed: int
+    items: list[KnowledgeBaseSecParseItemResponse]
+
+
 @router.get("/health", response_model=KnowledgeBaseHealthResponse)
 def knowledge_base_health() -> KnowledgeBaseHealthResponse:
     return KnowledgeBaseHealthResponse(**get_knowledge_base_service().health_check())
@@ -230,6 +259,38 @@ def knowledge_base_run_eval(
 def knowledge_base_eval_run_summary(eval_run_id: str) -> KnowledgeBaseEvalRunResponse:
     summary = get_knowledge_base_service().get_eval_run_summary(eval_run_id)
     return KnowledgeBaseEvalRunResponse(**summary.__dict__)
+
+
+@router.post("/sec/parse", response_model=KnowledgeBaseSecParseResponse)
+def knowledge_base_sec_parse(request: KnowledgeBaseSecParseRequest) -> KnowledgeBaseSecParseResponse:
+    result = get_knowledge_base_service().parse_sec_pdfs(
+        input_dir=request.input_dir,
+        output_dir=request.output_dir,
+        file_names=request.file_names,
+        force=request.force,
+        poll_interval_seconds=request.poll_interval_seconds,
+        timeout_seconds=request.timeout_seconds,
+        limit=request.limit,
+    )
+    return KnowledgeBaseSecParseResponse(
+        input_dir=result.input_dir,
+        output_dir=result.output_dir,
+        files_total=result.files_total,
+        parsed=result.parsed,
+        skipped=result.skipped,
+        failed=result.failed,
+        items=[
+            KnowledgeBaseSecParseItemResponse(
+                source_file=item.source_file,
+                output_file=item.output_file,
+                task_id=item.task_id,
+                status=item.status,
+                page_num=item.page_num,
+                skipped=item.skipped,
+            )
+            for item in result.items
+        ],
+    )
 
 
 @lru_cache

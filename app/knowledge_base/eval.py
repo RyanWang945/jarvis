@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 import time
 import uuid
@@ -128,11 +129,14 @@ class QueryGenerationService:
 
 
 class KnowledgeBaseEvaluationService:
+    _query_generation_max_workers = 4
+
     def __init__(self, *, settings: Settings, db: Any, kb_service: Any) -> None:
         self._settings = settings
         self._db = db
         self._kb_service = kb_service
         self._generator = QueryGenerationService(settings)
+        self._opensearch_client_instance: OpenSearchClient | None = None
 
     def generate_dataset(
         self,
@@ -156,39 +160,79 @@ class KnowledgeBaseEvaluationService:
             }
         )
         documents = self._db.documents.list_by_source(source_id, limit=max_documents)
+        tasks = self._build_generation_tasks(
+            documents=documents,
+            chunk_profile_id=chunk_profile_id,
+            chunks_per_document=chunks_per_document,
+        )
         query_count = 0
+        max_workers = min(self._query_generation_max_workers, len(tasks))
+        if max_workers > 0:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(
+                        self._generator.generate,
+                        document=task["document"],
+                        chunk=task["chunk"],
+                        mode=generation_mode,
+                    )
+                    for task in tasks
+                ]
+                for task, future in zip(tasks, futures, strict=True):
+                    generated = future.result()
+                    self._save_generated_query(
+                        dataset_id=dataset_id,
+                        document=task["document"],
+                        chunk=task["chunk"],
+                        generated=generated,
+                    )
+                    query_count += 1
+        return EvalDatasetResult(
+            dataset_id=dataset_id,
+            generated_queries=query_count,
+            generation_method=generation_mode,
+            query_model=query_model,
+        )
+
+    def _build_generation_tasks(
+        self,
+        *,
+        documents: list[dict[str, Any]],
+        chunk_profile_id: str,
+        chunks_per_document: int,
+    ) -> list[dict[str, Any]]:
+        tasks: list[dict[str, Any]] = []
         for document in documents:
             chunks = self._db.chunks.list_by_document(
                 document["doc_id"],
                 chunk_profile_id=chunk_profile_id,
             )[:chunks_per_document]
             for chunk in chunks:
-                generated = self._generator.generate(
-                    document=document,
-                    chunk=chunk,
-                    mode=generation_mode,
-                )
-                self._db.eval_queries.save(
-                    {
-                        "query_id": f"kb_eval_query_{uuid.uuid4()}",
-                        "dataset_id": dataset_id,
-                        "doc_id": document["doc_id"],
-                        "target_chunk_id": chunk["chunk_id"],
-                        "query_text": generated.query_text,
-                        "query_type": generated.query_type,
-                        "difficulty": generated.difficulty,
-                        "gold_answer": generated.gold_answer,
-                        "gold_evidence_json": [chunk["chunk_id"]],
-                        "generated_by": generated.generated_by,
-                        "review_status": "generated",
-                    }
-                )
-                query_count += 1
-        return EvalDatasetResult(
-            dataset_id=dataset_id,
-            generated_queries=query_count,
-            generation_method=generation_mode,
-            query_model=query_model,
+                tasks.append({"document": document, "chunk": chunk})
+        return tasks
+
+    def _save_generated_query(
+        self,
+        *,
+        dataset_id: str,
+        document: dict[str, Any],
+        chunk: dict[str, Any],
+        generated: GeneratedQuery,
+    ) -> None:
+        self._db.eval_queries.save(
+            {
+                "query_id": f"kb_eval_query_{uuid.uuid4()}",
+                "dataset_id": dataset_id,
+                "doc_id": document["doc_id"],
+                "target_chunk_id": chunk["chunk_id"],
+                "query_text": generated.query_text,
+                "query_type": generated.query_type,
+                "difficulty": generated.difficulty,
+                "gold_answer": generated.gold_answer,
+                "gold_evidence_json": [chunk["chunk_id"]],
+                "generated_by": generated.generated_by,
+                "review_status": "generated",
+            }
         )
 
     def run_evaluation(
@@ -329,19 +373,15 @@ class KnowledgeBaseEvaluationService:
         query_vectors: dict[str, list[float]],
     ) -> list[SearchHit]:
         if retrieval_mode == "bm25":
-            return self._kb_service.search(
+            return self._opensearch_client().bm25_search(
+                index_name=self._opensearch_client().index_name(
+                    language=language,
+                    chunk_profile_id=chunk_profile_id,
+                ),
                 query=query["query_text"],
-                language=language,
-                chunk_profile_id=chunk_profile_id,
-                mode="bm25",
                 top_k=top_k,
             )
-        opensearch_client = OpenSearchClient(
-            base_url=self._settings.opensearch_base_url,
-            index_prefix=self._settings.opensearch_index_prefix,
-            username=self._settings.opensearch_username,
-            password=self._settings.opensearch_password,
-        )
+        opensearch_client = self._opensearch_client()
         index_name = opensearch_client.index_name(
             language=language,
             chunk_profile_id=chunk_profile_id,
@@ -370,6 +410,16 @@ class KnowledgeBaseEvaluationService:
             vector_hits=vector_hits,
             top_k=top_k,
         )
+
+    def _opensearch_client(self) -> OpenSearchClient:
+        if self._opensearch_client_instance is None:
+            self._opensearch_client_instance = OpenSearchClient(
+                base_url=self._settings.opensearch_base_url,
+                index_prefix=self._settings.opensearch_index_prefix,
+                username=self._settings.opensearch_username,
+                password=self._settings.opensearch_password,
+            )
+        return self._opensearch_client_instance
 
     def get_run_summary(self, eval_run_id: str) -> EvalRunSummary:
         run = self._db.eval_runs.get(eval_run_id)
