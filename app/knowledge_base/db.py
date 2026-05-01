@@ -1,15 +1,21 @@
+import json
 import sqlite3
 from pathlib import Path
 
+from app.sqlite_utils import connect_sqlite
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS kb_sources (
     source_id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
+    source_type TEXT NOT NULL DEFAULT 'generic',
     language TEXT NOT NULL,
     dataset_version TEXT NOT NULL,
     file_path TEXT NOT NULL,
     description TEXT,
+    owner TEXT,
+    region TEXT,
+    metadata_json TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -103,6 +109,45 @@ CREATE TABLE IF NOT EXISTS kb_ingest_jobs (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS kb_parse_artifacts (
+    artifact_id TEXT PRIMARY KEY,
+    filing_id TEXT NOT NULL,
+    artifact_type TEXT NOT NULL,
+    parser_vendor TEXT NOT NULL,
+    parser_model TEXT,
+    parser_version TEXT,
+    parse_config_json TEXT,
+    input_sha256 TEXT,
+    raw_output_path TEXT,
+    normalized_output_path TEXT,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS kb_chunk_runs (
+    chunk_run_id TEXT PRIMARY KEY,
+    filing_id TEXT NOT NULL,
+    parse_artifact_id TEXT NOT NULL,
+    chunk_profile_id TEXT NOT NULL,
+    chunker_version TEXT NOT NULL,
+    config_json TEXT,
+    chunk_count INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS kb_index_runs (
+    index_run_id TEXT PRIMARY KEY,
+    source_id TEXT NOT NULL,
+    chunk_run_id TEXT NOT NULL,
+    index_name TEXT NOT NULL,
+    embedding_model TEXT,
+    embedding_dim INTEGER,
+    opensearch_mapping_version TEXT,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS kb_eval_datasets (
     dataset_id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -137,6 +182,7 @@ CREATE TABLE IF NOT EXISTS kb_eval_runs (
     chunker_version TEXT NOT NULL,
     embedding_model TEXT,
     index_name TEXT NOT NULL,
+    params_json TEXT,
     status TEXT NOT NULL,
     started_at TEXT,
     finished_at TEXT,
@@ -173,14 +219,32 @@ DEFAULT_CHUNK_PROFILES = (
         "normalization_rules_json": None,
         "is_active": 1,
     },
+    {
+        "chunk_profile_id": "sec_filing_medium_v1",
+        "name": "SEC Filing Medium V1",
+        "language": "en",
+        "chunker_version": "sec_v1",
+        "target_size": 1600,
+        "soft_min_size": 900,
+        "hard_max_size": 2400,
+        "overlap_size": 200,
+        "boundary_rules_json": {
+            "mode": "section_aware",
+            "preserve_table_context": True,
+        },
+        "normalization_rules_json": {
+            "strip_image_placeholders": False,
+        },
+        "is_active": 1,
+    },
 )
 
 
 def init_knowledge_db(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path), check_same_thread=False)
-    conn.row_factory = sqlite3.Row
+    conn = connect_sqlite(db_path)
     conn.executescript(SCHEMA)
+    _migrate_schema(conn)
     _seed_chunk_profiles(conn)
     conn.commit()
     return conn
@@ -204,18 +268,56 @@ def _seed_chunk_profiles(conn: sqlite3.Connection) -> None:
                 is_active
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (
-                profile["chunk_profile_id"],
-                profile["name"],
-                profile["language"],
-                profile["chunker_version"],
-                profile["target_size"],
-                profile["soft_min_size"],
-                profile["hard_max_size"],
-                profile["overlap_size"],
-                profile["boundary_rules_json"],
-                profile["normalization_rules_json"],
-                profile["is_active"],
-            ),
-        )
+                (
+                    profile["chunk_profile_id"],
+                    profile["name"],
+                    profile["language"],
+                    profile["chunker_version"],
+                    profile["target_size"],
+                    profile["soft_min_size"],
+                    profile["hard_max_size"],
+                    profile["overlap_size"],
+                    _dump_json(profile["boundary_rules_json"]),
+                    _dump_json(profile["normalization_rules_json"]),
+                    profile["is_active"],
+                ),
+            )
 
+
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    _ensure_columns(
+        conn,
+        table_name="kb_sources",
+        columns={
+            "source_type": "TEXT NOT NULL DEFAULT 'generic'",
+            "owner": "TEXT",
+            "region": "TEXT",
+            "metadata_json": "TEXT",
+        },
+    )
+    _ensure_columns(
+        conn,
+        table_name="kb_eval_runs",
+        columns={
+            "params_json": "TEXT",
+        },
+    )
+
+
+def _ensure_columns(conn: sqlite3.Connection, *, table_name: str, columns: dict[str, str]) -> None:
+    existing = {
+        row["name"]
+        for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    }
+    for column_name, column_def in columns.items():
+        if column_name in existing:
+            continue
+        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_def}")
+
+
+def _dump_json(value: object) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False, sort_keys=True)

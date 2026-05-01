@@ -35,21 +35,3 @@ class ToolSpec(BaseModel):
             self.worker_type = self.skill
         return self
 
-
-class ToolCallPlan(BaseModel):
-    tool_name: str
-    tool_args: dict[str, Any] = Field(default_factory=dict)
-    title: str | None = None
-    description: str | None = None
-    dod: str | None = None
-    verification_cmd: str | None = None
-    max_retries: int = 0
-    plan_step_id: str | None = None
-
-
-class PlannerDecision(BaseModel):
-    confidence: float = 1.0
-    needs_clarification: bool = False
-    clarification_question: str | None = None
-    tool_calls: list[ToolCallPlan] = Field(default_factory=list)
-    raw_output: dict[str, Any] | None = None

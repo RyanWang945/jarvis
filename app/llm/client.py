@@ -1,15 +1,21 @@
 import json
+import logging
 from typing import Any, Literal
 
 import httpx
 from pydantic import BaseModel
 
-LLMRole = Literal["system", "user", "assistant"]
+logger = logging.getLogger(__name__)
+
+LLMRole = Literal["system", "user", "assistant", "tool"]
 
 
 class LLMMessage(BaseModel):
     role: LLMRole
     content: str
+    tool_call_id: str | None = None
+    tool_calls: list[dict[str, Any]] | None = None
+    reasoning_content: str | None = None
 
 
 class ChatClient:
@@ -34,9 +40,23 @@ class ChatClient:
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        def _msg_dict(msg: LLMMessage) -> dict[str, Any]:
+            d: dict[str, Any] = {"role": msg.role}
+            # Omit empty content when tool_calls are present; some providers
+            # reject content="" alongside tool_calls.
+            if msg.content or not msg.tool_calls:
+                d["content"] = msg.content
+            if msg.tool_call_id is not None:
+                d["tool_call_id"] = msg.tool_call_id
+            if msg.tool_calls is not None:
+                d["tool_calls"] = msg.tool_calls
+            if msg.reasoning_content is not None:
+                d["reasoning_content"] = msg.reasoning_content
+            return d
+
         payload: dict[str, Any] = {
             "model": self._model,
-            "messages": [message.model_dump() for message in messages],
+            "messages": [_msg_dict(m) for m in messages],
             "stream": False,
         }
         if response_format is not None:
@@ -55,7 +75,11 @@ class ChatClient:
             json=payload,
             timeout=self._timeout_seconds,
         )
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            logger.error("llm request failed status=%s body=%s", exc.response.status_code, exc.response.text)
+            raise
         body = response.json()
         message = body["choices"][0]["message"]
         return message if isinstance(message, dict) else {"content": str(message)}

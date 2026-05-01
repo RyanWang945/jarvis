@@ -8,6 +8,7 @@ from app.knowledge_base.ingest import IngestResult, WikipediaIngestService
 from app.knowledge_base.indexing import IndexResult, KnowledgeBaseIndexService
 from app.knowledge_base.parsers.alibaba_pdf import AlibabaDocumentAnalyzeClient
 from app.knowledge_base.repositories import KnowledgeBaseDB, get_knowledge_base_db
+from app.knowledge_base.sec_ingest import SecFilingIngestService
 from app.knowledge_base.sec_parse import SecParseBatchResult, SecFilingParseService
 from app.knowledge_base.search import OpenSearchClient, SearchHit
 
@@ -87,6 +88,37 @@ class KnowledgeBaseService:
             top_limit=top_limit,
         )
 
+    def index_ingest_job(
+        self,
+        *,
+        ingest_job_id: str,
+        source_id: str,
+        chunk_profile_id: str | None = None,
+    ) -> IndexResult:
+        service = KnowledgeBaseIndexService(
+            db=self._db,
+            embedding_client=self._embedding_client(),
+            opensearch_client=self._opensearch_client(),
+        )
+        return service.index_ingest_job(
+            ingest_job_id=ingest_job_id,
+            source_id=source_id,
+            chunk_profile_id=chunk_profile_id or self._settings.knowledge_default_chunk_profile,
+        )
+
+    def index_sec_source(
+        self,
+        *,
+        source_id: str,
+        chunk_profile_id: str = "sec_filing_medium_v1",
+        top_limit: int | None = None,
+    ) -> IndexResult:
+        return self.index_source(
+            source_id=source_id,
+            chunk_profile_id=chunk_profile_id,
+            top_limit=top_limit,
+        )
+
     def search(
         self,
         *,
@@ -95,6 +127,8 @@ class KnowledgeBaseService:
         chunk_profile_id: str | None = None,
         mode: str,
         top_k: int,
+        source_type: str | None = None,
+        filters: dict | None = None,
     ) -> list[SearchHit]:
         service = KnowledgeBaseIndexService(
             db=self._db,
@@ -107,6 +141,37 @@ class KnowledgeBaseService:
             chunk_profile_id=chunk_profile_id or self._settings.knowledge_default_chunk_profile,
             mode=mode,
             top_k=top_k,
+            source_type=source_type,
+            filters=filters,
+        )
+
+    def search_sec(
+        self,
+        *,
+        query: str,
+        mode: str,
+        top_k: int,
+        chunk_profile_id: str = "sec_filing_medium_v1",
+        ticker: str | None = None,
+        company_name: str | None = None,
+        form_type: str | None = None,
+        fiscal_year: int | None = None,
+        section_title: str | None = None,
+    ) -> list[SearchHit]:
+        return self.search(
+            query=query,
+            language="en",
+            chunk_profile_id=chunk_profile_id,
+            mode=mode,
+            top_k=top_k,
+            source_type="sec_filing",
+            filters={
+                "ticker": ticker,
+                "company_name": company_name,
+                "form_type": form_type,
+                "fiscal_year": fiscal_year,
+                "section_title": section_title,
+            },
         )
 
     def generate_eval_dataset(
@@ -139,6 +204,7 @@ class KnowledgeBaseService:
         top_k: int,
         language: str | None = None,
         chunk_profile_id: str | None = None,
+        retrieval_params: dict | None = None,
     ) -> EvalRunSummary:
         service = KnowledgeBaseEvaluationService(
             settings=self._settings,
@@ -151,6 +217,7 @@ class KnowledgeBaseService:
             top_k=top_k,
             language=language or self._settings.knowledge_default_language,
             chunk_profile_id=chunk_profile_id or self._settings.knowledge_default_chunk_profile,
+            retrieval_params=retrieval_params,
         )
 
     def get_eval_run_summary(self, eval_run_id: str) -> EvalRunSummary:
@@ -183,6 +250,26 @@ class KnowledgeBaseService:
             timeout_seconds=timeout_seconds,
             limit=limit,
             file_names=file_names,
+        )
+
+    def ingest_sec_filings(
+        self,
+        *,
+        source_id: str | None = None,
+        raw_parse_dir: str | None = None,
+        normalized_blocks_dir: str | None = None,
+        file_names: list[str] | None = None,
+        chunk_profile_id: str = "sec_filing_medium_v1",
+    ) -> IngestResult:
+        service = SecFilingIngestService(
+            db=self._db,
+            raw_parse_dir=self._resolve_sec_raw_parse_dir(raw_parse_dir),
+            normalized_blocks_dir=self._resolve_sec_normalized_blocks_dir(normalized_blocks_dir),
+        )
+        return service.ingest(
+            source_id=source_id,
+            file_names=file_names,
+            chunk_profile_id=chunk_profile_id,
         )
 
     @staticmethod
@@ -243,3 +330,9 @@ class KnowledgeBaseService:
         if self._settings.sec_raw_parse_dir is not None:
             return self._settings.sec_raw_parse_dir
         return self._settings.data_dir / "sec-pdf" / "aliyun-raw"
+
+    def _resolve_sec_normalized_blocks_dir(self, normalized_dir: str | None) -> Path:
+        if normalized_dir:
+            return Path(normalized_dir)
+        raw_parse_dir = self._resolve_sec_raw_parse_dir(None)
+        return raw_parse_dir.parent / "normalized-blocks"

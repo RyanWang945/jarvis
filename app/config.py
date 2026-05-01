@@ -35,16 +35,12 @@ class Settings(BaseSettings):
     opensearch_index_prefix: str = "kb_wikipedia"
     opensearch_bulk_batch_size: int = 100
     opensearch_bulk_max_retries: int = 4
-    planner_type: str = "llm"
     llm_provider: str = "deepseek"
     llm_timeout_seconds: float = 60.0
-    worker_mode: str = "inline"
-    worker_max_workers: int = 4
-    auto_recover_on_startup: bool = True
     coder_timeout_seconds: int = 1800
     deepseek_api_key: str | None = None
     deepseek_base_url: str = "https://api.deepseek.com"
-    deepseek_model: str = "deepseek-v4-pro"
+    deepseek_model: str = "deepseek-v4-flash"
     deepseek_timeout_seconds: float | None = None
     kimi_api_key: str | None = None
     kimi_base_url: str = "https://api.moonshot.cn/v1"
@@ -58,6 +54,13 @@ class Settings(BaseSettings):
     feishu_app_secret: str | None = None
     feishu_bot_name: str = "Jarvis"
     obsidian_vault_path: Path | None = None
+
+    # MySQL configuration
+    mysql_host: str = "127.0.0.1"
+    mysql_port: int = 3306
+    mysql_user: str = "jarvis"
+    mysql_password: str = "jarvis"
+    mysql_database: str = "jarvis"
 
     model_config = SettingsConfigDict(
         env_file=".env",

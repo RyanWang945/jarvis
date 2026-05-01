@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 from app.knowledge_base.embedding import DashScopeEmbeddingClient, EmbeddingBatchResult, EmbeddingVector
 from app.knowledge_base.repositories import KnowledgeBaseDB
-from app.knowledge_base.search import OpenSearchClient, SearchHit, combine_hybrid_hits
+from app.knowledge_base.search import OpenSearchClient, SearchHit, combine_hybrid_hits, combine_rrf_hits
 
 
 @dataclass(frozen=True)
@@ -40,11 +40,7 @@ class KnowledgeBaseIndexService:
         top_limit: int | None = None,
     ) -> IndexResult:
         offset = 0
-        indexed_chunks = 0
-        embedding_model: str | None = None
-        index_name: str | None = None
-        index_ensured = False
-        documents_found = False
+        documents: list[dict] = []
 
         while True:
             limit = self._document_batch_size
@@ -53,18 +49,56 @@ class KnowledgeBaseIndexService:
                 if remaining <= 0:
                     break
                 limit = min(limit, remaining)
-            documents = self._db.documents.list_by_source(
+            batch = self._db.documents.list_by_source(
                 source_id,
                 limit=limit,
                 offset=offset,
             )
-            if not documents:
+            if not batch:
                 break
-            documents_found = True
-            offset += len(documents)
+            offset += len(batch)
+            documents.extend(batch)
 
+        return self._index_documents(
+            documents=documents,
+            source_id=source_id,
+            chunk_profile_id=chunk_profile_id,
+        )
+
+    def index_ingest_job(
+        self,
+        *,
+        ingest_job_id: str,
+        source_id: str,
+        chunk_profile_id: str,
+    ) -> IndexResult:
+        documents = self._db.documents.list_by_ingest_job(
+            ingest_job_id,
+            source_id=source_id,
+        )
+        return self._index_documents(
+            documents=documents,
+            source_id=source_id,
+            chunk_profile_id=chunk_profile_id,
+        )
+
+    def _index_documents(
+        self,
+        *,
+        documents: list[dict],
+        source_id: str,
+        chunk_profile_id: str,
+    ) -> IndexResult:
+        indexed_chunks = 0
+        embedding_model: str | None = None
+        index_name: str | None = None
+        index_ensured = False
+        documents_found = bool(documents)
+
+        for batch_start in range(0, len(documents), self._document_batch_size):
+            batch_documents = documents[batch_start : batch_start + self._document_batch_size]
             chunks: list[dict] = []
-            for document in documents:
+            for document in batch_documents:
                 chunks.extend(
                     self._db.chunks.list_by_document(
                         document["doc_id"],
@@ -80,10 +114,12 @@ class KnowledgeBaseIndexService:
                 embeddings_by_chunk_id[chunk["chunk_id"]] = vector.embedding
 
             if index_name is None:
-                first_document = documents[0]
+                first_document = batch_documents[0]
+                source = self._db.sources.get(source_id)
                 index_name = self._opensearch_client.index_name(
                     language=first_document["language"],
                     chunk_profile_id=chunk_profile_id,
+                    source_type=source["source_type"] if source else None,
                 )
             if not index_ensured:
                 self._opensearch_client.ensure_index(
@@ -95,7 +131,7 @@ class KnowledgeBaseIndexService:
                 index_name=index_name,
                 documents=[
                     _build_index_document(
-                        document=_document_map(documents, chunk["doc_id"]),
+                        document=_document_map(batch_documents, chunk["doc_id"]),
                         chunk=chunk,
                         embedding=embeddings_by_chunk_id[chunk["chunk_id"]],
                         embedding_model=embedding_result.model,
@@ -105,6 +141,21 @@ class KnowledgeBaseIndexService:
             )
             indexed_chunks += len(chunks)
             embedding_model = embedding_result.model
+            source = self._db.sources.get(source_id)
+            if source and source.get("source_type") == "sec_filing":
+                for document in batch_documents:
+                    self._db.index_runs.save(
+                        {
+                            "index_run_id": f"{document['doc_id']}:index-run:{chunk_profile_id}",
+                            "source_id": source_id,
+                            "chunk_run_id": f"{document['doc_id']}:chunk-run:{chunk_profile_id}",
+                            "index_name": index_name,
+                            "embedding_model": embedding_result.model,
+                            "embedding_dim": embedding_result.dimensions,
+                            "opensearch_mapping_version": "sec_v1",
+                            "status": "succeeded",
+                        }
+                    )
 
         if not documents_found:
             raise ValueError(f"No documents found for source: {source_id}")
@@ -183,16 +234,20 @@ class KnowledgeBaseIndexService:
         chunk_profile_id: str,
         mode: str,
         top_k: int,
+        source_type: str | None = None,
+        filters: dict | None = None,
     ) -> list[SearchHit]:
         index_name = self._opensearch_client.index_name(
             language=language,
             chunk_profile_id=chunk_profile_id,
+            source_type=source_type,
         )
         if mode == "bm25":
             return self._opensearch_client.bm25_search(
                 index_name=index_name,
                 query=query,
                 top_k=top_k,
+                filters=filters,
             )
         query_vector = self._embedding_client.embed_texts([query]).vectors[0].embedding
         if mode == "vector":
@@ -200,22 +255,62 @@ class KnowledgeBaseIndexService:
                 index_name=index_name,
                 query_vector=query_vector,
                 top_k=top_k,
+                filters=filters,
             )
         if mode == "hybrid":
             bm25_hits = self._opensearch_client.bm25_search(
                 index_name=index_name,
                 query=query,
                 top_k=top_k,
+                filters=filters,
             )
             vector_hits = self._opensearch_client.vector_search(
                 index_name=index_name,
                 query_vector=query_vector,
                 top_k=top_k,
+                filters=filters,
             )
             return combine_hybrid_hits(
                 bm25_hits=bm25_hits,
                 vector_hits=vector_hits,
                 top_k=top_k,
+            )
+        if mode == "rrf":
+            bm25_hits = self._opensearch_client.bm25_search(
+                index_name=index_name,
+                query=query,
+                top_k=top_k,
+                filters=filters,
+            )
+            vector_hits = self._opensearch_client.vector_search(
+                index_name=index_name,
+                query_vector=query_vector,
+                top_k=top_k,
+                filters=filters,
+            )
+            return combine_rrf_hits(
+                bm25_hits=bm25_hits,
+                vector_hits=vector_hits,
+                top_k=top_k,
+            )
+        if mode == "rrf_v2":
+            bm25_hits = self._opensearch_client.bm25_search(
+                index_name=index_name,
+                query=query,
+                top_k=20,
+                filters=filters,
+            )
+            vector_hits = self._opensearch_client.vector_search(
+                index_name=index_name,
+                query_vector=query_vector,
+                top_k=20,
+                filters=filters,
+            )
+            return combine_rrf_hits(
+                bm25_hits=bm25_hits,
+                vector_hits=vector_hits,
+                top_k=top_k,
+                k=60,
             )
         raise ValueError(f"Unsupported search mode: {mode}")
 
@@ -227,13 +322,23 @@ def _build_index_document(
     embedding: list[float],
     embedding_model: str,
 ) -> dict:
+    document_metadata = _load_json(document.get("metadata_json"))
+    chunk_metadata = _load_json(chunk.get("metadata_json"))
     return {
         "chunk_id": chunk["chunk_id"],
         "doc_id": chunk["doc_id"],
         "source_id": document["source_id"],
+        "source_type": _source_type_from_source_id(document["source_id"]),
         "external_id": document["external_id"],
         "language": document["language"],
         "chunk_profile_id": chunk["chunk_profile_id"],
+        "company_name": document_metadata.get("company_name"),
+        "ticker": document_metadata.get("ticker"),
+        "form_type": document_metadata.get("form_type"),
+        "filing_date": document_metadata.get("filing_date"),
+        "fiscal_year": document_metadata.get("fiscal_year"),
+        "fiscal_period": document_metadata.get("fiscal_period"),
+        "section_title": chunk_metadata.get("section_title"),
         "title": document["title"],
         "url": document["url"],
         "content": chunk["normalized_content"],
@@ -245,6 +350,7 @@ def _build_index_document(
         "embedding_model": embedding_model,
         "embedding": embedding,
         "text_hash": chunk["content_hash"],
+        "is_table_chunk": bool(chunk_metadata.get("is_table_chunk", False)),
         "created_at": _normalize_opensearch_date(chunk["created_at"]),
     }
 
@@ -260,3 +366,15 @@ def _normalize_opensearch_date(value: str) -> str:
     if "T" in value:
         return value
     return value.replace(" ", "T") + "Z"
+
+
+def _load_json(value: str | None) -> dict:
+    if not value:
+        return {}
+    if isinstance(value, str):
+        return json.loads(value)
+    return value
+
+
+def _source_type_from_source_id(source_id: str) -> str:
+    return "sec_filing" if source_id.startswith("sec_filing") else "generic"

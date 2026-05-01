@@ -1,37 +1,40 @@
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import httpx
+import lark_oapi.ws.client as lark_ws_client
 from lark_oapi import EventDispatcherHandler, ws
 from lark_oapi.api.im.v1 import P2ImMessageReceiveV1
-import lark_oapi.ws.client as lark_ws_client
 
-from app.agent.events import build_user_event
-from app.agent.runner import AgentRunResult, ThreadManager
+from app.agent_react import ChannelMessage, TurnResult
+from app.api.agent import get_agent_runtime, get_conversation_store
+from app.api.schemas import MessageCreateRequest, SenderInput
+from app.channels.feishu_renderer import FeishuDelivery, FeishuRenderer
 from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 
 
 class FeishuChannel:
-    """飞书 WebSocket 长连接通道，接收用户消息并投递给 Agent，执行完成后回传结果。"""
+    """Feishu WebSocket channel for inbound messages and outbound replies."""
 
     def __init__(
         self,
         app_id: str,
         app_secret: str,
-        thread_manager: ThreadManager,
         *,
         bot_name: str = "Jarvis",
     ) -> None:
         self._app_id = app_id
         self._app_secret = app_secret
-        self._thread_manager = thread_manager
         self._bot_name = bot_name
         self._client: ws.Client | None = None
         self._event_handler: EventDispatcherHandler | None = None
@@ -42,14 +45,10 @@ class FeishuChannel:
         self._running = False
         self._lock = threading.Lock()
 
-        # HTTP client for sending messages
         self._http = httpx.Client(timeout=30.0)
         self._tenant_access_token: str | None = None
         self._token_expires_at: float = 0.0
-
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
+        self._renderer = FeishuRenderer(title=bot_name)
 
     def start(self) -> None:
         with self._lock:
@@ -60,7 +59,6 @@ class FeishuChannel:
 
         logger.info("feishu channel starting app_id=%s", self._app_id)
         try:
-            # Long-connection mode does not require encrypt_key / verification_token.
             event_handler = _install_event_diagnostics(
                 EventDispatcherHandler.builder("", "")
                 .register_p2_im_message_receive_v1(self._on_message)
@@ -68,9 +66,6 @@ class FeishuChannel:
             )
             self._event_handler = event_handler
             self._stopping = False
-            # lark-oapi keeps a module-level asyncio loop and Client.start()
-            # calls run_until_complete() on that loop. Create the client inside
-            # the worker thread after rebinding that module-level loop.
             self._ws_thread = threading.Thread(
                 target=self._run_ws_in_thread,
                 name="feishu-ws",
@@ -85,7 +80,6 @@ class FeishuChannel:
             raise
 
     def _run_ws_in_thread(self) -> None:
-        """Run lark-oapi's blocking websocket client in an isolated loop."""
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         lark_ws_client.loop = loop
@@ -136,12 +130,7 @@ class FeishuChannel:
         self._http.close()
         logger.info("feishu channel stopped")
 
-    # ------------------------------------------------------------------
-    # Event handlers
-    # ------------------------------------------------------------------
-
     def _on_message(self, data: P2ImMessageReceiveV1) -> None:
-        """WebSocket 收到用户消息时的回调。"""
         try:
             event = data.event
             if event is None or event.sender is None or event.message is None:
@@ -149,119 +138,137 @@ class FeishuChannel:
                 return
             sender = event.sender.sender_id.open_id
             chat_id = event.message.chat_id
-            chat_type = event.message.chat_type  # "p2p" or "group"
+            chat_type = event.message.chat_type
             msg_type = event.message.message_type
             content_raw = event.message.content
+            message_id = getattr(event.message, "message_id", None)
+            parent_id = getattr(event.message, "parent_id", None)
+            root_id = getattr(event.message, "root_id", None)
 
             logger.info(
-                "feishu message received sender=%s chat=%s chat_type=%s type=%s",
+                "feishu message received sender=%s chat=%s chat_type=%s type=%s message_id=%s",
                 sender,
                 chat_id,
                 chat_type,
                 msg_type,
+                message_id,
             )
 
-            # Skip non-text messages for now
             if msg_type != "text":
                 logger.debug("skipping non-text message type=%s", msg_type)
                 return
 
             content = json.loads(content_raw)
-            text = content.get("text", "").strip()
+            raw_text = content.get("text", "").strip()
+            mentions = _extract_mentions(event.message, content, self._bot_name)
+            text = _strip_bot_mention(raw_text, mentions, self._bot_name)
             logger.info(
                 "feishu text parsed chat=%s chat_type=%s text_len=%s text_preview=%s",
                 chat_id,
                 chat_type,
-                len(text),
-                _safe_preview(text),
+                len(raw_text),
+                _safe_preview(raw_text),
             )
 
-            # Strip @bot mention in group chats
-            if chat_type == "group":
-                text = self._strip_at_bot(text)
-                logger.info(
-                    "feishu group text after mention strip chat=%s text_len=%s text_preview=%s",
-                    chat_id,
-                    len(text),
-                    _safe_preview(text),
-                )
-                if not text:
-                    logger.debug("message was only an @mention, ignoring")
-                    return
+            if chat_type == "group" and not text:
+                logger.debug("message was only an @mention, ignoring")
+                return
 
-            # Build AgentEvent and run in background so we do not block the
-            # WebSocket heartbeat thread.
+            ingest = get_conversation_store().ingest_message(
+                MessageCreateRequest(
+                    platform="feishu",
+                    external_chat_id=chat_id,
+                    chat_type=_conversation_chat_type(chat_type),
+                    sender=SenderInput(platform_user_id=sender),
+                    content=text or raw_text,
+                    external_message_id=message_id,
+                    reply_to_external_message_id=parent_id or root_id,
+                    mentions=mentions,
+                    raw_payload={
+                        "chat_type": chat_type,
+                        "message_type": msg_type,
+                        "content": content,
+                        "message_id": message_id,
+                        "parent_id": parent_id,
+                        "root_id": root_id,
+                    },
+                    metadata={
+                        "reply_to_bot": _reply_to_bot(event.message),
+                        "feishu_chat_type": chat_type,
+                    },
+                )
+            )
+            if not ingest.should_respond:
+                logger.info(
+                    "feishu message stored without response chat=%s conversation_id=%s message_id=%s",
+                    chat_id,
+                    ingest.conversation_id,
+                    ingest.message_id,
+                )
+                return
+
             self._executor.submit(
-                self._handle_agent_run, sender, chat_id, chat_type, text
+                self._handle_agent_run,
+                sender,
+                chat_id,
+                chat_type,
+                text or raw_text,
+                ingest.conversation_id,
+                ingest.turn_id,
             )
         except Exception:
             logger.exception("error handling feishu message")
 
-    @staticmethod
-    def _strip_at_bot(text: str) -> str:
-        """Remove @_user_xxx Feishu at-mention tags from group chat messages."""
-        import re
-
-        cleaned = re.sub(r"@_user_\d+", "", text)
-        return cleaned.strip()
-
     def _handle_agent_run(
-        self, sender_open_id: str, chat_id: str, chat_type: str, text: str
+        self,
+        sender_open_id: str,
+        chat_id: str,
+        chat_type: str,
+        text: str,
+        conversation_id: int,
+        turn_id: int | None,
     ) -> None:
-        """把用户消息转成 AgentEvent，执行 Agent，然后把结果发回飞书。"""
-        # Use chat_id as thread_id so the same conversation stays in one thread
-        event = build_user_event(
-            instruction=text,
-            thread_id=chat_id,
-            user_id=sender_open_id,
-        )
-        # Override source so downstream knows it came from Feishu
-        event.source = "feishu"  # type: ignore[assignment]
-
         try:
             logger.info(
-                "feishu agent run starting chat=%s chat_type=%s sender=%s text_preview=%s",
+                "feishu agent run starting chat=%s conversation_id=%s turn_id=%s chat_type=%s sender=%s text_preview=%s",
                 chat_id,
+                conversation_id,
+                turn_id,
                 chat_type,
                 sender_open_id,
                 _safe_preview(text),
             )
-            result = self._thread_manager.run_event(event)
+            if turn_id is None:
+                raise ValueError("Feishu triggered message did not create a turn.")
+            result = get_agent_runtime().run_turn(turn_id)
         except Exception:
             logger.exception("agent run failed for feishu message")
-            self._send_text_message(chat_id, chat_type, "抱歉，处理消息时出错了，请稍后再试。")
+            if turn_id is not None:
+                get_conversation_store().complete_turn(
+                    turn_id,
+                    status="failed",
+                    error_message="agent run failed",
+                )
+            self._send_text_message(
+                chat_id,
+                "Sorry, something went wrong. Please try again later.",
+            )
             return
 
         logger.info(
             "feishu agent run finished chat=%s status=%s summary_len=%s",
             chat_id,
             result.status,
-            len(result.summary or ""),
+            len(result.reply),
         )
-        reply = self._format_result(result)
-        self._send_text_message(chat_id, chat_type, reply)
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
+        message = self._format_result(result)
+        self._send_channel_message(chat_id, message)
 
     @staticmethod
-    def _format_result(result: AgentRunResult) -> str:
-        """把 AgentRunResult 格式化成飞书文本消息。"""
-        if result.summary:
-            return result.summary
-        if result.status == "waiting_approval":
-            return "任务需要审批，请在管理端处理。"
-        if result.status == "blocked":
-            return "任务被阻塞，无法继续执行。"
-        return "任务已完成，无输出内容。"
-
-    # ------------------------------------------------------------------
-    # HTTP API: send message
-    # ------------------------------------------------------------------
+    def _format_result(result: TurnResult) -> ChannelMessage:
+        return result.message
 
     def _ensure_token(self) -> str:
-        """获取或刷新 tenant_access_token（企业内部应用）。"""
         now = time.time()
         if self._tenant_access_token and now < self._token_expires_at - 60:
             return self._tenant_access_token
@@ -279,61 +286,56 @@ class FeishuChannel:
         self._token_expires_at = now + payload.get("expire", 7200)
         return self._tenant_access_token
 
-    def _send_text_message(
-        self, receive_id: str, chat_type: str, text: str
-    ) -> None:
-        """通过飞书 OpenAPI 发送纯文本消息。
-
-        Args:
-            receive_id: chat_id for the conversation.
-            chat_type: "p2p" or "group".
-            text: Message content.
-        """
+    def _send_channel_message(self, receive_id: str, message: ChannelMessage) -> None:
+        delivery = self._renderer.render(message)
         try:
-            token = self._ensure_token()
-            content = json.dumps({"text": text}, ensure_ascii=False)
-            id_type = "chat_id"
-            logger.info(
-                "feishu sending message receive_id=%s receive_id_type=%s chat_type=%s text_len=%s",
-                receive_id,
-                id_type,
-                chat_type,
-                len(text),
-            )
-            resp = self._http.post(
-                "https://open.feishu.cn/open-apis/im/v1/messages",
-                params={"receive_id_type": id_type},
-                headers={"Authorization": f"Bearer {token}"},
-                json={
-                    "receive_id": receive_id,
-                    "msg_type": "text",
-                    "content": content,
-                },
-            )
-            resp.raise_for_status()
-            payload = resp.json()
-            if payload.get("code") != 0:
-                logger.error("feishu send message failed: %s", payload)
-            else:
-                logger.info("feishu message sent to %s", receive_id)
+            self._send_delivery(receive_id, delivery)
         except Exception:
-            logger.exception("failed to send feishu message to %s", receive_id)
+            logger.exception(
+                "failed to send feishu delivery receive_id=%s msg_type=%s, retrying text fallback",
+                receive_id,
+                delivery.msg_type,
+            )
+            fallback = self._renderer.render_text_fallback(message.content)
+            try:
+                self._send_delivery(receive_id, fallback)
+            except Exception:
+                logger.exception("failed to send feishu fallback text to %s", receive_id)
 
-    # ------------------------------------------------------------------
-    # Public API used by FeishuMessageSkill
-    # ------------------------------------------------------------------
+    def _send_text_message(self, receive_id: str, text: str) -> None:
+        self._send_delivery(receive_id, self._renderer.render_text_fallback(text))
+
+    def _send_delivery(self, receive_id: str, delivery: FeishuDelivery) -> None:
+        token = self._ensure_token()
+        resp = self._http.post(
+            "https://open.feishu.cn/open-apis/im/v1/messages",
+            params={"receive_id_type": "chat_id"},
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "receive_id": receive_id,
+                "msg_type": delivery.msg_type,
+                "content": delivery.content,
+            },
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        if payload.get("code") != 0:
+            raise RuntimeError(f"feishu send message failed: {payload}")
+        logger.info(
+            "feishu message sent receive_id=%s msg_type=%s",
+            receive_id,
+            delivery.msg_type,
+        )
 
     def send_message(self, receive_id: str, text: str) -> bool:
-        """供 Skill 主动推送消息时调用。"""
         try:
-            self._send_text_message(receive_id, "group", text)
+            self._send_text_message(receive_id, text)
             return True
         except Exception:
             return False
 
 
-def build_feishu_channel(thread_manager: ThreadManager) -> FeishuChannel | None:
-    """根据配置创建飞书通道；若缺少配置则返回 None。"""
+def build_feishu_channel() -> FeishuChannel | None:
     settings = get_settings()
     if not settings.feishu_app_id or not settings.feishu_app_secret:
         logger.info("feishu credentials not configured, skipping channel")
@@ -341,9 +343,63 @@ def build_feishu_channel(thread_manager: ThreadManager) -> FeishuChannel | None:
     return FeishuChannel(
         app_id=settings.feishu_app_id,
         app_secret=settings.feishu_app_secret,
-        thread_manager=thread_manager,
         bot_name=settings.feishu_bot_name or "Jarvis",
     )
+
+
+def _conversation_chat_type(feishu_chat_type: str) -> str:
+    if feishu_chat_type == "p2p":
+        return "dm"
+    if feishu_chat_type == "group":
+        return "group"
+    return "group"
+
+
+def _extract_mentions(message: Any, content: dict[str, Any], bot_name: str) -> list[str]:
+    mentions: list[str] = []
+    raw_mentions = getattr(message, "mentions", None) or content.get("mentions") or []
+    for item in raw_mentions:
+        for value in _mention_values(item):
+            if value and value not in mentions:
+                mentions.append(value)
+
+    text = str(content.get("text", ""))
+    if f"@{bot_name}".lower() in text.lower() and "jarvis" not in {item.lower() for item in mentions}:
+        mentions.append("jarvis")
+    return mentions
+
+
+def _mention_values(item: Any) -> list[str]:
+    values: list[str] = []
+    if isinstance(item, dict):
+        for key in ("name", "key", "id", "open_id", "user_id", "tenant_key"):
+            value = item.get(key)
+            if value:
+                values.append(str(value))
+        return values
+
+    for attr in ("name", "key", "id", "open_id", "user_id", "tenant_key"):
+        value = getattr(item, attr, None)
+        if value:
+            values.append(str(value))
+    return values
+
+
+def _strip_bot_mention(text: str, mentions: list[str], bot_name: str) -> str:
+    cleaned = text
+    cleaned = re.sub(r"@_user_\d+", "", cleaned)
+    cleaned = re.sub(rf"@{re.escape(bot_name)}\b", "", cleaned, flags=re.IGNORECASE)
+    if any(value.lower() == "jarvis" for value in mentions):
+        cleaned = re.sub(r"@Jarvis\b", "", cleaned, flags=re.IGNORECASE)
+    return cleaned.strip()
+
+
+def _reply_to_bot(message: Any) -> bool:
+    parent_id = getattr(message, "parent_id", None)
+    root_id = getattr(message, "root_id", None)
+    if not parent_id and not root_id:
+        return False
+    return False
 
 
 def _install_event_diagnostics(handler: EventDispatcherHandler) -> EventDispatcherHandler:

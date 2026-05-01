@@ -1,0 +1,22 @@
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: jarvis-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: jarvis_root
+      MYSQL_DATABASE: jarvis
+      MYSQL_USER: jarvis
+      MYSQL_PASSWORD: jarvis
+      TZ: Asia/Shanghai
+    ports:
+      - "3306:3306"
+    volumes:
+      - ./data/mysql:/var/lib/mysql
+      - ./scripts/mysql-init:/docker-entrypoint-initdb.d:ro
+    command: >
+      --default-authentication-plugin=mysql_native_password
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_0900_ai_ci
+      --innodb_buffer_pool_size=256M
+      --max_connections=200

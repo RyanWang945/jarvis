@@ -16,7 +16,12 @@ wheels/
 
 # Local configuration and runtime data
 .env
+.claude/
 logs/
+sandbox/
+*.db
+*.db-journal
+nul
 data/*
 !data/skills/
 !data/skills/**

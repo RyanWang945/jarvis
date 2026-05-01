@@ -16,25 +16,37 @@ class SourceRepository:
             INSERT INTO kb_sources (
                 source_id,
                 name,
+                source_type,
                 language,
                 dataset_version,
                 file_path,
-                description
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                description,
+                owner,
+                region,
+                metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(source_id) DO UPDATE SET
                 name=excluded.name,
+                source_type=excluded.source_type,
                 language=excluded.language,
                 dataset_version=excluded.dataset_version,
                 file_path=excluded.file_path,
-                description=excluded.description
+                description=excluded.description,
+                owner=excluded.owner,
+                region=excluded.region,
+                metadata_json=excluded.metadata_json
             """,
             (
                 source["source_id"],
                 source["name"],
+                source.get("source_type", "generic"),
                 source["language"],
                 source["dataset_version"],
                 source["file_path"],
                 source.get("description"),
+                source.get("owner"),
+                source.get("region"),
+                _dump_json(source.get("metadata_json")),
             ),
         )
         self._conn.commit()
@@ -135,6 +147,21 @@ class DocumentRepository:
                 sql += " LIMIT -1"
             sql += " OFFSET ?"
             params.append(offset)
+        rows = self._conn.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_by_ingest_job(
+        self,
+        ingest_job_id: str,
+        *,
+        source_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM kb_documents WHERE ingest_job_id = ?"
+        params: list[Any] = [ingest_job_id]
+        if source_id is not None:
+            sql += " AND source_id = ?"
+            params.append(source_id)
+        sql += " ORDER BY created_at, doc_id"
         rows = self._conn.execute(sql, params).fetchall()
         return [dict(row) for row in rows]
 
@@ -400,6 +427,156 @@ class IngestJobRepository:
         return dict(row) if row else None
 
 
+class ParseArtifactRepository:
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def save(self, artifact: dict[str, Any]) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO kb_parse_artifacts (
+                artifact_id,
+                filing_id,
+                artifact_type,
+                parser_vendor,
+                parser_model,
+                parser_version,
+                parse_config_json,
+                input_sha256,
+                raw_output_path,
+                normalized_output_path,
+                status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(artifact_id) DO UPDATE SET
+                filing_id=excluded.filing_id,
+                artifact_type=excluded.artifact_type,
+                parser_vendor=excluded.parser_vendor,
+                parser_model=excluded.parser_model,
+                parser_version=excluded.parser_version,
+                parse_config_json=excluded.parse_config_json,
+                input_sha256=excluded.input_sha256,
+                raw_output_path=excluded.raw_output_path,
+                normalized_output_path=excluded.normalized_output_path,
+                status=excluded.status
+            """,
+            (
+                artifact["artifact_id"],
+                artifact["filing_id"],
+                artifact["artifact_type"],
+                artifact["parser_vendor"],
+                artifact.get("parser_model"),
+                artifact.get("parser_version"),
+                _dump_json(artifact.get("parse_config_json")),
+                artifact.get("input_sha256"),
+                artifact.get("raw_output_path"),
+                artifact.get("normalized_output_path"),
+                artifact["status"],
+            ),
+        )
+        self._conn.commit()
+
+    def get(self, artifact_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM kb_parse_artifacts WHERE artifact_id = ?",
+            (artifact_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+class ChunkRunRepository:
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def save(self, chunk_run: dict[str, Any]) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO kb_chunk_runs (
+                chunk_run_id,
+                filing_id,
+                parse_artifact_id,
+                chunk_profile_id,
+                chunker_version,
+                config_json,
+                chunk_count,
+                status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(chunk_run_id) DO UPDATE SET
+                filing_id=excluded.filing_id,
+                parse_artifact_id=excluded.parse_artifact_id,
+                chunk_profile_id=excluded.chunk_profile_id,
+                chunker_version=excluded.chunker_version,
+                config_json=excluded.config_json,
+                chunk_count=excluded.chunk_count,
+                status=excluded.status
+            """,
+            (
+                chunk_run["chunk_run_id"],
+                chunk_run["filing_id"],
+                chunk_run["parse_artifact_id"],
+                chunk_run["chunk_profile_id"],
+                chunk_run["chunker_version"],
+                _dump_json(chunk_run.get("config_json")),
+                chunk_run.get("chunk_count", 0),
+                chunk_run["status"],
+            ),
+        )
+        self._conn.commit()
+
+    def get(self, chunk_run_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM kb_chunk_runs WHERE chunk_run_id = ?",
+            (chunk_run_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+class IndexRunRepository:
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def save(self, index_run: dict[str, Any]) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO kb_index_runs (
+                index_run_id,
+                source_id,
+                chunk_run_id,
+                index_name,
+                embedding_model,
+                embedding_dim,
+                opensearch_mapping_version,
+                status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(index_run_id) DO UPDATE SET
+                source_id=excluded.source_id,
+                chunk_run_id=excluded.chunk_run_id,
+                index_name=excluded.index_name,
+                embedding_model=excluded.embedding_model,
+                embedding_dim=excluded.embedding_dim,
+                opensearch_mapping_version=excluded.opensearch_mapping_version,
+                status=excluded.status
+            """,
+            (
+                index_run["index_run_id"],
+                index_run["source_id"],
+                index_run["chunk_run_id"],
+                index_run["index_name"],
+                index_run.get("embedding_model"),
+                index_run.get("embedding_dim"),
+                index_run.get("opensearch_mapping_version"),
+                index_run["status"],
+            ),
+        )
+        self._conn.commit()
+
+    def get(self, index_run_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM kb_index_runs WHERE index_run_id = ?",
+            (index_run_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
 class ChunkEmbeddingRepository:
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
@@ -538,8 +715,8 @@ class EvalRunRepository:
             """
             INSERT INTO kb_eval_runs (
                 eval_run_id, dataset_id, retrieval_mode, top_k, chunk_profile_id,
-                chunker_version, embedding_model, index_name, status, started_at, finished_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                chunker_version, embedding_model, index_name, params_json, status, started_at, finished_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(eval_run_id) DO UPDATE SET
                 retrieval_mode=excluded.retrieval_mode,
                 top_k=excluded.top_k,
@@ -547,6 +724,7 @@ class EvalRunRepository:
                 chunker_version=excluded.chunker_version,
                 embedding_model=excluded.embedding_model,
                 index_name=excluded.index_name,
+                params_json=excluded.params_json,
                 status=excluded.status,
                 started_at=excluded.started_at,
                 finished_at=excluded.finished_at
@@ -560,6 +738,7 @@ class EvalRunRepository:
                 run["chunker_version"],
                 run.get("embedding_model"),
                 run["index_name"],
+                _dump_json(run.get("params_json")),
                 run["status"],
                 run.get("started_at"),
                 run.get("finished_at"),
@@ -627,6 +806,9 @@ class KnowledgeBaseDB:
     chunks: ChunkRepository
     chunk_embeddings: ChunkEmbeddingRepository
     ingest_jobs: IngestJobRepository
+    parse_artifacts: ParseArtifactRepository
+    chunk_runs: ChunkRunRepository
+    index_runs: IndexRunRepository
     eval_datasets: EvalDatasetRepository
     eval_queries: EvalQueryRepository
     eval_runs: EvalRunRepository
@@ -645,6 +827,9 @@ def get_knowledge_base_db(db_path: Any) -> KnowledgeBaseDB:
         chunks=ChunkRepository(conn),
         chunk_embeddings=ChunkEmbeddingRepository(conn),
         ingest_jobs=IngestJobRepository(conn),
+        parse_artifacts=ParseArtifactRepository(conn),
+        chunk_runs=ChunkRunRepository(conn),
+        index_runs=IndexRunRepository(conn),
         eval_datasets=EvalDatasetRepository(conn),
         eval_queries=EvalQueryRepository(conn),
         eval_runs=EvalRunRepository(conn),

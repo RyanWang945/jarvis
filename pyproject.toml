@@ -11,7 +11,9 @@ dependencies = [
     "langgraph>=1.1.8",
     "langgraph-checkpoint-sqlite>=3.0.3",
     "pydantic-settings>=2.7.0",
+    "pymysql>=1.1.0",
     "pyyaml>=6.0.3",
+    "sqlalchemy>=2.0.0",
     "uvicorn[standard]>=0.34.0",
 ]
 

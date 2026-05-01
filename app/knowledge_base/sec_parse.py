@@ -10,6 +10,7 @@ from app.knowledge_base.parsers.alibaba_pdf import (
     AlibabaDocumentAnalyzeClient,
     AlibabaDocumentAnalyzeResult,
 )
+from app.knowledge_base.sec_blocks import dump_normalized_blocks
 
 
 @dataclass(frozen=True)
@@ -121,6 +122,7 @@ class SecFilingParseService:
             final = self._client.get_async_task(task.task_id)
 
         output_path = self.output_path_for(resolved_file)
+        normalized_output_path = self.normalized_output_path_for(resolved_file)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(
             json.dumps(
@@ -136,6 +138,12 @@ class SecFilingParseService:
             ),
             encoding="utf-8",
         )
+        if final.content and final.content_type == "markdown":
+            normalized_output_path.parent.mkdir(parents=True, exist_ok=True)
+            normalized_output_path.write_text(
+                dump_normalized_blocks(final.content),
+                encoding="utf-8",
+            )
         return SecParseItemResult(
             source_file=str(resolved_file),
             output_file=str(output_path),
@@ -148,6 +156,10 @@ class SecFilingParseService:
     def output_path_for(self, file_path: str | Path) -> Path:
         path = Path(file_path)
         return self._output_dir / f"{path.stem}.aliyun.json"
+
+    def normalized_output_path_for(self, file_path: str | Path) -> Path:
+        path = Path(file_path)
+        return self._output_dir.parent / "normalized-blocks" / f"{path.stem}.blocks.json"
 
     def _list_pdf_files(self, *, file_names: list[str] | None = None) -> list[Path]:
         if file_names:

@@ -25,10 +25,96 @@ class IngestResult:
     status: str
 
 
-class WikipediaIngestService:
+@dataclass(frozen=True)
+class IngestSource:
+    source_id: str
+    name: str
+    source_type: str
+    language: str
+    dataset_version: str
+    file_path: str
+    description: str | None = None
+    owner: str | None = None
+    region: str | None = None
+    metadata_json: dict | None = None
+
+
+class BaseIngestService:
     def __init__(self, db: KnowledgeBaseDB) -> None:
         self._db = db
 
+    def _save_source(self, source: IngestSource) -> None:
+        self._db.sources.save(
+            {
+                "source_id": source.source_id,
+                "name": source.name,
+                "source_type": source.source_type,
+                "language": source.language,
+                "dataset_version": source.dataset_version,
+                "file_path": source.file_path,
+                "description": source.description,
+                "owner": source.owner,
+                "region": source.region,
+                "metadata_json": source.metadata_json,
+            }
+        )
+
+    def _start_job(
+        self,
+        *,
+        job_id: str,
+        source_id: str,
+        file_path: str,
+        limit_n: int | None,
+        started_at: str,
+    ) -> None:
+        self._db.ingest_jobs.save(
+            {
+                "job_id": job_id,
+                "source_id": source_id,
+                "file_path": file_path,
+                "limit_n": limit_n,
+                "status": "running",
+                "started_at": started_at,
+            }
+        )
+
+    def _finish_job(
+        self,
+        *,
+        job_id: str,
+        source_id: str,
+        file_path: str,
+        limit_n: int | None,
+        started_at: str,
+        documents_seen: int,
+        documents_inserted: int,
+        documents_updated: int,
+        documents_skipped: int,
+        chunks_created: int,
+        status: str,
+        error_message: str | None = None,
+    ) -> None:
+        self._db.ingest_jobs.save(
+            {
+                "job_id": job_id,
+                "source_id": source_id,
+                "file_path": file_path,
+                "limit_n": limit_n,
+                "status": status,
+                "started_at": started_at,
+                "finished_at": _utc_now(),
+                "documents_seen": documents_seen,
+                "documents_inserted": documents_inserted,
+                "documents_updated": documents_updated,
+                "documents_skipped": documents_skipped,
+                "chunks_created": chunks_created,
+                "error_message": error_message,
+            }
+        )
+
+
+class WikipediaIngestService(BaseIngestService):
     def ingest(
         self,
         *,
@@ -48,25 +134,23 @@ class WikipediaIngestService:
         job_id = f"kb_ingest_{uuid.uuid4()}"
         started_at = _utc_now()
 
-        self._db.sources.save(
-            {
-                "source_id": source_key,
-                "name": "wikipedia",
-                "language": language,
-                "dataset_version": dataset_version,
-                "file_path": str(resolved_path),
-                "description": f"Wikipedia {language} dataset",
-            }
+        self._save_source(
+            IngestSource(
+                source_id=source_key,
+                name="wikipedia",
+                source_type="wikipedia",
+                language=language,
+                dataset_version=dataset_version,
+                file_path=str(resolved_path),
+                description=f"Wikipedia {language} dataset",
+            )
         )
-        self._db.ingest_jobs.save(
-            {
-                "job_id": job_id,
-                "source_id": source_key,
-                "file_path": str(resolved_path),
-                "limit_n": limit_n,
-                "status": "running",
-                "started_at": started_at,
-            }
+        self._start_job(
+            job_id=job_id,
+            source_id=source_key,
+            file_path=str(resolved_path),
+            limit_n=limit_n,
+            started_at=started_at,
         )
 
         documents_seen = 0
@@ -130,39 +214,33 @@ class WikipediaIngestService:
                     )
                     chunks_created += 1
 
-            self._db.ingest_jobs.save(
-                {
-                    "job_id": job_id,
-                    "source_id": source_key,
-                    "file_path": str(resolved_path),
-                    "limit_n": limit_n,
-                    "status": "succeeded",
-                    "started_at": started_at,
-                    "finished_at": _utc_now(),
-                    "documents_seen": documents_seen,
-                    "documents_inserted": documents_inserted,
-                    "documents_updated": documents_updated,
-                    "documents_skipped": documents_skipped,
-                    "chunks_created": chunks_created,
-                }
+            self._finish_job(
+                job_id=job_id,
+                source_id=source_key,
+                file_path=str(resolved_path),
+                limit_n=limit_n,
+                started_at=started_at,
+                documents_seen=documents_seen,
+                documents_inserted=documents_inserted,
+                documents_updated=documents_updated,
+                documents_skipped=documents_skipped,
+                chunks_created=chunks_created,
+                status="succeeded",
             )
         except Exception as exc:
-            self._db.ingest_jobs.save(
-                {
-                    "job_id": job_id,
-                    "source_id": source_key,
-                    "file_path": str(resolved_path),
-                    "limit_n": limit_n,
-                    "status": "failed",
-                    "started_at": started_at,
-                    "finished_at": _utc_now(),
-                    "documents_seen": documents_seen,
-                    "documents_inserted": documents_inserted,
-                    "documents_updated": documents_updated,
-                    "documents_skipped": documents_skipped,
-                    "chunks_created": chunks_created,
-                    "error_message": str(exc),
-                }
+            self._finish_job(
+                job_id=job_id,
+                source_id=source_key,
+                file_path=str(resolved_path),
+                limit_n=limit_n,
+                started_at=started_at,
+                documents_seen=documents_seen,
+                documents_inserted=documents_inserted,
+                documents_updated=documents_updated,
+                documents_skipped=documents_skipped,
+                chunks_created=chunks_created,
+                status="failed",
+                error_message=str(exc),
             )
             raise
 

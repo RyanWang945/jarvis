@@ -21,6 +21,8 @@ class ShellSkill:
                 capture_output=True,
                 shell=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=request.timeout_seconds,
             )
         except subprocess.TimeoutExpired as exc:
@@ -36,8 +38,8 @@ class ShellSkill:
         except OSError as exc:
             return SkillResult(ok=False, exit_code=None, stderr=str(exc), summary=f"Command failed to start: {exc}")
 
-        stdout = _truncate(completed.stdout)
-        stderr = _truncate(completed.stderr)
+        stdout = _truncate(completed.stdout or "")
+        stderr = _truncate(completed.stderr or "")
         return SkillResult(
             ok=completed.returncode == 0,
             exit_code=completed.returncode,

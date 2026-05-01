@@ -4,8 +4,6 @@ from contextlib import asynccontextmanager
 import uvicorn
 from fastapi import FastAPI, Request
 
-from app.agent.dispatcher import DispatcherService
-from app.api.agent import get_thread_manager
 from app.api.routes import router
 from app.channels.feishu import build_feishu_channel
 from app.config import get_settings
@@ -18,27 +16,12 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    settings = get_settings()
-    dispatcher: DispatcherService | None = None
-    manager = get_thread_manager()
     registries = bootstrap_registries(force=True)
     app.state.skill_registry = registries.skill_registry
     app.state.tool_registry = registries.tool_registry
-    if settings.auto_recover_on_startup:
-        recovery = manager.recover_unfinished()
-        logger.info(
-            "startup recovery completed recovered=%s skipped=%s failed=%s",
-            len(recovery["recovered"]),
-            len(recovery["skipped"]),
-            len(recovery["failed"]),
-        )
-    if settings.worker_mode == "thread":
-        dispatcher = DispatcherService(manager)
-        dispatcher.start()
-        app.state.dispatcher = dispatcher
 
     # Start Feishu persistent WebSocket channel
-    feishu_channel = build_feishu_channel(manager)
+    feishu_channel = build_feishu_channel()
     if feishu_channel is not None:
         set_active_channel(feishu_channel)
         feishu_channel.start()
@@ -48,8 +31,6 @@ async def lifespan(app: FastAPI):
     finally:
         if feishu_channel is not None:
             feishu_channel.stop()
-        if dispatcher:
-            dispatcher.stop()
 
 
 def create_app() -> FastAPI:
@@ -81,7 +62,7 @@ def main() -> None:
         host=settings.host,
         port=settings.port,
         factory=True,
-        reload=settings.environment == "development",
+        reload=False,
         log_level=settings.log_level.lower(),
     )
 

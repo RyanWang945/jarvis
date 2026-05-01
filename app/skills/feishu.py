@@ -5,7 +5,6 @@ from app.skills.base import SkillRequest, SkillResult
 
 logger = logging.getLogger(__name__)
 
-# Populated by app.channels.feishu when the channel starts.
 _active_channel: Any = None
 
 
@@ -15,8 +14,6 @@ def set_active_channel(channel: Any) -> None:
 
 
 class FeishuMessageSkill:
-    """通过飞书 OpenAPI 向指定用户或群组发送文本消息。"""
-
     name = "feishu_message"
 
     def run(self, request: SkillRequest) -> SkillResult:
@@ -25,7 +22,7 @@ class FeishuMessageSkill:
                 ok=False,
                 exit_code=1,
                 stderr="Feishu channel is not active.",
-                summary="飞书通道未启动，无法发送消息。",
+                summary="Feishu channel is not active.",
             )
 
         receive_id = request.args.get("receive_id")
@@ -35,7 +32,7 @@ class FeishuMessageSkill:
                 ok=False,
                 exit_code=1,
                 stderr="Missing receive_id or text argument.",
-                summary="发送飞书消息失败：缺少 receive_id 或 text 参数。",
+                summary="Failed to send Feishu message: missing receive_id or text.",
             )
 
         ok = _active_channel.send_message(receive_id, text)
@@ -44,11 +41,11 @@ class FeishuMessageSkill:
                 ok=True,
                 exit_code=0,
                 stdout="",
-                summary=f"已向 {receive_id} 发送飞书消息。",
+                summary=f"Sent Feishu message to {receive_id}.",
             )
         return SkillResult(
             ok=False,
             exit_code=1,
             stderr="send_message returned False.",
-            summary="发送飞书消息失败（API 调用返回错误）。",
+            summary="Failed to send Feishu message: send_message returned False.",
         )

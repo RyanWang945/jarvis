@@ -59,7 +59,7 @@ class KnowledgeBaseIndexResponse(BaseModel):
 
 class KnowledgeBaseSearchRequest(BaseModel):
     query: str = Field(min_length=1)
-    mode: str = Field(pattern="^(bm25|vector|hybrid)$")
+    mode: str = Field(pattern="^(bm25|vector|hybrid|rrf|rrf_v2)$")
     language: str | None = None
     chunk_profile_id: str | None = None
     top_k: int = Field(default=5, ge=1, le=50)
@@ -93,7 +93,7 @@ class KnowledgeBaseEvalDatasetResponse(BaseModel):
 
 class KnowledgeBaseEvalRunRequest(BaseModel):
     dataset_id: str = Field(min_length=1)
-    retrieval_mode: str = Field(pattern="^(bm25|vector|hybrid)$")
+    retrieval_mode: str = Field(pattern="^(bm25|vector|hybrid|rrf|rrf_v2)$")
     top_k: int = Field(default=5, ge=1, le=50)
     language: str | None = None
     chunk_profile_id: str | None = None
@@ -142,6 +142,45 @@ class KnowledgeBaseSecParseResponse(BaseModel):
     skipped: int
     failed: int
     items: list[KnowledgeBaseSecParseItemResponse]
+
+
+class KnowledgeBaseSecIngestRequest(BaseModel):
+    source_id: str | None = None
+    raw_parse_dir: str | None = None
+    normalized_blocks_dir: str | None = None
+    file_names: list[str] | None = None
+    chunk_profile_id: str = "sec_filing_medium_v1"
+
+
+class KnowledgeBaseSecIngestResponse(BaseModel):
+    job_id: str
+    source_id: str
+    file_path: str
+    limit_n: int | None
+    documents_seen: int
+    documents_inserted: int
+    documents_updated: int
+    documents_skipped: int
+    chunks_created: int
+    status: str
+
+
+class KnowledgeBaseSecIndexRequest(BaseModel):
+    source_id: str = Field(min_length=1)
+    chunk_profile_id: str = "sec_filing_medium_v1"
+    top_limit: int | None = Field(default=None, ge=1)
+
+
+class KnowledgeBaseSecSearchRequest(BaseModel):
+    query: str = Field(min_length=1)
+    mode: str = Field(pattern="^(bm25|vector|hybrid|rrf|rrf_v2)$")
+    top_k: int = Field(default=5, ge=1, le=50)
+    chunk_profile_id: str = "sec_filing_medium_v1"
+    ticker: str | None = None
+    company_name: str | None = None
+    form_type: str | None = None
+    fiscal_year: int | None = None
+    section_title: str | None = None
 
 
 @router.get("/health", response_model=KnowledgeBaseHealthResponse)
@@ -290,6 +329,72 @@ def knowledge_base_sec_parse(request: KnowledgeBaseSecParseRequest) -> Knowledge
             )
             for item in result.items
         ],
+    )
+
+
+@router.post("/sec/ingest", response_model=KnowledgeBaseSecIngestResponse)
+def knowledge_base_sec_ingest(request: KnowledgeBaseSecIngestRequest) -> KnowledgeBaseSecIngestResponse:
+    result = get_knowledge_base_service().ingest_sec_filings(
+        source_id=request.source_id,
+        raw_parse_dir=request.raw_parse_dir,
+        normalized_blocks_dir=request.normalized_blocks_dir,
+        file_names=request.file_names,
+        chunk_profile_id=request.chunk_profile_id,
+    )
+    return KnowledgeBaseSecIngestResponse(
+        job_id=result.job_id,
+        source_id=result.source_id,
+        file_path=result.file_path,
+        limit_n=result.limit_n,
+        documents_seen=result.documents_seen,
+        documents_inserted=result.documents_inserted,
+        documents_updated=result.documents_updated,
+        documents_skipped=result.documents_skipped,
+        chunks_created=result.chunks_created,
+        status=result.status,
+    )
+
+
+@router.post("/sec/index", response_model=KnowledgeBaseIndexResponse)
+def knowledge_base_sec_index(request: KnowledgeBaseSecIndexRequest) -> KnowledgeBaseIndexResponse:
+    result = get_knowledge_base_service().index_sec_source(
+        source_id=request.source_id,
+        chunk_profile_id=request.chunk_profile_id,
+        top_limit=request.top_limit,
+    )
+    return KnowledgeBaseIndexResponse(
+        index_name=result.index_name,
+        source_id=result.source_id,
+        chunk_profile_id=result.chunk_profile_id,
+        indexed_chunks=result.indexed_chunks,
+        embedded_chunks=result.embedded_chunks,
+        embedding_model=result.embedding_model,
+    )
+
+
+@router.post("/sec/search", response_model=KnowledgeBaseSearchResponse)
+def knowledge_base_sec_search(request: KnowledgeBaseSecSearchRequest) -> KnowledgeBaseSearchResponse:
+    hits = get_knowledge_base_service().search_sec(
+        query=request.query,
+        mode=request.mode,
+        top_k=request.top_k,
+        chunk_profile_id=request.chunk_profile_id,
+        ticker=request.ticker,
+        company_name=request.company_name,
+        form_type=request.form_type,
+        fiscal_year=request.fiscal_year,
+        section_title=request.section_title,
+    )
+    return KnowledgeBaseSearchResponse(
+        hits=[
+            KnowledgeBaseSearchHitResponse(
+                chunk_id=hit.chunk_id,
+                doc_id=hit.doc_id,
+                score=hit.score,
+                source=hit.source,
+            )
+            for hit in hits
+        ]
     )
 
 

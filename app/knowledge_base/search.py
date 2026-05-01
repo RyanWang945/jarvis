@@ -37,8 +37,15 @@ class OpenSearchClient:
         self._http_client = http_client
         self._owned_client: httpx.Client | None = None
 
-    def index_name(self, *, language: str, chunk_profile_id: str) -> str:
-        return f"{self._index_prefix}_{language}_{chunk_profile_id}"
+    def index_name(
+        self,
+        *,
+        language: str,
+        chunk_profile_id: str,
+        source_type: str | None = None,
+    ) -> str:
+        prefix = "kb_sec" if source_type == "sec_filing" else self._index_prefix
+        return f"{prefix}_{language}_{chunk_profile_id}"
 
     def ensure_index(self, *, index_name: str, embedding_dim: int | None = None) -> None:
         mapping = {
@@ -52,9 +59,22 @@ class OpenSearchClient:
                     "chunk_id": {"type": "keyword"},
                     "doc_id": {"type": "keyword"},
                     "source_id": {"type": "keyword"},
+                    "source_type": {"type": "keyword"},
                     "external_id": {"type": "keyword"},
                     "language": {"type": "keyword"},
                     "chunk_profile_id": {"type": "keyword"},
+                    "company_name": {"type": "keyword"},
+                    "ticker": {"type": "keyword"},
+                    "form_type": {"type": "keyword"},
+                    "filing_date": {"type": "keyword"},
+                    "fiscal_year": {"type": "integer"},
+                    "fiscal_period": {"type": "keyword"},
+                    "section_title": {
+                        "type": "text",
+                        "fields": {
+                            "keyword": {"type": "keyword"},
+                        },
+                    },
                     "title": {
                         "type": "text",
                         "fields": {
@@ -76,6 +96,7 @@ class OpenSearchClient:
                     "chunker_version": {"type": "keyword"},
                     "embedding_model": {"type": "keyword"},
                     "text_hash": {"type": "keyword"},
+                    "is_table_chunk": {"type": "boolean"},
                     "created_at": {"type": "date"},
                 }
             }
@@ -136,7 +157,14 @@ class OpenSearchClient:
             raise RuntimeError("OpenSearch bulk indexing failed without details")
         raise last_error
 
-    def bm25_search(self, *, index_name: str, query: str, top_k: int) -> list[SearchHit]:
+    def bm25_search(
+        self,
+        *,
+        index_name: str,
+        query: str,
+        top_k: int,
+        filters: dict | None = None,
+    ) -> list[SearchHit]:
         body = {
             "size": top_k,
             "query": {
@@ -153,6 +181,7 @@ class OpenSearchClient:
                         {"wildcard": {"content.raw": {"value": f"*{query}*", "boost": 3}}},
                     ],
                     "minimum_should_match": 1,
+                    "filter": _build_filter_clauses(filters),
                 }
             },
         }
@@ -170,18 +199,37 @@ class OpenSearchClient:
         index_name: str,
         query_vector: list[float],
         top_k: int,
+        filters: dict | None = None,
     ) -> list[SearchHit]:
-        body = {
-            "size": top_k,
-            "query": {
-                "knn": {
-                    "embedding": {
-                        "vector": query_vector,
-                        "k": top_k,
+        if filters:
+            body = {
+                "size": top_k,
+                "query": {
+                    "bool": {
+                        "filter": _build_filter_clauses(filters),
+                        "must": {
+                            "knn": {
+                                "embedding": {
+                                    "vector": query_vector,
+                                    "k": top_k,
+                                }
+                            }
+                        },
                     }
-                }
-            },
-        }
+                },
+            }
+        else:
+            body = {
+                "size": top_k,
+                "query": {
+                    "knn": {
+                        "embedding": {
+                            "vector": query_vector,
+                            "k": top_k,
+                        }
+                    }
+                },
+            }
         response = self._client.post(
             f"{self._base_url}/{index_name}/_search",
             auth=self._auth,
@@ -245,6 +293,48 @@ def combine_hybrid_hits(
     return rescored[:top_k]
 
 
+def combine_rrf_hits(
+    *,
+    bm25_hits: list[SearchHit],
+    vector_hits: list[SearchHit],
+    top_k: int,
+    k: int = 60,
+) -> list[SearchHit]:
+    combined: dict[str, dict] = {}
+
+    for rank, hit in enumerate(bm25_hits, start=1):
+        item = combined.setdefault(
+            hit.chunk_id,
+            {
+                "hit": hit,
+                "score": 0.0,
+            },
+        )
+        item["score"] += 1.0 / (k + rank)
+
+    for rank, hit in enumerate(vector_hits, start=1):
+        item = combined.setdefault(
+            hit.chunk_id,
+            {
+                "hit": hit,
+                "score": 0.0,
+            },
+        )
+        item["score"] += 1.0 / (k + rank)
+
+    rescored = [
+        SearchHit(
+            chunk_id=item["hit"].chunk_id,
+            doc_id=item["hit"].doc_id,
+            score=item["score"],
+            source=item["hit"].source,
+        )
+        for item in combined.values()
+    ]
+    rescored.sort(key=lambda item: item.score, reverse=True)
+    return rescored[:top_k]
+
+
 def _parse_hits(body: dict) -> list[SearchHit]:
     return [
         SearchHit(
@@ -255,3 +345,20 @@ def _parse_hits(body: dict) -> list[SearchHit]:
         )
         for hit in body.get("hits", {}).get("hits", [])
     ]
+
+
+def _build_filter_clauses(filters: dict | None) -> list[dict]:
+    if not filters:
+        return []
+    clauses: list[dict] = []
+    if filters.get("ticker"):
+        clauses.append({"term": {"ticker": filters["ticker"]}})
+    if filters.get("company_name"):
+        clauses.append({"term": {"company_name": filters["company_name"]}})
+    if filters.get("form_type"):
+        clauses.append({"term": {"form_type": filters["form_type"]}})
+    if filters.get("fiscal_year") is not None:
+        clauses.append({"term": {"fiscal_year": filters["fiscal_year"]}})
+    if filters.get("section_title"):
+        clauses.append({"term": {"section_title.keyword": filters["section_title"]}})
+    return clauses

@@ -69,6 +69,7 @@ class QueryGenerationService:
         return self._generate_heuristic(document=document, chunk=chunk)
 
     def _generate_with_llm(self, *, document: dict[str, Any], chunk: dict[str, Any]) -> GeneratedQuery:
+        preferred_style = _preferred_query_style(chunk["chunk_id"])
         client = ChatClient(
             api_key=_provider_api_key(self._settings),
             base_url=_provider_base_url(self._settings),
@@ -80,7 +81,9 @@ class QueryGenerationService:
                 LLMMessage(
                     role="system",
                     content=(
-                        "You generate evaluation queries for a retrieval system. "
+                        "You generate realistic Chinese evaluation queries for a retrieval system. "
+                        "The goal is to simulate what real users would type into search or ask in a chat product, "
+                        "not to restate encyclopedia titles. "
                         "Return strict JSON with keys: query_text, query_type, difficulty, gold_answer."
                     ),
                 ),
@@ -90,12 +93,36 @@ class QueryGenerationService:
                         {
                             "title": document["title"],
                             "chunk_text": chunk["normalized_content"][:1200],
+                            "preferred_style": preferred_style,
                             "instructions": [
-                                "Generate one natural-language query that this chunk should answer.",
-                                "Avoid copying the first sentence verbatim.",
-                                "Use query_type in {fact, definition, entity, paraphrase}.",
-                                "Use difficulty in {easy, medium, hard}.",
-                                "Keep gold_answer short.",
+                                "Generate exactly one realistic Chinese query that this chunk should answer.",
+                                "Simulate a real user query, not an encyclopedia heading rewrite.",
+                                "Avoid copying the title or the first sentence verbatim.",
+                                "Avoid generic templates like 'X是什么', '请介绍X', or 'X的定义' unless the chunk is truly best served by a definition query.",
+                                "Prefer natural search-style wording such as partial descriptions, aliases, colloquial phrasing, task-oriented wording, or incomplete memory cues.",
+                                "Use the preferred_style when it fits the chunk, but keep the final query natural.",
+                                "Make the query answerable mainly from this chunk, without depending on unrelated context.",
+                                "Keep the query concise: usually 8 to 24 Chinese characters, and avoid unnecessary punctuation.",
+                                "Use query_type in {fact, definition, entity, paraphrase}. Use definition only when necessary.",
+                                "Use difficulty in {easy, medium, hard}. easy=direct mention or title-like, medium=paraphrased or partial clue, hard=alias, indirect clue, or colloquial phrasing.",
+                                "Keep gold_answer short and grounded in the chunk.",
+                            ],
+                            "style_reference": {
+                                "definition": "A direct definitional question, used sparingly.",
+                                "fact": "A factual question about a property, role, time, place, or relationship.",
+                                "entity": "A query that refers to a person, place, concept, or thing by alias or description.",
+                                "paraphrase": "A colloquial or reworded query that does not mirror the title.",
+                            },
+                            "good_patterns": [
+                                "开源操作系统内核是谁发起的",
+                                "那个提倡自由软件运动的人是谁",
+                                "URL一般指什么",
+                                "2003年7月香港23条相关事件",
+                            ],
+                            "avoid_patterns": [
+                                "Linux是什么？",
+                                "请介绍Linux",
+                                "Linux的定义是什么",
                             ],
                         },
                         ensure_ascii=False,
@@ -126,6 +153,18 @@ class QueryGenerationService:
             gold_answer=snippet,
             generated_by="heuristic",
         )
+
+
+def _preferred_query_style(chunk_id: str) -> str:
+    styles = [
+        "fact",
+        "entity",
+        "paraphrase",
+        "fact",
+        "paraphrase",
+        "definition",
+    ]
+    return styles[sum(ord(char) for char in chunk_id) % len(styles)]
 
 
 class KnowledgeBaseEvaluationService:
@@ -243,6 +282,7 @@ class KnowledgeBaseEvaluationService:
         top_k: int,
         chunk_profile_id: str,
         language: str,
+        retrieval_params: dict[str, Any] | None = None,
     ) -> EvalRunSummary:
         dataset = self._db.eval_datasets.get(dataset_id)
         if dataset is None:
@@ -250,6 +290,11 @@ class KnowledgeBaseEvaluationService:
         profile = self._db.chunk_profiles.get(chunk_profile_id)
         if profile is None:
             raise ValueError(f"Unknown chunk_profile_id: {chunk_profile_id}")
+        resolved_params = self._resolve_retrieval_params(
+            retrieval_mode=retrieval_mode,
+            top_k=top_k,
+            retrieval_params=retrieval_params,
+        )
         eval_run_id = f"kb_eval_run_{uuid.uuid4()}"
         index_name = f"{self._settings.opensearch_index_prefix}_{language}_{chunk_profile_id}"
         self._db.eval_runs.save(
@@ -262,6 +307,7 @@ class KnowledgeBaseEvaluationService:
                 "chunker_version": profile["chunker_version"],
                 "embedding_model": self._settings.dashscope_embedding_model if retrieval_mode != "bm25" else None,
                 "index_name": index_name,
+                "params_json": resolved_params,
                 "status": "running",
                 "started_at": _utc_now(),
             }
@@ -283,6 +329,7 @@ class KnowledgeBaseEvaluationService:
                 language=language,
                 chunk_profile_id=chunk_profile_id,
                 query_vectors=query_vectors,
+                retrieval_params=resolved_params,
             )
             latency_ms = int((time.perf_counter() - started) * 1000)
             latencies.append(latency_ms)
@@ -325,6 +372,7 @@ class KnowledgeBaseEvaluationService:
                 "chunker_version": profile["chunker_version"],
                 "embedding_model": self._settings.dashscope_embedding_model if retrieval_mode != "bm25" else None,
                 "index_name": index_name,
+                "params_json": resolved_params,
                 "status": "succeeded",
                 "finished_at": _utc_now(),
             }
@@ -371,6 +419,7 @@ class KnowledgeBaseEvaluationService:
         language: str,
         chunk_profile_id: str,
         query_vectors: dict[str, list[float]],
+        retrieval_params: dict[str, Any] | None,
     ) -> list[SearchHit]:
         if retrieval_mode == "bm25":
             return self._opensearch_client().bm25_search(
@@ -393,23 +442,69 @@ class KnowledgeBaseEvaluationService:
                 query_vector=query_vector,
                 top_k=top_k,
             )
+        if retrieval_mode in {"hybrid", "rrf"}:
+            bm25_top_k = top_k
+            vector_top_k = top_k
+            rrf_k = 60
+        elif retrieval_mode == "rrf_v2":
+            bm25_top_k = int((retrieval_params or {}).get("bm25_candidate_k", 20))
+            vector_top_k = int((retrieval_params or {}).get("vector_candidate_k", 20))
+            rrf_k = int((retrieval_params or {}).get("rrf_k", 60))
+        else:
+            raise ValueError(f"Unsupported retrieval mode: {retrieval_mode}")
         bm25_hits = opensearch_client.bm25_search(
             index_name=index_name,
             query=query["query_text"],
-            top_k=top_k,
+            top_k=bm25_top_k,
         )
         vector_hits = opensearch_client.vector_search(
             index_name=index_name,
             query_vector=query_vector,
-            top_k=top_k,
+            top_k=vector_top_k,
         )
-        from app.knowledge_base.search import combine_hybrid_hits
+        if retrieval_mode == "hybrid":
+            from app.knowledge_base.search import combine_hybrid_hits
 
-        return combine_hybrid_hits(
-            bm25_hits=bm25_hits,
-            vector_hits=vector_hits,
-            top_k=top_k,
-        )
+            return combine_hybrid_hits(
+                bm25_hits=bm25_hits,
+                vector_hits=vector_hits,
+                top_k=top_k,
+            )
+        if retrieval_mode == "rrf":
+            from app.knowledge_base.search import combine_rrf_hits
+
+            return combine_rrf_hits(
+                bm25_hits=bm25_hits,
+                vector_hits=vector_hits,
+                top_k=top_k,
+                k=rrf_k,
+            )
+        if retrieval_mode == "rrf_v2":
+            from app.knowledge_base.search import combine_rrf_hits
+
+            return combine_rrf_hits(
+                bm25_hits=bm25_hits,
+                vector_hits=vector_hits,
+                top_k=top_k,
+                k=rrf_k,
+            )
+        raise ValueError(f"Unsupported retrieval mode: {retrieval_mode}")
+
+    def _resolve_retrieval_params(
+        self,
+        *,
+        retrieval_mode: str,
+        top_k: int,
+        retrieval_params: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if retrieval_mode != "rrf_v2":
+            return retrieval_params
+        params = dict(retrieval_params or {})
+        params.setdefault("bm25_candidate_k", 20)
+        params.setdefault("vector_candidate_k", 20)
+        params.setdefault("rrf_k", 60)
+        params.setdefault("final_top_k", top_k)
+        return params
 
     def _opensearch_client(self) -> OpenSearchClient:
         if self._opensearch_client_instance is None:
