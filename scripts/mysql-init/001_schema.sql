@@ -101,6 +101,9 @@ CREATE TABLE IF NOT EXISTS tool_calls (
     id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
     turn_id BIGINT UNSIGNED NOT NULL,
     tool_name VARCHAR(128) NOT NULL,
+    assistant_message_id BIGINT UNSIGNED NULL,
+    provider_tool_call_id VARCHAR(128) NULL,
+    step_index INTEGER UNSIGNED NOT NULL DEFAULT 0,
     status VARCHAR(32) NOT NULL DEFAULT 'running',
     input JSON,
     output JSON,
@@ -108,10 +111,13 @@ CREATE TABLE IF NOT EXISTS tool_calls (
     started_at DATETIME(6),
     finished_at DATETIME(6),
     created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    UNIQUE KEY uk_tool_calls_turn_provider_call (turn_id, provider_tool_call_id),
     KEY idx_tool_calls_turn_created (turn_id, created_at),
+    KEY idx_tool_calls_assistant_message (assistant_message_id),
     KEY idx_tool_calls_status_created (status, created_at),
     KEY idx_tool_calls_tool_name_created (tool_name, created_at),
-    CONSTRAINT fk_tool_calls_turn FOREIGN KEY (turn_id) REFERENCES turns(id) ON DELETE CASCADE
+    CONSTRAINT fk_tool_calls_turn FOREIGN KEY (turn_id) REFERENCES turns(id) ON DELETE CASCADE,
+    CONSTRAINT fk_tool_calls_assistant_message FOREIGN KEY (assistant_message_id) REFERENCES messages(id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 -- -----------------------------------------------------

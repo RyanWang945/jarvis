@@ -67,6 +67,9 @@ class ToolCallRecord:
     id: int
     turn_id: int
     tool_name: str
+    assistant_message_id: int | None
+    provider_tool_call_id: str | None
+    step_index: int
     status: str
     input: dict[str, Any]
     output: dict[str, Any] | None

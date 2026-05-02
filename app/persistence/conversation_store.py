@@ -31,6 +31,22 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _fmt_time(iso: str) -> str:
+    try:
+        dt = datetime.fromisoformat(iso)
+        return dt.strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return iso
+
+
+def _chat_type_label(chat_type: str) -> str:
+    if chat_type == "dm":
+        return "私聊"
+    if chat_type == "group":
+        return "群聊"
+    return chat_type
+
+
 def _trigger_type(
     *,
     chat_type: str,
@@ -172,6 +188,31 @@ class MySQLConversationStore:
                 raw_payload=raw_payload or {},
             )
 
+    def append_tool_message(
+        self,
+        *,
+        conversation_id: int,
+        turn_id: int | None,
+        content: str,
+        content_type: str = "text",
+        external_message_id: str | None = None,
+        raw_payload: dict[str, Any] | None = None,
+    ) -> MessageRecord:
+        with self._engine.begin() as conn:
+            return self._append_message(
+                conn,
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                sender_type="tool",
+                user_id=None,
+                role="tool",
+                content=content,
+                content_type=content_type,
+                external_message_id=external_message_id,
+                reply_to_message_id=None,
+                raw_payload=raw_payload or {},
+            )
+
     def mark_turn_running(self, turn_id: int) -> None:
         with self._engine.begin() as conn:
             conn.execute(
@@ -295,17 +336,24 @@ class MySQLConversationStore:
         turn_id: int,
         tool_name: str,
         input: dict[str, Any],
+        assistant_message_id: int | None = None,
+        provider_tool_call_id: str | None = None,
+        step_index: int = 0,
     ) -> ToolCallRecord:
         now = _now()
         with self._engine.begin() as conn:
             result = conn.execute(
                 sa.text(
-                    "INSERT INTO tool_calls (turn_id, tool_name, status, input, started_at, created_at) "
-                    "VALUES (:turn_id, :tool_name, 'requested', :input, :now, :now)"
+                    "INSERT INTO tool_calls "
+                    "(turn_id, tool_name, assistant_message_id, provider_tool_call_id, step_index, status, input, started_at, created_at) "
+                    "VALUES (:turn_id, :tool_name, :assistant_message_id, :provider_tool_call_id, :step_index, 'requested', :input, :now, :now)"
                 ),
                 {
                     "turn_id": turn_id,
                     "tool_name": tool_name,
+                    "assistant_message_id": assistant_message_id,
+                    "provider_tool_call_id": provider_tool_call_id,
+                    "step_index": step_index,
                     "input": json.dumps(input),
                     "now": now,
                 },
@@ -314,6 +362,9 @@ class MySQLConversationStore:
                 id=result.lastrowid,  # type: ignore[arg-type]
                 turn_id=turn_id,
                 tool_name=tool_name,
+                assistant_message_id=assistant_message_id,
+                provider_tool_call_id=provider_tool_call_id,
+                step_index=step_index,
                 status="requested",
                 input=dict(input),
                 output=None,
@@ -351,7 +402,7 @@ class MySQLConversationStore:
             if error_message is not None:
                 updates.append("error_message = :error")
                 params["error"] = error_message
-            if status in {"completed", "failed", "cancelled"}:
+            if status in {"completed", "failed", "cancelled", "rejected"}:
                 updates.append("finished_at = :now")
 
             if updates:
@@ -386,6 +437,16 @@ class MySQLConversationStore:
                 created_by_user_id=user_id,
                 metadata={},
             )
+
+            # Intercept DM commands before creating a turn.
+            if conversation.chat_type == "dm" and request.content.strip().startswith("/"):
+                return self._handle_command(
+                    conn,
+                    conversation=conversation,
+                    user_id=user_id,
+                    request=request,
+                )
+
             return self._create_message_and_maybe_turn(
                 conn,
                 conversation=conversation,
@@ -626,6 +687,367 @@ class MySQLConversationStore:
             status="queued" if should_respond else "stored",
         )
 
+    def _handle_command(
+        self,
+        conn: sa.Connection,
+        *,
+        conversation: ConversationRecord,
+        user_id: int,
+        request: MessageCreateRequest,
+    ) -> MessageIngestResponse:
+        """Dispatch DM commands. Unknown commands fall through to normal turn creation."""
+        cmd = request.content.strip().lower().split(maxsplit=1)[0]
+        if cmd == "/clear":
+            return self._handle_clear_command(
+                conn, conversation=conversation, user_id=user_id, request=request
+            )
+        if cmd == "/cancel":
+            return self._handle_cancel_command(
+                conn, conversation=conversation, user_id=user_id, request=request
+            )
+        if cmd == "/status":
+            return self._handle_status_command(
+                conn, conversation=conversation, user_id=user_id, request=request
+            )
+        # Unknown command: fall through to normal turn creation.
+        return self._create_message_and_maybe_turn(
+            conn,
+            conversation=conversation,
+            user_id=user_id,
+            content=request.content,
+            content_type=request.content_type,
+            external_message_id=request.external_message_id,
+            reply_to_message_id=self._resolve_reply_message_id(
+                conn,
+                conversation.id,
+                request.reply_to_message_id,
+                request.reply_to_external_message_id,
+            ),
+            mentions=request.mentions,
+            raw_payload=request.raw_payload,
+            metadata=request.metadata,
+        )
+
+    def _handle_clear_command(
+        self,
+        conn: sa.Connection,
+        *,
+        conversation: ConversationRecord,
+        user_id: int,
+        request: MessageCreateRequest,
+    ) -> MessageIngestResponse:
+        """Archive the current conversation and create a new generation.
+
+        Idempotent across conversations for the same external_message_id.
+        Rejects if a turn is currently running.
+        """
+        # Idempotency: same external_message_id should not trigger multiple clears.
+        if request.external_message_id:
+            existing = conn.execute(
+                sa.text(
+                    "SELECT 1 FROM messages m "
+                    "JOIN conversations c ON m.conversation_id = c.id "
+                    "WHERE c.platform = :platform AND c.external_chat_id = :eid AND m.external_message_id = :mid "
+                    "LIMIT 1"
+                ),
+                {
+                    "platform": request.platform,
+                    "eid": request.external_chat_id,
+                    "mid": request.external_message_id,
+                },
+            ).mappings().one_or_none()
+            if existing is not None:
+                return MessageIngestResponse(
+                    conversation_id=conversation.id,
+                    message_id=0,
+                    turn_id=None,
+                    should_respond=False,
+                    trigger_type="command",
+                    status="duplicate",
+                )
+
+        # Reject if any turn is currently running.
+        running = conn.execute(
+            sa.text(
+                "SELECT id FROM turns WHERE conversation_id = :cid AND status = 'running' LIMIT 1"
+            ),
+            {"cid": conversation.id},
+        ).mappings().one_or_none()
+        if running is not None:
+            return MessageIngestResponse(
+                conversation_id=conversation.id,
+                message_id=0,
+                turn_id=None,
+                should_respond=False,
+                trigger_type="command",
+                status="reset",
+                reset_message="当前对话正在生成中，请稍后再试。",
+            )
+
+        now = _now()
+
+        # Record the /clear command in the old conversation for audit.
+        clear_msg = self._append_message(
+            conn,
+            conversation_id=conversation.id,
+            turn_id=None,
+            sender_type="user",
+            user_id=user_id,
+            role="user",
+            content=request.content,
+            content_type=request.content_type,
+            external_message_id=request.external_message_id,
+            reply_to_message_id=None,
+            raw_payload=dict(request.raw_payload),
+        )
+
+        # Archive old conversation.
+        conn.execute(
+            sa.text(
+                "UPDATE conversations SET status = 'archived', updated_at = :now WHERE id = :id"
+            ),
+            {"now": now, "id": conversation.id},
+        )
+
+        # Create new conversation with incremented generation.
+        new_gen = conversation.clear_generation + 1
+        result = conn.execute(
+            sa.text(
+                "INSERT INTO conversations (platform, external_chat_id, chat_type, title, owner_user_id, created_by_user_id, "
+                "status, clear_generation, metadata, created_at, updated_at) "
+                "VALUES (:platform, :eid, :ctype, :title, :owner, :created_by, 'active', :gen, :meta, :now, :now)"
+            ),
+            {
+                "platform": conversation.platform,
+                "eid": conversation.external_chat_id,
+                "ctype": conversation.chat_type,
+                "title": conversation.title,
+                "owner": conversation.owner_user_id,
+                "created_by": conversation.created_by_user_id,
+                "gen": new_gen,
+                "meta": json.dumps({"cleared_from_conversation_id": conversation.id}),
+                "now": now,
+            },
+        )
+        new_conv_id = result.lastrowid
+
+        # Audit system message in the new conversation.
+        audit_content = f"Conversation cleared from {conversation.id} by user {user_id} at {now}"
+        self._append_message(
+            conn,
+            conversation_id=new_conv_id,
+            turn_id=None,
+            sender_type="system",
+            user_id=None,
+            role="system",
+            content=audit_content,
+            content_type="text",
+            external_message_id=None,
+            reply_to_message_id=None,
+            raw_payload={"source": "clear_command", "previous_conversation_id": conversation.id},
+        )
+
+        return MessageIngestResponse(
+            conversation_id=new_conv_id,
+            message_id=clear_msg.id,
+            turn_id=None,
+            should_respond=False,
+            trigger_type="command",
+            status="reset",
+            reset_message="已开始新对话。",
+        )
+
+    def _handle_cancel_command(
+        self,
+        conn: sa.Connection,
+        *,
+        conversation: ConversationRecord,
+        user_id: int,
+        request: MessageCreateRequest,
+    ) -> MessageIngestResponse:
+        # Duplicate guard within the current conversation.
+        if request.external_message_id:
+            dup = conn.execute(
+                sa.text(
+                    "SELECT id, turn_id FROM messages WHERE conversation_id = :cid AND external_message_id = :eid"
+                ),
+                {"cid": conversation.id, "eid": request.external_message_id},
+            ).mappings().one_or_none()
+            if dup is not None:
+                turn_id = dup["turn_id"]
+                trigger_type = None
+                if turn_id:
+                    trow = conn.execute(
+                        sa.text("SELECT trigger_type FROM turns WHERE id = :id"),
+                        {"id": turn_id},
+                    ).mappings().one_or_none()
+                    trigger_type = trow["trigger_type"] if trow else None
+                return MessageIngestResponse(
+                    conversation_id=conversation.id,
+                    message_id=dup["id"],
+                    turn_id=turn_id,
+                    should_respond=turn_id is not None,
+                    trigger_type=trigger_type,
+                    status="duplicate",
+                )
+
+        now = _now()
+
+        # Record the /cancel command.
+        message = self._append_message(
+            conn,
+            conversation_id=conversation.id,
+            turn_id=None,
+            sender_type="user",
+            user_id=user_id,
+            role="user",
+            content=request.content,
+            content_type=request.content_type,
+            external_message_id=request.external_message_id,
+            reply_to_message_id=None,
+            raw_payload=dict(request.raw_payload),
+        )
+
+        running_rows = conn.execute(
+            sa.text(
+                "SELECT id FROM turns WHERE conversation_id = :cid AND status = 'running'"
+            ),
+            {"cid": conversation.id},
+        ).mappings().all()
+
+        if running_rows:
+            for row in running_rows:
+                conn.execute(
+                    sa.text(
+                        "UPDATE turns SET status = 'cancelled', completed_at = :now WHERE id = :id"
+                    ),
+                    {"now": now, "id": row["id"]},
+                )
+            reply = "已取消当前生成。"
+        else:
+            reply = "没有正在进行的对话。"
+
+        conn.execute(
+            sa.text("UPDATE conversations SET updated_at = :now WHERE id = :id"),
+            {"now": now, "id": conversation.id},
+        )
+
+        return MessageIngestResponse(
+            conversation_id=conversation.id,
+            message_id=message.id,
+            turn_id=None,
+            should_respond=False,
+            trigger_type="command",
+            status="cancelled",
+            reset_message=reply,
+        )
+
+    def _handle_status_command(
+        self,
+        conn: sa.Connection,
+        *,
+        conversation: ConversationRecord,
+        user_id: int,
+        request: MessageCreateRequest,
+    ) -> MessageIngestResponse:
+        # Duplicate guard within the current conversation.
+        if request.external_message_id:
+            dup = conn.execute(
+                sa.text(
+                    "SELECT id, turn_id FROM messages WHERE conversation_id = :cid AND external_message_id = :eid"
+                ),
+                {"cid": conversation.id, "eid": request.external_message_id},
+            ).mappings().one_or_none()
+            if dup is not None:
+                turn_id = dup["turn_id"]
+                trigger_type = None
+                if turn_id:
+                    trow = conn.execute(
+                        sa.text("SELECT trigger_type FROM turns WHERE id = :id"),
+                        {"id": turn_id},
+                    ).mappings().one_or_none()
+                    trigger_type = trow["trigger_type"] if trow else None
+                return MessageIngestResponse(
+                    conversation_id=conversation.id,
+                    message_id=dup["id"],
+                    turn_id=turn_id,
+                    should_respond=turn_id is not None,
+                    trigger_type=trigger_type,
+                    status="duplicate",
+                )
+
+        now = _now()
+
+        # Record the /status command.
+        message = self._append_message(
+            conn,
+            conversation_id=conversation.id,
+            turn_id=None,
+            sender_type="user",
+            user_id=user_id,
+            role="user",
+            content=request.content,
+            content_type=request.content_type,
+            external_message_id=request.external_message_id,
+            reply_to_message_id=None,
+            raw_payload=dict(request.raw_payload),
+        )
+
+        msg_count = conn.execute(
+            sa.text("SELECT COUNT(*) AS cnt FROM messages WHERE conversation_id = :cid"),
+            {"cid": conversation.id},
+        ).mappings().one()["cnt"]
+
+        turn_stats = conn.execute(
+            sa.text(
+                "SELECT "
+                "COUNT(*) AS total, "
+                "SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END) AS running, "
+                "SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed, "
+                "SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed, "
+                "SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) AS cancelled "
+                "FROM turns WHERE conversation_id = :cid"
+            ),
+            {"cid": conversation.id},
+        ).mappings().one()
+
+        settings = get_settings()
+        provider = settings.llm_provider
+        model = getattr(settings, f"{provider}_model", "unknown")
+
+        running_count = turn_stats["running"] or 0
+        status_label = "执行中" if running_count > 0 else "空闲"
+
+        reply = (
+            f"当前会话\n"
+            f"类型: {_chat_type_label(conversation.chat_type)}\n"
+            f"状态: {status_label}\n"
+            f"消息数: {msg_count}\n"
+            f"会话代数: {conversation.clear_generation}\n"
+            f"最近活跃: {_fmt_time(conversation.updated_at)}\n"
+            f"---\n"
+            f"系统参数\n"
+            f"App: {settings.app_name} ({settings.environment})\n"
+            f"LLM: {provider} / {model}\n"
+            f"超时: {settings.llm_timeout_seconds}s\n"
+            f"Bot: {settings.feishu_bot_name}"
+        )
+
+        conn.execute(
+            sa.text("UPDATE conversations SET updated_at = :now WHERE id = :id"),
+            {"now": now, "id": conversation.id},
+        )
+
+        return MessageIngestResponse(
+            conversation_id=conversation.id,
+            message_id=message.id,
+            turn_id=None,
+            should_respond=False,
+            trigger_type="command",
+            status="status_report",
+            reset_message=reply,
+        )
+
     def _create_turn(
         self,
         conn: sa.Connection,
@@ -771,6 +1193,9 @@ class MySQLConversationStore:
             id=row["id"],
             turn_id=row["turn_id"],
             tool_name=row["tool_name"],
+            assistant_message_id=row.get("assistant_message_id"),
+            provider_tool_call_id=row.get("provider_tool_call_id"),
+            step_index=row.get("step_index") or 0,
             status=row["status"],
             input=json.loads(row["input"] or "{}"),
             output=json.loads(row["output"]) if row["output"] else None,

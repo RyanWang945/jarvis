@@ -8,8 +8,6 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
-from langchain_core.messages import AIMessage, BaseMessage
-
 from app.agent_react.agent_graph import build_turn_graph
 
 logger = logging.getLogger(__name__)
@@ -53,6 +51,17 @@ class ConversationStore(Protocol):
         raw_payload: dict | None = None,
     ): ...
 
+    def append_tool_message(
+        self,
+        *,
+        conversation_id: int,
+        turn_id: int | None,
+        content: str,
+        content_type: str = "text",
+        external_message_id: str | None = None,
+        raw_payload: dict | None = None,
+    ): ...
+
     def complete_turn(
         self,
         turn_id: int,
@@ -80,10 +89,25 @@ class ConversationStore(Protocol):
         error_message: str | None = None,
     ) -> None: ...
 
-    # tool_calls (Phase 1 persistence)
-    def create_tool_call(self, *, turn_id: int, tool_name: str, input: dict): ...
+    def create_tool_call(
+        self,
+        *,
+        turn_id: int,
+        tool_name: str,
+        input: dict,
+        assistant_message_id: int | None = None,
+        provider_tool_call_id: str | None = None,
+        step_index: int = 0,
+    ): ...
 
-    def update_tool_call(self, tool_call_id: int, *, status: str | None = None, output: dict | None = None, error_message: str | None = None): ...
+    def update_tool_call(
+        self,
+        tool_call_id: int,
+        *,
+        status: str | None = None,
+        output: dict | None = None,
+        error_message: str | None = None,
+    ): ...
 
     def list_tool_calls_by_turn(self, turn_id: int) -> list: ...
 
@@ -95,7 +119,6 @@ class AgentRuntime:
     - Turn lifecycle (running / completed / failed)
     - Load MySQL context into graph state
     - Invoke the compiled Turn graph
-    - Audit tool_calls after execution
     - Return TurnResult to callers (API, CLI, Feishu)
     """
 
@@ -114,8 +137,11 @@ class AgentRuntime:
             result = self._graph.invoke({
                 "turn_id": turn_id,
                 "conversation_id": turn.conversation_id,
+                "trigger_message_id": getattr(turn, "trigger_message_id", None),
                 "messages": [],
+                "selected_skills": [],
                 "reply": "",
+                "reply_message_id": None,
                 "status": "running",
                 "error": None,
             })
@@ -125,8 +151,11 @@ class AgentRuntime:
             result = {
                 "turn_id": turn_id,
                 "conversation_id": turn.conversation_id,
+                "trigger_message_id": getattr(turn, "trigger_message_id", None),
                 "messages": [],
+                "selected_skills": [],
                 "reply": "",
+                "reply_message_id": None,
                 "status": "failed",
                 "error": str(exc),
             }
@@ -138,9 +167,6 @@ class AgentRuntime:
         if status == "failed" and error:
             logger.error("turn failed turn_id=%s error=%s", turn_id, error)
 
-        # Audit tool_calls: walk new messages and record each tool execution
-        self._persist_tool_calls(turn_id, result.get("messages", []))
-
         return TurnResult(
             turn_id=turn_id,
             conversation_id=turn.conversation_id,
@@ -151,41 +177,3 @@ class AgentRuntime:
                 summary=reply,
             ),
         )
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _persist_tool_calls(self, turn_id: int, messages: list[BaseMessage]) -> None:
-        """Walk messages to find tool_call pairs and write them to MySQL."""
-        for msg in messages:
-            if not isinstance(msg, AIMessage):
-                continue
-            for tc in msg.tool_calls:
-                tool_name = tc["name"]
-                tool_args = tc["args"]
-                tool_call_id = tc["id"]
-
-                # Find the corresponding ToolMessage by tool_call_id
-                output = ""
-                for follow in messages:
-                    if (
-                        isinstance(follow, BaseMessage)
-                        and getattr(follow, "tool_call_id", None) == tool_call_id
-                    ):
-                        output = str(follow.content)
-                        break
-
-                try:
-                    record = self._store.create_tool_call(
-                        turn_id=turn_id,
-                        tool_name=tool_name,
-                        input=tool_args,
-                    )
-                    self._store.update_tool_call(
-                        record.id,
-                        status="completed",
-                        output={"result": output[:2000]} if output else {},
-                    )
-                except Exception:
-                    logger.exception("failed to persist tool_call turn=%s tool=%s", turn_id, tool_name)

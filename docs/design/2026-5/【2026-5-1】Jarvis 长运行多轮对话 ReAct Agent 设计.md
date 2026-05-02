@@ -272,6 +272,42 @@ on event resume: reload state and continue loop
 
 这里的 plan 是 LLM 的内部过程和可选输出，不是持久化 DAG。可以记录 reasoning summary 和 tool call sequence，但不要强制转成 Task 图。
 
+### 4.2.1 tool_calls 持久化与 proposal gate
+
+`tool_calls` 的设计目标不是保存一份“消息回放摘要”，而是保存一次真实工具执行事实。第一版没有独立 `events` 表时，`tool_calls` 需要直接承担审计、测试、恢复判断三类职责：
+
+- 审计：回答这个 turn 调了什么工具、输入是什么、何时开始、何时结束、结果如何。
+- 测试：验证 ReAct loop 是否真的按预期调用了目标工具，而不是只从最终回复反推。
+- 恢复：系统重启后扫描 `running` / `requested` 的 `tool_calls`，判断是否需要标记失败、取消或人工恢复。
+
+现状：
+
+- `prepare` 会加载整个 conversation 历史消息，图内 state 同时包含“历史消息”和“本 turn 新增消息”。
+- runtime 在图执行结束后扫描最终 `messages`，再反向补写 `tool_calls`。
+- `delegate_to_claude_code` 这类高权限工具虽然由 LLM 通过 tool call 触发，但执行前还要经过 runtime policy gate，而不是模型一调用就直接执行。
+
+问题：
+
+- 如果 `tool_calls` 在图结束后通过扫描消息补写，历史 tool call 和本 turn 新 tool call 很容易混淆，审计记录不再是执行事实，而变成消息推断。
+- `tool_calls` 表当前字段表达的是生命周期事实：`status`、`started_at`、`finished_at`、`error_message`。如果落库时机放在执行完成之后，这些字段很难保持严格语义。
+- proposal 类工具的“被拒绝”是 runtime 的治理结果，不应该在审计上伪装成一次成功执行。
+
+解决方案：
+
+- `tool_calls` 必须在 `execute_tools` 节点内持久化，不再由 runtime 在图结束后统一回扫消息补记。
+- 每个 tool call 的推荐时序为：创建 `requested` 记录 -> 开始执行时更新为 `running` -> 执行结束后更新为 `completed` / `failed` / `cancelled` / `rejected`。
+- proposal gate 属于 runtime policy。它负责判断高权限工具是否满足执行前提；如果不满足，应记录为一次被 runtime 拒绝的工具调用，而不是跳过审计。
+- ReAct state 需要显式区分 `history_messages` 和 `new_messages`，或者保留 `initial_message_count` 之类的增量边界，避免图外逻辑误把历史消息再次记账。
+- 最终 assistant reply 应单独作为 turn 输出持久化；`tool_calls` 只表达工具执行事实，不承担“推断最终答复”的职责。
+
+关系要求：
+
+- `conversation` 是顶层会话容器，`tool_calls` 不直接挂在 `conversation` 上，而是通过 `turn` 和 `message` 间接归属到某个 conversation。
+- `turn` 表示 Jarvis 对某次触发消息的一次响应生命周期；一次 `tool_call` 必须属于且只属于一个 `turn`。
+- `messages` 保存用户、assistant、tool 的可见对话事实；`tool_calls` 保存对应的结构化执行事实。
+- assistant 发起工具调用时，应该同时产生一条 assistant message 和零到多条 `tool_calls` 记录；后续 tool result message 只是把执行结果回灌给模型，不替代 `tool_calls` 审计。
+- 因此 `tool_calls` 的结构关系不应只靠 `turn_id` 和 `tool_name` 弱关联，而应能追溯到“由哪条 assistant message 发起、在该 message 中是哪一个 tool call”。
+
 ### 4.3 挂起和恢复
 
 Turn 可以因为以下原因挂起：
@@ -930,11 +966,34 @@ image_generation
 
 `tool_calls` 表记录某个 turn 内部的一次工具调用。
 
+原则：
+
+- 一行 `tool_calls` 代表一次真实工具执行尝试，而不是从 `messages` 派生出来的摘要。
+- `tool_calls` 的写入边界在 runtime 的 `execute_tools` 节点内，而不是 turn 结束后的统一补录。
+- proposal gate 的拒绝结果也属于可审计事实。拒绝不等于 turn failed，但应该体现在 `tool_calls` 上。
+- `tool_calls` 不是孤立表。它必须能和 `conversations -> turns -> messages` 这条事实链路对齐。
+
+关系：
+
+- `conversations`：会话容器，提供跨 turn 的上下文边界。
+- `turns`：一次 Jarvis 响应生命周期；`tool_calls.turn_id` 说明这次工具调用属于哪个响应。
+- `messages`：可见对话事实；assistant message 负责表达“模型决定调用了什么工具”，tool message 负责把执行结果回灌到对话。
+- `tool_calls`：结构化执行事实；负责回答“这次调用何时开始、何时结束、执行还是被拒绝、输入输出是什么”。
+
+建议查询链路：
+
+- 查某次响应发生了哪些工具调用：按 `turn_id` 查 `tool_calls`。
+- 查某个工具调用是由哪次模型决策发起：通过 `assistant_message_id` 回查 `messages.id`。
+- 查某次模型决策里有几个工具调用：按 `assistant_message_id` 聚合 `tool_calls`。
+
 ```sql
 CREATE TABLE jarvis.tool_calls (
     id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
     turn_id BIGINT UNSIGNED NOT NULL,
     tool_name VARCHAR(128) NOT NULL,
+    assistant_message_id BIGINT UNSIGNED NULL,
+    provider_tool_call_id VARCHAR(128),
+    step_index INTEGER UNSIGNED NOT NULL DEFAULT 0,
     status VARCHAR(32) NOT NULL DEFAULT 'running',
     input JSON,
     output JSON,
@@ -942,14 +1001,60 @@ CREATE TABLE jarvis.tool_calls (
     started_at DATETIME(6),
     finished_at DATETIME(6),
     created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    UNIQUE KEY uk_tool_calls_turn_provider_call (turn_id, provider_tool_call_id),
     KEY idx_tool_calls_turn_created (turn_id, created_at),
+    KEY idx_tool_calls_assistant_message (assistant_message_id),
     KEY idx_tool_calls_status_created (status, created_at),
     KEY idx_tool_calls_tool_name_created (tool_name, created_at),
-    CONSTRAINT fk_tool_calls_turn FOREIGN KEY (turn_id) REFERENCES jarvis.turns(id) ON DELETE CASCADE
+    CONSTRAINT fk_tool_calls_turn FOREIGN KEY (turn_id) REFERENCES jarvis.turns(id) ON DELETE CASCADE,
+    CONSTRAINT fk_tool_calls_assistant_message FOREIGN KEY (assistant_message_id) REFERENCES jarvis.messages(id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 ```
 
-`status` 建议值：`requested`、`running`、`completed`、`failed`、`cancelled`。
+`status` 建议值：`requested`、`running`、`completed`、`failed`、`cancelled`、`rejected`。
+
+字段说明：
+
+- `assistant_message_id`：指向发起这次工具调用的 assistant message。这个字段把结构化审计记录正式挂回 `messages` 事实链，避免 `tool_calls` 成为悬空表。
+- `provider_tool_call_id`：保存模型 provider 返回的 tool call id。它不是业务主键，而是“该 assistant message 内部的调用标识”，用于对账、排查和幂等辅助。
+- `step_index`：保存本 turn 内第几次进入工具执行阶段，便于审计 ReAct loop 顺序，也方便恢复和测试断言。
+
+新增字段在审计上的好处：
+
+- `assistant_message_id`
+  - 能明确回答“这次工具调用是由哪条 assistant message 发起的”。
+  - 审计时可以把 assistant 的原始决策文本、tool call 列表、后续 tool result 放到一条完整链路里看。
+  - 测试时不再只能按 `turn_id + tool_name` 做弱匹配。
+- `provider_tool_call_id`
+  - 能明确回答“这是不是同一条 assistant message 里的同一个 tool call”。
+  - 对同名工具多次调用、重复回放、幂等防重都有帮助。
+  - 排查 provider 输出和数据库记录不一致时，可以直接对账。
+- `step_index`
+  - 能明确回答“这次调用处于 turn 的第几轮 ReAct 决策”。
+  - 比只看 `created_at` 更稳定，特别适合测试断言和故障回放。
+  - 一条 assistant message 里可以有多个 tool call，`step_index` 用来表达轮次，`provider_tool_call_id` 用来表达同轮内的具体调用。
+
+现状：
+
+- 当前实现已经有 `tool_calls` 表，但写入发生在 turn 结束后，由 runtime 扫描整段 `messages` 再补写。
+- 这种方式默认假设消息列表只包含本 turn 新增内容，但实际图 state 往往还包含 conversation 历史。
+- proposal gate 的拒绝文本如果只作为 `ToolMessage` 回给模型，而不写入结构化状态，就会丢失“是谁拒绝、为什么拒绝”的审计价值。
+
+问题：
+
+- 同一个历史 tool call 可能在后续 turn 中被重复补录。
+- 同一次工具调用如果执行失败、被 gate 拒绝或被取消，最终仍可能在审计表里表现为 `completed`。
+- 没有 `assistant_message_id` 时，`tool_calls` 和 `messages` 的关系是断开的，无法精确知道是哪次模型决策发起了这次调用。
+- 没有 `provider_tool_call_id` 时，测试和审计只能按 `tool_name` 和时间顺序做弱匹配，稳定性差。
+- 没有 `step_index` 时，只能按时间猜测 ReAct loop 的顺序，不适合做精确断言。
+
+解决方案：
+
+- 在 `execute_tools` 节点收到 `AIMessage.tool_calls` 后，逐条立即创建 `tool_calls` 记录。
+- 创建记录时同步写入 `turn_id`、`assistant_message_id`、`provider_tool_call_id`、`step_index`。
+- proposal gate 拒绝时，更新该条记录为 `rejected`，并把拒绝原因写入 `error_message`；同时向模型返回对应 `ToolMessage`，让 ReAct loop 自行换方案或解释。
+- 工具真正开始执行后，将状态更新为 `running`；执行成功写 `completed + output`，执行异常写 `failed + error_message`，turn 被取消则写 `cancelled`。
+- `runtime` 不再扫描全量 `messages` 回填 `tool_calls`。图外只消费结构化结果，不再负责推断工具执行历史。
 
 `input` / `output` 不要无脑存完整内容。不建议完整存：
 

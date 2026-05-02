@@ -19,6 +19,17 @@ from app.api.schemas import (
     SenderInput,
     TurnResponse,
 )
+from app.config import get_settings
+from app.persistence.models import (
+    ConversationRecord as _ConversationRecord,
+    MessageRecord as _MessageRecord,
+    ToolCallRecord as _ToolCallRecord,
+    TurnRecord as _TurnRecord,
+    UserRecord as _UserRecord,
+)
+from app.persistence.conversation_store import MySQLConversationStore
+
+router = APIRouter(tags=["conversation-runtime"])
 from app.persistence.models import (
     ConversationRecord as _ConversationRecord,
     MessageRecord as _MessageRecord,
@@ -43,6 +54,7 @@ class InMemoryConversationStore:
         self._next_conversation_id = 1
         self._next_message_id = 1
         self._next_turn_id = 1
+        self._next_tool_call_id = 1
         self._users: dict[int, _UserRecord] = {}
         self._users_by_external: dict[tuple[str, str], int] = {}
         self._conversations: dict[int, _ConversationRecord] = {}
@@ -50,6 +62,7 @@ class InMemoryConversationStore:
         self._messages: dict[int, _MessageRecord] = {}
         self._messages_by_external: dict[tuple[int, str], int] = {}
         self._turns: dict[int, _TurnRecord] = {}
+        self._tool_calls: dict[int, _ToolCallRecord] = {}
 
     def create_conversation(self, request: ConversationCreateRequest) -> _ConversationRecord:
         with self._lock:
@@ -129,6 +142,34 @@ class InMemoryConversationStore:
                 raw_payload=raw_payload or {},
             )
 
+    def append_tool_message(
+        self,
+        *,
+        conversation_id: int,
+        turn_id: int | None,
+        content: str,
+        content_type: str = "text",
+        external_message_id: str | None = None,
+        raw_payload: dict[str, Any] | None = None,
+    ) -> _MessageRecord:
+        with self._lock:
+            if conversation_id not in self._conversations:
+                raise KeyError(conversation_id)
+            if turn_id is not None and turn_id not in self._turns:
+                raise KeyError(turn_id)
+            return self._append_message_locked(
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                sender_type="tool",
+                user_id=None,
+                role="tool",
+                content=content,
+                content_type=content_type,
+                external_message_id=external_message_id,
+                reply_to_message_id=None,
+                raw_payload=raw_payload or {},
+            )
+
     def mark_turn_running(self, turn_id: int) -> None:
         with self._lock:
             turn = self._turns.get(turn_id)
@@ -198,6 +239,67 @@ class InMemoryConversationStore:
             turn.completed_at = _now()
             turn.error_message = error_message
 
+    def create_tool_call(
+        self,
+        *,
+        turn_id: int,
+        tool_name: str,
+        input: dict[str, Any],
+        assistant_message_id: int | None = None,
+        provider_tool_call_id: str | None = None,
+        step_index: int = 0,
+    ) -> _ToolCallRecord:
+        with self._lock:
+            record_id = self._next_tool_call_id
+            self._next_tool_call_id += 1
+            record = _ToolCallRecord(
+                id=record_id,
+                turn_id=turn_id,
+                tool_name=tool_name,
+                assistant_message_id=assistant_message_id,
+                provider_tool_call_id=provider_tool_call_id,
+                step_index=step_index,
+                status="requested",
+                input=dict(input),
+                output=None,
+                error_message=None,
+                started_at=_now(),
+                finished_at=None,
+                created_at=_now(),
+            )
+            self._tool_calls[record_id] = record
+            return record
+
+    def update_tool_call(
+        self,
+        tool_call_id: int,
+        *,
+        status: str | None = None,
+        output: dict[str, Any] | None = None,
+        error_message: str | None = None,
+    ) -> _ToolCallRecord | None:
+        with self._lock:
+            record = self._tool_calls.get(tool_call_id)
+            if record is None:
+                return None
+            if status is not None:
+                record.status = status
+            if output is not None:
+                record.output = dict(output)
+            if error_message is not None:
+                record.error_message = error_message
+            if status in {"completed", "failed", "cancelled", "rejected"}:
+                record.finished_at = _now()
+            return record
+
+    def list_tool_calls_by_turn(self, turn_id: int) -> list[_ToolCallRecord]:
+        with self._lock:
+            return [
+                record
+                for record in sorted(self._tool_calls.values(), key=lambda item: item.created_at)
+                if record.turn_id == turn_id
+            ]
+
     def ingest_message(self, request: MessageCreateRequest) -> MessageIngestResponse:
         with self._lock:
             user_id = self._ensure_user_locked(request.platform, request.sender)
@@ -209,6 +311,14 @@ class InMemoryConversationStore:
                 created_by_user_id=user_id,
                 metadata={},
             )
+
+            if conversation.chat_type == "dm" and request.content.strip().startswith("/"):
+                return self._handle_command_locked(
+                    conversation=conversation,
+                    user_id=user_id,
+                    request=request,
+                )
+
             return self._create_message_and_maybe_turn_locked(
                 conversation=conversation,
                 user_id=user_id,
@@ -390,6 +500,292 @@ class InMemoryConversationStore:
             should_respond=should_respond,
             trigger_type=trigger_type,
             status="queued" if should_respond else "stored",
+        )
+
+    def _handle_command_locked(
+        self,
+        *,
+        conversation: _ConversationRecord,
+        user_id: int,
+        request: MessageCreateRequest,
+    ) -> MessageIngestResponse:
+        """Dispatch DM commands. Unknown commands fall through to normal turn creation."""
+        cmd = request.content.strip().lower().split(maxsplit=1)[0]
+        if cmd == "/clear":
+            return self._handle_clear_command_locked(
+                conversation=conversation, user_id=user_id, request=request
+            )
+        if cmd == "/cancel":
+            return self._handle_cancel_command_locked(
+                conversation=conversation, user_id=user_id, request=request
+            )
+        if cmd == "/status":
+            return self._handle_status_command_locked(
+                conversation=conversation, user_id=user_id, request=request
+            )
+        # Unknown command: fall through to normal turn creation.
+        return self._create_message_and_maybe_turn_locked(
+            conversation=conversation,
+            user_id=user_id,
+            content=request.content,
+            content_type=request.content_type,
+            external_message_id=request.external_message_id,
+            reply_to_message_id=self._resolve_reply_message_id_locked(
+                conversation.id,
+                request.reply_to_message_id,
+                request.reply_to_external_message_id,
+            ),
+            mentions=request.mentions,
+            raw_payload=request.raw_payload,
+            metadata=request.metadata,
+        )
+
+    def _handle_clear_command_locked(
+        self,
+        *,
+        conversation: _ConversationRecord,
+        user_id: int,
+        request: MessageCreateRequest,
+    ) -> MessageIngestResponse:
+        # Idempotency across any conversation for this chat.
+        if request.external_message_id:
+            for msg in self._messages.values():
+                conv = self._conversations.get(msg.conversation_id)
+                if (
+                    conv
+                    and conv.platform == conversation.platform
+                    and conv.external_chat_id == conversation.external_chat_id
+                    and msg.external_message_id == request.external_message_id
+                ):
+                    return MessageIngestResponse(
+                        conversation_id=conversation.id,
+                        message_id=msg.id,
+                        turn_id=msg.turn_id,
+                        should_respond=msg.turn_id is not None,
+                        trigger_type=self._turns[msg.turn_id].trigger_type if msg.turn_id else None,
+                        status="duplicate",
+                    )
+
+        # Reject if any turn is currently running.
+        running = any(
+            turn.conversation_id == conversation.id and turn.status == "running"
+            for turn in self._turns.values()
+        )
+        if running:
+            return MessageIngestResponse(
+                conversation_id=conversation.id,
+                message_id=0,
+                turn_id=None,
+                should_respond=False,
+                trigger_type="command",
+                status="reset",
+                reset_message="当前对话正在生成中，请稍后再试。",
+            )
+
+        now = _now()
+
+        # Record /clear in old conversation.
+        clear_msg = self._append_message_locked(
+            conversation_id=conversation.id,
+            turn_id=None,
+            sender_type="user",
+            user_id=user_id,
+            role="user",
+            content=request.content,
+            content_type=request.content_type,
+            external_message_id=request.external_message_id,
+            reply_to_message_id=None,
+            raw_payload=dict(request.raw_payload),
+        )
+
+        # Archive old conversation.
+        conversation.status = "archived"
+        conversation.updated_at = now
+        key = (conversation.platform, conversation.external_chat_id)
+        if self._active_conversations.get(key) == conversation.id:
+            del self._active_conversations[key]
+
+        # Create new conversation.
+        new_conv_id = self._next_conversation_id
+        self._next_conversation_id += 1
+        new_conv = _ConversationRecord(
+            id=new_conv_id,
+            platform=conversation.platform,
+            external_chat_id=conversation.external_chat_id,
+            chat_type=conversation.chat_type,
+            title=conversation.title,
+            status="active",
+            clear_generation=conversation.clear_generation + 1,
+            owner_user_id=conversation.owner_user_id,
+            created_by_user_id=conversation.created_by_user_id,
+            created_at=now,
+            updated_at=now,
+            metadata={"cleared_from_conversation_id": conversation.id},
+        )
+        self._conversations[new_conv_id] = new_conv
+        self._active_conversations[key] = new_conv_id
+
+        # Audit system message.
+        audit_content = f"Conversation cleared from {conversation.id} by user {user_id} at {now}"
+        self._append_message_locked(
+            conversation_id=new_conv_id,
+            turn_id=None,
+            sender_type="system",
+            user_id=None,
+            role="system",
+            content=audit_content,
+            content_type="text",
+            external_message_id=None,
+            reply_to_message_id=None,
+            raw_payload={"source": "clear_command", "previous_conversation_id": conversation.id},
+        )
+
+        return MessageIngestResponse(
+            conversation_id=new_conv_id,
+            message_id=clear_msg.id,
+            turn_id=None,
+            should_respond=False,
+            trigger_type="command",
+            status="reset",
+            reset_message="已开始新对话。",
+        )
+
+    def _handle_cancel_command_locked(
+        self,
+        *,
+        conversation: _ConversationRecord,
+        user_id: int,
+        request: MessageCreateRequest,
+    ) -> MessageIngestResponse:
+        # Duplicate guard within the current conversation.
+        if request.external_message_id:
+            existing_id = self._messages_by_external.get((conversation.id, request.external_message_id))
+            if existing_id is not None:
+                msg = self._messages[existing_id]
+                turn_id = msg.turn_id
+                trigger_type = self._turns[turn_id].trigger_type if turn_id else None
+                return MessageIngestResponse(
+                    conversation_id=conversation.id,
+                    message_id=msg.id,
+                    turn_id=turn_id,
+                    should_respond=turn_id is not None,
+                    trigger_type=trigger_type,
+                    status="duplicate",
+                )
+
+        now = _now()
+        message = self._append_message_locked(
+            conversation_id=conversation.id,
+            turn_id=None,
+            sender_type="user",
+            user_id=user_id,
+            role="user",
+            content=request.content,
+            content_type=request.content_type,
+            external_message_id=request.external_message_id,
+            reply_to_message_id=None,
+            raw_payload=dict(request.raw_payload),
+        )
+
+        running = [
+            turn for turn in self._turns.values()
+            if turn.conversation_id == conversation.id and turn.status == "running"
+        ]
+        if running:
+            for turn in running:
+                turn.status = "cancelled"
+                turn.completed_at = now
+            reply = "已取消当前生成。"
+        else:
+            reply = "没有正在进行的对话。"
+
+        conversation.updated_at = now
+        return MessageIngestResponse(
+            conversation_id=conversation.id,
+            message_id=message.id,
+            turn_id=None,
+            should_respond=False,
+            trigger_type="command",
+            status="cancelled",
+            reset_message=reply,
+        )
+
+    def _handle_status_command_locked(
+        self,
+        *,
+        conversation: _ConversationRecord,
+        user_id: int,
+        request: MessageCreateRequest,
+    ) -> MessageIngestResponse:
+        # Duplicate guard within the current conversation.
+        if request.external_message_id:
+            existing_id = self._messages_by_external.get((conversation.id, request.external_message_id))
+            if existing_id is not None:
+                msg = self._messages[existing_id]
+                turn_id = msg.turn_id
+                trigger_type = self._turns[turn_id].trigger_type if turn_id else None
+                return MessageIngestResponse(
+                    conversation_id=conversation.id,
+                    message_id=msg.id,
+                    turn_id=turn_id,
+                    should_respond=turn_id is not None,
+                    trigger_type=trigger_type,
+                    status="duplicate",
+                )
+
+        now = _now()
+        message = self._append_message_locked(
+            conversation_id=conversation.id,
+            turn_id=None,
+            sender_type="user",
+            user_id=user_id,
+            role="user",
+            content=request.content,
+            content_type=request.content_type,
+            external_message_id=request.external_message_id,
+            reply_to_message_id=None,
+            raw_payload=dict(request.raw_payload),
+        )
+
+        msg_count = len([
+            m for m in self._messages.values() if m.conversation_id == conversation.id
+        ])
+        turns = [t for t in self._turns.values() if t.conversation_id == conversation.id]
+        total = len(turns)
+        running = sum(1 for t in turns if t.status == "running")
+        completed = sum(1 for t in turns if t.status == "completed")
+        failed = sum(1 for t in turns if t.status == "failed")
+        cancelled = sum(1 for t in turns if t.status == "cancelled")
+
+        settings = get_settings()
+        provider = settings.llm_provider
+        model = getattr(settings, f"{provider}_model", "unknown")
+        status_label = "执行中" if running > 0 else "空闲"
+
+        reply = (
+            f"当前会话\n"
+            f"类型: {_chat_type_label(conversation.chat_type)}\n"
+            f"状态: {status_label}\n"
+            f"消息数: {msg_count}\n"
+            f"会话代数: {conversation.clear_generation}\n"
+            f"最近活跃: {_fmt_time(conversation.updated_at)}\n"
+            f"---\n"
+            f"系统参数\n"
+            f"App: {settings.app_name} ({settings.environment})\n"
+            f"LLM: {provider} / {model}\n"
+            f"超时: {settings.llm_timeout_seconds}s\n"
+            f"Bot: {settings.feishu_bot_name}"
+        )
+
+        conversation.updated_at = now
+        return MessageIngestResponse(
+            conversation_id=conversation.id,
+            message_id=message.id,
+            turn_id=None,
+            should_respond=False,
+            trigger_type="command",
+            status="status_report",
+            reset_message=reply,
         )
 
     def _append_message_locked(
@@ -622,3 +1018,19 @@ def _turn_type(content: str) -> str:
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _fmt_time(iso: str) -> str:
+    try:
+        dt = datetime.fromisoformat(iso)
+        return dt.strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return iso
+
+
+def _chat_type_label(chat_type: str) -> str:
+    if chat_type == "dm":
+        return "私聊"
+    if chat_type == "group":
+        return "群聊"
+    return chat_type
