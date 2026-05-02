@@ -67,6 +67,22 @@ Jarvis 里的 `obsidian_wiki` 不是一个独立产品，而是 ReAct runtime �
 - 不替代 git 仓库中的源码和 commit 历史。
 - 不在 v1 直接做自动知识图谱、复杂双向同步和全自动页面去重。
 
+### 3.1 v1 产品结论
+
+v1 不做“自动生长的长期大脑”，而做“可控的知识沉淀管道”。
+
+也就是说，v1 的重点是：
+
+- 用户或 Agent 显式决定哪些内容值得沉淀
+- 先生成候选 draft
+- 再由用户确认写入正式 wiki
+
+而不是：
+
+- 自动把每段 conversation 都导入 raw
+- 自动全量扫描 raw 并批量生成 wiki
+- 自动后台重写正式页面
+
 ---
 
 ## 4. v1 目标与非目标
@@ -74,7 +90,7 @@ Jarvis 里的 `obsidian_wiki` 不是一个独立产品，而是 ReAct runtime �
 ### 4.1 v1 目标
 
 - 提供一个 Obsidian 兼容的本地 Wiki 目录结构。
-- 支持把对话、网页、文档、已有笔记导入到 `raw/`。
+- 支持把被显式选中的对话片段、网页、文档、已有笔记导入到 `raw/`。
 - 支持生成候选 draft，并在用户确认后将 draft 应用到正式 wiki 页面。
 - 支持按 query 检索 wiki 页面，并可按模式回查 raw source。
 - 支持后台维护，处理最基础的 frontmatter、page_type、source_ids 和死链问题。
@@ -84,10 +100,29 @@ Jarvis 里的 `obsidian_wiki` 不是一个独立产品，而是 ReAct runtime �
 
 - 不做 Obsidian 插件开发。
 - 不做复杂 GUI。
+- 不做 conversation 自动全量导入 raw。
+- 不做后台定期扫描 raw 自动生成 draft。
 - 不做自动后台持续重写全部页面。
 - 不做自动合并全部重复知识页。
 - 不做真正意义上的图数据库或实体关系图谱。
 - 不要求一开始就和 OpenSearch / 向量库深度绑定。
+
+### 4.3 v1 路线选择
+
+v1 明确选择：
+
+- **A. 先只支持显式触发的 `draft -> 用户确认 -> apply`**
+
+不选：
+
+- B. conversation 自动进 raw，再由后台任务扫描 raw
+- C. 只做查询，不做写入链路
+
+原因：
+
+- A 的链路最短，最容易先跑通。
+- A 最符合当前 Jarvis 的成熟度和权限边界。
+- A 能先验证 wiki 工具链本身，不会因为自动化过早污染知识库。
 
 ---
 
@@ -122,6 +157,26 @@ tags[]
 - raw 默认不可改写，只允许追加、标记 superseded 或重新导入。
 - raw 必须保留来源信息，不能只保留正文。
 - raw 是证据层，不承担最终组织职责。
+- v1 不自动全量导入 conversation，只有被显式选中的知识片段才进入 raw。
+- raw 的 `source_id / source_ref / created_at / content_hash` 全部由代码生成，不由 LLM 负责填写。
+
+### 5.1.1 Conversation -> Raw 规则
+
+v1 对 Conversation -> Raw 采用保守策略：
+
+- 不在每个 turn 结束后自动扫描对话
+- 不对所有 conversation 做自动全量导出
+- 只在以下场景创建 raw source：
+  - 用户明确说“记下来”“写进 wiki”“沉淀这段内容”
+  - Agent 在当前任务流里显式决定“这段内容值得沉淀”
+
+raw 的存储粒度也不按整段 thread，也不按单 turn 全拆，而是：
+
+- 一条 raw source 对应一段被显式选中的知识片段
+- 必要时可包含若干相关 turn
+- 如果结论依赖 tool result，则相关 tool result 一并纳入 raw
+
+这样可以避免 raw 在 v1 过早变成噪音堆。
 
 ### 5.2 Wiki Page
 
@@ -162,26 +217,22 @@ Schema 不是一份抽象说明，而是一组可执行约束：
 
 ---
 
-## 6. Obsidian 目录设计
+## 6. Workspace 与 Vault 目录设计
+
+v1 需要明确区分两个概念：
+
+- `workspace/`：模块工作区根目录，包含系统内部状态和人类可读知识页
+- `vault/`：真正给 Obsidian 打开的目录，只包含人类可读页面
+
+也就是说，**不要把 raw / drafts / schema 直接暴露在 Obsidian 主 vault 里**。否则图谱会被 `src_*`、`draft_*`、规则文件和日志污染，不适合人类使用。
 
 推荐目录如下：
 
 ```text
-JarvisWiki/
-  schema/
-    wiki-schema.md
-    naming.md
-    page-types.md
-    writing-rules.md
+JarvisWikiWorkspace/
+  README.md
 
-  raw/
-    conversations/
-    documents/
-    web/
-    repos/
-    obsidian-notes/
-
-  wiki/
+  vault/
     index.md
     inbox/
     projects/
@@ -192,22 +243,47 @@ JarvisWiki/
     concepts/
     tools/
     playbooks/
+    .obsidian/
 
-  drafts/
-  templates/
-  logs/
+  system/
+    schema/
+      wiki-schema.md
+      naming.md
+      page-types.md
+      writing-rules.md
+    raw/
+      conversations/
+      documents/
+      web/
+      repos/
+      obsidian-notes/
+    drafts/
+    templates/
+    logs/
 ```
 
 目录职责：
 
-- `schema/`：规则层，由用户和 Jarvis 共同维护。
-- `raw/`：证据层，只追加。
-- `wiki/`：知识层，面向查询和长期维护。
-- `drafts/`：编译过程中的候选稿，避免直接污染正式 wiki。
-- `templates/`：页面模板。
-- `logs/`：编译日志、lint 报告、冲突记录。
+- `vault/`：人类主视图，也是 Obsidian 应该打开的目录。
+- `system/schema/`：规则层，由用户和 Jarvis 共同维护，但不进入主图谱。
+- `system/raw/`：证据层，只追加，不直接暴露给 Obsidian 图谱。
+- `system/drafts/`：编译过程中的候选稿，避免直接污染正式 wiki。
+- `system/templates/`：页面模板。
+- `system/logs/`：编译日志、lint 报告、冲突记录。
 
-其中 `wiki/inbox/` 很重要，它用来承接暂时无法归类、但值得保留的知识页。这样可以避免 v1 因为“分类不完美”而阻塞写入。
+其中：
+
+- Obsidian 客户端应打开 `workspace/vault/`
+- Jarvis 模块应持有 `workspace/` 根路径
+- `vault/` 与 `system/` 必须一起管理，但面向不同角色
+
+这样做的直接收益是：
+
+- 人类图谱里只出现正式知识页
+- `src_*`、`draft_*`、schema 文件不会污染图谱
+- `maintain` 仍然可以检查 `source_ids`、raw 和 drafts，只是这些不再占据人类工作台
+
+其中 `vault/inbox/` 很重要，它用来承接暂时无法归类、但值得保留的知识页。这样可以避免 v1 因为“分类不完美”而阻塞写入。
 
 ---
 
@@ -283,6 +359,22 @@ JarvisWiki/
 - `draft` 只生成候选内容，不直接改正式 wiki。
 - 如果需要大幅改写已有页面，也应先走 `draft`。
 
+v1 的沉淀标准必须收敛。默认只允许沉淀：
+
+- 设计决策
+- 概念定义
+- 稳定操作步骤
+- 用户明确确认过的事实
+- 后续会重复复用的项目知识
+
+默认不沉淀：
+
+- 临时探索过程
+- 未确认猜测
+- 一次性报错过程
+- 普通闲聊
+- 重复背景信息
+
 ### 8.3 `obsidian_wiki_apply(draft_id, target_page)`
 
 职责：
@@ -315,6 +407,16 @@ Phase 2 再补：
 - 标题重复检查
 - inbox 长期滞留治理
 
+### 8.5 Draft 判断原则
+
+如果由 LLM 判断当前内容是否值得沉淀，system prompt 或 tool 使用说明中必须明确写入这些原则：
+
+- 只沉淀后续仍会复用的知识
+- 只沉淀已经相对稳定的信息
+- 只写事实、定义、决策、步骤
+- 不写临时推测和探索轨迹
+- 不确定归类时，允许进入 `inbox`，不要强行写正式页
+
 ---
 
 ## 9. 写入与编译流程
@@ -323,6 +425,7 @@ Phase 2 再补：
 
 ```text
 外部资料 / 对话 / 网页 / 文档
+  -> 显式选择值得沉淀的片段
   -> 标准化
   -> 保存到 raw/
   -> 写 source metadata
@@ -330,6 +433,8 @@ Phase 2 再补：
 ```
 
 这个阶段是模块内部能力，对外不一定单独暴露为工具。
+
+v1 不做“每轮 conversation 自动进 raw”，而是先要求显式触发。
 
 ### 9.2 Draft 流程
 
@@ -349,10 +454,12 @@ Phase 2 再补：
 
 ```text
 draft
-  -> 用户确认或策略允许
+  -> 在当前对话流中请求用户确认
   -> apply 到 target page
   -> 记录 apply log
 ```
+
+v1 不做异步审批流，也不做事后批量审批。写入确认应直接发生在当前对话里。
 
 ### 9.4 Query 流程
 
@@ -375,6 +482,8 @@ wiki / drafts / logs
   -> 记录 maintain log
 ```
 
+其中 `inbox` 的整理在 v1 默认由 `obsidian_wiki_maintain` 负责，也允许用户手工整理，但不要求自动分类完美。
+
 ---
 
 ## 10. 与 Jarvis ReAct Runtime 的集成
@@ -387,6 +496,7 @@ wiki / drafts / logs
 - 识别这是“查询知识”还是“沉淀知识”
 - 控制路径权限、写入范围和 commit 策略
 - 在需要时触发索引刷新
+- 在 `apply` 前向用户同步确认
 
 ### 10.2 在子图中的职责
 
@@ -396,6 +506,14 @@ ReAct loop 负责：
 - 调用 `obsidian_wiki_draft` 生成候选沉淀稿
 - 调用 `obsidian_wiki_apply` 在确认后写入正式 wiki
 - 调用 `obsidian_wiki_maintain` 做后台治理和轻维护
+
+其中查询不是每个 turn 默认执行。v1 建议只在以下场景触发 `obsidian_wiki_query`：
+
+- 用户明确询问“之前怎么定的”“这个概念是什么”“依据是什么”
+- 当前任务明显依赖长期项目背景
+- Agent 判断短期上下文不足，需要长期知识补充
+
+不要把 `obsidian_wiki_query` 作为每轮固定步骤，否则会引入不必要的成本和噪声。
 
 ### 10.3 和 ContextAssembler 的关系
 
@@ -416,17 +534,40 @@ system prompt
 
 这样职责边界清晰，不会把“对话摘要”和“长期知识库”混成一层。
 
+### 10.4 写入确认与冲突处理
+
+v1 对正式 wiki 的写入采用同步、保守策略：
+
+- `apply` 前必须在当前对话流中请求用户确认
+- 不做异步审批队列
+- 不做静默覆盖
+
+如果目标 page 在用户手工编辑后发生变化，而 Jarvis 持有旧 draft，则：
+
+- `apply` 先做冲突检测
+- 若检测到 page 内容已变化，则不直接覆盖
+- 输出当前 page 摘要、draft 摘要和冲突提示
+- 由用户决定是否覆盖、放弃或重新 draft
+
+v1 不做自动 merge。
+
 ---
 
 ## 11. 与 Obsidian 的关系
 
-Obsidian 在这里首先是 **文件系统和知识工作台**，不是同步协议中心。
+Obsidian 在这里首先是 **知识工作台**，不是系统内部状态目录。
 
 设计上要坚持三点：
 
 - Jarvis 操作的是标准 Markdown 文件，而不是依赖 Obsidian 私有能力。
 - 即使用户不用 Obsidian 客户端，这套 Wiki 也仍然可工作。
-- 如果用户已经在 Obsidian 中手工维护笔记，Jarvis 应把它视为一类 `raw/obsidian-notes` 或受控 `wiki/` 输入，而不是无条件覆盖。
+- 如果用户已经在 Obsidian 中手工维护笔记，Jarvis 应把它视为一类 `system/raw/obsidian-notes` 或受控 `vault/` 输入，而不是无条件覆盖。
+
+同时要补一条更具体的界面原则：
+
+- Obsidian 默认只打开 `vault/`
+- `system/` 不应作为人类主工作台，也不应进入默认图谱关注范围
+- 人类图谱表达的是正式知识网络，不是系统执行现场
 
 换句话说，Obsidian 是最佳使用界面，但不是架构依赖。
 
@@ -472,6 +613,38 @@ Wiki 写入比普通检索更敏感，建议 v1 明确区分三类动作：
 - 自动写入必须记录 `updated_at`、`source_ids` 和变更原因。
 - 用户手工写的页面，不应被无提示覆盖。
 
+### 13.1 Source 追溯与审计链
+
+v1 对 source 审计采用“完整优先、优化后置”的策略。
+
+规则如下：
+
+- page frontmatter 允许保留 `source_ids`
+- 如果某个 page 经历多次增量更新，`source_ids` 不要求无限增长到前端可读；必要时可以只保留当前有效 source，历史来源进入日志或 sidecar metadata
+- 用户手工创建或修改的页面允许 `source_ids: []`
+- 但这类页面建议增加额外标记，例如：
+
+```yaml
+source_mode: manual | generated | mixed
+```
+
+这样可以明确说明该页面的审计链是否完整，而不是假装所有页面都来源清晰。
+
+### 13.2 Raw 生命周期
+
+v1 对 raw source 不做物理清理策略，只做逻辑标记：
+
+- `active`
+- `superseded`
+- `ignored`
+
+也就是说：
+
+- 允许把旧 raw 标记为 `superseded`
+- 但不在 v1 自动删除 raw 文件
+
+原因是 v1 更强调保留证据链，而不是提前做存储优化。
+
 ---
 
 ## 14. v1 风险与取舍
@@ -501,6 +674,7 @@ Wiki 写入比普通检索更敏感，建议 v1 明确区分三类动作：
 - 建立 `JarvisWiki/` 目录
 - 定义 schema、templates、page types
 - 实现模块内部的 `init / ingest` 基础能力
+- 跑通显式触发的 `draft -> 用户确认 -> apply`
 
 ### Phase 2：编译与查询
 
@@ -519,6 +693,8 @@ Wiki 写入比普通检索更敏感，建议 v1 明确区分三类动作：
 
 ### Phase 4：运行时自动化
 
+- 评估是否引入 conversation -> raw 半自动导入
+- 评估是否引入 raw -> draft 的后台扫描任务
 - 设计文档讨论后自动生成 decision/design 草稿
 - 对高频知识页做增量 refresh
 

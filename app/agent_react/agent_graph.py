@@ -7,7 +7,7 @@ receive the store instance through closures without polluting the state schema.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.graph import END, StateGraph
@@ -15,6 +15,9 @@ from typing_extensions import TypedDict
 
 from app.agent_react.react_graph import build_react_graph
 from app.skills.bootstrap import get_skill_registry
+
+if TYPE_CHECKING:
+    from app.agent_react.runtime import ConversationStore
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +44,10 @@ def _records_to_lc_messages(messages: list) -> list[BaseMessage]:
         if role == "user":
             lc.append(HumanMessage(content=content))
         elif role == "assistant":
+            response_metadata: dict[str, Any] = {}
+            reasoning = raw.get("reasoning_content")
+            if reasoning is not None:
+                response_metadata["reasoning_content"] = reasoning
             lc.append(
                 AIMessage(
                     content=content,
@@ -53,6 +60,7 @@ def _records_to_lc_messages(messages: list) -> list[BaseMessage]:
                         for tc in raw.get("tool_calls", [])
                         if tc.get("id") and tc.get("name")
                     ],
+                    response_metadata=response_metadata if response_metadata else {},
                 )
             )
         elif role == "tool":
@@ -107,7 +115,7 @@ def _inject_selected_skills(messages: list[BaseMessage], skill_names: list[str])
     return [skill_message, *messages]
 
 
-def build_turn_graph(store):
+def build_turn_graph(store: ConversationStore) -> StateGraph:
     """Build the compiled Turn graph with store injected via closures."""
     react_graph = build_react_graph(store)
 
@@ -157,6 +165,7 @@ def build_turn_graph(store):
                 "messages": state["messages"],
                 "cancelled": False,
                 "status": "running",
+                "step_count": 0,
             })
         except Exception as exc:
             logger.exception("react subgraph failed")
@@ -215,12 +224,18 @@ def build_turn_graph(store):
         ]
         reply = assistant_messages[-1].content if assistant_messages else ""
 
+        raw_payload: dict[str, Any] = {"source": "agent_react"}
+        if assistant_messages:
+            reasoning = assistant_messages[-1].response_metadata.get("reasoning_content") if assistant_messages[-1].response_metadata else None
+            if reasoning is not None:
+                raw_payload["reasoning_content"] = reasoning
+
         message = store.finalize_turn_success(
             turn_id=turn_id,
             conversation_id=state["conversation_id"],
             content=reply,
             content_type="markdown",
-            raw_payload={"source": "agent_react"},
+            raw_payload=raw_payload,
         )
 
         return {

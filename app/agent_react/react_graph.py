@@ -12,13 +12,14 @@ from typing_extensions import TypedDict
 
 from app.config import get_settings
 from app.llm.client import ChatClient, LLMMessage
+from app.persistence.models import TurnRecord
 from app.tools.runtime import build_llm_tools, check_tool_policy, execute_tool, get_tool_definition
 
 logger = logging.getLogger(__name__)
 
 
 class TurnStore(Protocol):
-    def get_turn(self, turn_id: int): ...
+    def get_turn(self, turn_id: int) -> TurnRecord | None: ...
 
     def append_assistant_message(
         self,
@@ -29,7 +30,7 @@ class TurnStore(Protocol):
         content_type: str = "markdown",
         external_message_id: str | None = None,
         raw_payload: dict | None = None,
-    ): ...
+    ) -> Any: ...
 
     def append_tool_message(
         self,
@@ -40,7 +41,7 @@ class TurnStore(Protocol):
         content_type: str = "text",
         external_message_id: str | None = None,
         raw_payload: dict | None = None,
-    ): ...
+    ) -> Any: ...
 
     def create_tool_call(
         self,
@@ -51,7 +52,7 @@ class TurnStore(Protocol):
         assistant_message_id: int | None = None,
         provider_tool_call_id: str | None = None,
         step_index: int = 0,
-    ): ...
+    ) -> Any: ...
 
     def update_tool_call(
         self,
@@ -60,9 +61,12 @@ class TurnStore(Protocol):
         status: str | None = None,
         output: dict | None = None,
         error_message: str | None = None,
-    ): ...
+    ) -> Any: ...
 
     def list_tool_calls_by_turn(self, turn_id: int) -> list: ...
+
+
+_MAX_REACT_STEPS = 8
 
 
 class ReActState(TypedDict):
@@ -70,6 +74,7 @@ class ReActState(TypedDict):
     messages: list[BaseMessage]
     cancelled: bool
     status: str
+    step_count: int
 
 
 def _lc_messages_to_llm(messages: list[BaseMessage]) -> list[LLMMessage]:
@@ -142,6 +147,31 @@ def _is_turn_cancelled(store: TurnStore, turn_id: int) -> bool:
     return turn is not None and getattr(turn, "status", None) == "cancelled"
 
 
+def _trim_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
+    """保留 system 消息和最近的用户/助手/工具消息，避免上下文过长。"""
+    if len(messages) <= 16:
+        return messages
+    first = messages[0] if isinstance(messages[0], SystemMessage) else None
+    trimmed = messages[-15:]
+    if first and first is not trimmed[0]:
+        trimmed.insert(0, first)
+    return trimmed
+
+
+_SYSTEM_PROMPT = (
+    "You are Jarvis, a helpful AI assistant. "
+    "Reply in the same language the user uses (Chinese or English). Be concise.\n\n"
+    "Tool usage rules — follow strictly:\n"
+    "1. After a tool returns useful results, summarize them and reply to the user IMMEDIATELY. "
+    "Do NOT call any more tools.\n"
+    "2. Do NOT search the same topic more than once. One search is enough.\n"
+    "3. If a tool call fails, do NOT retry the same tool with the same arguments. "
+    "Tell the user it failed.\n"
+    "4. For factual or web-search questions, use tavily_search only. "
+    "Never use shell commands for web searches or fact lookups."
+)
+
+
 def call_llm(state: ReActState, store: TurnStore) -> ReActState:
     if _is_turn_cancelled(store, state["turn_id"]):
         return {
@@ -158,22 +188,25 @@ def call_llm(state: ReActState, store: TurnStore) -> ReActState:
         timeout_seconds=settings.llm_timeout_seconds,
     )
 
-    llm_messages = _lc_messages_to_llm(state["messages"])
+    messages = _trim_messages(state["messages"])
+    llm_messages = _lc_messages_to_llm(messages)
     if not llm_messages or llm_messages[0].role != "system":
-        llm_messages.insert(
-            0,
-            LLMMessage(
+        llm_messages.insert(0, LLMMessage(role="system", content=_SYSTEM_PROMPT))
+    else:
+        # 保留原有 system message（可能是 skill），追加工具规则
+        original = llm_messages[0].content or ""
+        if _SYSTEM_PROMPT not in original:
+            llm_messages[0] = LLMMessage(
                 role="system",
-                content=(
-                    "You are Jarvis, an AI programming assistant. "
-                    "You can help with coding, shell commands, and general questions. "
-                    "You have access to tools when needed. Be concise and helpful. "
-                    "Reply in the same language the user uses (Chinese or English)."
-                ),
-            ),
-        )
+                content=f"{original}\n\n{_SYSTEM_PROMPT}",
+            )
 
-    tools = build_llm_tools()
+    # 达到最大步数前最后一次调用时，强制 LLM 生成文字总结（不传 tools）
+    current_step = state.get("step_count", 0)
+    force_final = current_step >= _MAX_REACT_STEPS - 1
+    tools = None if force_final else build_llm_tools()
+    if force_final:
+        logger.warning("forcing final text response turn_id=%s step=%s", state["turn_id"], current_step)
     for idx, message in enumerate(llm_messages):
         logger.info(
             "llm_input msg[%s] role=%s content=%s tool_call_id=%s has_tool_calls=%s",
@@ -191,8 +224,9 @@ def call_llm(state: ReActState, store: TurnStore) -> ReActState:
         return {
             "turn_id": state["turn_id"],
             "cancelled": False,
-            "status": "running",
-            "messages": state["messages"] + [AIMessage(content="抱歉，调用模型时出错了，请稍后再试。")],
+            "status": "failed",
+            "messages": messages + [AIMessage(content="抱歉，调用模型时出错了，请稍后再试。")],
+            "step_count": state.get("step_count", 0) + 1,
         }
 
     ai_message = _llm_response_to_ai_message(response)
@@ -200,7 +234,8 @@ def call_llm(state: ReActState, store: TurnStore) -> ReActState:
         "turn_id": state["turn_id"],
         "cancelled": False,
         "status": "running",
-        "messages": state["messages"] + [ai_message],
+        "messages": messages + [ai_message],
+        "step_count": state.get("step_count", 0) + 1,
     }
 def _execute_single_tool(tool_name: str, tool_args: dict[str, Any]) -> tuple[bool, str]:
     tool = get_tool_definition(tool_name)
@@ -250,16 +285,21 @@ def execute_tools(state: ReActState, store: TurnStore) -> ReActState:
     if turn is None:
         raise ValueError(f"Turn not found: {state['turn_id']}")
     step_index = _next_step_index(store, state["turn_id"])
+    raw_payload: dict[str, Any] = {
+        "source": "agent_react.tool_call",
+        "tool_calls": _serialize_tool_calls(last_message),
+        "step_index": step_index,
+    }
+    # DeepSeek thinking mode requires reasoning_content to be passed back in subsequent requests.
+    reasoning = last_message.response_metadata.get("reasoning_content") if last_message.response_metadata else None
+    if reasoning:
+        raw_payload["reasoning_content"] = reasoning
     assistant_message = store.append_assistant_message(
         conversation_id=turn.conversation_id,
         turn_id=state["turn_id"],
         content=str(last_message.content or ""),
         content_type="markdown",
-        raw_payload={
-            "source": "agent_react.tool_call",
-            "tool_calls": _serialize_tool_calls(last_message),
-            "step_index": step_index,
-        },
+        raw_payload=raw_payload,
     )
     for tool_call in last_message.tool_calls:
         tool_name = tool_call["name"]
@@ -349,11 +389,15 @@ def execute_tools(state: ReActState, store: TurnStore) -> ReActState:
         "cancelled": False,
         "status": "running",
         "messages": state["messages"] + tool_messages,
+        "step_count": state.get("step_count", 0),
     }
 
 
 def should_continue(state: ReActState) -> str:
     if state.get("cancelled"):
+        return END
+    if state.get("step_count", 0) >= _MAX_REACT_STEPS:
+        logger.warning("react max steps reached turn_id=%s step_count=%s", state["turn_id"], state.get("step_count", 0))
         return END
     last_message = state["messages"][-1]
     if isinstance(last_message, AIMessage) and last_message.tool_calls:

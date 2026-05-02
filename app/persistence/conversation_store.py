@@ -97,6 +97,23 @@ class MySQLConversationStore:
         )
         self._engine = create_engine(url, pool_pre_ping=True, pool_recycle=3600)
         logger.info("mysql store initialized host=%s db=%s", settings.mysql_host, settings.mysql_database)
+        self._reset_stale_turns()
+
+    def _reset_stale_turns(self) -> None:
+        """Mark any leftover 'running' turns as failed on startup."""
+        try:
+            with self._engine.begin() as conn:
+                result = conn.execute(
+                    sa.text(
+                        "UPDATE turns SET status = 'failed', completed_at = NOW(), "
+                        "error_message = 'Server restarted while turn was running.' "
+                        "WHERE status = 'running'"
+                    )
+                )
+                if result.rowcount:
+                    logger.warning("reset %s stale running turn(s) to failed", result.rowcount)
+        except Exception:
+            logger.exception("failed to reset stale running turns")
 
     def create_conversation(self, request: ConversationCreateRequest) -> ConversationRecord:
         with self._engine.begin() as conn:
