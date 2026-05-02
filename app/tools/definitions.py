@@ -13,6 +13,7 @@ from app.tools.obsidian_wiki import (
 )
 from app.tools.shell import run_shell_command, run_shell_inspect
 from app.tools.tavily import run_tavily_search
+from app.tools.write_file import run_write_file
 
 RiskLevel = Literal["low", "medium", "high", "critical"]
 ExecutionMode = Literal["direct", "proposal"]
@@ -195,6 +196,31 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
                 },
             },
             handler=run_obsidian_wiki_maintain,
+        ),
+        ToolDefinition(
+            name="write_file",
+            description=(
+                "Write a UTF-8 markdown file inside the local Jarvis workspace. "
+                "Use this when the user explicitly asks to create or overwrite a markdown file in the repository. "
+                "Always provide a workspace-relative .md path. Do not guess paths outside the project. "
+                "If the target directory does not already exist, stop and ask the user before proceeding."
+            ),
+            args_schema={
+                "type": "object",
+                "properties": {
+                    "relative_path": {
+                        "type": "string",
+                        "description": "Workspace-relative markdown path such as docs/research/2026-05/example.md",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Full markdown content to write.",
+                    },
+                },
+                "required": ["relative_path", "content"],
+            },
+            handler=run_write_file,
+            risk_level="medium",
         ),
         ToolDefinition(
             name="tavily_search",

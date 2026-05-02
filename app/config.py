@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     host: str = "127.0.0.1"
     port: int = 8000
     log_level: str = "INFO"
+    workspace_root: Path = Field(default_factory=lambda: Path(__file__).resolve().parents[1])
     log_dir: Path = Field(default=Path("logs"))
     data_dir: Path = Field(default=Path("data"))
     sec_pdf_dir: Path | None = None
@@ -37,6 +38,9 @@ class Settings(BaseSettings):
     opensearch_bulk_max_retries: int = 4
     llm_provider: str = "deepseek"
     llm_timeout_seconds: float = 60.0
+    llm_max_context_tokens: int = 12000
+    llm_max_output_tokens: int = 2000
+    llm_context_safety_buffer: int = 1000
     coder_timeout_seconds: int = 1800
     deepseek_api_key: str | None = None
     deepseek_base_url: str = "https://api.deepseek.com"

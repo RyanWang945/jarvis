@@ -45,6 +45,12 @@ ReactGraph:
 第二层：Turn Runtime
 ```
 
+说明：
+
+- 文档中统一使用 `Runtime Orchestrator`
+- 不再使用 `MainGraph` 作为目标架构名称
+- `Orchestrator` 是正确拼写
+
 ---
 
 ## 2. 为什么主图 / 子图分层不再自然
@@ -151,6 +157,13 @@ Runtime Orchestrator / Turn Runtime
 - 每一步 tool call 怎么推进
 - 当前 turn 的 working state 如何压缩
 
+可以把它理解为：
+
+```text
+它决定“要不要跑这个 turn、怎么调度这个 turn”
+但不决定“这个 turn 里面每一步怎么执行”
+```
+
 ### 4.2 职责
 
 这一层负责：
@@ -179,7 +192,25 @@ Runtime Orchestrator / Turn Runtime
 - 写 event / artifact metadata
 - 管理 checkpoint 恢复边界
 
-### 4.3 不负责什么
+### 4.3 整体上它做什么
+
+一句话：
+
+```text
+Runtime Orchestrator 负责调度一个 run，而不是执行一个 run
+```
+
+更具体地说，它负责：
+
+- 接收外部请求并归一化为 turn
+- 选择 runtime profile、model、policy、skills、allowed tools
+- 启动或恢复 Turn Runtime
+- 处理 cancel / timeout / retry / resume
+- 管理 subagent / worker 生命周期
+- 消费 Turn Runtime 返回的结果、事件、artifacts
+- 完成高层持久化与对外输出协调
+
+### 4.4 不负责什么
 
 这一层不负责：
 
@@ -200,6 +231,18 @@ Runtime Orchestrator / Turn Runtime
 `Turn Runtime` 是单个 turn 或单个 agent run 的完整执行闭环。
 
 它是 runtime 内真正的“agent loop”。
+
+第一版最自然的形态是：
+
+```text
+Turn Runtime = 以 ReAct 为默认执行策略的 agent runtime
+```
+
+这意味着：
+
+- `Turn Runtime` 仍然可以是 ReAct agent
+- 但 `ReAct` 是执行模式，不是系统分层
+- 不应再把 ReAct 直接实现成一个独立的 graph 架构层
 
 ### 5.2 职责
 
@@ -233,7 +276,40 @@ Runtime Orchestrator / Turn Runtime
 - final_reply
 - running / completed / failed / cancelled
 
-### 5.3 这一层的核心原则
+### 5.3 ReAct agent 在这里做什么
+
+在新的二层架构里，ReAct agent 的职责应当被明确收敛到 `Turn Runtime` 内部。
+
+也就是说，ReAct agent 负责的是：
+
+1. 读取当前可见上下文
+2. 调用模型进行推理
+3. 生成 tool calls 或最终回复
+4. 消费 tool results
+5. 更新当前 turn 的 working state
+6. 判断是否继续下一步
+
+可以把它理解为：
+
+```text
+ReAct agent = Turn Runtime 内部的执行循环
+```
+
+而不是：
+
+```text
+ReAct agent = 系统的第二层架构
+```
+
+这一点非常关键，因为后续如果：
+
+- chat 继续使用 ReAct
+- research 改用更复杂的 research loop
+- coding 增加 verifier / reviewer loop
+
+那么变化的应该是 `Turn Runtime` 内部执行策略，而不是再次调整整个二层架构。
+
+### 5.4 这一层的核心原则
 
 这一层必须统一：
 
@@ -248,6 +324,13 @@ Runtime Orchestrator / Turn Runtime
 ```text
 谁负责执行 turn
 谁就负责维护 turn 的 context
+```
+
+进一步说：
+
+```text
+Turn Runtime 负责 turn 的完整执行
+ReAct agent 只是 Turn Runtime 的默认执行机制
 ```
 
 ---
@@ -275,6 +358,24 @@ load visible context
 -> update working state
 -> maybe compact
 -> continue or stop
+-> return result
+```
+
+如果用 ReAct 来展开，Turn Runtime 内部可进一步写成：
+
+```text
+load visible context
+-> ReAct loop:
+     call llm
+     parse tool calls
+     if tool calls:
+       execute tools
+       update working state
+       maybe compact
+       continue
+     else:
+       finalize reply
+       stop
 -> return result
 ```
 
@@ -318,6 +419,7 @@ Turn Runtime
   + ContextManager
   + ToolRuntime
   + ModelClient
+  + ReAct loop
 ```
 
 而不是：
@@ -422,7 +524,7 @@ checkpoint 只负责恢复，不负责业务事实源。
 更现实的演进路径是：
 
 1. 先用 `ContextManager` 收敛上下文 owner
-2. 再把 ReAct 子图收缩为普通 Python loop
+2. 再把 ReAct 子图收缩为 `Turn Runtime` 内的普通 Python loop
 3. 最后把 LangGraph 退到更外层，或者只保留在 Orchestrator 层
 
 ### 11.2 现阶段可以接受的过渡形态
@@ -433,6 +535,7 @@ checkpoint 只负责恢复，不负责业务事实源。
 LangGraph 继续保留
 但只作为外层 orchestration 壳
 Turn Runtime 内部不再继续 graph 化
+ReAct 作为 Turn Runtime 内部 loop 保留
 ```
 
 这已经比现在的主图/子图边界自然很多。
@@ -511,6 +614,7 @@ Turn Runtime 内部不再继续 graph 化
 
 - `ContextManager` 属于 Turn Runtime
 - 工具执行 loop 属于 Turn Runtime
+- `ReAct agent` 属于 Turn Runtime 的内部执行机制
 - checkpoint 只做恢复，不做业务事实源
 - 多代理通过独立 runtime 实例扩展，而不是 graph 内继续嵌套
 

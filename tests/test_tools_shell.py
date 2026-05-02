@@ -55,3 +55,12 @@ def test_shell_run_command_executes_single_command() -> None:
 
     assert result.ok is True
     assert "shell-ok" in result.stdout
+
+
+def test_shell_inspect_rejects_absolute_path_outside_workspace() -> None:
+    tool = get_tool_definition("shell_inspect")
+
+    rejection = check_tool_policy(tool, {"command": r"dir C:\Users\Administrator"}, messages=[])
+
+    assert rejection is not None
+    assert "inside the Jarvis workspace" in rejection

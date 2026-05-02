@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from typing import Any
 
 import httpx
 
@@ -81,11 +82,12 @@ def run_tavily_search(request: ToolExecutionRequest) -> ToolExecutionResult:
         )
 
     output = _format_results(data)
+    source_urls = _extract_source_urls(data)
     return ToolExecutionResult(
         ok=True,
         exit_code=0,
         stdout=output,
-        summary=f"Tavily search returned {len(data.get('results', []))} results.",
+        summary=_build_summary(data, source_urls),
     )
 
 
@@ -108,12 +110,19 @@ def _format_results(data: dict) -> str:
             score_str = f" (score: {score:.2f})" if isinstance(score, (int, float)) else ""
             parts.append(f"{idx}. {title}{score_str}")
             if url:
-                parts.append(f"   URL: {url}")
+                parts.append(f"   Original URL: {url}")
             if content:
                 snippet = content.replace("\n", " ")
                 if len(snippet) > 300:
                     snippet = snippet[:300] + "..."
                 parts.append(f"   {snippet}")
+            parts.append("")
+
+        urls = _extract_source_urls(data)
+        if urls:
+            parts.append("Original source URLs:")
+            for idx, url in enumerate(urls, start=1):
+                parts.append(f"{idx}. {url}")
             parts.append("")
 
     if not parts:
@@ -123,3 +132,24 @@ def _format_results(data: dict) -> str:
     if len(output) > _MAX_OUTPUT_CHARS:
         output = output[:_MAX_OUTPUT_CHARS] + "\n...[truncated]"
     return output
+
+
+def _extract_source_urls(data: dict[str, Any]) -> list[str]:
+    urls: list[str] = []
+    seen: set[str] = set()
+    for item in data.get("results", []):
+        url = str(item.get("url", "") or "").strip()
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        urls.append(url)
+    return urls
+
+
+def _build_summary(data: dict[str, Any], source_urls: list[str]) -> str:
+    result_count = len(data.get("results", []))
+    if not source_urls:
+        return f"Tavily search returned {result_count} results."
+    joined = ", ".join(source_urls[:3])
+    extra = "" if len(source_urls) <= 3 else f" (+{len(source_urls) - 3} more)"
+    return f"Tavily search returned {result_count} results. Source URLs: {joined}{extra}"

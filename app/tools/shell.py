@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+from app.config import get_settings
 from app.tools.common import ToolExecutionRequest, ToolExecutionResult
 
 MAX_OUTPUT_CHARS = 12_000
@@ -21,10 +22,20 @@ def _run_subprocess(request: ToolExecutionRequest) -> ToolExecutionResult:
     if not command:
         return ToolExecutionResult(ok=False, exit_code=None, stderr="missing command", summary="Missing shell command.")
 
+    workspace_root = get_settings().workspace_root.resolve()
+    cwd = _resolve_cwd(request.workdir, workspace_root)
+    if cwd is None:
+        return ToolExecutionResult(
+            ok=False,
+            exit_code=None,
+            stderr="Requested workdir escapes the Jarvis workspace.",
+            summary="Shell workdir must stay inside the Jarvis workspace.",
+        )
+
     try:
         completed = subprocess.run(
             command,
-            cwd=str(Path(request.workdir).resolve()) if request.workdir else None,
+            cwd=str(cwd),
             capture_output=True,
             shell=True,
             text=True,
@@ -66,3 +77,12 @@ def _truncate(value: str) -> str:
         return value
     return value[:MAX_OUTPUT_CHARS] + "\n...[truncated]"
 
+
+def _resolve_cwd(workdir: str | None, workspace_root: Path) -> Path | None:
+    candidate = Path(workdir) if workdir else workspace_root
+    resolved = candidate.resolve() if candidate.is_absolute() else (workspace_root / candidate).resolve()
+    try:
+        resolved.relative_to(workspace_root)
+    except ValueError:
+        return None
+    return resolved

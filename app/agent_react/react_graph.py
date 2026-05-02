@@ -6,16 +6,18 @@ import json
 import logging
 from typing import Any, Protocol
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 from langgraph.graph import END, StateGraph
 from typing_extensions import TypedDict
 
+from app.agent_react.context_manager import ContextManager
 from app.config import get_settings
-from app.llm.client import ChatClient, LLMMessage
+from app.llm.client import ChatClient
 from app.persistence.models import TurnRecord
 from app.tools.runtime import build_llm_tools, check_tool_policy, execute_tool, get_tool_definition
 
 logger = logging.getLogger(__name__)
+_CONTEXT_MANAGER = ContextManager()
 
 
 class TurnStore(Protocol):
@@ -75,49 +77,10 @@ class ReActState(TypedDict):
     cancelled: bool
     status: str
     step_count: int
+    token_budget: int | None
 
 
-def _lc_messages_to_llm(messages: list[BaseMessage]) -> list[LLMMessage]:
-    result: list[LLMMessage] = []
-    for msg in messages:
-        if isinstance(msg, SystemMessage):
-            result.append(LLMMessage(role="system", content=str(msg.content)))
-        elif isinstance(msg, HumanMessage):
-            result.append(LLMMessage(role="user", content=str(msg.content)))
-        elif isinstance(msg, AIMessage):
-            tool_calls: list[dict[str, Any]] | None = None
-            if msg.tool_calls:
-                tool_calls = [
-                    {
-                        "id": tc["id"],
-                        "type": "function",
-                        "function": {
-                            "name": tc["name"],
-                            "arguments": json.dumps(tc["args"]),
-                        },
-                    }
-                    for tc in msg.tool_calls
-                ]
-            reasoning = None
-            if msg.response_metadata:
-                reasoning = msg.response_metadata.get("reasoning_content")
-            result.append(
-                LLMMessage(
-                    role="assistant",
-                    content=str(msg.content or ""),
-                    tool_calls=tool_calls,
-                    reasoning_content=reasoning,
-                )
-            )
-        elif isinstance(msg, ToolMessage):
-            result.append(
-                LLMMessage(
-                    role="tool",
-                    content=str(msg.content),
-                    tool_call_id=msg.tool_call_id,
-                )
-            )
-    return result
+_MAX_TAVILY_CALLS_PER_TURN = 2
 
 
 def _llm_response_to_ai_message(response: dict[str, Any]) -> AIMessage:
@@ -147,31 +110,6 @@ def _is_turn_cancelled(store: TurnStore, turn_id: int) -> bool:
     return turn is not None and getattr(turn, "status", None) == "cancelled"
 
 
-def _trim_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
-    """保留 system 消息和最近的用户/助手/工具消息，避免上下文过长。"""
-    if len(messages) <= 16:
-        return messages
-    first = messages[0] if isinstance(messages[0], SystemMessage) else None
-    trimmed = messages[-15:]
-    if first and first is not trimmed[0]:
-        trimmed.insert(0, first)
-    return trimmed
-
-
-_SYSTEM_PROMPT = (
-    "You are Jarvis, a helpful AI assistant. "
-    "Reply in the same language the user uses (Chinese or English). Be concise.\n\n"
-    "Tool usage rules — follow strictly:\n"
-    "1. After a tool returns useful results, summarize them and reply to the user IMMEDIATELY. "
-    "Do NOT call any more tools.\n"
-    "2. Do NOT search the same topic more than once. One search is enough.\n"
-    "3. If a tool call fails, do NOT retry the same tool with the same arguments. "
-    "Tell the user it failed.\n"
-    "4. For factual or web-search questions, use tavily_search only. "
-    "Never use shell commands for web searches or fact lookups."
-)
-
-
 def call_llm(state: ReActState, store: TurnStore) -> ReActState:
     if _is_turn_cancelled(store, state["turn_id"]):
         return {
@@ -188,18 +126,10 @@ def call_llm(state: ReActState, store: TurnStore) -> ReActState:
         timeout_seconds=settings.llm_timeout_seconds,
     )
 
-    messages = _trim_messages(state["messages"])
-    llm_messages = _lc_messages_to_llm(messages)
+    messages = state["messages"]
+    llm_messages = _CONTEXT_MANAGER.render_for_model(messages, state.get("token_budget"))
     if not llm_messages or llm_messages[0].role != "system":
-        llm_messages.insert(0, LLMMessage(role="system", content=_SYSTEM_PROMPT))
-    else:
-        # 保留原有 system message（可能是 skill），追加工具规则
-        original = llm_messages[0].content or ""
-        if _SYSTEM_PROMPT not in original:
-            llm_messages[0] = LLMMessage(
-                role="system",
-                content=f"{original}\n\n{_SYSTEM_PROMPT}",
-            )
+        raise ValueError("turn runtime must provide a system message before call_llm")
 
     # 达到最大步数前最后一次调用时，强制 LLM 生成文字总结（不传 tools）
     current_step = state.get("step_count", 0)
@@ -230,6 +160,20 @@ def call_llm(state: ReActState, store: TurnStore) -> ReActState:
         }
 
     ai_message = _llm_response_to_ai_message(response)
+    if ai_message.tool_calls:
+        logger.info(
+            "llm proposed tool calls turn_id=%s step=%s tools=%s",
+            state["turn_id"],
+            state.get("step_count", 0) + 1,
+            [
+                {
+                    "id": tool_call["id"],
+                    "name": tool_call["name"],
+                    "args": tool_call["args"],
+                }
+                for tool_call in ai_message.tool_calls
+            ],
+        )
     return {
         "turn_id": state["turn_id"],
         "cancelled": False,
@@ -285,6 +229,8 @@ def execute_tools(state: ReActState, store: TurnStore) -> ReActState:
     if turn is None:
         raise ValueError(f"Turn not found: {state['turn_id']}")
     step_index = _next_step_index(store, state["turn_id"])
+    existing_tool_calls = store.list_tool_calls_by_turn(state["turn_id"])
+    tavily_calls_used = sum(1 for record in existing_tool_calls if getattr(record, "tool_name", None) == "tavily_search")
     raw_payload: dict[str, Any] = {
         "source": "agent_react.tool_call",
         "tool_calls": _serialize_tool_calls(last_message),
@@ -306,6 +252,14 @@ def execute_tools(state: ReActState, store: TurnStore) -> ReActState:
         tool_args = tool_call["args"]
         tool_call_id = tool_call["id"]
         record = None
+        logger.info(
+            "tool execution requested turn_id=%s step=%s tool=%s tool_call_id=%s args=%s",
+            state["turn_id"],
+            step_index,
+            tool_name,
+            tool_call_id,
+            tool_args,
+        )
 
         try:
             tool = get_tool_definition(tool_name)
@@ -318,8 +272,21 @@ def execute_tools(state: ReActState, store: TurnStore) -> ReActState:
                 step_index=step_index,
             )
             rejection = check_tool_policy(tool, tool_args, state["messages"])
+            if rejection is None and tool_name == "tavily_search" and tavily_calls_used >= _MAX_TAVILY_CALLS_PER_TURN:
+                rejection = (
+                    "Rejected: tavily_search budget exceeded for this turn. "
+                    "Use the results already gathered and respond to the user."
+                )
             if rejection is not None:
                 output = rejection
+                logger.info(
+                    "tool execution rejected turn_id=%s step=%s tool=%s tool_call_id=%s reason=%s",
+                    state["turn_id"],
+                    step_index,
+                    tool_name,
+                    tool_call_id,
+                    rejection,
+                )
                 store.update_tool_call(
                     record.id,
                     status="rejected",
@@ -330,6 +297,14 @@ def execute_tools(state: ReActState, store: TurnStore) -> ReActState:
                 store.update_tool_call(record.id, status="running")
                 ok, output = _execute_single_tool(tool_name, tool_args)
                 if not ok:
+                    logger.warning(
+                        "tool execution failed turn_id=%s step=%s tool=%s tool_call_id=%s output_preview=%s",
+                        state["turn_id"],
+                        step_index,
+                        tool_name,
+                        tool_call_id,
+                        repr(output[:300]),
+                    )
                     store.update_tool_call(
                         record.id,
                         status="failed",
@@ -337,6 +312,16 @@ def execute_tools(state: ReActState, store: TurnStore) -> ReActState:
                         error_message=output,
                     )
                 else:
+                    if tool_name == "tavily_search":
+                        tavily_calls_used += 1
+                    logger.info(
+                        "tool execution completed turn_id=%s step=%s tool=%s tool_call_id=%s output_preview=%s",
+                        state["turn_id"],
+                        step_index,
+                        tool_name,
+                        tool_call_id,
+                        repr(output[:300]),
+                    )
                     store.update_tool_call(
                         record.id,
                         status="completed",
@@ -417,4 +402,3 @@ def build_react_graph(store: TurnStore) -> StateGraph:
     )
     builder.add_edge("execute_tools", "call_llm")
     return builder.compile()
-
