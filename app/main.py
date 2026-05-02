@@ -9,7 +9,6 @@ from app.channels.feishu import build_feishu_channel
 from app.config import get_settings
 from app.logging_config import configure_logging
 from app.skills.bootstrap import bootstrap_registries
-from app.skills.feishu import set_active_channel
 
 logger = logging.getLogger(__name__)
 
@@ -18,12 +17,10 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     registries = bootstrap_registries(force=True)
     app.state.skill_registry = registries.skill_registry
-    app.state.tool_registry = registries.tool_registry
 
     # Start Feishu persistent WebSocket channel
     feishu_channel = build_feishu_channel()
     if feishu_channel is not None:
-        set_active_channel(feishu_channel)
         feishu_channel.start()
         app.state.feishu_channel = feishu_channel
     try:

@@ -1,20 +1,16 @@
 from __future__ import annotations
 
-import importlib.util
 import logging
 import os
-import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from types import ModuleType
 from typing import Any
 
 import yaml
 from pydantic import ValidationError
 
-from app.skills.base import Skill
 from app.skills.manifest import SkillManifest
-from app.tools.specs import ToolSpec
+from app.skills.skill import Skill
 
 logger = logging.getLogger(__name__)
 
@@ -23,8 +19,7 @@ logger = logging.getLogger(__name__)
 class LoadedSkillPackage:
     path: Path
     manifest: SkillManifest
-    skill: Skill | None = None
-    tools: list[ToolSpec] = field(default_factory=list)
+    skill: Skill
 
 
 class SkillPackageLoader:
@@ -67,26 +62,14 @@ class SkillPackageLoader:
 
     def load_package(self, path: Path) -> LoadedSkillPackage:
         manifest = _read_manifest(path)
-        skill = _load_skill(path, manifest) if manifest.jarvis else None
-        tools = [
-            ToolSpec(
-                name=tool.name,
-                capability_name=tool.capability_name,
-                description=tool.description,
-                args_schema=tool.args_schema,
-                skill=tool.skill or manifest.name,
-                worker_type=tool.worker_type or tool.skill or manifest.name,
-                action=tool.action,
-                risk_level=tool.risk_level,
-                exposed_to_llm=tool.exposed_to_llm,
-                intent_kinds=tool.intent_kinds,
-                requires_explicit_user_command=tool.requires_explicit_user_command,
-                can_modify_files=tool.can_modify_files,
-                requires_workdir=tool.requires_workdir,
-            )
-            for tool in (manifest.jarvis.tools if manifest.jarvis else [])
-        ]
-        return LoadedSkillPackage(path=path, manifest=manifest, skill=skill, tools=tools)
+        skill = Skill(
+            name=manifest.name,
+            description=manifest.description,
+            path=path,
+            manifest=manifest,
+            content_path=(path / "SKILL.md") if (path / "SKILL.md").exists() else None,
+        )
+        return LoadedSkillPackage(path=path, manifest=manifest, skill=skill)
 
 
 def _read_manifest(path: Path) -> SkillManifest:
@@ -115,49 +98,3 @@ def _read_skill_md_frontmatter(path: Path) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise ValueError("SKILL.md frontmatter must be a mapping")
     return raw
-
-
-def _load_skill(path: Path, manifest: SkillManifest) -> Skill:
-    if manifest.jarvis is None:
-        raise ValueError("manifest has no jarvis extension")
-    module_path = _module_path(path, manifest.jarvis.module)
-    module_name = f"jarvis_external_skill_{manifest.name}_{abs(hash(module_path))}"
-    module = _load_module(module_name, module_path)
-    skill_class = getattr(module, manifest.jarvis.class_name, None)
-    if skill_class is None:
-        raise ValueError(f"skill class not found: {manifest.jarvis.class_name}")
-    skill = skill_class()
-    if not hasattr(skill, "name") or not hasattr(skill, "run"):
-        raise ValueError(f"{manifest.jarvis.class_name} is not a Skill")
-    if str(skill.name) != manifest.name:
-        logger.warning(
-            "external skill name differs from manifest path=%s manifest=%s skill=%s",
-            path,
-            manifest.name,
-            skill.name,
-        )
-    return skill
-
-
-def _module_path(package_path: Path, module: str) -> Path:
-    if module.endswith(".py"):
-        candidate = package_path / module
-    else:
-        candidate = package_path / (module.replace(".", "/") + ".py")
-    resolved_package = package_path.resolve()
-    resolved_candidate = candidate.resolve()
-    if resolved_package not in resolved_candidate.parents and resolved_candidate != resolved_package:
-        raise ValueError(f"module path escapes skill package: {module}")
-    if not resolved_candidate.exists() or not resolved_candidate.is_file():
-        raise ValueError(f"skill module not found: {module}")
-    return resolved_candidate
-
-
-def _load_module(name: str, path: Path) -> ModuleType:
-    spec = importlib.util.spec_from_file_location(name, path)
-    if spec is None or spec.loader is None:
-        raise ValueError(f"cannot import skill module: {path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module

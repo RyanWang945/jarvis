@@ -94,6 +94,7 @@ class MessageIngestResponse(BaseModel):
     should_respond: bool
     trigger_type: str | None
     status: str
+    reset_message: str | None = None
 
 
 class TurnResponse(BaseModel):

@@ -45,7 +45,7 @@ class FeishuChannel:
         self._running = False
         self._lock = threading.Lock()
 
-        self._http = httpx.Client(timeout=30.0)
+        self._http = httpx.Client(timeout=30.0, trust_env=False)
         self._tenant_access_token: str | None = None
         self._token_expires_at: float = 0.0
         self._renderer = FeishuRenderer(title=bot_name)
@@ -199,11 +199,14 @@ class FeishuChannel:
                 )
             )
             if not ingest.should_respond:
+                if getattr(ingest, "reset_message", None):
+                    self._send_text_message(chat_id, ingest.reset_message)
                 logger.info(
-                    "feishu message stored without response chat=%s conversation_id=%s message_id=%s",
+                    "feishu message stored without response chat=%s conversation_id=%s message_id=%s status=%s",
                     chat_id,
                     ingest.conversation_id,
                     ingest.message_id,
+                    ingest.status,
                 )
                 return
 
@@ -228,6 +231,7 @@ class FeishuChannel:
         conversation_id: int,
         turn_id: int | None,
     ) -> None:
+        thinking_message_id: str | None = None
         try:
             logger.info(
                 "feishu agent run starting chat=%s conversation_id=%s turn_id=%s chat_type=%s sender=%s text_preview=%s",
@@ -240,6 +244,7 @@ class FeishuChannel:
             )
             if turn_id is None:
                 raise ValueError("Feishu triggered message did not create a turn.")
+            thinking_message_id = self._send_thinking_card(chat_id, text)
             result = get_agent_runtime().run_turn(turn_id)
         except Exception:
             logger.exception("agent run failed for feishu message")
@@ -249,10 +254,16 @@ class FeishuChannel:
                     status="failed",
                     error_message="agent run failed",
                 )
-            self._send_text_message(
-                chat_id,
-                "Sorry, something went wrong. Please try again later.",
-            )
+            if thinking_message_id:
+                self._update_card_message(
+                    thinking_message_id,
+                    self._renderer.render_error_card("Sorry, something went wrong. Please try again later."),
+                )
+            else:
+                self._send_text_message(
+                    chat_id,
+                    "Sorry, something went wrong. Please try again later.",
+                )
             return
 
         logger.info(
@@ -262,7 +273,10 @@ class FeishuChannel:
             len(result.reply),
         )
         message = self._format_result(result)
-        self._send_channel_message(chat_id, message)
+        if thinking_message_id:
+            self._update_channel_message(thinking_message_id, message)
+        else:
+            self._send_channel_message(chat_id, message)
 
     @staticmethod
     def _format_result(result: TurnResult) -> ChannelMessage:
@@ -302,10 +316,24 @@ class FeishuChannel:
             except Exception:
                 logger.exception("failed to send feishu fallback text to %s", receive_id)
 
+    def _update_channel_message(self, message_id: str, message: ChannelMessage) -> None:
+        delivery = self._renderer.render(message)
+        if delivery.msg_type != "interactive":
+            raise RuntimeError("Only interactive card messages can be updated.")
+        self._update_card_message(message_id, delivery)
+
+    def _send_thinking_card(self, receive_id: str, prompt: str) -> str | None:
+        try:
+            payload = self._send_delivery(receive_id, self._renderer.render_thinking_card(prompt))
+        except Exception:
+            logger.exception("failed to send thinking card to %s", receive_id)
+            return None
+        return _extract_message_id(payload)
+
     def _send_text_message(self, receive_id: str, text: str) -> None:
         self._send_delivery(receive_id, self._renderer.render_text_fallback(text))
 
-    def _send_delivery(self, receive_id: str, delivery: FeishuDelivery) -> None:
+    def _send_delivery(self, receive_id: str, delivery: FeishuDelivery) -> dict[str, Any]:
         token = self._ensure_token()
         resp = self._http.post(
             "https://open.feishu.cn/open-apis/im/v1/messages",
@@ -326,6 +354,22 @@ class FeishuChannel:
             receive_id,
             delivery.msg_type,
         )
+        return payload
+
+    def _update_card_message(self, message_id: str, delivery: FeishuDelivery) -> None:
+        if delivery.msg_type != "interactive":
+            raise RuntimeError("Only interactive card messages can be updated.")
+        token = self._ensure_token()
+        resp = self._http.patch(
+            f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"content": delivery.content},
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        if payload.get("code") != 0:
+            raise RuntimeError(f"feishu update message failed: {payload}")
+        logger.info("feishu message updated message_id=%s", message_id)
 
     def send_message(self, receive_id: str, text: str) -> bool:
         try:
@@ -459,3 +503,12 @@ def _safe_preview(value: str, *, limit: int = 120) -> str:
     if len(normalized) <= limit:
         return normalized
     return normalized[:limit] + "...[truncated]"
+
+
+def _extract_message_id(payload: dict[str, Any]) -> str | None:
+    data = payload.get("data")
+    if isinstance(data, dict):
+        message_id = data.get("message_id")
+        if isinstance(message_id, str) and message_id:
+            return message_id
+    return None

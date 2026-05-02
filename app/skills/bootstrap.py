@@ -5,15 +5,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from app.config import get_settings
-from app.skills.base import Skill
-from app.skills.coder import CoderSkill
-from app.skills.echo import EchoSkill
-from app.skills.feishu import FeishuMessageSkill
 from app.skills.loader import SkillPackageLoader
 from app.skills.registry import SkillRegistry
-from app.skills.shell import ShellSkill
-from app.tools.registry import ToolRegistry
-from app.tools.specs import ToolSpec
+from app.skills.skill import Skill
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +15,6 @@ logger = logging.getLogger(__name__)
 @dataclass(frozen=True)
 class Registries:
     skill_registry: SkillRegistry
-    tool_registry: ToolRegistry
 
 
 _registries: Registries | None = None
@@ -33,32 +26,24 @@ def bootstrap_registries(*, external_paths: list[Path] | None = None, force: boo
         return _registries
 
     settings = get_settings()
-    skills: list[Skill] = _load_builtin_skills()
-    tools = _load_builtin_tools()
+    skills = _load_builtin_skills()
     skill_names = {skill.name for skill in skills}
-    tool_names = {tool.name for tool in tools}
 
     loader = SkillPackageLoader.from_default_paths(data_dir=settings.data_dir, extra_paths=external_paths)
     for package in loader.load():
-        duplicate_skill = package.skill is not None and package.skill.name in skill_names
-        duplicate_tools = _duplicate_tool_names(package.tools, existing=tool_names)
-        if duplicate_skill or duplicate_tools:
+        duplicate_skill = package.skill.name in skill_names
+        if duplicate_skill:
             logger.warning(
-                "skipping skill package with duplicate registrations path=%s skill=%s tools=%s",
+                "skipping skill package with duplicate registrations path=%s skill=%s",
                 package.path,
-                package.skill.name if package.skill is not None else None,
-                duplicate_tools,
+                package.skill.name,
             )
             continue
-        if package.skill is not None:
-            skills.append(package.skill)
-            skill_names.add(package.skill.name)
-        tools.extend(package.tools)
-        tool_names.update(tool.name for tool in package.tools)
+        skills.append(package.skill)
+        skill_names.add(package.skill.name)
 
     _registries = Registries(
         skill_registry=SkillRegistry(skills),
-        tool_registry=ToolRegistry(tools),
     )
     return _registries
 
@@ -67,167 +52,10 @@ def get_skill_registry() -> SkillRegistry:
     return bootstrap_registries().skill_registry
 
 
-def get_tool_registry() -> ToolRegistry:
-    return bootstrap_registries().tool_registry
-
-
 def reset_registries_for_tests() -> None:
     global _registries
     _registries = None
 
 
-def _duplicate_tool_names(tools: list[ToolSpec], *, existing: set[str]) -> list[str]:
-    seen: set[str] = set()
-    duplicates: list[str] = []
-    for tool in tools:
-        if tool.name in existing or tool.name in seen:
-            duplicates.append(tool.name)
-        seen.add(tool.name)
-    return duplicates
-
-
 def _load_builtin_skills() -> list[Skill]:
-    return [
-        EchoSkill(),
-        ShellSkill(),
-        CoderSkill(),
-        FeishuMessageSkill(),
-    ]
-
-
-def _load_builtin_tools() -> list[ToolSpec]:
-    return [
-        ToolSpec(
-            name="echo",
-            capability_name="answer.echo",
-            description="Echo the task instruction without external side effects.",
-            args_schema={
-                "type": "object",
-                "properties": {"text": {"type": "string"}},
-                "required": ["text"],
-            },
-            skill="echo",
-            worker_type="echo",
-            action="echo",
-            risk_level="low",
-            exposed_to_llm=True,
-            intent_kinds=["simple_chat"],
-        ),
-        ToolSpec(
-            name="run_shell_command",
-            capability_name="shell.command",
-            description=(
-                "Run a simple local shell command after Jarvis risk checks. "
-                "Do not use this for multi-step code editing, git commit, or git push workflows; "
-                "use delegate_to_claude_code for those."
-            ),
-            args_schema={
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string"},
-                    "workdir": {"type": "string"},
-                },
-                "required": ["command"],
-            },
-            skill="shell",
-            worker_type="shell",
-            action="run",
-            risk_level="medium",
-            exposed_to_llm=True,
-            intent_kinds=["explicit_shell"],
-            requires_explicit_user_command=True,
-        ),
-        ToolSpec(
-            name="run_tests",
-            capability_name="shell.test",
-            description="Run a configured project test command.",
-            args_schema={
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "enum": ["uv run pytest", "pytest"],
-                    },
-                    "workdir": {"type": "string"},
-                },
-                "required": ["command"],
-            },
-            skill="shell",
-            worker_type="shell",
-            action="run",
-            risk_level="low",
-            exposed_to_llm=True,
-            intent_kinds=["test_only", "explicit_shell"],
-            requires_explicit_user_command=True,
-        ),
-        ToolSpec(
-            name="delegate_to_claude_code",
-            capability_name="coder.claude_code",
-            description=(
-                "Delegate a repository development workflow to the local Claude Code CLI. "
-                "Use this for code/file edits, README updates, tests, "
-                "git status/diff review, git commit, and git push when the user explicitly asks "
-                "to commit or push. The worker runs in the provided workdir and should complete "
-                "the workflow end-to-end instead of asking the user to type shell commands."
-            ),
-            args_schema={
-                "type": "object",
-                "properties": {
-                    "instruction": {
-                        "type": "string",
-                        "description": (
-                            "Detailed development task for the coder worker, including whether "
-                            "to commit and/or push. Include file constraints and commit message "
-                            "requirements if provided by the user."
-                        ),
-                    },
-                    "workdir": {
-                        "type": "string",
-                        "description": "Absolute path to the target repository working directory.",
-                    },
-                    "verification_cmd": {
-                        "type": "string",
-                        "description": "Optional command the coder worker should run before finishing.",
-                    },
-                },
-                "required": ["instruction", "workdir"],
-            },
-            skill="claude_code",
-            worker_type="coder",
-            action="run",
-            risk_level="high",
-            exposed_to_llm=True,
-            intent_kinds=["code_write", "code_review"],
-            can_modify_files=True,
-            requires_workdir=True,
-        ),
-        ToolSpec(
-            name="send_feishu_message",
-            capability_name="feishu_message.send",
-            description=(
-                "Send a text message to a Feishu user or group chat. "
-                "Use this to proactively notify the user of task completion, "
-                "ask clarifying questions, or deliver summaries."
-            ),
-            args_schema={
-                "type": "object",
-                "properties": {
-                    "receive_id": {
-                        "type": "string",
-                        "description": "The open_id of the user or chat_id of the group to send to.",
-                    },
-                    "text": {
-                        "type": "string",
-                        "description": "The plain text message content to send.",
-                    },
-                },
-                "required": ["receive_id", "text"],
-            },
-            skill="feishu_message",
-            worker_type="feishu",
-            action="send",
-            risk_level="low",
-            exposed_to_llm=True,
-            intent_kinds=["simple_chat"],
-        ),
-    ]
+    return []

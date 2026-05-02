@@ -1,17 +1,14 @@
-from app.skills.base import SkillRequest, SkillResult
-from app.skills.bootstrap import bootstrap_registries
-from app.skills.coder import CoderSkill
-from app.skills.echo import EchoSkill
+from app.skills.bootstrap import (
+    bootstrap_registries,
+    get_skill_registry,
+)
 from app.skills.registry import SkillRegistry, get_default_skill_registry
-from app.skills.shell import ShellSkill
+from app.skills.skill import Skill
 
 __all__ = [
-    "CoderSkill",
-    "EchoSkill",
-    "ShellSkill",
+    "Skill",
     "SkillRegistry",
-    "SkillRequest",
-    "SkillResult",
     "bootstrap_registries",
     "get_default_skill_registry",
+    "get_skill_registry",
 ]

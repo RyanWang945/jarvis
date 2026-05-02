@@ -33,6 +33,24 @@ class FeishuRenderer:
             return self.render_markdown_card(message.content)
         return self.render_text_fallback(message.content)
 
+    def render_thinking_card(self, prompt: str | None = None) -> FeishuDelivery:
+        return self._render_card_from_blocks(
+            [
+                "**🟡 Jarvis Thinking**",
+                "正在整理问题、检索上下文并生成答案，请稍候。",
+            ],
+            update_multi=True,
+        )
+
+    def render_error_card(self, message: str) -> FeishuDelivery:
+        return self._render_card_from_blocks(
+            [
+                "**❌ Request Failed**",
+                message.strip() or "Something went wrong.",
+            ],
+            update_multi=True,
+        )
+
     def render_markdown_card(self, markdown: str) -> FeishuDelivery:
         normalized = normalize_markdown(markdown)
         if not normalized:
@@ -41,7 +59,23 @@ class FeishuRenderer:
         blocks = split_markdown_blocks(normalized)
         if len(blocks) > _MAX_CARD_ELEMENTS:
             return self.render_text_fallback(downgrade_markdown_to_text(normalized))
+        return self._render_card_from_blocks(
+            ["**✅ Completed**", *blocks],
+            update_multi=True,
+        )
 
+    def render_text_fallback(self, text: str) -> FeishuDelivery:
+        return FeishuDelivery(
+            msg_type="text",
+            content=json.dumps({"text": text}, ensure_ascii=False),
+        )
+
+    def _render_card_from_blocks(
+        self,
+        blocks: list[str],
+        *,
+        update_multi: bool,
+    ) -> FeishuDelivery:
         elements = [
             {
                 "tag": "div",
@@ -56,6 +90,7 @@ class FeishuRenderer:
             "config": {
                 "wide_screen_mode": True,
                 "enable_forward": True,
+                "update_multi": update_multi,
             },
             "header": {
                 "title": {
@@ -67,14 +102,8 @@ class FeishuRenderer:
         }
         payload = json.dumps(card, ensure_ascii=False)
         if len(payload) > _MAX_CARD_JSON_LEN:
-            return self.render_text_fallback(downgrade_markdown_to_text(normalized))
+            return self.render_text_fallback(downgrade_markdown_to_text("\n\n".join(blocks)))
         return FeishuDelivery(msg_type="interactive", content=payload)
-
-    def render_text_fallback(self, text: str) -> FeishuDelivery:
-        return FeishuDelivery(
-            msg_type="text",
-            content=json.dumps({"text": text}, ensure_ascii=False),
-        )
 
 
 def normalize_markdown(markdown: str) -> str:
@@ -109,7 +138,12 @@ def split_markdown_blocks(markdown: str) -> list[str]:
             current = []
             current_len = 0
 
-        if line_len > _MAX_MARKDOWN_BLOCK_LEN:
+        if current and current_len + line_len > _MAX_MARKDOWN_BLOCK_LEN and in_fence:
+            blocks.append("\n".join(current).strip())
+            current = []
+            current_len = 0
+
+        if line_len > _MAX_MARKDOWN_BLOCK_LEN and not in_fence:
             if current:
                 blocks.append("\n".join(current).strip())
                 current = []
@@ -187,7 +221,7 @@ def adapt_markdown_for_feishu(markdown: str) -> str:
         if quote:
             if rendered and rendered[-1] != "":
                 rendered.append("")
-            rendered.append(f"**引文**")
+            rendered.append("**Quote**")
             rendered.append(quote.group(1))
             rendered.append("")
             index += 1
@@ -258,16 +292,16 @@ def _render_table_row(headers: list[str], row: list[str]) -> list[str]:
     if not pairs:
         return []
 
-    primary = []
+    primary: list[str] = []
     details: list[str] = []
     for index, (header, value) in enumerate(pairs):
         safe_value = value or "-"
         if index < 2:
             primary.append(safe_value)
         else:
-            details.append(f"**{header}**：{safe_value}")
+            details.append(f"**{header}**: {safe_value}")
 
-    title = "｜".join(primary) if primary else "记录"
+    title = " | ".join(primary) if primary else "Record"
     rendered = [f"**{title}**"]
     if details:
         rendered.extend(details)
