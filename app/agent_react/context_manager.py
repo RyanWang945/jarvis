@@ -207,7 +207,10 @@ class ContextManager:
         session_state: ConversationSessionState | None,
         runtime_policy: RuntimePolicy,
     ) -> str | None:
-        if not any(section in runtime_policy.context_sections for section in ("coding_protocol", "coding_background")):
+        if not any(
+            section in runtime_policy.context_sections
+            for section in ("workspace_protocol", "coding_protocol", "coding_background")
+        ):
             return None
         try:
             repositories = get_repository_registry().list_repositories()
@@ -231,6 +234,10 @@ class ContextManager:
                 "- If the user names a registered repository, use that repo_id.",
                 "- If the user says current/this project and an active repository is set, use that active repo_id.",
                 "- Prefer delegate_to_codex with repo_id over workdir for repository modifications.",
+                "- When delegating to Codex, describe the desired outcome and permissions; "
+                "do not decompose it into shell steps.",
+                "- Do not convert explicit edit, commit, or push requests into read-only inspection. "
+                "Set allow_commit/allow_push to match the user's requested outcome.",
             ]
         )
         return "\n".join(lines)

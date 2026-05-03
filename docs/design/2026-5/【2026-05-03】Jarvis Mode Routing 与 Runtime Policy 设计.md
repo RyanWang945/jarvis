@@ -9,7 +9,7 @@ Jarvis 需要引入一层轻量 `mode routing`，但不应该因此变成复杂�
 ```text
 Conversation / Session State
 -> DeepSeek V4 Flash Intent Router
--> turn_type + session_mode_update + capability flags
+-> turn_type + session_mode_update + target_resources + requested_capabilities
 -> RuntimePolicy
 -> Context / Skills / Tools / Budget / Writeback
 -> Turn Runtime
@@ -103,7 +103,7 @@ image_generation
 
 ### 3.3 RuntimePolicy
 
-`RuntimePolicy` 是由 `turn_type + session_mode + session_state` 映射出的执行策略。
+`RuntimePolicy` 是由 `TurnClassification + ConversationSessionState` 映射出的执行策略。
 
 它不应该由 `ContextManager` 或 `react_graph` 各自猜测，而应该成为明确对象。
 
@@ -121,33 +121,40 @@ class RuntimePolicy:
     writeback_strategy: str
 ```
 
-`RuntimePolicy` 的输入不应只剩 `session_mode + turn_type`。新版输入应是：
+`RuntimePolicy` 的输入不应只剩 `session_mode + turn_type`。新版输入应是结构化路由结果：
 
 ```python
 from dataclasses import dataclass, field
+from typing import Literal
 
 
 @dataclass(frozen=True)
-class TurnCapabilities:
-    needs_web: bool = False
-    needs_coding: bool = False
-    needs_knowledge_base: bool = False
-    needs_research_protocol: bool = False
-    needs_image_generation: bool = False
+class TargetResource:
+    type: Literal["repository", "knowledge_base", "conversation", "external_service"]
+    id: str | None = None
+    name: str | None = None
 
 
 @dataclass(frozen=True)
 class TurnClassification:
     turn_type: str
     session_mode_update: str | None = None
-    active_repo_id_update: str | None = None
-    capabilities: TurnCapabilities = field(default_factory=TurnCapabilities)
-    confidence: float = 0.0
+    target_resources: list[TargetResource] = field(default_factory=list)
+    requested_capabilities: list[str] = field(default_factory=list)
+    routing_basis: Literal["explicit", "contextual", "inferred", "fallback"] = "fallback"
+    model_confidence: float | None = None
     reason: str = ""
     source: str = "llm_router"
 ```
 
-这样 `turn_type` 不再承担所有语义。`turn_type=chat` 也可以因为 `needs_web=true` 获得搜索工具，`session_mode=coding` 也不会强行污染本轮工具集合。
+这样 `turn_type` 不再承担所有语义。`turn_type=chat` 也可以因为 `requested_capabilities=["web.search"]` 获得搜索工具，`session_mode=coding` 也不会强行污染本轮工具集合。
+
+关键原则：
+
+- Router 输出用户目标需要的能力标签，不输出具体工具名。
+- Router 不直接说“需要 tavily/codex”，只说 `web.search`、`code.inspect` 这类能力。
+- `model_confidence` 只用于日志和调试，不参与权限判断。
+- 真正的工具、权限、预算由 `RuntimePolicy` 做确定性映射。
 
 ## 4. DeepSeek V4 Flash Intent Router
 
@@ -205,15 +212,10 @@ deepseek-v4-flash
 {
   "turn_type": "chat",
   "session_mode_update": "chat",
-  "active_repo_id_update": null,
-  "capabilities": {
-    "needs_web": true,
-    "needs_coding": false,
-    "needs_knowledge_base": false,
-    "needs_research_protocol": false,
-    "needs_image_generation": false
-  },
-  "confidence": 0.92,
+  "target_resources": [],
+  "requested_capabilities": ["web.search"],
+  "routing_basis": "explicit",
+  "model_confidence": 0.92,
   "reason": "user switches away from code and asks for current market information"
 }
 ```
@@ -224,10 +226,13 @@ deepseek-v4-flash
 - 不允许调用工具。
 - 不允许生成用户可见回答。
 - reason 必须短。
+- `requested_capabilities` 必须使用能力标签，不允许输出工具名。
+- `target_resources` 只放用户明确提到或上下文强相关的资源。
+- `routing_basis` 比 `model_confidence` 更重要，policy 不应依赖模型自评置信度。
 - 输出必须短，禁止长链路推理。
 - temperature 建议为 0 或接近 0。
 - max output tokens 建议控制在 200 以内。
-- 低置信度回退 `chat`，但不要继承高风险工具。
+- Router 失败、JSON 无效或能力标签非法时回退 `chat`，但不要继承高风险工具。
 
 ### 4.3 Router Prompt 约束
 
@@ -239,9 +244,10 @@ Return compact JSON only.
 
 Decide the current turn execution type and capability needs.
 Prefer topic switch when the user explicitly says they stop/leave the previous task.
-Only set needs_coding=true when the user asks to inspect, modify, test, commit, review, or reason about a registered code repository.
-Only set active_repo_id_update when the message clearly refers to a registered repository.
-Set needs_web=true when the user asks for latest/current/recent/time-sensitive facts.
+Return capabilities as labels, not tool names.
+Use code.inspect/code.edit/code.test only when the user asks to inspect, modify, test, commit, review, or reason about a registered code repository.
+Use web.search when the user asks for latest/current/recent/time-sensitive facts.
+Use target_resources only when the message clearly refers to a registered repository, knowledge base, conversation, or external service.
 ```
 
 关键点：
@@ -250,6 +256,7 @@ Set needs_web=true when the user asks for latest/current/recent/time-sensitive f
 - 不让 router 做复杂计划。
 - 不把“项目”“研究”这类词本身当作决定性信号。
 - 允许 router 识别“离开当前 coding/research 上下文”的话题切换。
+- 不让 router 选择具体工具。工具选择属于 `RuntimePolicy`。
 
 ### 4.4 硬规则优先，但范围必须收窄
 
@@ -264,7 +271,7 @@ LLM router 不处理所有情况。硬规则仍然优先，但只覆盖确定性
 /research -> research
 /coding -> coding
 /chat -> chat
-显式 repo id 且明确 code action -> coding + active_repo_id_update
+显式 repo id 且明确 code action -> coding + target_resources=[repository:<repo_id>]
 ```
 
 不建议继续维护大规模中文关键词分类表。如下规则应迁移到 LLM router：
@@ -288,7 +295,10 @@ classification = deepseek_v4_flash_route(...)
 if classification.invalid_json:
     return safe_chat_fallback
 
-if classification.confidence < 0.65:
+if classification.has_unknown_capability:
+    return safe_chat_fallback
+
+if classification.routing_basis == "inferred" and classification.requests_high_risk_capability:
     return safe_chat_fallback
 
 return classification
@@ -298,14 +308,15 @@ return classification
 
 - `turn_type = chat`
 - `session_mode_update = null`
-- `capabilities.needs_web = false`
-- `capabilities.needs_coding = false`
+- `target_resources = []`
+- `requested_capabilities = []`
+- `routing_basis = fallback`
 - 不注入 coder / shell 等高权限工具
 - 可以注入低风险知识库工具，是否注入 web search 由后续策略决定
 
 ## 5. mode 对执行的影响
 
-`mode / turn_type / capabilities` 主要影响五件事：
+`mode / turn_type / requested_capabilities / target_resources` 主要影响五件事：
 
 - tools 注入
 - skills 选择
@@ -319,7 +330,7 @@ return classification
 allowed_tools:
   - obsidian_wiki_query
   - business_knowledge_search
-  - tavily_search  # only when capabilities.needs_web = true
+  - tavily_search  # only when requested_capabilities contains web.search
 
 context:
   - base system prompt
@@ -340,7 +351,7 @@ writeback:
 - 默认少工具。
 - 优先直接回答。
 - 需要事实或当前信息时再搜索。
-- 如果 router 输出 `needs_web=true`，即使当前 session 原本是 coding，也必须允许 `tavily_search`，因为当前 turn 已经切出 coding。
+- 如果 router 输出 `requested_capabilities=["web.search"]`，即使当前 session 原本是 coding，也必须允许 `tavily_search`，因为当前 turn 已经切出 coding。
 
 ### 5.2 research policy
 
@@ -411,9 +422,33 @@ writeback:
 - 第一阶段 code 任务只暴露 `delegate_to_codex`，不要把 shell 作为常规 coding turn 工具暴露给主模型。
 - shell 更适合 Jarvis 自身维护、诊断、测试当前服务，不适合作为飞书用户 code 任务的默认工具。
 
-### 5.4 capability flags 与 policy 关系
+### 5.4 能力标签与 policy 关系
 
-`turn_type` 负责决定当前 turn 的主执行形态，`capabilities` 负责决定本轮需要哪些能力。
+`turn_type` 负责决定当前 turn 的主执行形态，`requested_capabilities` 负责表达本轮需要哪些能力，`target_resources` 负责表达这些能力作用在哪些资源上。
+
+建议第一版能力标签：
+
+```text
+web.search
+kb.read
+kb.write
+code.inspect
+code.edit
+code.test
+research.deep
+image.generate
+```
+
+标签含义：
+
+- `web.search`：需要外部实时或公开网络信息。
+- `kb.read`：需要读取个人/业务知识库。
+- `kb.write`：需要写入个人/业务知识库。
+- `code.inspect`：需要查看、review、理解仓库代码。
+- `code.edit`：需要修改仓库代码。
+- `code.test`：需要运行或分析测试。
+- `research.deep`：需要研究协议、来源意识、证据整理。
+- `image.generate`：需要图片生成。
 
 示例：
 
@@ -421,10 +456,9 @@ writeback:
 {
   "turn_type": "chat",
   "session_mode_update": "chat",
-  "capabilities": {
-    "needs_web": true,
-    "needs_coding": false
-  }
+  "target_resources": [],
+  "requested_capabilities": ["web.search"],
+  "routing_basis": "explicit"
 }
 ```
 
@@ -442,11 +476,11 @@ context_sections = [base, session_state, recent_messages]
 {
   "turn_type": "coding",
   "session_mode_update": "coding",
-  "active_repo_id_update": "nltk",
-  "capabilities": {
-    "needs_web": false,
-    "needs_coding": true
-  }
+  "target_resources": [
+    {"type": "repository", "id": "nltk"}
+  ],
+  "requested_capabilities": ["code.inspect"],
+  "routing_basis": "explicit"
 }
 ```
 
@@ -459,6 +493,31 @@ context_sections = [base, session_state, coding_protocol, repo_context, recent_m
 ```
 
 这能避免一个常见错误：只因为 `session_mode=coding`，就让下一轮“查最新国际金价”继续拿不到搜索工具。
+
+混合任务示例：
+
+```json
+{
+  "turn_type": "coding",
+  "session_mode_update": "coding",
+  "target_resources": [
+    {"type": "repository", "id": "nltk"}
+  ],
+  "requested_capabilities": ["code.inspect", "web.search"],
+  "routing_basis": "explicit",
+  "reason": "Review repository and compare with latest release notes"
+}
+```
+
+对应策略：
+
+```text
+RuntimePolicy.mode = coding
+allowed_tools = [delegate_to_codex, tavily_search]
+context_sections = [base, session_state, coding_protocol, repo_context, search_note, recent_messages]
+```
+
+注意：这是给 ReAct loop 暴露工具，不是写死“先 search 再 codex”。Loop 在 policy 允许的工具集合内自主决定调用顺序。
 
 ## 6. 普通 ReAct 与 Deep Research 的关系
 
@@ -607,14 +666,14 @@ Specialist Runtimes / Tools
 
 建议按以下顺序实现：
 
-1. 扩展 `TurnClassification`，新增 `capabilities` 和 `active_repo_id_update`。
+1. 扩展 `TurnClassification`，新增 `requested_capabilities`、`target_resources`、`routing_basis`。
 2. 引入 DeepSeek V4 Flash router，替换非命令 turn 的关键词分类。
 3. 收窄硬规则，只保留 slash command、安全 gate、显式 repo code action。
 4. 把 ingest 阶段的 `_turn_type(content)` 替换为 router 结果。
 5. `RuntimePolicy` 改为接收 `classification + session_state`，不再只看 `turn_type + session_mode`。
 6. 让 `ContextManager` 按 policy 组装 header。
 7. 让 `react_graph.build_llm_tools()` 支持 `allowed_tools`。
-8. 增加 classification/policy 日志，至少记录 `turn_type`、`session_mode_update`、`active_repo_id_update`、`capabilities`、`allowed_tools`。
+8. 增加 classification/policy 日志，至少记录 `turn_type`、`session_mode_update`、`target_resources`、`requested_capabilities`、`routing_basis`、`allowed_tools`。
 9. 增加 `research` policy，不改变普通 chat 的行为。
 10. 增加 `ResearchSessionState` 和 `/status` 展示。
 11. 增加 evidence ledger 的最小持久化。
@@ -623,8 +682,9 @@ Specialist Runtimes / Tools
 
 第一批验收测试应覆盖：
 
-- `review 下 nltk 项目的代码` -> `turn_type=coding`、`needs_coding=true`、`active_repo_id_update=nltk`、只暴露 `delegate_to_codex`。
-- `不看项目了，查查最新国际金价` -> `turn_type=chat`、`session_mode_update=chat`、`needs_web=true`、暴露 `tavily_search`。
+- `review 下 nltk 项目的代码` -> `turn_type=coding`、`requested_capabilities=["code.inspect"]`、`target_resources=[repository:nltk]`、只暴露 `delegate_to_codex`。
+- `不看项目了，查查最新国际金价` -> `turn_type=chat`、`session_mode_update=chat`、`requested_capabilities=["web.search"]`、暴露 `tavily_search`。
+- `review nltk 并结合最新 release note 看兼容风险` -> `requested_capabilities=["code.inspect","web.search"]`、暴露 `delegate_to_codex` 和 `tavily_search`。
 - `继续` 在 research session 中 -> 可以继承 `session_mode=research`，但仍由 router 判断是否需要 research protocol。
 - `/status` -> hard rule command，不调用 router。
 - router 失败或 JSON 无效 -> safe chat fallback，不暴露 coder/shell。

@@ -51,6 +51,91 @@ class FeishuRenderer:
             update_multi=True,
         )
 
+    def render_approval_card(
+        self,
+        *,
+        approval_id: str,
+        conversation_id: int,
+        turn_id: int,
+        chat_id: str = "",
+        command: str = "",
+        reason: str = "",
+        language: str = "zh",
+    ) -> FeishuDelivery:
+        blocks = ["**Codex 权限审批**"]
+        elements = self._blocks_to_elements(blocks)
+        if command:
+            elements.extend(_command_elements(command))
+        if reason:
+            elements.extend(_reason_elements(reason, language=language))
+        elements.extend(self._blocks_to_elements(["该操作需要确认后继续。"]))
+        action_value = {
+            "source": "jarvis_codex_approval",
+            "approval_id": approval_id,
+            "conversation_id": conversation_id,
+            "turn_id": turn_id,
+            "chat_id": chat_id,
+            "command": command,
+            "reason": reason,
+            "language": language,
+        }
+        elements.append(
+            {
+                "tag": "action",
+                "actions": [
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "同意"},
+                        "type": "primary",
+                        "behaviors": [
+                            {
+                                "type": "callback",
+                                "value": {**action_value, "decision": "approve"},
+                            }
+                        ],
+                    },
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "拒绝"},
+                        "type": "danger",
+                        "behaviors": [
+                            {
+                                "type": "callback",
+                                "value": {**action_value, "decision": "reject"},
+                            }
+                        ],
+                    },
+                ],
+            }
+        )
+        return self._render_card_from_elements(elements, update_multi=True)
+
+    def render_approval_decision_card(
+        self,
+        *,
+        decision: str,
+        command: str = "",
+        reason: str = "",
+        language: str = "zh",
+    ) -> FeishuDelivery:
+        label = {
+            "approve": "已同意",
+            "approved": "已同意",
+            "reject": "已拒绝",
+            "rejected": "已拒绝",
+            "completed": "已完成",
+            "failed": "已失败",
+            "timeout": "已超时",
+            "missing": "已失效",
+        }.get(decision, "已处理")
+        blocks = [f"**Codex 权限审批：{label}**"]
+        elements = self._blocks_to_elements(blocks)
+        if command:
+            elements.extend(_command_elements(command))
+        if reason:
+            elements.extend(_reason_elements(reason, language=language))
+        return self._render_card_from_elements(elements, update_multi=True)
+
     def render_markdown_card(self, markdown: str) -> FeishuDelivery:
         normalized = normalize_markdown(markdown)
         if not normalized:
@@ -76,7 +161,10 @@ class FeishuRenderer:
         *,
         update_multi: bool,
     ) -> FeishuDelivery:
-        elements = [
+        return self._render_card_from_elements(self._blocks_to_elements(blocks), update_multi=update_multi)
+
+    def _blocks_to_elements(self, blocks: list[str]) -> list[dict]:
+        return [
             {
                 "tag": "div",
                 "text": {
@@ -86,6 +174,13 @@ class FeishuRenderer:
             }
             for block in blocks
         ]
+
+    def _render_card_from_elements(
+        self,
+        elements: list[dict],
+        *,
+        update_multi: bool,
+    ) -> FeishuDelivery:
         card = {
             "config": {
                 "wide_screen_mode": True,
@@ -102,6 +197,11 @@ class FeishuRenderer:
         }
         payload = json.dumps(card, ensure_ascii=False)
         if len(payload) > _MAX_CARD_JSON_LEN:
+            blocks = []
+            for element in elements:
+                text = element.get("text") if isinstance(element, dict) else None
+                if isinstance(text, dict):
+                    blocks.append(str(text.get("content") or ""))
             return self.render_text_fallback(downgrade_markdown_to_text("\n\n".join(blocks)))
         return FeishuDelivery(msg_type="interactive", content=payload)
 
@@ -361,3 +461,68 @@ def _split_long_line(line: str) -> list[str]:
         parts.append(remaining[:_MAX_MARKDOWN_BLOCK_LEN].strip())
         remaining = remaining[_MAX_MARKDOWN_BLOCK_LEN:]
     return [part for part in parts if part]
+
+
+def _command_elements(command: str) -> list[dict]:
+    return [
+        {
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": "**命令**",
+            },
+        },
+        {
+            "tag": "div",
+            "text": {
+                "tag": "plain_text",
+                "content": _truncate_card_text(command, 1600),
+            },
+        },
+    ]
+
+
+def _reason_elements(reason: str, *, language: str) -> list[dict]:
+    return [
+        {
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": "**原因**\n" + _truncate_card_text(_localize_approval_reason(reason, language=language), 1200),
+            },
+        }
+    ]
+
+
+def _localize_approval_reason(reason: str, *, language: str) -> str:
+    text = str(reason).strip()
+    if language != "zh":
+        return text
+    if not text or re.search(r"[\u4e00-\u9fff]", text):
+        return text
+    normalized = re.sub(r"\s+", " ", text).strip().rstrip("?")
+    lower = normalized.lower()
+    if lower.startswith("do you want to allow "):
+        action = normalized[len("Do you want to allow ") :]
+        action_lower = action.lower()
+        if "push" in action_lower and "origin" in action_lower:
+            return "是否允许将新的提交推送到 origin 远程仓库？"
+        if "push" in action_lower:
+            return "是否允许将本地提交推送到远程仓库？"
+        if "staging" in action_lower or "stage" in action_lower:
+            return "是否允许暂存本次仓库变更？"
+        if "creating" in action_lower and "commit" in action_lower:
+            return "是否允许在该仓库创建请求的 git commit？"
+        if "commit" in action_lower:
+            return "是否允许执行本次 git commit 操作？"
+        if "install" in action_lower or "dependency" in action_lower:
+            return "是否允许安装任务所需的依赖？"
+        return f"是否允许执行该提权操作：{action}？"
+    return text
+
+
+def _truncate_card_text(text: str, limit: int) -> str:
+    normalized = str(text).strip()
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: limit - 14].rstrip() + "\n...[truncated]"

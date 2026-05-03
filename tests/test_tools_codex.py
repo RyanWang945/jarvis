@@ -2,12 +2,21 @@ import json
 import subprocess
 from pathlib import Path
 
+from langchain_core.messages import HumanMessage
+
 from app.agent_react.runtime_policy import resolve_runtime_policy
 from app.repositories import RepositoryRef, RepositoryRegistry
 from app.tools.codex import run_codex_coder_tool
-from app.tools.coder_common import check_coder_permissions
+from app.tools.codex_app_server import (
+    CodexAppServerRunResult,
+    _approval_decision,
+    _is_routine_repo_git_approval,
+    _matches_trusted_command_prefix,
+    approval_command_prefix,
+)
+from app.tools.coder_common import build_coder_instruction, check_coder_permissions
 from app.tools.common import ToolExecutionRequest
-from app.tools.runtime import build_llm_tools, get_tool_definition
+from app.tools.runtime import build_llm_tools, check_tool_policy, get_tool_definition
 
 
 def test_codex_tool_is_injected_and_claude_tool_is_hidden() -> None:
@@ -19,16 +28,37 @@ def test_codex_tool_is_injected_and_claude_tool_is_hidden() -> None:
     assert codex_tool.exposed_to_llm is True
     assert codex_tool.args_schema["required"] == ["instruction"]
     assert "repo_id" in codex_tool.args_schema["properties"]
+    assert "mode" not in codex_tool.args_schema["properties"]
+    assert "outcome-oriented task" in codex_tool.description
+    assert "Do not turn the task into a step-by-step shell script" in codex_tool.description
+    instruction_description = codex_tool.args_schema["properties"]["instruction"]["description"]
+    assert "avoid enumerating shell commands or recovery steps" in instruction_description
     assert get_tool_definition("delegate_to_claude_code").exposed_to_llm is False
 
 
 def test_coding_policy_allows_codex_but_not_claude() -> None:
-    policy = resolve_runtime_policy(session_mode="chat", turn_type="coding")
+    policy = resolve_runtime_policy(
+        session_mode="chat",
+        turn_type="coding",
+        requested_capabilities=("workspace.inspect",),
+    )
 
     assert "delegate_to_codex" in policy.allowed_tools
     assert "delegate_to_claude_code" not in policy.allowed_tools
     assert "shell_inspect" not in policy.allowed_tools
     assert "shell_run_command" not in policy.allowed_tools
+
+
+def test_codex_policy_allows_repository_analysis_without_edit_intent() -> None:
+    tool = get_tool_definition("delegate_to_codex")
+
+    rejection = check_tool_policy(
+        tool,
+        {"instruction": "Review Jarvis architecture against Hermes.", "repo_id": "jarvis"},
+        [HumanMessage(content="Compare Jarvis design with Hermes.")],
+    )
+
+    assert rejection is None
 
 
 def test_codex_coder_runs_with_clean_stdout_and_jsonl_artifact(monkeypatch, tmp_path: Path) -> None:
@@ -40,19 +70,20 @@ def test_codex_coder_runs_with_clean_stdout_and_jsonl_artifact(monkeypatch, tmp_
     monkeypatch.setattr("app.tools.codex._resolve_codex_command", lambda: ["codex"])
     monkeypatch.setattr("app.tools.codex._coder_run_dir", lambda run_id: run_root / run_id)
 
-    def _fake_run(command, *, workdir, instruction, timeout_seconds):
-        captured["command"] = command
+    def _fake_run(*, provider_command, workdir, run_dir, instruction, timeout_seconds, trusted_command_prefixes=None):
+        captured["provider_command"] = provider_command
         captured["workdir"] = workdir
+        captured["run_dir"] = run_dir
         captured["instruction"] = instruction
         captured["timeout_seconds"] = timeout_seconds
         events = [
-            {"type": "session_started", "id": "session_1"},
+            {"method": "thread/started", "params": {"thread": {"id": "thread_1"}}},
             {"type": "agent_message", "message": "Changed README and ran tests."},
         ]
         stdout = "\n".join(json.dumps(event) for event in events)
-        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+        return CodexAppServerRunResult(status="completed", raw_events=stdout, exit_code=0, final_text="Changed README and ran tests.")
 
-    monkeypatch.setattr("app.tools.codex._run_codex_process", _fake_run)
+    monkeypatch.setattr("app.tools.codex._run_codex_app_server", _fake_run)
 
     result = run_codex_coder_tool(
         ToolExecutionRequest(
@@ -69,22 +100,228 @@ def test_codex_coder_runs_with_clean_stdout_and_jsonl_artifact(monkeypatch, tmp_
     )
 
     assert result.ok is True
-    assert captured["command"] == [
-        "codex",
-        "exec",
-        "--json",
-        "--sandbox",
-        "workspace-write",
-        "--cd",
-        str(repo.resolve()),
-        "-",
-    ]
+    assert captured["provider_command"] == ["codex"]
+    assert captured["workdir"] == repo.resolve()
     assert "Jarvis coder worker instructions" in str(captured["instruction"])
     assert "Changed README and ran tests." in result.stdout
     assert "{\"type\"" not in result.stdout
     assert "[JARVIS_" not in result.stdout
     assert any(str(artifact).startswith("codex_events:") for artifact in result.artifacts)
     assert any(str(artifact).startswith("jarvis_audit:") for artifact in result.artifacts)
+
+
+def test_codex_instruction_contract_overrides_generated_preconfirmation() -> None:
+    instruction = build_coder_instruction(
+        "将当前 nltk 项目中所有未提交的更改进行 git commit，然后 push。请在执行前让我确认 commit message。",
+        {"allow_commit": True, "allow_push": True},
+    )
+
+    assert "Approval authority lives in the Codex approval flow" in instruction
+    assert "do not replace it with chat confirmations" in instruction
+    assert "Do not stop to ask Jarvis or the user to confirm routine execution details" in instruction
+    assert "choose a concise commit message yourself" in instruction
+    assert "请在执行前让我确认 commit message" in instruction
+
+
+def test_codex_surfaces_approval_requests(monkeypatch, tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    run_root = tmp_path / "runs"
+
+    _install_registry(monkeypatch, repo)
+    monkeypatch.setattr("app.tools.codex._resolve_codex_command", lambda: ["codex"])
+    monkeypatch.setattr("app.tools.codex._coder_run_dir", lambda run_id: run_root / run_id)
+
+    def _fake_run(*, provider_command, workdir, run_dir, instruction, timeout_seconds, trusted_command_prefixes=None):
+        stdout = json.dumps(
+            {
+                "method": "item/commandExecution/requestApproval",
+                "id": 0,
+                "params": {
+                    "threadId": "thread_1",
+                    "turnId": "turn_1",
+                    "itemId": "item_1",
+                    "command": "uv add httpx",
+                    "reason": "Install a dependency required by the requested implementation.",
+                },
+            }
+        )
+        return CodexAppServerRunResult(
+            status="approval_requested",
+            raw_events=stdout,
+            exit_code=None,
+            approval_requests=[
+                {
+                    "type": "item/commandExecution/requestApproval",
+                    "id": "approval_1",
+                    "command": "uv add httpx",
+                    "reason": "Install a dependency required by the requested implementation.",
+                }
+            ],
+        )
+
+    monkeypatch.setattr("app.tools.codex._run_codex_app_server", _fake_run)
+
+    result = run_codex_coder_tool(
+        ToolExecutionRequest(
+            tool_name="delegate_to_codex",
+            workdir=str(repo),
+            args={"instruction": "Add HTTP support.", "repo_id": "jarvis"},
+            timeout_seconds=30,
+        )
+    )
+
+    assert result.ok is False
+    assert "Codex requested approval" in result.summary
+    assert "uv add httpx" in result.summary
+    assert "Install a dependency" in result.stdout
+    audit_path = _artifact_path(result.artifacts, "jarvis_audit")
+    assert "[JARVIS_CODEX_APPROVAL_REQUESTS]" in audit_path.read_text(encoding="utf-8")
+    approval_path = _artifact_path(result.artifacts, "codex_approval_requests")
+    approval_payload = json.loads(approval_path.read_text(encoding="utf-8"))
+    assert approval_payload[0]["command"] == "uv add httpx"
+
+
+def test_codex_failed_app_server_prefers_final_text_over_stderr(monkeypatch, tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    run_root = tmp_path / "runs"
+
+    _install_registry(monkeypatch, repo)
+    monkeypatch.setattr("app.tools.codex._resolve_codex_command", lambda: ["codex"])
+    monkeypatch.setattr("app.tools.codex._coder_run_dir", lambda run_id: run_root / run_id)
+
+    def _fake_run(*, provider_command, workdir, run_dir, instruction, timeout_seconds, trusted_command_prefixes=None):
+        return CodexAppServerRunResult(
+            status="failed",
+            raw_events="",
+            raw_stderr="older low-level stderr",
+            exit_code=None,
+            final_text="Codex final diagnosis.",
+            error="Codex app-server stdout closed.",
+        )
+
+    monkeypatch.setattr("app.tools.codex._run_codex_app_server", _fake_run)
+
+    result = run_codex_coder_tool(
+        ToolExecutionRequest(
+            tool_name="delegate_to_codex",
+            workdir=str(repo),
+            args={"instruction": "Do the repo task.", "repo_id": "jarvis"},
+            timeout_seconds=30,
+        )
+    )
+
+    assert result.ok is False
+    assert result.stdout == "Codex final diagnosis."
+    assert result.summary == "Codex final diagnosis."
+    assert result.stderr == "older low-level stderr"
+
+
+def test_codex_approval_uses_one_time_accept_not_persistent_execpolicy() -> None:
+    amendment = {
+        "acceptWithExecpolicyAmendment": {
+            "execpolicy_amendment": ["powershell.exe", "-Command", "git add README.md"]
+        }
+    }
+
+    decision = _approval_decision(
+        {"available_decisions": ["accept", amendment, "cancel"]},
+        approved=True,
+    )
+
+    assert decision == "accept"
+    assert _approval_decision({"available_decisions": ["accept", "cancel"]}, approved=False) == "cancel"
+
+
+def test_codex_auto_approves_only_routine_local_git_commands() -> None:
+    assert _is_routine_repo_git_approval(
+        {
+            "command": (
+                '"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" '
+                "-Command 'git add api pyproject.toml'"
+            )
+        }
+    )
+    assert _is_routine_repo_git_approval({"command": "git commit -m 'Add FastAPI greeting service'"})
+    assert _is_routine_repo_git_approval({"command": "git restore --staged ."})
+
+    assert not _is_routine_repo_git_approval({"command": "git push origin main"})
+    assert not _is_routine_repo_git_approval({"command": "git commit --amend -m fix"})
+    assert not _is_routine_repo_git_approval({"command": "git restore ."})
+    assert not _is_routine_repo_git_approval({"command": "Remove-Item -Recurse data"})
+    assert not _is_routine_repo_git_approval({"command": "git add .; Remove-Item -Recurse data"})
+
+
+def test_codex_approval_prefix_matching_normalizes_shell_wrappers() -> None:
+    wrapped = (
+        '"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" '
+        "-Command 'git add api pyproject.toml'"
+    )
+
+    assert approval_command_prefix(wrapped) == "git add"
+    assert _matches_trusted_command_prefix({"command": wrapped}, ("git add",))
+    assert not _matches_trusted_command_prefix({"command": "uv add httpx"}, ("git add",))
+    assert approval_command_prefix("git push -u origin main") == ""
+    assert not _matches_trusted_command_prefix({"command": "git push -u origin main"}, ("git push -u origin main",))
+
+
+def test_codex_ignores_jarvis_run_artifacts_inside_repo(monkeypatch, tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    run_root = repo / "data" / "coder_runs"
+
+    _install_registry(monkeypatch, repo)
+    monkeypatch.setattr("app.tools.codex._resolve_codex_command", lambda: ["codex"])
+    monkeypatch.setattr("app.tools.codex._coder_run_dir", lambda run_id: run_root / run_id)
+    monkeypatch.setattr(
+        "app.tools.codex._run_codex_app_server",
+        lambda *, provider_command, workdir, run_dir, instruction, timeout_seconds, trusted_command_prefixes=None: CodexAppServerRunResult(
+            status="completed",
+            raw_events=json.dumps({"type": "agent_message", "message": "Reviewed only."}),
+            exit_code=0,
+            final_text="Reviewed only.",
+        ),
+    )
+
+    result = run_codex_coder_tool(
+        ToolExecutionRequest(
+            tool_name="delegate_to_codex",
+            workdir=str(repo),
+            args={"instruction": "Review the repository.", "repo_id": "jarvis"},
+            timeout_seconds=30,
+        )
+    )
+
+    assert result.ok is True
+    assert "Reviewed only." in result.stdout
+    assert not any(str(artifact).startswith("git_file:data/coder_runs") for artifact in result.artifacts)
+
+
+def test_codex_allows_worktree_changes_without_commit(monkeypatch, tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    run_root = tmp_path / "runs"
+
+    _install_registry(monkeypatch, repo)
+    monkeypatch.setattr("app.tools.codex._resolve_codex_command", lambda: ["codex"])
+    monkeypatch.setattr("app.tools.codex._coder_run_dir", lambda run_id: run_root / run_id)
+
+    def _fake_run(*, provider_command, workdir, run_dir, instruction, timeout_seconds, trusted_command_prefixes=None):
+        (workdir / "README.md").write_text("# Changed\n", encoding="utf-8")
+        stdout = json.dumps({"type": "agent_message", "message": "Edited README."})
+        return CodexAppServerRunResult(status="completed", raw_events=stdout, exit_code=0, final_text="Edited README.")
+
+    monkeypatch.setattr("app.tools.codex._run_codex_app_server", _fake_run)
+
+    result = run_codex_coder_tool(
+        ToolExecutionRequest(
+            tool_name="delegate_to_codex",
+            workdir=str(repo),
+            args={"instruction": "Update README.md.", "repo_id": "jarvis"},
+            timeout_seconds=30,
+        )
+    )
+
+    assert result.ok is True
+    assert "Edited README." in result.stdout
+    assert "git_file:README.md" in result.artifacts
 
 
 def test_codex_coder_fails_when_commit_created_without_permission(monkeypatch, tmp_path: Path) -> None:
@@ -95,15 +332,15 @@ def test_codex_coder_fails_when_commit_created_without_permission(monkeypatch, t
     monkeypatch.setattr("app.tools.codex._resolve_codex_command", lambda: ["codex"])
     monkeypatch.setattr("app.tools.codex._coder_run_dir", lambda run_id: run_root / run_id)
 
-    def _fake_run(command, *, workdir, instruction, timeout_seconds):
+    def _fake_run(*, provider_command, workdir, run_dir, instruction, timeout_seconds, trusted_command_prefixes=None):
         changed = workdir / "change.txt"
         changed.write_text("created by codex\n", encoding="utf-8")
         _git(workdir, "add", "change.txt")
         _git(workdir, "commit", "-m", "codex change")
         stdout = json.dumps({"type": "agent_message", "message": "Committed a change."})
-        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+        return CodexAppServerRunResult(status="completed", raw_events=stdout, exit_code=0, final_text="Committed a change.")
 
-    monkeypatch.setattr("app.tools.codex._run_codex_process", _fake_run)
+    monkeypatch.setattr("app.tools.codex._run_codex_app_server", _fake_run)
 
     result = run_codex_coder_tool(
         ToolExecutionRequest(
@@ -137,7 +374,7 @@ def test_codex_coder_parses_nested_agent_message_event(monkeypatch, tmp_path: Pa
     monkeypatch.setattr("app.tools.codex._resolve_codex_command", lambda: ["codex"])
     monkeypatch.setattr("app.tools.codex._coder_run_dir", lambda run_id: run_root / run_id)
 
-    def _fake_run(command, *, workdir, instruction, timeout_seconds):
+    def _fake_run(*, provider_command, workdir, run_dir, instruction, timeout_seconds, trusted_command_prefixes=None):
         stdout = json.dumps(
             {
                 "type": "item.completed",
@@ -148,9 +385,9 @@ def test_codex_coder_parses_nested_agent_message_event(monkeypatch, tmp_path: Pa
                 },
             }
         )
-        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+        return CodexAppServerRunResult(status="completed", raw_events=stdout, exit_code=0, final_text="Nested final review.")
 
-    monkeypatch.setattr("app.tools.codex._run_codex_process", _fake_run)
+    monkeypatch.setattr("app.tools.codex._run_codex_app_server", _fake_run)
 
     result = run_codex_coder_tool(
         ToolExecutionRequest(
@@ -246,12 +483,12 @@ def test_codex_coder_allows_registered_workdir_with_warning(monkeypatch, tmp_pat
     monkeypatch.setattr("app.tools.codex._resolve_codex_command", lambda: ["codex"])
     monkeypatch.setattr("app.tools.codex._coder_run_dir", lambda run_id: run_root / run_id)
     monkeypatch.setattr(
-        "app.tools.codex._run_codex_process",
-        lambda command, *, workdir, instruction, timeout_seconds: subprocess.CompletedProcess(
-            command,
-            0,
-            stdout=json.dumps({"type": "agent_message", "message": "Done."}),
-            stderr="",
+        "app.tools.codex._run_codex_app_server",
+        lambda *, provider_command, workdir, run_dir, instruction, timeout_seconds, trusted_command_prefixes=None: CodexAppServerRunResult(
+            status="completed",
+            raw_events=json.dumps({"type": "agent_message", "message": "Done."}),
+            exit_code=0,
+            final_text="Done.",
         ),
     )
 

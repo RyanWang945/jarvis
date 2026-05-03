@@ -130,11 +130,18 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
         ToolDefinition(
             name="delegate_to_codex",
             description=(
-                "High-privilege delegation tool backed by Codex for repository development workflows. "
-                "Use this only for substantial code tasks such as multi-file edits, refactors, "
-                "bug fixes, code review follow-up, test execution, and git workflows inside a repository. "
-                "Do not use this for simple shell commands, factual questions, or lightweight search. "
-                "Before calling it, gather enough context to issue one complete task contract."
+                "High-privilege delegation tool backed by Codex for local repository workflows. "
+                "Use this for substantial repository inspection, architecture review, reports, tests, "
+                "code edits, refactors, bug fixes, and git workflows inside a registered repository. "
+                "Do not use this for simple shell commands, general factual questions, or lightweight web search. "
+                "Pass one compact outcome-oriented task: user goal, repo_id, constraints, permissions, "
+                "and verification expectations. Codex owns planning, repository inspection, command selection, "
+                "retry strategy, and approval requests. Do not turn the task into a step-by-step shell script "
+                "or prescribe recovery commands unless the user explicitly requested exact commands. "
+                "Preserve the user's full repository outcome: if the user asks to edit/update/create, the "
+                "instruction must remain an execution task, not a request to read files and ask what to do. "
+                "Do not ask Codex to confirm commit messages or other routine execution details unless the "
+                "user explicitly requested that confirmation."
             ),
             args_schema={
                 "type": "object",
@@ -142,8 +149,10 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
                     "instruction": {
                         "type": "string",
                         "description": (
-                            "Detailed development task for the coder worker, including file constraints, "
-                            "verification expectations, and whether commit or push is permitted."
+                            "Outcome-oriented task contract for Codex. Include the goal, constraints, "
+                            "verification expectations, and whether commit or push is permitted; avoid "
+                            "enumerating shell commands or recovery steps, and avoid routine pre-confirmation prompts. "
+                            "Do not downgrade explicit edit/commit/push requests into read-only inspection."
                         ),
                     },
                     "repo_id": {
@@ -160,12 +169,18 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
                     },
                     "allow_commit": {
                         "type": "boolean",
-                        "description": "Whether the coder worker may create a git commit.",
+                        "description": (
+                            "Whether the coder worker may create a git commit. Set true when the user asks to commit, "
+                            "create a commit, save changes in git, or push."
+                        ),
                         "default": False,
                     },
                     "allow_push": {
                         "type": "boolean",
-                        "description": "Whether the coder worker may push to origin. Requires allow_commit=true.",
+                        "description": (
+                            "Whether the coder worker may push to origin. Set true when the user asks to push or "
+                            "publish to a remote; requires allow_commit=true."
+                        ),
                         "default": False,
                     },
                 },

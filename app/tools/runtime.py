@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 import re
-from pathlib import Path
 from collections.abc import Collection
+from pathlib import Path
 from typing import Any
 
 from langchain_core.messages import BaseMessage, HumanMessage
 
 from app.config import get_settings
-from app.tools.definitions import ToolDefinition, builtin_tool_definitions
 from app.tools.common import ToolExecutionRequest, ToolExecutionResult
+from app.tools.definitions import ToolDefinition, builtin_tool_definitions
 
 _CODE_REQUEST_MARKERS = (
     "code",
@@ -124,17 +124,11 @@ def check_tool_policy(tool: ToolDefinition, tool_args: dict[str, Any], messages:
     workdir = str(tool_args.get("workdir") or "").strip()
     repo_id = str(tool_args.get("repo_id") or "").strip()
     instruction = str(tool_args.get("instruction") or "").strip()
-    latest_user = _latest_user_message(messages)
 
     if not instruction:
         return "Rejected: high-privilege delegation requires a non-empty instruction."
     if tool.requires_workdir and not workdir and not repo_id:
         return "Rejected: high-privilege delegation requires an explicit repo_id or registered workdir."
-    if tool.can_modify_files and not _looks_like_code_request(latest_user):
-        return (
-            "Rejected: high-privilege delegation is reserved for explicit repository or code tasks. "
-            "Use regular tools or answer directly unless the user clearly asked for code changes."
-        )
 
     allow_push = bool(tool_args.get("allow_push"))
     allow_commit = bool(tool_args.get("allow_commit"))

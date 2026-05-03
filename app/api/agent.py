@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import logging
 from dataclasses import replace
 from datetime import UTC, datetime
 from functools import lru_cache
@@ -15,7 +17,12 @@ from app.agent_react.session_state import (
     load_session_state,
     render_session_state,
 )
-from app.agent_react.turn_classifier import classify_turn, should_apply_repo_update, should_apply_session_mode_update
+from app.agent_react.turn_classifier import (
+    classification_to_metadata,
+    classify_turn,
+    should_apply_repo_update,
+    should_apply_session_mode_update,
+)
 from app.api.schemas import (
     ConversationCreateRequest,
     ConversationMessageCreateRequest,
@@ -37,6 +44,8 @@ from app.persistence.models import (
 )
 from app.persistence.conversation_store import MySQLConversationStore
 from app.repositories import render_repository_report
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["conversation-runtime"])
 from app.persistence.models import (
@@ -102,6 +111,14 @@ class InMemoryConversationStore:
                 **conversation.metadata,
                 **dump_session_state(session_state),
             }
+            conversation.updated_at = _now()
+
+    def update_conversation_metadata(self, conversation_id: int, patch: dict[str, Any]) -> None:
+        with self._lock:
+            conversation = self._conversations.get(conversation_id)
+            if conversation is None:
+                raise KeyError(conversation_id)
+            conversation.metadata = _merge_metadata_patch(conversation.metadata, patch)
             conversation.updated_at = _now()
 
     def list_messages(self, conversation_id: int) -> list[_MessageRecord]:
@@ -504,6 +521,13 @@ class InMemoryConversationStore:
                 content=content,
                 session_state=load_session_state(conversation.metadata),
             )
+            classification_metadata = classification_to_metadata(classification)
+            logger.info(
+                "turn classified conversation_id=%s turn_type=%s classification=%s",
+                conversation.id,
+                classification.turn_type,
+                json.dumps(classification_metadata, ensure_ascii=False),
+            )
             session_state = load_session_state(conversation.metadata)
             if should_apply_session_mode_update(classification) and classification.session_mode_update is not None:
                 session_state = replace(session_state, session_mode=classification.session_mode_update)
@@ -529,13 +553,7 @@ class InMemoryConversationStore:
                 started_at=_now(),
                 metadata={
                     "mentions": mentions,
-                    "classification": {
-                        "source": classification.source,
-                        "confidence": classification.confidence,
-                        "reason": classification.reason,
-                        "session_mode_update": classification.session_mode_update,
-                        "active_repo_id_update": classification.active_repo_id_update,
-                    },
+                    "classification": classification_metadata,
                 },
             )
             self._turns[turn_id] = turn
@@ -1103,6 +1121,16 @@ def _trigger_type(
     if reply_to_message_id is not None and metadata.get("reply_to_bot"):
         return "reply_to_bot"
     return None
+
+
+def _merge_metadata_patch(current: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(current)
+    for key, value in patch.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _merge_metadata_patch(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
 
 
 def _turn_type(content: str) -> str:

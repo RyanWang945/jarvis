@@ -1,8 +1,12 @@
-from app.agent_react.runtime_policy import resolve_runtime_policy
+from app.agent_react.runtime_policy import render_runtime_policy_for_model, resolve_runtime_policy
 
 
 def test_research_policy_exposes_research_tools_and_budget() -> None:
-    policy = resolve_runtime_policy(session_mode="research", turn_type="research")
+    policy = resolve_runtime_policy(
+        session_mode="research",
+        turn_type="research",
+        requested_capabilities=("research.deep", "web.search"),
+    )
 
     assert policy.mode == "research"
     assert "tavily_search" in policy.allowed_tools
@@ -16,18 +20,67 @@ def test_chat_policy_does_not_expose_coder_tools() -> None:
     policy = resolve_runtime_policy(session_mode="chat", turn_type="chat")
 
     assert policy.mode == "chat"
-    assert "tavily_search" in policy.allowed_tools
-    assert "obsidian_wiki_draft" in policy.allowed_tools
-    assert "obsidian_wiki_apply" in policy.allowed_tools
+    assert "tavily_search" not in policy.allowed_tools
+    assert "obsidian_wiki_draft" not in policy.allowed_tools
+    assert "obsidian_wiki_apply" not in policy.allowed_tools
+    assert "obsidian_wiki_query" in policy.allowed_tools
+    assert "business_knowledge_search" in policy.allowed_tools
     assert "delegate_to_codex" not in policy.allowed_tools
     assert "shell_run_command" not in policy.allowed_tools
 
 
 def test_coding_policy_exposes_coder_tools() -> None:
-    policy = resolve_runtime_policy(session_mode="chat", turn_type="coding")
+    policy = resolve_runtime_policy(
+        session_mode="chat",
+        turn_type="coding",
+        requested_capabilities=("workspace.inspect",),
+    )
 
     assert policy.mode == "coding"
     assert "delegate_to_codex" in policy.allowed_tools
     assert "shell_inspect" not in policy.allowed_tools
     assert "shell_run_command" not in policy.allowed_tools
     assert "tavily_search" not in policy.allowed_tools
+
+    rendered = render_runtime_policy_for_model(policy)
+    assert "compact outcome-oriented tasks" in rendered
+    assert "do not prescribe shell commands" in rendered
+
+
+def test_coding_policy_exposes_search_when_web_capability_requested() -> None:
+    policy = resolve_runtime_policy(
+        session_mode="chat",
+        turn_type="coding",
+        requested_capabilities=("workspace.inspect", "web.search"),
+    )
+
+    assert policy.mode == "coding"
+    assert "delegate_to_codex" in policy.allowed_tools
+    assert "tavily_search" in policy.allowed_tools
+    assert policy.search_budget == 2
+
+
+def test_research_policy_allows_workspace_and_web_capabilities_together() -> None:
+    policy = resolve_runtime_policy(
+        session_mode="chat",
+        turn_type="research",
+        requested_capabilities=("workspace.inspect", "web.search", "research.deep"),
+    )
+
+    assert policy.mode == "research"
+    assert "delegate_to_codex" in policy.allowed_tools
+    assert "tavily_search" in policy.allowed_tools
+    assert "workspace_protocol" in policy.context_sections
+    assert "research_protocol" in policy.context_sections
+    assert policy.search_budget == 4
+
+
+def test_legacy_code_capabilities_map_to_workspace_tools() -> None:
+    policy = resolve_runtime_policy(
+        session_mode="chat",
+        turn_type="research",
+        requested_capabilities=("code.inspect", "web.search"),
+    )
+
+    assert "delegate_to_codex" in policy.allowed_tools
+    assert "tavily_search" in policy.allowed_tools

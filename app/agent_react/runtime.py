@@ -61,6 +61,8 @@ class ConversationStore(Protocol):
         session_state: ConversationSessionState,
     ) -> None: ...
 
+    def update_conversation_metadata(self, conversation_id: int, patch: dict[str, Any]) -> None: ...
+
     def mark_turn_running(self, turn_id: int) -> None: ...
 
     def append_assistant_message(
@@ -187,6 +189,14 @@ class TurnRuntime:
         runtime_policy = resolve_runtime_policy(
             session_mode=session_state.session_mode,
             turn_type=getattr(turn, "turn_type", "chat"),
+            requested_capabilities=_requested_capabilities_from_turn(turn),
+        )
+        logger.info(
+            "runtime policy resolved turn_id=%s mode=%s allowed_tools=%s requested_capabilities=%s",
+            turn_id,
+            runtime_policy.mode,
+            list(runtime_policy.allowed_tools),
+            _requested_capabilities_from_turn(turn),
         )
 
         lc_messages, skill_names = self._context_manager.build_initial_messages(
@@ -288,7 +298,16 @@ class TurnRuntime:
         runtime_policy = state.get("runtime_policy")
         if runtime_policy is None or runtime_policy.mode != "coding":
             return False
+        if not self._latest_ai_message_called_tool(next_state["messages"], "delegate_to_codex"):
+            return False
         return bool(self._latest_tool_message_content(next_state["messages"]))
+
+    @staticmethod
+    def _latest_ai_message_called_tool(messages: list[BaseMessage], tool_name: str) -> bool:
+        for message in reversed(messages):
+            if isinstance(message, AIMessage):
+                return any(tool_call.get("name") == tool_name for tool_call in message.tool_calls)
+        return False
 
     @staticmethod
     def _latest_tool_message_content(messages: list[BaseMessage]) -> str:
@@ -457,3 +476,18 @@ class AgentRuntime:
                 summary=reply,
             ),
         )
+
+
+def _requested_capabilities_from_turn(turn: TurnRecord) -> tuple[str, ...]:
+    metadata = getattr(turn, "metadata", {}) or {}
+    classification = metadata.get("classification")
+    if not isinstance(classification, dict):
+        return ()
+    raw = classification.get("requested_capabilities")
+    if not isinstance(raw, list):
+        return ()
+    capabilities: list[str] = []
+    for item in raw:
+        if isinstance(item, str) and item not in capabilities:
+            capabilities.append(item)
+    return tuple(capabilities)

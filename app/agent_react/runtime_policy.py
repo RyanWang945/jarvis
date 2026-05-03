@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from app.agent_react.session_state import SessionMode
-from app.agent_react.turn_classifier import TurnType
+from app.agent_react.turn_classifier import Capability, TurnType
 
 WritebackStrategy = Literal["basic", "research", "coding", "none"]
 
@@ -20,59 +20,39 @@ class RuntimePolicy:
     writeback_strategy: WritebackStrategy = "basic"
 
 
-_CHAT_TOOLS = (
-    "tavily_search",
+_BASE_READ_TOOLS = (
     "obsidian_wiki_query",
-    "obsidian_wiki_draft",
-    "obsidian_wiki_apply",
     "business_knowledge_search",
 )
-_RESEARCH_TOOLS = (
-    "tavily_search",
-    "business_knowledge_search",
-    "obsidian_wiki_query",
+_WEB_TOOLS = ("tavily_search",)
+_KB_WRITE_TOOLS = (
     "obsidian_wiki_draft",
     "obsidian_wiki_apply",
-    "write_file",
 )
-_CODING_TOOLS = (
-    "delegate_to_codex",
-)
+_WORKSPACE_TOOLS = ("delegate_to_codex",)
+_WORKSPACE_CAPABILITIES = {
+    "workspace.inspect",
+    "workspace.edit",
+    "workspace.test",
+    "workspace.report",
+}
+_CODE_CAPABILITY_ALIASES = {
+    "code.inspect": "workspace.inspect",
+    "code.edit": "workspace.edit",
+    "code.test": "workspace.test",
+}
 
 
 def resolve_runtime_policy(
     *,
     session_mode: SessionMode,
     turn_type: TurnType | str,
+    requested_capabilities: tuple[Capability | str, ...] = (),
 ) -> RuntimePolicy:
-    if turn_type == "research":
-        return RuntimePolicy(
-            mode="research",
-            allowed_tools=_RESEARCH_TOOLS,
-            context_sections=("research_protocol", "session_state"),
-            max_steps=10,
-            search_budget=4,
-            writeback_strategy="research",
-        )
-    if turn_type == "coding":
-        return RuntimePolicy(
-            mode="coding",
-            allowed_tools=_CODING_TOOLS,
-            context_sections=("coding_protocol", "session_state"),
-            max_steps=8,
-            search_budget=0,
-            writeback_strategy="coding",
-        )
-    if turn_type == "summary":
-        return RuntimePolicy(
-            mode="summary",
-            allowed_tools=("obsidian_wiki_query", "business_knowledge_search"),
-            context_sections=("summary_protocol", "session_state"),
-            max_steps=4,
-            search_budget=0,
-            writeback_strategy="basic",
-        )
-    if turn_type == "command":
+    capabilities = _normalize_capabilities(requested_capabilities)
+    mode = _mode_for_turn(turn_type)
+
+    if mode == "command":
         return RuntimePolicy(
             mode="command",
             allowed_tools=(),
@@ -81,7 +61,7 @@ def resolve_runtime_policy(
             search_budget=0,
             writeback_strategy="none",
         )
-    if turn_type == "image_generation":
+    if mode == "image_generation":
         return RuntimePolicy(
             mode="image_generation",
             allowed_tools=(),
@@ -91,20 +71,77 @@ def resolve_runtime_policy(
             writeback_strategy="basic",
         )
 
-    if session_mode == "research":
-        context_sections = ("session_state", "research_background")
-    elif session_mode == "coding":
-        context_sections = ("session_state", "coding_background")
-    else:
-        context_sections = ("session_state",)
+    allowed_tools: list[str] = list(_BASE_READ_TOOLS)
+    context_sections: list[str] = ["session_state"]
+
+    if "web.search" in capabilities:
+        allowed_tools.extend(_WEB_TOOLS)
+    if "kb.write" in capabilities:
+        allowed_tools.extend(_KB_WRITE_TOOLS)
+    if capabilities & _WORKSPACE_CAPABILITIES:
+        allowed_tools.extend(_WORKSPACE_TOOLS)
+        context_sections.append("workspace_protocol")
+
+    if mode == "research" or "research.deep" in capabilities:
+        context_sections.append("research_protocol")
+    elif mode == "summary":
+        context_sections.append("summary_protocol")
+    elif session_mode == "research":
+        context_sections.append("research_background")
+    elif session_mode == "coding" and not capabilities & _WORKSPACE_CAPABILITIES:
+        context_sections.append("coding_background")
+
     return RuntimePolicy(
-        mode="chat",
-        allowed_tools=_CHAT_TOOLS,
-        context_sections=context_sections,
-        max_steps=6,
-        search_budget=2,
-        writeback_strategy="basic",
+        mode=mode,
+        allowed_tools=tuple(dict.fromkeys(allowed_tools)),
+        context_sections=tuple(dict.fromkeys(context_sections)),
+        max_steps=_max_steps(mode, capabilities),
+        search_budget=_search_budget(mode, capabilities),
+        writeback_strategy=_writeback_strategy(mode),
     )
+
+
+def _normalize_capabilities(capabilities: tuple[Capability | str, ...]) -> set[str]:
+    normalized: set[str] = set()
+    for capability in capabilities:
+        value = str(capability)
+        normalized.add(value)
+        alias = _CODE_CAPABILITY_ALIASES.get(value)
+        if alias is not None:
+            normalized.add(alias)
+    return normalized
+
+
+def _mode_for_turn(turn_type: TurnType | str) -> str:
+    if turn_type in {"research", "coding", "summary", "command", "image_generation"}:
+        return str(turn_type)
+    return "chat"
+
+
+def _max_steps(mode: str, capabilities: set[str]) -> int:
+    if mode == "research" or "research.deep" in capabilities:
+        return 10
+    if capabilities & _WORKSPACE_CAPABILITIES:
+        return 8
+    if mode == "summary":
+        return 4
+    return 6
+
+
+def _search_budget(mode: str, capabilities: set[str]) -> int:
+    if "web.search" not in capabilities:
+        return 0
+    if mode == "research" or "research.deep" in capabilities:
+        return 4
+    return 2
+
+
+def _writeback_strategy(mode: str) -> WritebackStrategy:
+    if mode == "research":
+        return "research"
+    if mode == "coding":
+        return "coding"
+    return "basic"
 
 
 def render_runtime_policy_for_model(policy: RuntimePolicy) -> str:
@@ -124,15 +161,22 @@ def render_runtime_policy_for_model(policy: RuntimePolicy) -> str:
                 "- Stop searching when gathered evidence is sufficient for the current turn.",
             ]
         )
-    if "coding_protocol" in policy.context_sections:
+    if "workspace_protocol" in policy.context_sections or "coding_protocol" in policy.context_sections:
         lines.extend(
             [
                 "",
-                "Coding protocol:",
-                "- Inspect before changing repository state.",
-                "- Use high-privilege coder delegation only for explicit repository tasks.",
+                "Workspace protocol:",
+                "- Use delegate_to_codex for local repository inspection, reports, tests, and edits.",
+                "- Trust Codex to handle routine repository work inside the registered workspace.",
+                "- Preserve the user's full repository outcome when delegating. If the user asks to update/edit/create, delegate an execution task, not a read-only preview.",
+                "- If the user asks to commit, set allow_commit=true. If the user asks to push, set allow_commit=true and allow_push=true.",
+                "- Delegate compact outcome-oriented tasks to Codex; do not prescribe shell commands, "
+                "recovery steps, or old stderr unless the user explicitly asks.",
+                "- Codex owns repository inspection, planning, retries, and approval requests.",
+                "- Do not ask Codex to confirm routine details such as commit messages; let Codex choose and proceed.",
+                "- Let Codex request approval for elevated actions; do not pre-split ordinary repo work into micro approvals.",
                 "- Prefer delegate_to_codex with repo_id; do not guess unregistered workdirs.",
-                "- Report changed files, verification, and permission limits.",
+                "- Surface only material approval requests to the user, then report changed files and verification.",
             ]
         )
     if "summary_protocol" in policy.context_sections:

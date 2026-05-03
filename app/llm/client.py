@@ -89,5 +89,14 @@ def parse_json_content(message: dict[str, Any]) -> dict[str, Any]:
     content = message.get("content")
     if not isinstance(content, str) or not content.strip():
         return {}
-    parsed = json.loads(content)
+    parsed = json.loads(_extract_first_json_object(content))
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _extract_first_json_object(content: str) -> str:
+    text = content.strip()
+    decoder = json.JSONDecoder()
+    parsed, end = decoder.raw_decode(text)
+    if isinstance(parsed, dict):
+        return text[:end]
+    return text

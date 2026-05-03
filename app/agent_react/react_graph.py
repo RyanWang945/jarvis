@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any, Protocol
 
-from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langgraph.graph import END, StateGraph
 from typing_extensions import TypedDict
 
@@ -85,6 +86,25 @@ class ReActState(TypedDict):
 
 _MAX_TAVILY_CALLS_PER_TURN = 2
 
+_COMMIT_INTENT_PATTERN = r"(?<![A-Za-z])commit(?![A-Za-z])|提交|创建\s*commit|建立\s*commit"
+_PUSH_INTENT_PATTERN = r"(?<![A-Za-z])push(?![A-Za-z])|推送|远程|origin"
+_EDIT_INTENT_PATTERN = (
+    r"\b(update|modify|change|edit|add|create|write|fix|repair|delete|remove)\b"
+    r"|更新|修改|改一下|增加|新增|创建|写入|修复|删除|移除"
+)
+_READ_ONLY_INSTRUCTION_PATTERN = (
+    r"\b(read|show|inspect|list|summari[sz]e|review|analy[sz]e)\b"
+    r"|读取|查看|展示|列出|分析|总结|检查"
+)
+_DOWNGRADED_DECISION_PATTERN = (
+    r"\b(show me|so i can decide|let me decide|ask the user|confirm what to update|decide what to update)\b"
+    r"|让我.*决定|给我.*决定|我再决定|先.*看"
+)
+_EXECUTION_INSTRUCTION_PATTERN = (
+    r"\b(update|modify|change|edit|add|create|write|fix|delete|commit|push)\b"
+    r"|更新|修改|增加|新增|创建|写入|修复|删除|提交|推送"
+)
+
 
 def _llm_response_to_ai_message(response: dict[str, Any]) -> AIMessage:
     content = response.get("content") or ""
@@ -106,6 +126,91 @@ def _llm_response_to_ai_message(response: dict[str, Any]) -> AIMessage:
     if reasoning_content is not None:
         response_metadata["reasoning_content"] = reasoning_content
     return AIMessage(content=content, tool_calls=tool_calls, response_metadata=response_metadata)
+
+
+def _latest_human_message_text(messages: list[BaseMessage]) -> str:
+    for message in reversed(messages):
+        if isinstance(message, HumanMessage):
+            return str(message.content or "")
+    return ""
+
+
+def _has_pattern(text: str, pattern: str) -> bool:
+    return bool(re.search(pattern, text, flags=re.IGNORECASE))
+
+
+def _codex_instruction_was_downgraded(instruction: str, *, user_requested_execution: bool) -> bool:
+    if not user_requested_execution:
+        return False
+    if not instruction.strip():
+        return True
+    if _has_pattern(instruction, _DOWNGRADED_DECISION_PATTERN):
+        return True
+    if _has_pattern(instruction, _EXECUTION_INSTRUCTION_PATTERN):
+        return False
+    return _has_pattern(instruction, _READ_ONLY_INSTRUCTION_PATTERN)
+
+
+def _strengthen_codex_contract(tool_args: dict[str, Any], messages: list[BaseMessage]) -> dict[str, Any]:
+    latest_user_text = _latest_human_message_text(messages).strip()
+    if not latest_user_text:
+        return tool_args
+
+    user_requested_commit = _has_pattern(latest_user_text, _COMMIT_INTENT_PATTERN)
+    user_requested_push = _has_pattern(latest_user_text, _PUSH_INTENT_PATTERN)
+    user_requested_edit = _has_pattern(latest_user_text, _EDIT_INTENT_PATTERN)
+    user_requested_execution = user_requested_edit or user_requested_commit or user_requested_push
+    instruction = str(tool_args.get("instruction") or "").strip()
+    needs_contract_rewrite = _codex_instruction_was_downgraded(
+        instruction,
+        user_requested_execution=user_requested_execution,
+    )
+    needs_permission_repair = (
+        (user_requested_commit and not bool(tool_args.get("allow_commit")))
+        or (user_requested_push and (not bool(tool_args.get("allow_push")) or not bool(tool_args.get("allow_commit"))))
+    )
+    if not needs_contract_rewrite and not needs_permission_repair:
+        return tool_args
+
+    repaired = dict(tool_args)
+    if user_requested_commit or user_requested_push:
+        repaired["allow_commit"] = True
+    if user_requested_push:
+        repaired["allow_push"] = True
+    if needs_contract_rewrite:
+        repaired["instruction"] = "\n".join(
+            [
+                "Complete the full repository task requested by the user. Do not downgrade it into a read-only inspection or ask the user to decide routine implementation details.",
+                "Codex owns repository reading, planning, editing, verification, commit creation, push execution, and approval requests within the permissions below.",
+                "",
+                "Original user request:",
+                latest_user_text,
+                "",
+                "Planner-provided draft instruction, for context only:",
+                instruction or "(empty)",
+            ]
+        )
+    elif needs_permission_repair:
+        repaired["instruction"] = "\n".join(
+            [
+                instruction,
+                "",
+                "Jarvis contract repair: the original user request explicitly included commit/push intent. Preserve that outcome and use Codex approval flow for elevated actions.",
+                "Original user request:",
+                latest_user_text,
+            ]
+        )
+    logger.info(
+        "codex delegation contract repaired commit_requested=%s push_requested=%s edit_requested=%s rewrite=%s permission_repair=%s original_args=%s repaired_args=%s",
+        user_requested_commit,
+        user_requested_push,
+        user_requested_edit,
+        needs_contract_rewrite,
+        needs_permission_repair,
+        tool_args,
+        repaired,
+    )
+    return repaired
 
 
 def _is_turn_cancelled(store: TurnStore, turn_id: int) -> bool:
@@ -194,7 +299,22 @@ def _execute_single_tool(tool_name: str, tool_args: dict[str, Any]) -> tuple[boo
     result = execute_tool(tool, tool_args, timeout_seconds=30)
     if result.ok:
         return True, result.stdout or result.summary or "Completed successfully."
+    if tool_name == "delegate_to_codex":
+        output = result.stdout or result.summary or result.stderr
+        if output:
+            return True, output
     return False, f"Error (exit_code={result.exit_code}): {result.stderr or result.summary}"
+
+
+def _codex_trusted_approval_prefixes(store: TurnStore, conversation_id: int) -> list[str]:
+    conversation = store.get_conversation(conversation_id)
+    if conversation is None:
+        return []
+    metadata = getattr(conversation, "metadata", None) or {}
+    prefixes = metadata.get("codex_approval_prefixes")
+    if not isinstance(prefixes, list):
+        return []
+    return [str(item) for item in prefixes if str(item).strip()]
 
 
 def _tool_output_payload(output: str) -> dict[str, Any]:
@@ -261,6 +381,8 @@ def execute_tools(state: ReActState, store: TurnStore) -> ReActState:
     for tool_call in last_message.tool_calls:
         tool_name = tool_call["name"]
         tool_args = tool_call["args"]
+        if tool_name == "delegate_to_codex":
+            tool_args = _strengthen_codex_contract(dict(tool_args), state["messages"])
         tool_call_id = tool_call["id"]
         record = None
         logger.info(
@@ -312,7 +434,13 @@ def execute_tools(state: ReActState, store: TurnStore) -> ReActState:
                 store.update_tool_call(record.id, status="running")
                 if tool is None:
                     raise ValueError(f"unknown tool: {tool_name}")
-                ok, output = _execute_single_tool(tool_name, tool_args)
+                execution_args = dict(tool_args)
+                if tool_name == "delegate_to_codex":
+                    execution_args["_trusted_codex_approval_prefixes"] = _codex_trusted_approval_prefixes(
+                        store,
+                        turn.conversation_id,
+                    )
+                ok, output = _execute_single_tool(tool_name, execution_args)
                 if not ok:
                     logger.warning(
                         "tool execution failed turn_id=%s step=%s tool=%s tool_call_id=%s output_preview=%s",

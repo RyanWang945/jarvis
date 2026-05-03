@@ -15,7 +15,12 @@ from app.agent_react.session_state import (
     load_session_state,
     render_session_state,
 )
-from app.agent_react.turn_classifier import classify_turn, should_apply_repo_update, should_apply_session_mode_update
+from app.agent_react.turn_classifier import (
+    classification_to_metadata,
+    classify_turn,
+    should_apply_repo_update,
+    should_apply_session_mode_update,
+)
 from app.api.schemas import (
     ConversationCreateRequest,
     ConversationMessageCreateRequest,
@@ -160,6 +165,22 @@ class MySQLConversationStore:
                 ),
                 {
                     "patch": json.dumps(dump_session_state(session_state)),
+                    "now": _now(),
+                    "id": conversation_id,
+                },
+            )
+
+    def update_conversation_metadata(self, conversation_id: int, patch: dict[str, Any]) -> None:
+        with self._engine.begin() as conn:
+            conn.execute(
+                sa.text(
+                    "UPDATE conversations "
+                    "SET metadata = JSON_MERGE_PATCH(COALESCE(metadata, '{}'), :patch), "
+                    "updated_at = :now "
+                    "WHERE id = :id"
+                ),
+                {
+                    "patch": json.dumps(patch),
                     "now": _now(),
                     "id": conversation_id,
                 },
@@ -717,6 +738,13 @@ class MySQLConversationStore:
                 content=content,
                 session_state=load_session_state(conversation.metadata),
             )
+            classification_metadata = classification_to_metadata(classification)
+            logger.info(
+                "turn classified conversation_id=%s turn_type=%s classification=%s",
+                conversation.id,
+                classification.turn_type,
+                json.dumps(classification_metadata, ensure_ascii=False),
+            )
             original_session_state = load_session_state(conversation.metadata)
             session_state = original_session_state
             if should_apply_session_mode_update(classification) and classification.session_mode_update is not None:
@@ -747,13 +775,7 @@ class MySQLConversationStore:
                 turn_type=classification.turn_type,
                 started_by_user_id=user_id,
                 mentions=mentions,
-                classification={
-                    "source": classification.source,
-                    "confidence": classification.confidence,
-                    "reason": classification.reason,
-                    "session_mode_update": classification.session_mode_update,
-                    "active_repo_id_update": classification.active_repo_id_update,
-                },
+                classification=classification_metadata,
             )
             conn.execute(
                 sa.text("UPDATE messages SET turn_id = :turn_id WHERE id = :msg_id"),

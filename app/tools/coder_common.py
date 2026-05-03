@@ -15,13 +15,22 @@ def build_coder_instruction(instruction: str, request_args: dict[str, Any]) -> s
         "You are running as a Jarvis coder worker for a local repository.",
         "Operate only inside the working directory provided by the process cwd.",
         "Prefer direct file edits over explaining what should be changed.",
-        "Before committing or pushing, inspect git status and the relevant diff.",
         "Treat the provided task contract and permissions as hard constraints.",
         "Do not modify unrelated files.",
+        "Use Codex's approval flow for elevated actions instead of working around permission failures.",
+        "Ask for approval only when the action is materially beyond routine repository work.",
+        "Approval authority lives in the Codex approval flow; do not replace it with chat confirmations.",
+        "Treat generated planning details in the task text as hints, not as stop conditions.",
+        "Do not stop to ask Jarvis or the user to confirm routine execution details such as commit messages, file staging, command order, or retry strategy.",
+        "Ask a normal chat question only when required information is missing and no reasonable default exists.",
+        "Before committing or pushing, inspect git status and the relevant diff.",
+        "When committing existing work, prefer one coherent commit unless the user explicitly asks for multiple commits.",
+        "Group routine local git staging and commit work; do not create per-file approval churn.",
         "End with a concise summary of files changed, commit hash if created, and push result if pushed.",
     ]
     if allow_commit:
         rules.append("You may create a focused git commit only if it is needed to complete the task.")
+        rules.append("When a commit is needed, choose a concise commit message yourself unless the user explicitly supplied an exact message.")
     else:
         rules.append("Do not create any git commit.")
     if allow_push:
@@ -59,9 +68,10 @@ def prepare_workspace(workdir: Path) -> list[str]:
     return notes
 
 
-def collect_git_state(workdir: Path) -> dict[str, object]:
-    status = run_git(workdir, "status", "--short", "--branch")
-    porcelain_status = run_git(workdir, "status", "--porcelain")
+def collect_git_state(workdir: Path, *, ignored_paths: tuple[Path, ...] = ()) -> dict[str, object]:
+    ignored_prefixes = ignored_relative_prefixes(workdir, ignored_paths)
+    status = run_git(workdir, "status", "--short", "--branch", "--untracked-files=all")
+    porcelain_status = run_git(workdir, "status", "--porcelain", "--untracked-files=all")
     diff_stat = run_git(workdir, "diff", "--stat")
     branch = run_git(workdir, "branch", "--show-current")
     short_head = run_git(workdir, "rev-parse", "--short", "HEAD")
@@ -69,9 +79,14 @@ def collect_git_state(workdir: Path) -> dict[str, object]:
     commit_subject = run_git(workdir, "log", "-1", "--pretty=%s")
     remote = run_git(workdir, "remote", "get-url", "origin")
     upstream = run_git(workdir, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
-    upstream_head = run_git(workdir, "rev-parse", "@{u}") if upstream["exit_code"] == 0 else {"exit_code": None, "stdout": "", "stderr": ""}
+    upstream_head = (
+        run_git(workdir, "rev-parse", "@{u}")
+        if upstream["exit_code"] == 0
+        else {"exit_code": None, "stdout": "", "stderr": ""}
+    )
 
-    status_stdout = str(status["stdout"]).strip()
+    status_stdout = filter_status_stdout(str(status["stdout"]), ignored_prefixes).strip()
+    porcelain_stdout = filter_status_stdout(str(porcelain_status["stdout"]), ignored_prefixes)
     branch_name = str(branch["stdout"]).strip()
     upstream_name = str(upstream["stdout"]).strip()
     return {
@@ -79,7 +94,7 @@ def collect_git_state(workdir: Path) -> dict[str, object]:
         "status_exit_code": status["exit_code"],
         "status": status_stdout,
         "status_short_branch": status_stdout,
-        "status_porcelain": str(porcelain_status["stdout"]).strip(),
+        "status_porcelain": porcelain_stdout.strip(),
         "branch": branch_name,
         "head": str(head["stdout"]).strip(),
         "short_head": str(short_head["stdout"]).strip(),
@@ -91,7 +106,7 @@ def collect_git_state(workdir: Path) -> dict[str, object]:
         "upstream_available": upstream["exit_code"] == 0 and bool(upstream_name),
         "working_tree_clean": is_working_tree_clean(status_stdout),
         "synced_with_upstream": is_synced_with_upstream(status_stdout),
-        "files_modified": modified_files_from_status(str(porcelain_status["stdout"])),
+        "files_modified": modified_files_from_status(porcelain_stdout),
         "diff_stat": str(diff_stat["stdout"]).strip(),
         "diff_stat_stderr": str(diff_stat["stderr"]).strip(),
         "status_stderr": str(status["stderr"]).strip(),
@@ -218,6 +233,46 @@ def is_synced_with_upstream(status_stdout: str) -> bool:
     if "..." not in first_line:
         return False
     return "[" not in first_line
+
+
+def ignored_relative_prefixes(workdir: Path, ignored_paths: tuple[Path, ...]) -> tuple[str, ...]:
+    prefixes: list[str] = []
+    root = workdir.resolve()
+    for ignored_path in ignored_paths:
+        try:
+            relative = ignored_path.resolve().relative_to(root).as_posix().strip("/")
+        except ValueError:
+            continue
+        if relative:
+            prefixes.append(relative)
+            prefixes.append(relative + "/")
+    return tuple(dict.fromkeys(prefixes))
+
+
+def filter_status_stdout(status_stdout: str, ignored_prefixes: tuple[str, ...]) -> str:
+    if not ignored_prefixes:
+        return status_stdout
+    lines: list[str] = []
+    for line in status_stdout.splitlines():
+        if line.startswith("## "):
+            lines.append(line)
+            continue
+        path = status_path(line)
+        if path is not None and is_ignored_relative_path(path, ignored_prefixes):
+            continue
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def is_ignored_relative_path(path: str, ignored_prefixes: tuple[str, ...]) -> bool:
+    normalized = path.replace("\\", "/").strip("/")
+    for prefix in ignored_prefixes:
+        if prefix.endswith("/"):
+            if normalized.startswith(prefix):
+                return True
+        elif normalized == prefix:
+            return True
+    return False
 
 
 def is_zero_byte(path: Path) -> bool:
