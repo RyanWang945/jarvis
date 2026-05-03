@@ -8,6 +8,7 @@ from shutil import which
 from uuid import uuid4
 
 from app.config import get_settings
+from app.repositories import RepositoryRef, RepositoryRegistryError, get_repository_registry
 from app.tools.coder_common import (
     build_coder_instruction,
     check_coder_permissions,
@@ -23,12 +24,13 @@ def run_codex_coder_tool(request: ToolExecutionRequest) -> ToolExecutionResult:
     instruction = build_coder_instruction(raw_instruction, request.args)
     if not instruction:
         return ToolExecutionResult(ok=False, exit_code=None, summary="Coder instruction is required.")
-    if not request.workdir:
-        return ToolExecutionResult(ok=False, exit_code=None, summary="Coder workdir is required.")
 
-    workdir = Path(request.workdir).resolve()
-    if not workdir.exists() or not workdir.is_dir():
-        return ToolExecutionResult(ok=False, exit_code=None, summary=f"Coder workdir does not exist: {workdir}")
+    try:
+        repo, repository_warnings = _resolve_repository(request)
+    except RepositoryRegistryError as exc:
+        return ToolExecutionResult(ok=False, exit_code=None, summary=str(exc))
+
+    workdir = repo.canonical_root_path
 
     provider_command = _resolve_codex_command()
     if provider_command is None:
@@ -39,7 +41,7 @@ def run_codex_coder_tool(request: ToolExecutionRequest) -> ToolExecutionResult:
     run_dir = _coder_run_dir(run_id)
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    preflight_notes = prepare_workspace(workdir)
+    preflight_notes = [*repository_warnings, *prepare_workspace(workdir)]
     preflight = collect_git_state(workdir)
     command = provider_command + [
         "exec",
@@ -70,20 +72,25 @@ def run_codex_coder_tool(request: ToolExecutionRequest) -> ToolExecutionResult:
         if raw_stderr:
             _write_text(run_dir / "codex-stderr.log", raw_stderr)
         postflight = collect_git_state(workdir)
-        artifacts = postflight_artifacts(postflight)
-        artifacts.append(f"codex_events:{run_dir / 'codex-events.jsonl'}")
-        if raw_stderr:
-            artifacts.append(f"codex_stderr:{run_dir / 'codex-stderr.log'}")
-        return ToolExecutionResult(
-            ok=False,
-            exit_code=None,
-            stdout=_compose_clean_stdout(
-                "Codex CLI timed out.",
+        audit_path = run_dir / "jarvis-audit.log"
+        _write_text(
+            audit_path,
+            _compose_audit_report(
                 preflight=preflight,
                 postflight=postflight,
                 permission_check=None,
                 preflight_notes=preflight_notes,
             ),
+        )
+        artifacts = postflight_artifacts(postflight)
+        artifacts.append(f"codex_events:{run_dir / 'codex-events.jsonl'}")
+        artifacts.append(f"jarvis_audit:{audit_path}")
+        if raw_stderr:
+            artifacts.append(f"codex_stderr:{run_dir / 'codex-stderr.log'}")
+        return ToolExecutionResult(
+            ok=False,
+            exit_code=None,
+            stdout=_compose_user_stdout("Codex CLI timed out."),
             stderr=raw_stderr,
             artifacts=artifacts,
             summary="codex CLI timed out.",
@@ -105,17 +112,22 @@ def run_codex_coder_tool(request: ToolExecutionRequest) -> ToolExecutionResult:
         allow_push=bool(request.args.get("allow_push")),
     )
     final_summary = parsed["final_text"] or _default_codex_summary(exit_code, parsed["parse_errors"])
-    stdout = _compose_clean_stdout(
-        final_summary,
-        preflight=preflight,
-        postflight=postflight,
-        permission_check=permission_check,
-        preflight_notes=preflight_notes,
-        parse_errors=parsed["parse_errors"],
+    stdout = _compose_user_stdout(final_summary)
+    audit_path = run_dir / "jarvis-audit.log"
+    _write_text(
+        audit_path,
+        _compose_audit_report(
+            preflight=preflight,
+            postflight=postflight,
+            permission_check=permission_check,
+            preflight_notes=preflight_notes,
+            parse_errors=parsed["parse_errors"],
+        ),
     )
     artifacts = postflight_artifacts(postflight)
     artifacts.append(f"codex_events:{events_path}")
     artifacts.append(f"codex_run:{run_dir}")
+    artifacts.append(f"jarvis_audit:{audit_path}")
     if stderr_path is not None:
         artifacts.append(f"codex_stderr:{stderr_path}")
     for violation in permission_check["violations"]:
@@ -158,6 +170,31 @@ def _run_codex_process(
         env=env,
         timeout=timeout_seconds,
     )
+
+
+def _resolve_repository(request: ToolExecutionRequest) -> tuple[RepositoryRef, list[str]]:
+    registry = get_repository_registry()
+    repo_id = str(request.args.get("repo_id") or "").strip()
+    raw_workdir = str(request.args.get("workdir") or request.workdir or "").strip()
+    warnings: list[str] = []
+
+    if repo_id:
+        repo = registry.resolve_repo(repo_id)
+        if raw_workdir:
+            matched = registry.find_by_workdir(raw_workdir)
+            if matched is None or matched.repo_id != repo.repo_id:
+                raise RepositoryRegistryError("repo_id and workdir do not refer to the same registered repository.")
+            warnings.append("workdir is deprecated; use repo_id instead.")
+        return repo, warnings
+
+    if raw_workdir:
+        repo = registry.find_by_workdir(raw_workdir)
+        if repo is None:
+            raise RepositoryRegistryError("Repository is not registered or not authorized. Ask the user to register this repository first.")
+        warnings.append("workdir is deprecated; use repo_id instead.")
+        return repo, warnings
+
+    raise RepositoryRegistryError("Coder repo_id or registered workdir is required.")
 
 
 def _resolve_codex_command() -> list[str] | None:
@@ -206,6 +243,11 @@ def _parse_codex_jsonl(raw_events: str) -> dict[str, object]:
 def _extract_event_text(event: object) -> str:
     if not isinstance(event, dict):
         return ""
+    nested_item = event.get("item")
+    if isinstance(nested_item, dict):
+        text = _extract_event_text(nested_item)
+        if text:
+            return text
     event_type = str(event.get("type") or event.get("event") or "").lower()
     role = str(event.get("role") or "").lower()
     if event_type in {"agent_message", "assistant_message", "final_answer", "task_complete", "message"} or role == "assistant":
@@ -243,8 +285,11 @@ def _default_codex_summary(exit_code: int, parse_errors: list[str]) -> str:
     return "Codex CLI failed. See codex_events and codex_stderr artifacts."
 
 
-def _compose_clean_stdout(
-    final_summary: str,
+def _compose_user_stdout(final_summary: str) -> str:
+    return final_summary.strip()
+
+
+def _compose_audit_report(
     *,
     preflight: dict[str, object],
     postflight: dict[str, object],
@@ -252,14 +297,13 @@ def _compose_clean_stdout(
     preflight_notes: list[str],
     parse_errors: list[str] | None = None,
 ) -> str:
-    lines = [final_summary.strip()]
+    lines: list[str] = []
     if parse_errors:
-        lines.extend(["", "[JARVIS_CODEX_PARSE]", *[f"- {error}" for error in parse_errors[:5]]])
+        lines.extend(["[JARVIS_CODEX_PARSE]", *[f"- {error}" for error in parse_errors[:5]], ""])
     if preflight_notes:
-        lines.extend(["", "[JARVIS_PREFLIGHT_NOTES]", *[f"- {note}" for note in preflight_notes]])
+        lines.extend(["[JARVIS_PREFLIGHT_NOTES]", *[f"- {note}" for note in preflight_notes], ""])
     lines.extend(
         [
-            "",
             "[JARVIS_PREFLIGHT]",
             _state_line(preflight),
             "",

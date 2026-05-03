@@ -15,7 +15,7 @@ from app.agent_react.session_state import (
     load_session_state,
     render_session_state,
 )
-from app.agent_react.turn_classifier import classify_turn, should_apply_session_mode_update
+from app.agent_react.turn_classifier import classify_turn, should_apply_repo_update, should_apply_session_mode_update
 from app.api.schemas import (
     ConversationCreateRequest,
     ConversationMessageCreateRequest,
@@ -36,6 +36,7 @@ from app.persistence.models import (
     UserRecord as _UserRecord,
 )
 from app.persistence.conversation_store import MySQLConversationStore
+from app.repositories import render_repository_report
 
 router = APIRouter(tags=["conversation-runtime"])
 from app.persistence.models import (
@@ -463,14 +464,14 @@ class InMemoryConversationStore:
         metadata: dict[str, Any],
     ) -> MessageIngestResponse:
         if external_message_id:
-            existing_message_id = self._messages_by_external.get((conversation.id, external_message_id))
+            existing_message_id = self._find_message_by_external_chat_locked(conversation, external_message_id)
             if existing_message_id is not None:
                 message = self._messages[existing_message_id]
                 return MessageIngestResponse(
-                    conversation_id=conversation.id,
+                    conversation_id=message.conversation_id,
                     message_id=message.id,
                     turn_id=message.turn_id,
-                    should_respond=message.turn_id is not None,
+                    should_respond=False,
                     trigger_type=self._turns[message.turn_id].trigger_type if message.turn_id else None,
                     status="duplicate",
                 )
@@ -503,11 +504,14 @@ class InMemoryConversationStore:
                 content=content,
                 session_state=load_session_state(conversation.metadata),
             )
+            session_state = load_session_state(conversation.metadata)
             if should_apply_session_mode_update(classification) and classification.session_mode_update is not None:
-                session_state = replace(
-                    load_session_state(conversation.metadata),
-                    session_mode=classification.session_mode_update,
-                )
+                session_state = replace(session_state, session_mode=classification.session_mode_update)
+            if should_apply_repo_update(classification):
+                session_state = replace(session_state, active_repo_id=classification.active_repo_id_update)
+            if (
+                session_state != load_session_state(conversation.metadata)
+            ):
                 conversation.metadata = {
                     **conversation.metadata,
                     **dump_session_state(session_state),
@@ -530,6 +534,7 @@ class InMemoryConversationStore:
                         "confidence": classification.confidence,
                         "reason": classification.reason,
                         "session_mode_update": classification.session_mode_update,
+                        "active_repo_id_update": classification.active_repo_id_update,
                     },
                 },
             )
@@ -565,6 +570,10 @@ class InMemoryConversationStore:
             )
         if cmd == "/status":
             return self._handle_status_command_locked(
+                conversation=conversation, user_id=user_id, request=request
+            )
+        if cmd == "/repos":
+            return self._handle_repos_command_locked(
                 conversation=conversation, user_id=user_id, request=request
             )
         # Unknown command: fall through to normal turn creation.
@@ -835,6 +844,36 @@ class InMemoryConversationStore:
             reset_message=reply,
         )
 
+    def _handle_repos_command_locked(
+        self,
+        *,
+        conversation: _ConversationRecord,
+        user_id: int,
+        request: MessageCreateRequest,
+    ) -> MessageIngestResponse:
+        message = self._append_message_locked(
+            conversation_id=conversation.id,
+            turn_id=None,
+            sender_type="user",
+            user_id=user_id,
+            role="user",
+            content=request.content,
+            content_type=request.content_type,
+            external_message_id=request.external_message_id,
+            reply_to_message_id=None,
+            raw_payload=dict(request.raw_payload),
+        )
+        conversation.updated_at = _now()
+        return MessageIngestResponse(
+            conversation_id=conversation.id,
+            message_id=message.id,
+            turn_id=None,
+            should_respond=False,
+            trigger_type="command",
+            status="repos_report",
+            reset_message=render_repository_report(),
+        )
+
     def _append_message_locked(
         self,
         *,
@@ -883,6 +922,24 @@ class InMemoryConversationStore:
             return reply_to_message_id
         if reply_to_external_message_id:
             return self._messages_by_external.get((conversation_id, reply_to_external_message_id))
+        return None
+
+    def _find_message_by_external_chat_locked(
+        self,
+        conversation: _ConversationRecord,
+        external_message_id: str,
+    ) -> int | None:
+        for message in sorted(self._messages.values(), key=lambda item: item.id):
+            if message.external_message_id != external_message_id:
+                continue
+            existing_conversation = self._conversations.get(message.conversation_id)
+            if existing_conversation is None:
+                continue
+            if (
+                existing_conversation.platform == conversation.platform
+                and existing_conversation.external_chat_id == conversation.external_chat_id
+            ):
+                return message.id
         return None
 
 

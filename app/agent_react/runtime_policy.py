@@ -36,10 +36,7 @@ _RESEARCH_TOOLS = (
     "write_file",
 )
 _CODING_TOOLS = (
-    "shell_inspect",
-    "shell_run_command",
     "delegate_to_codex",
-    "delegate_to_claude_code",
 )
 
 
@@ -134,6 +131,7 @@ def render_runtime_policy_for_model(policy: RuntimePolicy) -> str:
                 "Coding protocol:",
                 "- Inspect before changing repository state.",
                 "- Use high-privilege coder delegation only for explicit repository tasks.",
+                "- Prefer delegate_to_codex with repo_id; do not guess unregistered workdirs.",
                 "- Report changed files, verification, and permission limits.",
             ]
         )

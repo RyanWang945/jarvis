@@ -6,7 +6,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
-from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 from typing_extensions import TypedDict
 
 from app.agent_react.context_manager import ContextManager
@@ -256,6 +256,16 @@ class TurnRuntime:
                     "status": "failed",
                     "error": str(exc),
                 }
+            if self._should_complete_after_coder_tool(state, next_state):
+                coder_reply = self._latest_tool_message_content(next_state["messages"])
+                return {
+                    **state,
+                    "messages": next_state["messages"] + [AIMessage(content=coder_reply)],
+                    "step_count": next_state["step_count"],
+                    "cancelled": bool(next_state.get("cancelled")),
+                    "status": "completed",
+                    "error": state.get("error"),
+                }
             return {
                 **state,
                 "messages": next_state["messages"],
@@ -273,6 +283,21 @@ class TurnRuntime:
             "status": "cancelled" if llm_state.get("cancelled") else "completed",
             "error": state.get("error"),
         }
+
+    def _should_complete_after_coder_tool(self, state: TurnRuntimeState, next_state: dict[str, Any]) -> bool:
+        runtime_policy = state.get("runtime_policy")
+        if runtime_policy is None or runtime_policy.mode != "coding":
+            return False
+        return bool(self._latest_tool_message_content(next_state["messages"]))
+
+    @staticmethod
+    def _latest_tool_message_content(messages: list[BaseMessage]) -> str:
+        for message in reversed(messages):
+            if isinstance(message, ToolMessage):
+                content = str(message.content or "").strip()
+                if content:
+                    return content
+        return ""
 
     def _finalize(self, state: TurnRuntimeState) -> TurnRuntimeState:
         turn_id = state["turn_id"]

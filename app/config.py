@@ -42,6 +42,7 @@ class Settings(BaseSettings):
     llm_max_output_tokens: int = 2000
     llm_context_safety_buffer: int = 1000
     coder_timeout_seconds: int = 1800
+    repositories_config_path: Path | None = Field(default=Path("data/repositories.json"))
     deepseek_api_key: str | None = None
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_model: str = "deepseek-v4-flash"

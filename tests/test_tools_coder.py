@@ -88,13 +88,33 @@ def test_codex_tool_is_rejected_for_non_code_request(monkeypatch) -> None:
 def test_codex_tool_runs_for_explicit_code_request(monkeypatch) -> None:
     client = _client(monkeypatch)
     store = get_conversation_store()
-    _install_delegation_chat(
-        monkeypatch,
-        instruction="Fix the bug in app/channels/feishu_renderer.py and run related checks.",
-        workdir=str(Path.cwd()),
-        allow_commit=False,
-        allow_push=False,
-    )
+    chat_calls = 0
+
+    def _fake_chat(self, messages, tools=None):
+        nonlocal chat_calls
+        chat_calls += 1
+        return {
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_delegation_1",
+                    "type": "function",
+                    "function": {
+                        "name": "delegate_to_codex",
+                        "arguments": json.dumps(
+                            {
+                                "instruction": "Fix the bug in app/channels/feishu_renderer.py and run related checks.",
+                                "workdir": str(Path.cwd()),
+                                "allow_commit": False,
+                                "allow_push": False,
+                            }
+                        ),
+                    },
+                }
+            ],
+        }
+
+    monkeypatch.setattr(ChatClient, "chat", _fake_chat)
 
     def _fake_execute_tool(tool, tool_args, *, timeout_seconds=30):
         return ToolExecutionResult(ok=True, exit_code=0, stdout="coder-ran", summary="coder-ran")
@@ -119,6 +139,7 @@ def test_codex_tool_runs_for_explicit_code_request(monkeypatch) -> None:
     body = run.json()
     assert body["status"] == "completed"
     assert body["reply"] == "coder-ran"
+    assert chat_calls == 1
     tool_calls = store.list_tool_calls_by_turn(created["turn_id"])
     assert len(tool_calls) == 1
     assert tool_calls[0].tool_name == "delegate_to_codex"

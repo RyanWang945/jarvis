@@ -10,6 +10,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from app.agent_react.runtime_policy import RuntimePolicy, render_runtime_policy_for_model
 from app.agent_react.session_state import ConversationSessionState, render_session_state_for_model
 from app.llm.client import LLMMessage
+from app.repositories import RepositoryRegistryError, get_repository_registry
 from app.skills.bootstrap import get_skill_registry
 
 SYSTEM_PROMPT = _SYSTEM_PROMPT = """
@@ -64,6 +65,11 @@ def latest_user_text(messages: list[BaseMessage]) -> str:
     return ""
 
 
+def _looks_like_raw_tool_markup(content: str) -> bool:
+    normalized = content.lstrip()
+    return normalized.startswith("<｜｜DSML｜｜tool_calls>") or normalized.startswith("<|tool_calls|>")
+
+
 class ContextManager:
     """Owns model-visible message preparation inside the turn runtime."""
 
@@ -101,6 +107,26 @@ class ContextManager:
             elif role == "system":
                 lc.append(SystemMessage(content=content))
         return lc
+
+    def strip_historical_tool_protocol(self, messages: list[BaseMessage]) -> list[BaseMessage]:
+        """Persisted tool protocol is turn-local; do not replay it into later turns."""
+        stripped: list[BaseMessage] = []
+        for message in messages:
+            if isinstance(message, ToolMessage):
+                continue
+            if isinstance(message, AIMessage):
+                content = str(message.content or "").strip()
+                if not content or _looks_like_raw_tool_markup(content):
+                    continue
+                stripped.append(
+                    AIMessage(
+                        content=content,
+                        response_metadata=message.response_metadata if message.response_metadata else {},
+                    )
+                )
+                continue
+            stripped.append(message)
+        return stripped
 
     def inject_selected_skills(self, messages: list[BaseMessage], skill_names: list[str]) -> list[BaseMessage]:
         if not skill_names:
@@ -145,6 +171,9 @@ class ContextManager:
 
         if runtime_policy is not None:
             sections.append(render_runtime_policy_for_model(runtime_policy))
+            rendered_repositories = self._render_repository_context(session_state, runtime_policy)
+            if rendered_repositories is not None:
+                sections.append(rendered_repositories)
 
         rendered_skills = self._render_selected_skills(skill_names)
         if rendered_skills is not None:
@@ -172,6 +201,39 @@ class ContextManager:
             "Selected skills for this turn. Use them as procedural guidance when relevant.\n\n"
             + "\n\n".join(sections)
         )
+
+    def _render_repository_context(
+        self,
+        session_state: ConversationSessionState | None,
+        runtime_policy: RuntimePolicy,
+    ) -> str | None:
+        if not any(section in runtime_policy.context_sections for section in ("coding_protocol", "coding_background")):
+            return None
+        try:
+            repositories = get_repository_registry().list_repositories()
+        except (RepositoryRegistryError, OSError):
+            return None
+        if not repositories:
+            return None
+
+        active_repo_id = session_state.active_repo_id if session_state is not None else None
+        lines = ["Repository context:"]
+        if active_repo_id:
+            lines.append(f"Active repository: {active_repo_id}")
+        lines.append("Registered repositories:")
+        for repo in repositories:
+            active_marker = " (active)" if repo.repo_id == active_repo_id else ""
+            lines.append(f"- {repo.repo_id}{active_marker}: {repo.canonical_root_path}")
+        lines.extend(
+            [
+                "",
+                "Repository tool routing:",
+                "- If the user names a registered repository, use that repo_id.",
+                "- If the user says current/this project and an active repository is set, use that active repo_id.",
+                "- Prefer delegate_to_codex with repo_id over workdir for repository modifications.",
+            ]
+        )
+        return "\n".join(lines)
 
     def ensure_system_prompt(self, messages: list[BaseMessage]) -> list[BaseMessage]:
         if not messages:
@@ -215,6 +277,7 @@ class ContextManager:
     ) -> tuple[list[BaseMessage], list[str]]:
         bounded_records = slice_records_through_trigger(records, trigger_message_id)
         lc_messages = self.records_to_lc_messages(bounded_records)
+        lc_messages = self.strip_historical_tool_protocol(lc_messages)
         skill_names = [skill.name for skill in get_skill_registry().select_for_query(latest_user_text(lc_messages))]
         if runtime_policy is not None and runtime_policy.forced_skills:
             skill_names = list(dict.fromkeys([*runtime_policy.forced_skills, *skill_names]))

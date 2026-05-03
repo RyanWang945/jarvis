@@ -19,6 +19,14 @@ _CODE_REQUEST_MARKERS = (
     "repair",
     "change",
     "modify",
+    "代码",
+    "项目",
+    "仓库",
+    "修改",
+    "修复",
+    "写个",
+    "写一个",
+    "测试",
     "refactor",
     "repo",
     "repository",
@@ -114,13 +122,14 @@ def check_tool_policy(tool: ToolDefinition, tool_args: dict[str, Any], messages:
         return None
 
     workdir = str(tool_args.get("workdir") or "").strip()
+    repo_id = str(tool_args.get("repo_id") or "").strip()
     instruction = str(tool_args.get("instruction") or "").strip()
     latest_user = _latest_user_message(messages)
 
     if not instruction:
         return "Rejected: high-privilege delegation requires a non-empty instruction."
-    if tool.requires_workdir and not workdir:
-        return "Rejected: high-privilege delegation requires an explicit workdir."
+    if tool.requires_workdir and not workdir and not repo_id:
+        return "Rejected: high-privilege delegation requires an explicit repo_id or registered workdir."
     if tool.can_modify_files and not _looks_like_code_request(latest_user):
         return (
             "Rejected: high-privilege delegation is reserved for explicit repository or code tasks. "

@@ -15,7 +15,7 @@ from app.agent_react.session_state import (
     load_session_state,
     render_session_state,
 )
-from app.agent_react.turn_classifier import classify_turn, should_apply_session_mode_update
+from app.agent_react.turn_classifier import classify_turn, should_apply_repo_update, should_apply_session_mode_update
 from app.api.schemas import (
     ConversationCreateRequest,
     ConversationMessageCreateRequest,
@@ -31,6 +31,7 @@ from app.persistence.models import (
     TurnRecord,
     UserRecord,
 )
+from app.repositories import render_repository_report
 
 logger = logging.getLogger(__name__)
 
@@ -656,9 +657,18 @@ class MySQLConversationStore:
         if external_message_id:
             dup = conn.execute(
                 sa.text(
-                    "SELECT id, turn_id FROM messages WHERE conversation_id = :cid AND external_message_id = :eid"
+                    "SELECT m.id, m.turn_id, m.conversation_id "
+                    "FROM messages m "
+                    "JOIN conversations c ON c.id = m.conversation_id "
+                    "WHERE c.platform = :platform AND c.external_chat_id = :external_chat_id "
+                    "AND m.external_message_id = :eid "
+                    "ORDER BY m.id ASC LIMIT 1"
                 ),
-                {"cid": conversation.id, "eid": external_message_id},
+                {
+                    "platform": conversation.platform,
+                    "external_chat_id": conversation.external_chat_id,
+                    "eid": external_message_id,
+                },
             ).mappings().one_or_none()
             if dup is not None:
                 turn_id = dup["turn_id"]
@@ -670,10 +680,10 @@ class MySQLConversationStore:
                     ).mappings().one_or_none()
                     trigger_type = trow["trigger_type"] if trow else None
                 return MessageIngestResponse(
-                    conversation_id=conversation.id,
+                    conversation_id=dup["conversation_id"],
                     message_id=dup["id"],
                     turn_id=turn_id,
-                    should_respond=turn_id is not None,
+                    should_respond=False,
                     trigger_type=trigger_type,
                     status="duplicate",
                 )
@@ -707,11 +717,13 @@ class MySQLConversationStore:
                 content=content,
                 session_state=load_session_state(conversation.metadata),
             )
+            original_session_state = load_session_state(conversation.metadata)
+            session_state = original_session_state
             if should_apply_session_mode_update(classification) and classification.session_mode_update is not None:
-                session_state = replace(
-                    load_session_state(conversation.metadata),
-                    session_mode=classification.session_mode_update,
-                )
+                session_state = replace(session_state, session_mode=classification.session_mode_update)
+            if should_apply_repo_update(classification):
+                session_state = replace(session_state, active_repo_id=classification.active_repo_id_update)
+            if session_state != original_session_state:
                 session_patch = dump_session_state(session_state)
                 conversation.metadata = {**conversation.metadata, **session_patch}
                 conn.execute(
@@ -740,6 +752,7 @@ class MySQLConversationStore:
                     "confidence": classification.confidence,
                     "reason": classification.reason,
                     "session_mode_update": classification.session_mode_update,
+                    "active_repo_id_update": classification.active_repo_id_update,
                 },
             )
             conn.execute(
@@ -782,6 +795,10 @@ class MySQLConversationStore:
             )
         if cmd == "/status":
             return self._handle_status_command(
+                conn, conversation=conversation, user_id=user_id, request=request
+            )
+        if cmd == "/repos":
+            return self._handle_repos_command(
                 conn, conversation=conversation, user_id=user_id, request=request
             )
         # Unknown command: fall through to normal turn creation.
@@ -1124,6 +1141,41 @@ class MySQLConversationStore:
             trigger_type="command",
             status="status_report",
             reset_message=reply,
+        )
+
+    def _handle_repos_command(
+        self,
+        conn: sa.Connection,
+        *,
+        conversation: ConversationRecord,
+        user_id: int,
+        request: MessageCreateRequest,
+    ) -> MessageIngestResponse:
+        message = self._append_message(
+            conn,
+            conversation_id=conversation.id,
+            turn_id=None,
+            sender_type="user",
+            user_id=user_id,
+            role="user",
+            content=request.content,
+            content_type=request.content_type,
+            external_message_id=request.external_message_id,
+            reply_to_message_id=None,
+            raw_payload=dict(request.raw_payload),
+        )
+        conn.execute(
+            sa.text("UPDATE conversations SET updated_at = :now WHERE id = :id"),
+            {"now": _now(), "id": conversation.id},
+        )
+        return MessageIngestResponse(
+            conversation_id=conversation.id,
+            message_id=message.id,
+            turn_id=None,
+            should_respond=False,
+            trigger_type="command",
+            status="repos_report",
+            reset_message=render_repository_report(),
         )
 
     def _create_turn(

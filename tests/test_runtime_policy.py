@@ -27,6 +27,7 @@ def test_coding_policy_exposes_coder_tools() -> None:
     policy = resolve_runtime_policy(session_mode="chat", turn_type="coding")
 
     assert policy.mode == "coding"
-    assert "shell_inspect" in policy.allowed_tools
     assert "delegate_to_codex" in policy.allowed_tools
+    assert "shell_inspect" not in policy.allowed_tools
+    assert "shell_run_command" not in policy.allowed_tools
     assert "tavily_search" not in policy.allowed_tools

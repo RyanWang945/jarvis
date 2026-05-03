@@ -529,6 +529,55 @@ def test_clear_command_in_dm_creates_new_conversation_generation(monkeypatch) ->
     assert any(msg["content"] == "/clear" for msg in old_messages)
 
 
+def test_duplicate_message_after_clear_does_not_trigger_new_turn(monkeypatch) -> None:
+    client = _client(monkeypatch)
+    chat_id = _unique_id("chat-dm-dup-after-clear")
+    msg_id = _unique_id("msg-review")
+
+    first = client.post(
+        "/messages",
+        json={
+            "platform": "feishu",
+            "external_chat_id": chat_id,
+            "chat_type": "dm",
+            "sender": {"platform_user_id": "ou_1", "display_name": "Ryan"},
+            "content": "review 下nltk项目的代码",
+            "external_message_id": msg_id,
+        },
+    ).json()
+    assert first["should_respond"] is True
+
+    cleared = client.post(
+        "/messages",
+        json={
+            "platform": "feishu",
+            "external_chat_id": chat_id,
+            "chat_type": "dm",
+            "sender": {"platform_user_id": "ou_1", "display_name": "Ryan"},
+            "content": "/clear",
+            "external_message_id": _unique_id("msg-clear"),
+        },
+    ).json()
+    assert cleared["status"] == "reset"
+    assert cleared["conversation_id"] != first["conversation_id"]
+
+    duplicate = client.post(
+        "/messages",
+        json={
+            "platform": "feishu",
+            "external_chat_id": chat_id,
+            "chat_type": "dm",
+            "sender": {"platform_user_id": "ou_1", "display_name": "Ryan"},
+            "content": "review 下nltk项目的代码",
+            "external_message_id": msg_id,
+        },
+    ).json()
+
+    assert duplicate["status"] == "duplicate"
+    assert duplicate["should_respond"] is False
+    assert duplicate["turn_id"] == first["turn_id"]
+
+
 def test_clear_command_rejected_when_turn_running(monkeypatch) -> None:
     client = _client(monkeypatch)
     chat_id = _unique_id("chat-dm-clear-busy")
@@ -737,6 +786,29 @@ def test_status_command_returns_conversation_stats(monkeypatch) -> None:
     assert "Working summary: Need a lightweight session state" in status["reset_message"]
     assert "消息数:" in status["reset_message"]
     assert "会话代数:" in status["reset_message"]
+
+
+def test_repos_command_returns_registered_repositories(monkeypatch) -> None:
+    client = _client(monkeypatch)
+    chat_id = _unique_id("chat-dm-repos")
+
+    repos = client.post(
+        "/messages",
+        json={
+            "platform": "feishu",
+            "external_chat_id": chat_id,
+            "chat_type": "dm",
+            "sender": {"platform_user_id": "ou_1", "display_name": "Ryan"},
+            "content": "/repos",
+            "external_message_id": _unique_id("msg-repos"),
+        },
+    ).json()
+
+    assert repos["status"] == "repos_report"
+    assert repos["should_respond"] is False
+    assert "Registered repositories:" in repos["reset_message"]
+    assert "- jarvis" in repos["reset_message"]
+
 
 def test_tool_call_audit_records_message_relationship_for_rejected_proposal(monkeypatch) -> None:
     client = _client(monkeypatch)

@@ -1,4 +1,5 @@
 import json
+import math
 
 from fastapi.testclient import TestClient
 from httpx import Request, Response
@@ -1169,6 +1170,123 @@ def test_eval_dataset_generation_and_run_with_heuristic(tmp_path) -> None:
     assert summary.recall_at_k == 1.0
     assert summary.mrr == 1.0
     assert summary.chunk_hit_rate == 1.0
+
+
+def test_eval_recall_at_10_counts_tenth_rank_hit(tmp_path) -> None:
+    db = get_knowledge_base_db(tmp_path / "knowledge.db")
+    db.sources.save(
+        {
+            "source_id": "src1",
+            "name": "wikipedia",
+            "source_type": "wikipedia",
+            "language": "zh",
+            "dataset_version": "sample",
+            "file_path": "sample.jsonl",
+            "description": "sample",
+        }
+    )
+    db.documents.save(
+        {
+            "doc_id": "src1:13",
+            "source_id": "src1",
+            "external_id": "13",
+            "title": "数学",
+            "url": "https://example.com/math",
+            "text": "数学是研究数量、结构与变化的学科。",
+            "text_hash": "doc-hash",
+            "char_count": 18,
+            "language": "zh",
+            "metadata_json": None,
+            "ingest_job_id": "job-1",
+        }
+    )
+    target_chunk_id = "src1:13:chunk:0009"
+    for index in range(10):
+        chunk_id = f"src1:13:chunk:{index:04d}"
+        db.chunks.save(
+            {
+                "chunk_id": chunk_id,
+                "doc_id": "src1:13",
+                "chunk_profile_id": "medium_overlap_v1",
+                "chunk_index": index,
+                "chunker_version": "v1",
+                "section_path": None,
+                "raw_content": f"chunk-{index}",
+                "normalized_content": f"chunk-{index}",
+                "content_hash": f"chunk-hash-{index}",
+                "char_start": index,
+                "char_end": index + 1,
+                "char_count": 1,
+                "token_estimate": 1,
+                "overlap_prev_chars": 0,
+                "metadata_json": None,
+            }
+        )
+    db.eval_datasets.save(
+        {
+            "dataset_id": "ds-1",
+            "name": "src1:medium_overlap_v1:test",
+            "source_id": "src1",
+            "generation_method": "test",
+            "query_model": None,
+            "sample_doc_count": 1,
+        }
+    )
+    db.eval_queries.save(
+        {
+            "query_id": "q-1",
+            "dataset_id": "ds-1",
+            "doc_id": "src1:13",
+            "target_chunk_id": target_chunk_id,
+            "query_text": "数学是什么",
+            "query_type": "fact",
+            "difficulty": "easy",
+            "gold_answer": "数学",
+            "gold_evidence_json": [target_chunk_id],
+            "generated_by": "test",
+            "review_status": "generated",
+        }
+    )
+
+    service = KnowledgeBaseEvaluationService(
+        settings=get_settings().model_copy(update={"data_dir": tmp_path}),
+        db=db,
+        kb_service=object(),
+    )
+
+    class FakeOpenSearchClient:
+        def index_name(self, *, language: str, chunk_profile_id: str) -> str:
+            return f"kb_wikipedia_{language}_{chunk_profile_id}"
+
+        def bm25_search(self, *, index_name: str, query: str, top_k: int):
+            return [
+                type(
+                    "Hit",
+                    (),
+                    {
+                        "chunk_id": f"src1:13:chunk:{index:04d}",
+                        "doc_id": "src1:13",
+                        "score": float(10 - index),
+                        "source": {"title": "数学"},
+                    },
+                )()
+                for index in range(top_k)
+            ]
+
+    service._opensearch_client_instance = FakeOpenSearchClient()
+
+    summary = service.run_evaluation(
+        dataset_id="ds-1",
+        retrieval_mode="bm25",
+        top_k=10,
+        chunk_profile_id="medium_overlap_v1",
+        language="zh",
+    )
+
+    assert summary.recall_at_k == 1.0
+    assert summary.precision_at_k == 0.1
+    assert summary.mrr == 0.1
+    assert round(summary.ndcg, 6) == round(1.0 / math.log2(11), 6)
 
 
 def test_eval_dataset_generation_persists_multiple_queries(tmp_path) -> None:

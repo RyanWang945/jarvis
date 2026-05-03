@@ -8,8 +8,8 @@ Jarvis 需要引入一层轻量 `mode routing`，但不应该因此变成复杂�
 
 ```text
 Conversation / Session State
--> LLM Intent Classifier
--> turn_type + session_mode
+-> DeepSeek V4 Flash Intent Router
+-> turn_type + session_mode_update + capability flags
 -> RuntimePolicy
 -> Context / Skills / Tools / Budget / Writeback
 -> Turn Runtime
@@ -19,6 +19,7 @@ Conversation / Session State
 
 - `session_mode` 是 conversation 的长期会话模式。
 - `turn_type` 是当前 turn 的执行类型。
+- 意图识别第一阶段应使用 DeepSeek V4 Flash 做轻量 LLM router，而不是继续堆关键词规则。
 - `RuntimePolicy` 是真正影响执行行为的配置层。
 - deep research 第一阶段不是独立子 agent，而是 `research` mode 下的研究型执行策略。
 - 未来可以支持 specialist subagent，但必须由 Jarvis supervisor 统一调度，不做自由群聊式 agent swarm。
@@ -120,7 +121,35 @@ class RuntimePolicy:
     writeback_strategy: str
 ```
 
-## 4. LLM Intent Classifier
+`RuntimePolicy` 的输入不应只剩 `session_mode + turn_type`。新版输入应是：
+
+```python
+from dataclasses import dataclass, field
+
+
+@dataclass(frozen=True)
+class TurnCapabilities:
+    needs_web: bool = False
+    needs_coding: bool = False
+    needs_knowledge_base: bool = False
+    needs_research_protocol: bool = False
+    needs_image_generation: bool = False
+
+
+@dataclass(frozen=True)
+class TurnClassification:
+    turn_type: str
+    session_mode_update: str | None = None
+    active_repo_id_update: str | None = None
+    capabilities: TurnCapabilities = field(default_factory=TurnCapabilities)
+    confidence: float = 0.0
+    reason: str = ""
+    source: str = "llm_router"
+```
+
+这样 `turn_type` 不再承担所有语义。`turn_type=chat` 也可以因为 `needs_web=true` 获得搜索工具，`session_mode=coding` 也不会强行污染本轮工具集合。
+
+## 4. DeepSeek V4 Flash Intent Router
 
 ### 4.1 为什么不是纯规则
 
@@ -130,12 +159,26 @@ class RuntimePolicy:
 - research / chat / summary 边界经常依赖语义。
 - 关键词容易误判，比如“研究一下这个 bug”可能是 coding。
 - deep research 的触发常常是“帮我系统梳理”“对比几个方案”“给我一份报告”，不一定包含“研究”。
+- 代码任务后的话题切换容易被历史 mode 污染，例如“先不看项目了，查查最新金价”不应该继续走 coding policy。
 
-因此可以引入轻量 LLM classifier。
+因此 `turn_classifier` 不应继续扩展关键词表。关键词规则只保留命令、安全边界和失败兜底，其余非命令消息交给轻量 LLM router。
+
+推荐模型：
+
+```text
+deepseek-v4-flash
+```
+
+选择理由：
+
+- 任务只需要短 JSON 分类，不需要强推理。
+- 成本低，适合每个用户消息都调用。
+- 中文语义、话题切换、上下文 mode 判断比关键词稳定。
+- 延迟可控，可以放在 conversation ingest 阶段。
 
 ### 4.2 分类器职责
 
-分类器只做调度，不回答用户。
+分类器本质上是 router，只做调度，不回答用户。
 
 输入：
 
@@ -145,7 +188,14 @@ class RuntimePolicy:
   "session_mode": "research",
   "session_goal": "可选",
   "working_summary": "可选",
-  "last_turn_status": "completed"
+  "active_repo_id": "nltk",
+  "registered_repositories": [
+    {"repo_id": "jarvis", "name": "Jarvis"},
+    {"repo_id": "nltk", "name": "NLTK Smoke Repo"}
+  ],
+  "last_turn_type": "coding",
+  "last_turn_status": "completed",
+  "recent_user_intent_digest": "上一轮在 review nltk 项目"
 }
 ```
 
@@ -153,10 +203,18 @@ class RuntimePolicy:
 
 ```json
 {
-  "turn_type": "research",
-  "session_mode_update": "research",
-  "confidence": 0.86,
-  "reason": "user asks for multi-source comparison and architecture review"
+  "turn_type": "chat",
+  "session_mode_update": "chat",
+  "active_repo_id_update": null,
+  "capabilities": {
+    "needs_web": true,
+    "needs_coding": false,
+    "needs_knowledge_base": false,
+    "needs_research_protocol": false,
+    "needs_image_generation": false
+  },
+  "confidence": 0.92,
+  "reason": "user switches away from code and asks for current market information"
 }
 ```
 
@@ -166,11 +224,36 @@ class RuntimePolicy:
 - 不允许调用工具。
 - 不允许生成用户可见回答。
 - reason 必须短。
-- 低置信度回退 `chat`。
+- 输出必须短，禁止长链路推理。
+- temperature 建议为 0 或接近 0。
+- max output tokens 建议控制在 200 以内。
+- 低置信度回退 `chat`，但不要继承高风险工具。
 
-### 4.3 硬规则优先
+### 4.3 Router Prompt 约束
 
-LLM classifier 不处理所有情况。硬规则仍然优先。
+Router prompt 应直接说明 Jarvis 的能力边界：
+
+```text
+You are Jarvis' routing model. Do not answer the user.
+Return compact JSON only.
+
+Decide the current turn execution type and capability needs.
+Prefer topic switch when the user explicitly says they stop/leave the previous task.
+Only set needs_coding=true when the user asks to inspect, modify, test, commit, review, or reason about a registered code repository.
+Only set active_repo_id_update when the message clearly refers to a registered repository.
+Set needs_web=true when the user asks for latest/current/recent/time-sensitive facts.
+```
+
+关键点：
+
+- 不让 router 生成正文。
+- 不让 router 做复杂计划。
+- 不把“项目”“研究”这类词本身当作决定性信号。
+- 允许 router 识别“离开当前 coding/research 上下文”的话题切换。
+
+### 4.4 硬规则优先，但范围必须收窄
+
+LLM router 不处理所有情况。硬规则仍然优先，但只覆盖确定性强的情况。
 
 硬规则包括：
 
@@ -179,10 +262,20 @@ LLM classifier 不处理所有情况。硬规则仍然优先。
 /cancel -> command
 /clear -> command
 /research -> research
-明显图片生成命令 -> image_generation
+/coding -> coding
+/chat -> chat
+显式 repo id 且明确 code action -> coding + active_repo_id_update
 ```
 
-其余情况交给 LLM classifier。
+不建议继续维护大规模中文关键词分类表。如下规则应迁移到 LLM router：
+
+```text
+调研 / 查一下 / 最新 / 项目 / review / 总结 / 继续
+```
+
+原因是这些词都需要上下文 disambiguation。
+
+### 4.5 推荐流程
 
 推荐流程：
 
@@ -190,17 +283,29 @@ LLM classifier 不处理所有情况。硬规则仍然优先。
 if hard_command:
     return command/research/etc.
 
-classification = llm_classify(...)
+classification = deepseek_v4_flash_route(...)
+
+if classification.invalid_json:
+    return safe_chat_fallback
 
 if classification.confidence < 0.65:
-    return chat
+    return safe_chat_fallback
 
-return classification.turn_type
+return classification
 ```
+
+`safe_chat_fallback` 的含义：
+
+- `turn_type = chat`
+- `session_mode_update = null`
+- `capabilities.needs_web = false`
+- `capabilities.needs_coding = false`
+- 不注入 coder / shell 等高权限工具
+- 可以注入低风险知识库工具，是否注入 web search 由后续策略决定
 
 ## 5. mode 对执行的影响
 
-`mode / turn_type` 主要影响五件事：
+`mode / turn_type / capabilities` 主要影响五件事：
 
 - tools 注入
 - skills 选择
@@ -212,9 +317,9 @@ return classification.turn_type
 
 ```text
 allowed_tools:
-  - tavily_search
   - obsidian_wiki_query
   - business_knowledge_search
+  - tavily_search  # only when capabilities.needs_web = true
 
 context:
   - base system prompt
@@ -235,6 +340,7 @@ writeback:
 - 默认少工具。
 - 优先直接回答。
 - 需要事实或当前信息时再搜索。
+- 如果 router 输出 `needs_web=true`，即使当前 session 原本是 coding，也必须允许 `tavily_search`，因为当前 turn 已经切出 coding。
 
 ### 5.2 research policy
 
@@ -277,10 +383,7 @@ writeback:
 
 ```text
 allowed_tools:
-  - shell_inspect
-  - delegate_to_claude_code
   - delegate_to_codex
-  - shell_run_command
 
 context:
   - base system prompt
@@ -305,6 +408,57 @@ writeback:
 - 高权限工具必须经过 policy gate。
 - Jarvis 是 supervisor，coder 是 worker tool。
 - 不把 coding worker 设计成和用户平等对话的子 agent。
+- 第一阶段 code 任务只暴露 `delegate_to_codex`，不要把 shell 作为常规 coding turn 工具暴露给主模型。
+- shell 更适合 Jarvis 自身维护、诊断、测试当前服务，不适合作为飞书用户 code 任务的默认工具。
+
+### 5.4 capability flags 与 policy 关系
+
+`turn_type` 负责决定当前 turn 的主执行形态，`capabilities` 负责决定本轮需要哪些能力。
+
+示例：
+
+```json
+{
+  "turn_type": "chat",
+  "session_mode_update": "chat",
+  "capabilities": {
+    "needs_web": true,
+    "needs_coding": false
+  }
+}
+```
+
+对应策略：
+
+```text
+RuntimePolicy.mode = chat
+allowed_tools = [tavily_search, obsidian_wiki_query, business_knowledge_search]
+context_sections = [base, session_state, recent_messages]
+```
+
+再如：
+
+```json
+{
+  "turn_type": "coding",
+  "session_mode_update": "coding",
+  "active_repo_id_update": "nltk",
+  "capabilities": {
+    "needs_web": false,
+    "needs_coding": true
+  }
+}
+```
+
+对应策略：
+
+```text
+RuntimePolicy.mode = coding
+allowed_tools = [delegate_to_codex]
+context_sections = [base, session_state, coding_protocol, repo_context, recent_messages]
+```
+
+这能避免一个常见错误：只因为 `session_mode=coding`，就让下一轮“查最新国际金价”继续拿不到搜索工具。
 
 ## 6. 普通 ReAct 与 Deep Research 的关系
 
@@ -453,16 +607,27 @@ Specialist Runtimes / Tools
 
 建议按以下顺序实现：
 
-1. 实现 `TurnClassification` 和轻量 LLM classifier。
-2. 把 ingest 阶段的 `_turn_type(content)` 替换为 classifier 结果。
-3. 引入 `RuntimePolicy`。
-4. 让 `ContextManager` 按 policy 组装 header。
-5. 让 `react_graph.build_llm_tools()` 支持 `allowed_tools`。
-6. 增加 `research` policy，不改变普通 chat 的行为。
-7. 增加 `ResearchSessionState` 和 `/status` 展示。
-8. 增加 evidence ledger 的最小持久化。
-9. 增加 `/research status`、`/research reset`、`/research report`。
-10. 根据需要再拆 specialist runtime。
+1. 扩展 `TurnClassification`，新增 `capabilities` 和 `active_repo_id_update`。
+2. 引入 DeepSeek V4 Flash router，替换非命令 turn 的关键词分类。
+3. 收窄硬规则，只保留 slash command、安全 gate、显式 repo code action。
+4. 把 ingest 阶段的 `_turn_type(content)` 替换为 router 结果。
+5. `RuntimePolicy` 改为接收 `classification + session_state`，不再只看 `turn_type + session_mode`。
+6. 让 `ContextManager` 按 policy 组装 header。
+7. 让 `react_graph.build_llm_tools()` 支持 `allowed_tools`。
+8. 增加 classification/policy 日志，至少记录 `turn_type`、`session_mode_update`、`active_repo_id_update`、`capabilities`、`allowed_tools`。
+9. 增加 `research` policy，不改变普通 chat 的行为。
+10. 增加 `ResearchSessionState` 和 `/status` 展示。
+11. 增加 evidence ledger 的最小持久化。
+12. 增加 `/research status`、`/research reset`、`/research report`。
+13. 根据需要再拆 specialist runtime。
+
+第一批验收测试应覆盖：
+
+- `review 下 nltk 项目的代码` -> `turn_type=coding`、`needs_coding=true`、`active_repo_id_update=nltk`、只暴露 `delegate_to_codex`。
+- `不看项目了，查查最新国际金价` -> `turn_type=chat`、`session_mode_update=chat`、`needs_web=true`、暴露 `tavily_search`。
+- `继续` 在 research session 中 -> 可以继承 `session_mode=research`，但仍由 router 判断是否需要 research protocol。
+- `/status` -> hard rule command，不调用 router。
+- router 失败或 JSON 无效 -> safe chat fallback，不暴露 coder/shell。
 
 ## 11. 非目标
 
@@ -482,9 +647,11 @@ Specialist Runtimes / Tools
 - `app/agent_react/runtime.py`：turn runtime、session writeback。
 - `app/agent_react/context_manager.py`：固定 context header、session state 注入。
 - `app/agent_react/react_graph.py`：LLM/tool ReAct loop。
+- `app/agent_react/runtime_policy.py`：由 classification/session state 生成 allowed tools、context sections、budget。
 - `app/tools/runtime.py`：tool policy gate。
 - `app/tools/definitions.py`：工具定义。
 - `app/agent_react/session_state.py`：`ConversationSessionState`。
+- `app/agent_react/turn_classifier.py`：改造成 DeepSeek V4 Flash intent router，规则只做 hard command 和安全兜底。
 
 下一步最小改造应优先落在：
 
@@ -495,4 +662,6 @@ app/api/agent.py
 app/agent_react/context_manager.py
 app/agent_react/react_graph.py
 ```
+
+其中 `turn_classifier.py` 的改造优先级最高。当前线上暴露出来的问题不是 `tavily_search` 未注册，而是分类层把话题切换误判成 coding，导致 policy 没有给搜索工具。继续修补关键词会让系统越来越不可预测，应该尽快切到 LLM router。
 

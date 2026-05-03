@@ -95,9 +95,13 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
                             "verification expectations, and whether commit or push is permitted."
                         ),
                     },
+                    "repo_id": {
+                        "type": "string",
+                        "description": "Registered repository id, such as jarvis. Prefer this over workdir.",
+                    },
                     "workdir": {
                         "type": "string",
-                        "description": "Absolute path to the target repository working directory.",
+                        "description": "Deprecated compatibility field. Must match a registered repository root.",
                     },
                     "verification_cmd": {
                         "type": "string",
@@ -114,7 +118,7 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
                         "default": False,
                     },
                 },
-                "required": ["instruction", "workdir"],
+                "required": ["instruction"],
             },
             handler=run_coder_tool,
             risk_level="high",
@@ -142,9 +146,13 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
                             "verification expectations, and whether commit or push is permitted."
                         ),
                     },
+                    "repo_id": {
+                        "type": "string",
+                        "description": "Registered repository id, such as jarvis. Prefer this over workdir.",
+                    },
                     "workdir": {
                         "type": "string",
-                        "description": "Absolute path to the target repository working directory.",
+                        "description": "Deprecated compatibility field. Must match a registered repository root.",
                     },
                     "verification_cmd": {
                         "type": "string",
@@ -161,7 +169,7 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
                         "default": False,
                     },
                 },
-                "required": ["instruction", "workdir"],
+                "required": ["instruction"],
             },
             handler=run_codex_coder_tool,
             risk_level="high",
