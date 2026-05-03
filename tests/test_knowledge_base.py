@@ -391,6 +391,7 @@ def test_index_service_embeds_and_indexes_chunks(tmp_path) -> None:
 
     embedded_requests: list[dict] = []
     indexed_requests: list[str] = []
+    created_index_mapping: dict | None = None
 
     def embedding_handler(request: Request) -> Response:
         embedded_requests.append(json.loads(request.content.decode("utf-8")))
@@ -403,8 +404,10 @@ def test_index_service_embeds_and_indexes_chunks(tmp_path) -> None:
         )
 
     def search_handler(request: Request) -> Response:
+        nonlocal created_index_mapping
         indexed_requests.append(request.url.path)
         if request.method == "PUT":
+            created_index_mapping = json.loads(request.content.decode("utf-8"))
             return Response(200, json={"acknowledged": True})
         if request.url.path.endswith("/_bulk"):
             return Response(200, json={"errors": False, "items": []})
@@ -441,6 +444,9 @@ def test_index_service_embeds_and_indexes_chunks(tmp_path) -> None:
     assert saved_embedding["embedding_model"] == "text-embedding-v4"
     assert embedded_requests[0]["input"] == ["数学是研究数量、结构与变化的学科。"]
     assert any(path.endswith("/_bulk") for path in indexed_requests)
+    properties = created_index_mapping["mappings"]["properties"]
+    assert properties["title"]["analyzer"] == "smartcn"
+    assert properties["content"]["analyzer"] == "smartcn"
 
 
 def test_index_service_reuses_existing_chunk_embeddings(tmp_path) -> None:
@@ -538,6 +544,7 @@ def test_index_service_reuses_existing_chunk_embeddings(tmp_path) -> None:
     assert result.indexed_chunks == 1
     assert result.embedded_chunks == 1
     assert '"embedding": [0.1, 0.2, 0.3]' in indexed_payloads[0]
+    assert '"source_type": "wikipedia"' in indexed_payloads[0]
 
 
 def test_index_service_indexes_only_documents_from_ingest_job(tmp_path) -> None:
@@ -967,6 +974,39 @@ def test_opensearch_client_sec_bm25_search_adds_filters() -> None:
     assert {"term": {"form_type": "10-K"}} in filter_terms
     assert {"term": {"fiscal_year": 2025}} in filter_terms
     assert {"term": {"section_title.keyword": "MD&A"}} in filter_terms
+
+
+def test_opensearch_client_bm25_search_adds_business_corpus_filters() -> None:
+    captured_body: dict | None = None
+
+    def handler(request: Request) -> Response:
+        nonlocal captured_body
+        captured_body = json.loads(request.content.decode("utf-8"))
+        return Response(200, json={"hits": {"hits": []}})
+
+    client = OpenSearchClient(
+        base_url="http://127.0.0.1:9200",
+        index_prefix="kb_business",
+        http_client=MockHttpxClient(handler),
+    )
+
+    client.bm25_search(
+        index_name="kb_business_zh_medium_overlap_v1",
+        query="market research",
+        top_k=5,
+        filters={
+            "source_id": "deepresearch:run-1",
+            "source_type": "deep_research",
+            "language": "zh",
+            "chunk_profile_id": "medium_overlap_v1",
+        },
+    )
+
+    filter_terms = captured_body["query"]["bool"]["filter"]
+    assert {"term": {"source_id": "deepresearch:run-1"}} in filter_terms
+    assert {"term": {"source_type": "deep_research"}} in filter_terms
+    assert {"term": {"language": "zh"}} in filter_terms
+    assert {"term": {"chunk_profile_id": "medium_overlap_v1"}} in filter_terms
 
 
 def test_opensearch_client_reuses_owned_http_client() -> None:

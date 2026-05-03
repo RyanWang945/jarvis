@@ -1,0 +1,59 @@
+name: knowledge-base
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: kb_mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: root_password
+      MYSQL_DATABASE: knowledge_base
+      MYSQL_USER: kb_user
+      MYSQL_PASSWORD: kb_password
+    ports:
+      - "3307:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    command: --default-authentication-plugin=mysql_native_password --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "kb_user", "-pkb_password"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  opensearch:
+    build:
+      context: .
+      dockerfile: docker/opensearch/Dockerfile
+      args:
+        OPENSEARCH_IMAGE: docker.xuanyuan.run/opensearchproject/opensearch:2.17.1
+    image: jarvis/opensearch-smartcn:2.17.1
+    container_name: kb_opensearch
+    restart: unless-stopped
+    environment:
+      - discovery.type=single-node
+      - plugins.security.disabled=true
+      - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m"
+      - bootstrap.memory_lock=true
+      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=MyStrong@Pass123!
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    ports:
+      - "9201:9200"
+      - "9601:9600"
+    volumes:
+      - opensearch_data:/usr/share/opensearch/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9200/_cluster/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+volumes:
+  mysql_data:
+  opensearch_data:

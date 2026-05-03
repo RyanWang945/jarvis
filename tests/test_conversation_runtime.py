@@ -6,6 +6,7 @@ from uuid import uuid4
 
 from app.agent_react import AgentRuntime
 from app.agent_react import react_graph as react_graph_module
+from app.agent_react.session_state import ConversationSessionState, load_session_state
 from app.api.agent import get_conversation_store
 from app.config import get_settings
 from app.llm.client import ChatClient
@@ -54,6 +55,17 @@ def _install_skill_echo_chat(monkeypatch) -> None:
     monkeypatch.setattr(ChatClient, "chat", _fake_chat)
 
 
+def _install_session_echo_chat(monkeypatch) -> None:
+    def _fake_chat(self, messages, tools=None):
+        system_messages = [m.content for m in messages if m.role == "system"]
+        session = next((content for content in system_messages if "Conversation session state:" in content), "")
+        if "Goal: compare agent runtime designs" in session and "Working summary: Keep context lightweight." in session:
+            return {"content": "session-loaded", "tool_calls": []}
+        return {"content": "session-missing", "tool_calls": []}
+
+    monkeypatch.setattr(ChatClient, "chat", _fake_chat)
+
+
 def _install_delegation_chat(
     monkeypatch,
     *,
@@ -73,7 +85,7 @@ def _install_delegation_chat(
                     "id": "call_delegation_1",
                     "type": "function",
                     "function": {
-                        "name": "delegate_to_claude_code",
+                        "name": "delegate_to_codex",
                         "arguments": json.dumps(
                             {
                                 "instruction": instruction,
@@ -388,6 +400,85 @@ def test_skill_body_is_injected_when_selected(monkeypatch, tmp_path: Path) -> No
     assert body["reply"] == "skill-loaded"
 
 
+def test_session_state_is_injected_into_model_context(monkeypatch) -> None:
+    client = _client(monkeypatch)
+    _install_session_echo_chat(monkeypatch)
+    chat_id = _unique_id("chat-dm-session-context")
+
+    created = client.post(
+        "/messages",
+        json={
+            "platform": "feishu",
+            "external_chat_id": chat_id,
+            "chat_type": "dm",
+            "sender": {"platform_user_id": "ou_1", "display_name": "Ryan"},
+            "content": "continue the design review",
+            "external_message_id": _unique_id("msg-session-context"),
+        },
+    ).json()
+
+    get_conversation_store().update_conversation_session(
+        created["conversation_id"],
+        ConversationSessionState(
+            session_mode="research",
+            session_goal="compare agent runtime designs",
+            working_summary="Keep context lightweight.",
+            last_turn_id=999,
+            last_turn_status="completed",
+            last_assistant_summary="Do not inject this debug summary.",
+            updated_by_turn_id=999,
+        ),
+    )
+
+    run = client.post(f"/turns/{created['turn_id']}/run")
+
+    assert run.status_code == 200
+    body = run.json()
+    assert body["status"] == "completed"
+    assert body["reply"] == "session-loaded"
+
+
+def test_turn_completion_writes_back_session_debug_state_conservatively(monkeypatch) -> None:
+    client = _client(monkeypatch)
+    _install_fake_chat(monkeypatch)
+    chat_id = _unique_id("chat-dm-session-writeback")
+
+    created = client.post(
+        "/messages",
+        json={
+            "platform": "feishu",
+            "external_chat_id": chat_id,
+            "chat_type": "dm",
+            "sender": {"platform_user_id": "ou_1", "display_name": "Ryan"},
+            "content": "continue the design review",
+            "external_message_id": _unique_id("msg-session-writeback"),
+        },
+    ).json()
+    store = get_conversation_store()
+    store.update_conversation_session(
+        created["conversation_id"],
+        ConversationSessionState(
+            session_mode="research",
+            session_goal="compare agent runtime designs",
+            working_summary="Do not overwrite this working summary.",
+            waiting_for="tool",
+        ),
+    )
+
+    run = client.post(f"/turns/{created['turn_id']}/run")
+
+    assert run.status_code == 200
+    state = load_session_state(store.get_conversation(created["conversation_id"]).metadata)
+    assert state.session_mode == "research"
+    assert state.session_goal == "compare agent runtime designs"
+    assert state.working_summary == "Do not overwrite this working summary."
+    assert state.waiting_for is None
+    assert state.last_turn_id == created["turn_id"]
+    assert state.last_turn_status == "completed"
+    assert state.last_assistant_summary == "reply:continue the design review"
+    assert state.updated_by_turn_id == created["turn_id"]
+
+
 def test_clear_command_in_dm_creates_new_conversation_generation(monkeypatch) -> None:
     client = _client(monkeypatch)
     chat_id = _unique_id("chat-dm-clear")
@@ -601,7 +692,7 @@ def test_status_command_returns_conversation_stats(monkeypatch) -> None:
     client = _client(monkeypatch)
     chat_id = _unique_id("chat-dm-status")
 
-    client.post(
+    created = client.post(
         "/messages",
         json={
             "platform": "feishu",
@@ -612,6 +703,19 @@ def test_status_command_returns_conversation_stats(monkeypatch) -> None:
             "external_message_id": _unique_id("msg-1"),
         },
     ).json()
+
+    get_conversation_store().update_conversation_session(
+        created["conversation_id"],
+        ConversationSessionState(
+            session_mode="research",
+            session_goal="compare agent runtime designs",
+            working_summary="Need a lightweight session state before heavier long-run features.",
+            last_turn_id=created["turn_id"],
+            last_turn_status="queued",
+            last_assistant_summary="No assistant response yet.",
+            updated_by_turn_id=created["turn_id"],
+        ),
+    )
 
     status = client.post(
         "/messages",
@@ -627,6 +731,10 @@ def test_status_command_returns_conversation_stats(monkeypatch) -> None:
 
     assert status["status"] == "status_report"
     assert status["should_respond"] is False
+    assert "Session State" in status["reset_message"]
+    assert "Mode: research" in status["reset_message"]
+    assert "Goal: compare agent runtime designs" in status["reset_message"]
+    assert "Working summary: Need a lightweight session state" in status["reset_message"]
     assert "消息数:" in status["reset_message"]
     assert "会话代数:" in status["reset_message"]
 
@@ -657,12 +765,12 @@ def test_tool_call_audit_records_message_relationship_for_rejected_proposal(monk
     tool_calls = store.list_tool_calls_by_turn(created["turn_id"])
     assert len(tool_calls) == 1
     tool_call = tool_calls[0]
-    assert tool_call.tool_name == "delegate_to_claude_code"
+    assert tool_call.tool_name == "delegate_to_codex"
     assert tool_call.assistant_message_id is not None
     assert tool_call.provider_tool_call_id == "call_delegation_1"
     assert tool_call.step_index == 1
     assert tool_call.status == "rejected"
-    assert "Rejected: high-privilege delegation" in (tool_call.error_message or "")
+    assert "Rejected: tool not allowed by runtime policy" in (tool_call.error_message or "")
 
     messages = store.list_messages(created["conversation_id"])
     assistant_message = next(message for message in messages if message.id == tool_call.assistant_message_id)

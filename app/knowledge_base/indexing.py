@@ -113,18 +113,20 @@ class KnowledgeBaseIndexService:
             for chunk, vector in zip(chunks, embedding_result.vectors, strict=True):
                 embeddings_by_chunk_id[chunk["chunk_id"]] = vector.embedding
 
+            source = self._db.sources.get(source_id)
+            source_type = source["source_type"] if source else None
             if index_name is None:
                 first_document = batch_documents[0]
-                source = self._db.sources.get(source_id)
                 index_name = self._opensearch_client.index_name(
                     language=first_document["language"],
                     chunk_profile_id=chunk_profile_id,
-                    source_type=source["source_type"] if source else None,
+                    source_type=source_type,
                 )
             if not index_ensured:
                 self._opensearch_client.ensure_index(
                     index_name=index_name,
                     embedding_dim=embedding_result.dimensions,
+                    language=batch_documents[0]["language"],
                 )
                 index_ensured = True
             self._opensearch_client.bulk_index(
@@ -135,13 +137,13 @@ class KnowledgeBaseIndexService:
                         chunk=chunk,
                         embedding=embeddings_by_chunk_id[chunk["chunk_id"]],
                         embedding_model=embedding_result.model,
+                        source_type=source_type,
                     )
                     for chunk in chunks
                 ],
             )
             indexed_chunks += len(chunks)
             embedding_model = embedding_result.model
-            source = self._db.sources.get(source_id)
             if source and source.get("source_type") == "sec_filing":
                 for document in batch_documents:
                     self._db.index_runs.save(
@@ -321,6 +323,7 @@ def _build_index_document(
     chunk: dict,
     embedding: list[float],
     embedding_model: str,
+    source_type: str | None,
 ) -> dict:
     document_metadata = _load_json(document.get("metadata_json"))
     chunk_metadata = _load_json(chunk.get("metadata_json"))
@@ -328,7 +331,7 @@ def _build_index_document(
         "chunk_id": chunk["chunk_id"],
         "doc_id": chunk["doc_id"],
         "source_id": document["source_id"],
-        "source_type": _source_type_from_source_id(document["source_id"]),
+        "source_type": source_type or "generic",
         "external_id": document["external_id"],
         "language": document["language"],
         "chunk_profile_id": chunk["chunk_profile_id"],
@@ -374,7 +377,3 @@ def _load_json(value: str | None) -> dict:
     if isinstance(value, str):
         return json.loads(value)
     return value
-
-
-def _source_type_from_source_id(source_id: str) -> str:
-    return "sec_filing" if source_id.startswith("sec_filing") else "generic"

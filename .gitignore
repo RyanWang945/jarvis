@@ -10,6 +10,7 @@ wheels/
 # IDE files
 .idea/
 .DS_Store
+__MACOSX/
 
 # Virtual environments
 .venv

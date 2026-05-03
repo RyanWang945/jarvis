@@ -78,6 +78,9 @@ class ReActState(TypedDict):
     status: str
     step_count: int
     token_budget: int | None
+    allowed_tools: list[str]
+    max_steps: int
+    search_budget: int | None
 
 
 _MAX_TAVILY_CALLS_PER_TURN = 2
@@ -133,8 +136,11 @@ def call_llm(state: ReActState, store: TurnStore) -> ReActState:
 
     # 达到最大步数前最后一次调用时，强制 LLM 生成文字总结（不传 tools）
     current_step = state.get("step_count", 0)
-    force_final = current_step >= _MAX_REACT_STEPS - 1
-    tools = None if force_final else build_llm_tools()
+    max_steps = int(state.get("max_steps") or _MAX_REACT_STEPS)
+    force_final = current_step >= max_steps - 1
+    tools = None if force_final else build_llm_tools(allowed_tools=state.get("allowed_tools") or None)
+    if tools == []:
+        tools = None
     if force_final:
         logger.warning("forcing final text response turn_id=%s step=%s", state["turn_id"], current_step)
     for idx, message in enumerate(llm_messages):
@@ -152,6 +158,7 @@ def call_llm(state: ReActState, store: TurnStore) -> ReActState:
     except Exception:
         logger.exception("llm call failed messages_count=%s", len(llm_messages))
         return {
+            **state,
             "turn_id": state["turn_id"],
             "cancelled": False,
             "status": "failed",
@@ -175,6 +182,7 @@ def call_llm(state: ReActState, store: TurnStore) -> ReActState:
             ],
         )
     return {
+        **state,
         "turn_id": state["turn_id"],
         "cancelled": False,
         "status": "running",
@@ -231,6 +239,9 @@ def execute_tools(state: ReActState, store: TurnStore) -> ReActState:
     step_index = _next_step_index(store, state["turn_id"])
     existing_tool_calls = store.list_tool_calls_by_turn(state["turn_id"])
     tavily_calls_used = sum(1 for record in existing_tool_calls if getattr(record, "tool_name", None) == "tavily_search")
+    allowed_tools = set(state.get("allowed_tools") or [])
+    search_budget = state.get("search_budget")
+    tavily_budget = _MAX_TAVILY_CALLS_PER_TURN if search_budget is None else max(int(search_budget), 0)
     raw_payload: dict[str, Any] = {
         "source": "agent_react.tool_call",
         "tool_calls": _serialize_tool_calls(last_message),
@@ -262,7 +273,6 @@ def execute_tools(state: ReActState, store: TurnStore) -> ReActState:
         )
 
         try:
-            tool = get_tool_definition(tool_name)
             record = store.create_tool_call(
                 turn_id=state["turn_id"],
                 tool_name=tool_name,
@@ -271,8 +281,13 @@ def execute_tools(state: ReActState, store: TurnStore) -> ReActState:
                 provider_tool_call_id=tool_call_id,
                 step_index=step_index,
             )
-            rejection = check_tool_policy(tool, tool_args, state["messages"])
-            if rejection is None and tool_name == "tavily_search" and tavily_calls_used >= _MAX_TAVILY_CALLS_PER_TURN:
+            if allowed_tools and tool_name not in allowed_tools:
+                tool = None
+                rejection = f"Rejected: tool not allowed by runtime policy: {tool_name}"
+            else:
+                tool = get_tool_definition(tool_name)
+                rejection = check_tool_policy(tool, tool_args, state["messages"])
+            if rejection is None and tool_name == "tavily_search" and tavily_calls_used >= tavily_budget:
                 rejection = (
                     "Rejected: tavily_search budget exceeded for this turn. "
                     "Use the results already gathered and respond to the user."
@@ -295,6 +310,8 @@ def execute_tools(state: ReActState, store: TurnStore) -> ReActState:
                 )
             else:
                 store.update_tool_call(record.id, status="running")
+                if tool is None:
+                    raise ValueError(f"unknown tool: {tool_name}")
                 ok, output = _execute_single_tool(tool_name, tool_args)
                 if not ok:
                     logger.warning(
@@ -370,6 +387,7 @@ def execute_tools(state: ReActState, store: TurnStore) -> ReActState:
         tool_messages.append(ToolMessage(content=output, tool_call_id=tool_call_id))
 
     return {
+        **state,
         "turn_id": state["turn_id"],
         "cancelled": False,
         "status": "running",
@@ -381,7 +399,8 @@ def execute_tools(state: ReActState, store: TurnStore) -> ReActState:
 def should_continue(state: ReActState) -> str:
     if state.get("cancelled"):
         return END
-    if state.get("step_count", 0) >= _MAX_REACT_STEPS:
+    max_steps = int(state.get("max_steps") or _MAX_REACT_STEPS)
+    if state.get("step_count", 0) >= max_steps:
         logger.warning("react max steps reached turn_id=%s step_count=%s", state["turn_id"], state.get("step_count", 0))
         return END
     last_message = state["messages"][-1]

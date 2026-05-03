@@ -34,7 +34,7 @@ def _install_delegation_chat(monkeypatch, *, instruction: str, workdir: str, all
                     "id": "call_delegation_1",
                     "type": "function",
                     "function": {
-                        "name": "delegate_to_claude_code",
+                        "name": "delegate_to_codex",
                         "arguments": json.dumps(
                             {
                                 "instruction": instruction,
@@ -51,7 +51,7 @@ def _install_delegation_chat(monkeypatch, *, instruction: str, workdir: str, all
     monkeypatch.setattr(ChatClient, "chat", _fake_chat)
 
 
-def test_claude_code_tool_is_rejected_for_non_code_request(monkeypatch) -> None:
+def test_codex_tool_is_rejected_for_non_code_request(monkeypatch) -> None:
     client = _client(monkeypatch)
     store = get_conversation_store()
     _install_delegation_chat(
@@ -77,15 +77,15 @@ def test_claude_code_tool_is_rejected_for_non_code_request(monkeypatch) -> None:
     assert run.status_code == 200
     body = run.json()
     assert body["status"] == "completed"
-    assert "Rejected: high-privilege delegation" in body["reply"]
+    assert "Rejected: tool not allowed by runtime policy" in body["reply"]
     tool_calls = store.list_tool_calls_by_turn(created["turn_id"])
     assert len(tool_calls) == 1
-    assert tool_calls[0].tool_name == "delegate_to_claude_code"
+    assert tool_calls[0].tool_name == "delegate_to_codex"
     assert tool_calls[0].status == "rejected"
-    assert "Rejected: high-privilege delegation" in (tool_calls[0].error_message or "")
+    assert "Rejected: tool not allowed by runtime policy" in (tool_calls[0].error_message or "")
 
 
-def test_claude_code_tool_runs_for_explicit_code_request(monkeypatch) -> None:
+def test_codex_tool_runs_for_explicit_code_request(monkeypatch) -> None:
     client = _client(monkeypatch)
     store = get_conversation_store()
     _install_delegation_chat(
@@ -121,6 +121,6 @@ def test_claude_code_tool_runs_for_explicit_code_request(monkeypatch) -> None:
     assert body["reply"] == "coder-ran"
     tool_calls = store.list_tool_calls_by_turn(created["turn_id"])
     assert len(tool_calls) == 1
-    assert tool_calls[0].tool_name == "delegate_to_claude_code"
+    assert tool_calls[0].tool_name == "delegate_to_codex"
     assert tool_calls[0].status == "completed"
     assert tool_calls[0].output == {"result": "coder-ran"}

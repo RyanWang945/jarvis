@@ -2,12 +2,20 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 
 import sqlalchemy as sa
 from sqlalchemy import create_engine
 
+from app.agent_react.session_state import (
+    ConversationSessionState,
+    dump_session_state,
+    load_session_state,
+    render_session_state,
+)
+from app.agent_react.turn_classifier import classify_turn, should_apply_session_mode_update
 from app.api.schemas import (
     ConversationCreateRequest,
     ConversationMessageCreateRequest,
@@ -135,6 +143,26 @@ class MySQLConversationStore:
                 {"id": conversation_id},
             ).mappings().one_or_none()
             return self._conv_from_row(row) if row else None
+
+    def update_conversation_session(
+        self,
+        conversation_id: int,
+        session_state: ConversationSessionState,
+    ) -> None:
+        with self._engine.begin() as conn:
+            conn.execute(
+                sa.text(
+                    "UPDATE conversations "
+                    "SET metadata = JSON_MERGE_PATCH(COALESCE(metadata, '{}'), :patch), "
+                    "updated_at = :now "
+                    "WHERE id = :id"
+                ),
+                {
+                    "patch": json.dumps(dump_session_state(session_state)),
+                    "now": _now(),
+                    "id": conversation_id,
+                },
+            )
 
     def list_messages(self, conversation_id: int) -> list[MessageRecord]:
         with self._engine.begin() as conn:
@@ -675,14 +703,44 @@ class MySQLConversationStore:
 
         turn_id: int | None = None
         if should_respond:
+            classification = classify_turn(
+                content=content,
+                session_state=load_session_state(conversation.metadata),
+            )
+            if should_apply_session_mode_update(classification) and classification.session_mode_update is not None:
+                session_state = replace(
+                    load_session_state(conversation.metadata),
+                    session_mode=classification.session_mode_update,
+                )
+                session_patch = dump_session_state(session_state)
+                conversation.metadata = {**conversation.metadata, **session_patch}
+                conn.execute(
+                    sa.text(
+                        "UPDATE conversations "
+                        "SET metadata = JSON_MERGE_PATCH(COALESCE(metadata, '{}'), :patch), "
+                        "updated_at = :now "
+                        "WHERE id = :id"
+                    ),
+                    {
+                        "patch": json.dumps(session_patch),
+                        "now": _now(),
+                        "id": conversation.id,
+                    },
+                )
             turn_id = self._create_turn(
                 conn,
                 conversation_id=conversation.id,
                 trigger_message_id=message.id,
                 trigger_type=trigger_type,
-                turn_type=_turn_type(content),
+                turn_type=classification.turn_type,
                 started_by_user_id=user_id,
                 mentions=mentions,
+                classification={
+                    "source": classification.source,
+                    "confidence": classification.confidence,
+                    "reason": classification.reason,
+                    "session_mode_update": classification.session_mode_update,
+                },
             )
             conn.execute(
                 sa.text("UPDATE messages SET turn_id = :turn_id WHERE id = :msg_id"),
@@ -1031,11 +1089,14 @@ class MySQLConversationStore:
         settings = get_settings()
         provider = settings.llm_provider
         model = getattr(settings, f"{provider}_model", "unknown")
+        session_report = render_session_state(load_session_state(conversation.metadata))
 
         running_count = turn_stats["running"] or 0
         status_label = "执行中" if running_count > 0 else "空闲"
 
         reply = (
+            f"{session_report}\n"
+            f"---\n"
             f"当前会话\n"
             f"类型: {_chat_type_label(conversation.chat_type)}\n"
             f"状态: {status_label}\n"
@@ -1075,8 +1136,12 @@ class MySQLConversationStore:
         turn_type: str,
         started_by_user_id: int,
         mentions: list[str],
+        classification: dict[str, Any] | None = None,
     ) -> int:
         now = _now()
+        metadata = {"mentions": mentions}
+        if classification is not None:
+            metadata["classification"] = classification
         result = conn.execute(
             sa.text(
                 "INSERT INTO turns (conversation_id, trigger_message_id, trigger_type, status, turn_type, "
@@ -1090,7 +1155,7 @@ class MySQLConversationStore:
                 "turn_type": turn_type,
                 "user_id": started_by_user_id,
                 "now": now,
-                "meta": json.dumps({"mentions": mentions}),
+                "meta": json.dumps(metadata),
             },
         )
         return result.lastrowid  # type: ignore[return-value]

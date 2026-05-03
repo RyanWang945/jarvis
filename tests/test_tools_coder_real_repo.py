@@ -5,7 +5,7 @@ from uuid import uuid4
 
 import pytest
 
-from app.tools.coder import run_coder_tool
+from app.tools.codex import run_codex_coder_tool
 from app.tools.common import ToolExecutionRequest
 
 REAL_REPO = Path(os.environ.get("JARVIS_REAL_CODER_REPO", r"G:\pycharm-project\nltk"))
@@ -73,7 +73,7 @@ def test_real_repo_bootstrap_and_extend_greeter() -> None:
 
 def _run_real_coder(instruction: str, *, verification_cmd: str | None = None):
     request = ToolExecutionRequest(
-        tool_name="delegate_to_claude_code",
+        tool_name="delegate_to_codex",
         workdir=str(REAL_REPO),
         args={
             "instruction": instruction,
@@ -84,7 +84,7 @@ def _run_real_coder(instruction: str, *, verification_cmd: str | None = None):
         },
         timeout_seconds=1800,
     )
-    return run_coder_tool(request)
+    return run_codex_coder_tool(request)
 
 
 def _current_branch() -> str:

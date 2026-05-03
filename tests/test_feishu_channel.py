@@ -67,6 +67,32 @@ def test_feishu_renderer_adapts_commonmark_and_table() -> None:
     assert "**Skill**: Strategy" in all_content
 
 
+def test_feishu_renderer_repairs_quad_asterisk_labels() -> None:
+    renderer = FeishuRenderer(title="Jarvis")
+
+    delivery = renderer.render(
+        ChannelMessage(
+            content=(
+                "****定价市场 | 全球美元计价\n"
+                "固高科技股价: A股人民币计价\n\n"
+                "****驱动因素 | 地缘政治、美联储政策、美元走势\n"
+                "固高科技股价: 公司业绩、行业景气度、A股资金面\n\n"
+                "****资产属性 | 避险资产\n"
+                "固高科技股价: 成长型科技股（工业自动化/运动控制）"
+            ),
+            content_type="markdown",
+        )
+    )
+
+    all_content = "\n".join(element["text"]["content"] for element in json.loads(delivery.content)["elements"])
+    assert "****定价市场" not in all_content
+    assert "****驱动因素" not in all_content
+    assert "****资产属性" not in all_content
+    assert "**定价市场** | 全球美元计价" in all_content
+    assert "**驱动因素** | 地缘政治、美联储政策、美元走势" in all_content
+    assert "**资产属性** | 避险资产" in all_content
+
+
 def test_feishu_channel_retries_text_fallback_when_interactive_fails(monkeypatch) -> None:
     channel = FeishuChannel(app_id="app", app_secret="secret")
     attempts: list[str] = []

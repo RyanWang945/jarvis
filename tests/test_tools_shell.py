@@ -30,7 +30,7 @@ def test_shell_run_command_rejects_dangerous_command() -> None:
 
     rejection = check_tool_policy(tool, {"command": "git push origin main", "workdir": "."}, messages=[])
 
-    assert rejection == "Rejected: this command is too risky for shell_run_command; use delegate_to_claude_code or ask explicitly."
+    assert rejection == "Rejected: this command is too risky for shell_run_command; use delegate_to_codex or ask explicitly."
 
 
 def test_shell_run_command_rejects_multi_command() -> None:

@@ -47,7 +47,16 @@ class OpenSearchClient:
         prefix = "kb_sec" if source_type == "sec_filing" else self._index_prefix
         return f"{prefix}_{language}_{chunk_profile_id}"
 
-    def ensure_index(self, *, index_name: str, embedding_dim: int | None = None) -> None:
+    def ensure_index(
+        self,
+        *,
+        index_name: str,
+        embedding_dim: int | None = None,
+        language: str | None = None,
+    ) -> None:
+        title_mapping = _text_mapping(language=language, raw=True)
+        section_title_mapping = _text_mapping(language=language, keyword=True)
+        content_mapping = _text_mapping(language=language, raw=True, raw_ignore_above=32766)
         mapping = {
             "settings": {
                 "index": {
@@ -69,26 +78,10 @@ class OpenSearchClient:
                     "filing_date": {"type": "keyword"},
                     "fiscal_year": {"type": "integer"},
                     "fiscal_period": {"type": "keyword"},
-                    "section_title": {
-                        "type": "text",
-                        "fields": {
-                            "keyword": {"type": "keyword"},
-                        },
-                    },
-                    "title": {
-                        "type": "text",
-                        "fields": {
-                            "keyword": {"type": "keyword"},
-                            "raw": {"type": "keyword"},
-                        },
-                    },
+                    "section_title": section_title_mapping,
+                    "title": title_mapping,
                     "url": {"type": "keyword"},
-                    "content": {
-                        "type": "text",
-                        "fields": {
-                            "raw": {"type": "keyword", "ignore_above": 32766},
-                        },
-                    },
+                    "content": content_mapping,
                     "section_path": {"type": "keyword"},
                     "chunk_index": {"type": "integer"},
                     "char_count": {"type": "integer"},
@@ -351,6 +344,16 @@ def _build_filter_clauses(filters: dict | None) -> list[dict]:
     if not filters:
         return []
     clauses: list[dict] = []
+    if filters.get("source_id"):
+        clauses.append({"term": {"source_id": filters["source_id"]}})
+    if filters.get("source_ids"):
+        clauses.append({"terms": {"source_id": list(filters["source_ids"])}})
+    if filters.get("source_type"):
+        clauses.append({"term": {"source_type": filters["source_type"]}})
+    if filters.get("language"):
+        clauses.append({"term": {"language": filters["language"]}})
+    if filters.get("chunk_profile_id"):
+        clauses.append({"term": {"chunk_profile_id": filters["chunk_profile_id"]}})
     if filters.get("ticker"):
         clauses.append({"term": {"ticker": filters["ticker"]}})
     if filters.get("company_name"):
@@ -362,3 +365,27 @@ def _build_filter_clauses(filters: dict | None) -> list[dict]:
     if filters.get("section_title"):
         clauses.append({"term": {"section_title.keyword": filters["section_title"]}})
     return clauses
+
+
+def _text_mapping(
+    *,
+    language: str | None,
+    keyword: bool = False,
+    raw: bool = False,
+    raw_ignore_above: int | None = None,
+) -> dict:
+    mapping: dict = {"type": "text"}
+    if language == "zh":
+        mapping["analyzer"] = "smartcn"
+        mapping["search_analyzer"] = "smartcn"
+    fields: dict = {}
+    if keyword:
+        fields["keyword"] = {"type": "keyword"}
+    if raw:
+        raw_field = {"type": "keyword"}
+        if raw_ignore_above is not None:
+            raw_field["ignore_above"] = raw_ignore_above
+        fields["raw"] = raw_field
+    if fields:
+        mapping["fields"] = fields
+    return mapping

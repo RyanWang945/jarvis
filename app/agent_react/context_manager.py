@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
-from textwrap import dedent
 from typing import Any
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
+from app.agent_react.runtime_policy import RuntimePolicy, render_runtime_policy_for_model
+from app.agent_react.session_state import ConversationSessionState, render_session_state_for_model
 from app.llm.client import LLMMessage
 from app.skills.bootstrap import get_skill_registry
 
@@ -108,7 +109,10 @@ class ContextManager:
         registry = get_skill_registry()
         sections: list[str] = []
         for skill_name in skill_names:
-            skill = registry.get(skill_name)
+            try:
+                skill = registry.get(skill_name)
+            except ValueError:
+                continue
             body = skill.load_body().strip()
             if not body:
                 continue
@@ -125,6 +129,50 @@ class ContextManager:
         )
         return [skill_message, *messages]
 
+    def build_context_header(
+        self,
+        *,
+        session_state: ConversationSessionState | None,
+        skill_names: list[str],
+        runtime_policy: RuntimePolicy | None = None,
+    ) -> SystemMessage:
+        sections = [SYSTEM_PROMPT.strip()]
+
+        if session_state is not None:
+            rendered_session = render_session_state_for_model(session_state)
+            if rendered_session is not None:
+                sections.append(rendered_session)
+
+        if runtime_policy is not None:
+            sections.append(render_runtime_policy_for_model(runtime_policy))
+
+        rendered_skills = self._render_selected_skills(skill_names)
+        if rendered_skills is not None:
+            sections.append(rendered_skills)
+
+        return SystemMessage(content="\n\n".join(sections))
+
+    def _render_selected_skills(self, skill_names: list[str]) -> str | None:
+        if not skill_names:
+            return None
+
+        registry = get_skill_registry()
+        sections: list[str] = []
+        for skill_name in skill_names:
+            skill = registry.get(skill_name)
+            body = skill.load_body().strip()
+            if not body:
+                continue
+            sections.append(f"[Skill: {skill.name}]\n{body}")
+
+        if not sections:
+            return None
+
+        return (
+            "Selected skills for this turn. Use them as procedural guidance when relevant.\n\n"
+            + "\n\n".join(sections)
+        )
+
     def ensure_system_prompt(self, messages: list[BaseMessage]) -> list[BaseMessage]:
         if not messages:
             return [SystemMessage(content=SYSTEM_PROMPT)]
@@ -139,13 +187,43 @@ class ContextManager:
 
         return [SystemMessage(content=SYSTEM_PROMPT), *messages]
 
-    def build_initial_messages(self, records: list, trigger_message_id: int | None) -> tuple[list[BaseMessage], list[str]]:
+    def inject_session_state(
+        self,
+        messages: list[BaseMessage],
+        session_state: ConversationSessionState | None,
+    ) -> list[BaseMessage]:
+        if session_state is None:
+            return messages
+        rendered = render_session_state_for_model(session_state)
+        if rendered is None:
+            return messages
+
+        insert_at = 1 if messages and isinstance(messages[0], SystemMessage) else 0
+        return [
+            *messages[:insert_at],
+            SystemMessage(content=rendered),
+            *messages[insert_at:],
+        ]
+
+    def build_initial_messages(
+        self,
+        records: list,
+        trigger_message_id: int | None,
+        *,
+        session_state: ConversationSessionState | None = None,
+        runtime_policy: RuntimePolicy | None = None,
+    ) -> tuple[list[BaseMessage], list[str]]:
         bounded_records = slice_records_through_trigger(records, trigger_message_id)
         lc_messages = self.records_to_lc_messages(bounded_records)
         skill_names = [skill.name for skill in get_skill_registry().select_for_query(latest_user_text(lc_messages))]
-        lc_messages = self.inject_selected_skills(lc_messages, skill_names)
-        lc_messages = self.ensure_system_prompt(lc_messages)
-        return lc_messages, skill_names
+        if runtime_policy is not None and runtime_policy.forced_skills:
+            skill_names = list(dict.fromkeys([*runtime_policy.forced_skills, *skill_names]))
+        header = self.build_context_header(
+            session_state=session_state,
+            skill_names=skill_names,
+            runtime_policy=runtime_policy,
+        )
+        return [header, *lc_messages], skill_names
 
     def estimate_text_tokens(self, text: str) -> int:
         if not text:

@@ -3,7 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Literal
 
+from app.tools.business_knowledge import run_business_knowledge_search
 from app.tools.coder import run_coder_tool
+from app.tools.codex import run_codex_coder_tool
 from app.tools.common import ToolExecutionRequest, ToolExecutionResult
 from app.tools.obsidian_wiki import (
     run_obsidian_wiki_apply,
@@ -60,7 +62,7 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
                 "Use this for targeted commands such as tests, lint, build, or diagnostic commands. "
                 "Do NOT use this for web searches, factual lookups, or current events. "
                 "Do not use this for multi-step repository workflows, code editing, git commit, or git push; "
-                "use delegate_to_claude_code for those."
+                "use delegate_to_codex for those."
             ),
             args_schema={
                 "type": "object",
@@ -115,6 +117,53 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
                 "required": ["instruction", "workdir"],
             },
             handler=run_coder_tool,
+            risk_level="high",
+            exposed_to_llm=False,
+            execution_mode="proposal",
+            can_modify_files=True,
+            requires_workdir=True,
+        ),
+        ToolDefinition(
+            name="delegate_to_codex",
+            description=(
+                "High-privilege delegation tool backed by Codex for repository development workflows. "
+                "Use this only for substantial code tasks such as multi-file edits, refactors, "
+                "bug fixes, code review follow-up, test execution, and git workflows inside a repository. "
+                "Do not use this for simple shell commands, factual questions, or lightweight search. "
+                "Before calling it, gather enough context to issue one complete task contract."
+            ),
+            args_schema={
+                "type": "object",
+                "properties": {
+                    "instruction": {
+                        "type": "string",
+                        "description": (
+                            "Detailed development task for the coder worker, including file constraints, "
+                            "verification expectations, and whether commit or push is permitted."
+                        ),
+                    },
+                    "workdir": {
+                        "type": "string",
+                        "description": "Absolute path to the target repository working directory.",
+                    },
+                    "verification_cmd": {
+                        "type": "string",
+                        "description": "Optional command the coder worker should run before finishing.",
+                    },
+                    "allow_commit": {
+                        "type": "boolean",
+                        "description": "Whether the coder worker may create a git commit.",
+                        "default": False,
+                    },
+                    "allow_push": {
+                        "type": "boolean",
+                        "description": "Whether the coder worker may push to origin. Requires allow_commit=true.",
+                        "default": False,
+                    },
+                },
+                "required": ["instruction", "workdir"],
+            },
+            handler=run_codex_coder_tool,
             risk_level="high",
             execution_mode="proposal",
             can_modify_files=True,
@@ -196,6 +245,53 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
                 },
             },
             handler=run_obsidian_wiki_maintain,
+        ),
+        ToolDefinition(
+            name="business_knowledge_search",
+            description=(
+                "Query the OpenSearch-backed business knowledge store. "
+                "Use this for business corpora such as deep research materials, imported documents, "
+                "Wikipedia-style reference corpora, and SEC filings. "
+                "Do not use this for personal memory, user notes, project decisions, or Obsidian wiki pages; "
+                "use obsidian_wiki_query for those."
+            ),
+            args_schema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "mode": {
+                        "type": "string",
+                        "enum": ["bm25", "vector", "hybrid", "rrf", "rrf_v2"],
+                        "default": "rrf_v2",
+                    },
+                    "language": {
+                        "type": "string",
+                        "description": "Corpus language, default zh; sec_filing defaults to en.",
+                    },
+                    "chunk_profile_id": {"type": "string"},
+                    "top_k": {"type": "integer", "default": 5, "minimum": 1, "maximum": 20},
+                    "source_type": {
+                        "type": "string",
+                        "description": (
+                            "Optional business source type, for example wikipedia, "
+                            "deep_research, sec_filing, or generic."
+                        ),
+                    },
+                    "source_id": {"type": "string", "description": "Optional exact source id filter."},
+                    "source_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional list of source ids to search within.",
+                    },
+                    "ticker": {"type": "string", "description": "SEC filing ticker filter."},
+                    "company_name": {"type": "string", "description": "SEC filing company filter."},
+                    "form_type": {"type": "string", "description": "SEC filing form type such as 10-K or 10-Q."},
+                    "fiscal_year": {"type": "integer", "description": "SEC filing fiscal year filter."},
+                    "section_title": {"type": "string", "description": "SEC filing section title filter."},
+                },
+                "required": ["query"],
+            },
+            handler=run_business_knowledge_search,
         ),
         ToolDefinition(
             name="write_file",

@@ -209,10 +209,10 @@ def adapt_markdown_for_feishu(markdown: str) -> str:
 
         heading = re.match(r"^(#{1,6})\s+(.+)$", stripped)
         if heading:
-            title = _strip_trailing_heading_marks(heading.group(2))
+            title = _adapt_inline_markdown(_strip_trailing_heading_marks(heading.group(2)))
             if rendered and rendered[-1] != "":
                 rendered.append("")
-            rendered.append(f"**{title}**")
+            rendered.append(title if _is_strong_markdown(title) else f"**{title}**")
             rendered.append("")
             index += 1
             continue
@@ -222,24 +222,24 @@ def adapt_markdown_for_feishu(markdown: str) -> str:
             if rendered and rendered[-1] != "":
                 rendered.append("")
             rendered.append("**Quote**")
-            rendered.append(quote.group(1))
+            rendered.append(_adapt_inline_markdown(quote.group(1)))
             rendered.append("")
             index += 1
             continue
 
         ordered = re.match(r"^(\d+)\.\s+(.+)$", stripped)
         if ordered:
-            rendered.append(f"{ordered.group(1)}. {ordered.group(2)}")
+            rendered.append(f"{ordered.group(1)}. {_adapt_inline_markdown(ordered.group(2))}")
             index += 1
             continue
 
         bullet = re.match(r"^([*+-])\s+(.+)$", stripped)
         if bullet:
-            rendered.append(f"- {bullet.group(2)}")
+            rendered.append(f"- {_adapt_inline_markdown(bullet.group(2))}")
             index += 1
             continue
 
-        rendered.append(stripped)
+        rendered.append(_adapt_inline_markdown(stripped))
         index += 1
 
     while rendered and rendered[-1] == "":
@@ -249,6 +249,32 @@ def adapt_markdown_for_feishu(markdown: str) -> str:
 
 def _strip_trailing_heading_marks(value: str) -> str:
     return re.sub(r"\s+#+\s*$", "", value).strip()
+
+
+def _adapt_inline_markdown(text: str) -> str:
+    text = text.strip()
+    quad_label = re.match(r"^\*{4}\s*(?P<label>[^|:：]+?)\s*(?P<sep>[|:：])\s*(?P<value>.*)$", text)
+    if quad_label:
+        label = re.sub(r"\*+\s*$", "", quad_label.group("label")).strip()
+        value = quad_label.group("value").strip()
+        sep = quad_label.group("sep")
+        if sep == "|":
+            return f"**{label}** | {value}" if value else f"**{label}** |"
+        return f"**{label}**: {value}" if value else f"**{label}**:"
+
+    quad_wrapped = re.match(r"^\*{4}\s*(?P<body>.+?)\s*\*{2,4}$", text)
+    if quad_wrapped:
+        return f"**{quad_wrapped.group('body').strip()}**"
+
+    quad_open = re.match(r"^\*{4}\s*(?P<body>.+)$", text)
+    if quad_open:
+        return f"**{quad_open.group('body').strip()}**"
+
+    return text
+
+
+def _is_strong_markdown(text: str) -> bool:
+    return len(text) > 4 and text.startswith("**") and text.endswith("**")
 
 
 def _parse_table(lines: list[str], start_index: int) -> _ParsedTable | None:

@@ -11,9 +11,16 @@ from typing_extensions import TypedDict
 
 from app.agent_react.context_manager import ContextManager
 from app.agent_react.react_graph import call_llm, execute_tools, should_continue
+from app.agent_react.runtime_policy import RuntimePolicy, resolve_runtime_policy
+from app.agent_react.session_state import (
+    ConversationSessionState,
+    build_session_state_after_turn,
+    load_session_state,
+)
 from app.config import get_settings
 
 if TYPE_CHECKING:
+    from app.persistence.models import ConversationRecord
     from app.persistence.models import TurnRecord
 
 logger = logging.getLogger(__name__)
@@ -42,9 +49,17 @@ class TurnResult:
 class ConversationStore(Protocol):
     """Store contract for the outer runtime orchestrator and inner turn runtime."""
 
+    def get_conversation(self, conversation_id: int) -> ConversationRecord | None: ...
+
     def get_turn(self, turn_id: int) -> TurnRecord | None: ...
 
     def list_messages(self, conversation_id: int) -> list: ...
+
+    def update_conversation_session(
+        self,
+        conversation_id: int,
+        session_state: ConversationSessionState,
+    ) -> None: ...
 
     def mark_turn_running(self, turn_id: int) -> None: ...
 
@@ -116,6 +131,8 @@ class TurnRuntimeState(TypedDict):
     conversation_id: int
     trigger_message_id: int | None
     messages: list[BaseMessage]
+    session_state: ConversationSessionState | None
+    runtime_policy: RuntimePolicy | None
     selected_skills: list[str]
     reply: str
     reply_message_id: int | None
@@ -140,6 +157,7 @@ class TurnRuntime:
 
         running = prepared
         while running.get("status") == "running" and not running.get("cancelled"):
+            runtime_policy = running.get("runtime_policy")
             react_state = {
                 "turn_id": running["turn_id"],
                 "messages": running["messages"],
@@ -147,6 +165,9 @@ class TurnRuntime:
                 "status": running["status"],
                 "step_count": running["step_count"],
                 "token_budget": running["token_budget"],
+                "allowed_tools": list(runtime_policy.allowed_tools) if runtime_policy is not None else [],
+                "max_steps": runtime_policy.max_steps if runtime_policy is not None else 8,
+                "search_budget": runtime_policy.search_budget if runtime_policy is not None else None,
             }
             running = self._apply_react_step(running, react_state)
         return self._finalize(running)
@@ -161,9 +182,18 @@ class TurnRuntime:
                 "error": f"Turn not found: {turn_id}",
             }
 
+        conversation = self._store.get_conversation(turn.conversation_id)
+        session_state = load_session_state(conversation.metadata if conversation is not None else None)
+        runtime_policy = resolve_runtime_policy(
+            session_mode=session_state.session_mode,
+            turn_type=getattr(turn, "turn_type", "chat"),
+        )
+
         lc_messages, skill_names = self._context_manager.build_initial_messages(
             self._store.list_messages(turn.conversation_id),
             getattr(turn, "trigger_message_id", None),
+            session_state=session_state,
+            runtime_policy=runtime_policy,
         )
 
         return {
@@ -171,6 +201,8 @@ class TurnRuntime:
             "conversation_id": turn.conversation_id,
             "trigger_message_id": getattr(turn, "trigger_message_id", None),
             "messages": lc_messages,
+            "session_state": session_state,
+            "runtime_policy": runtime_policy,
             "selected_skills": skill_names,
             "reply": "",
             "reply_message_id": None,
@@ -249,10 +281,12 @@ class TurnRuntime:
                 turn_id,
                 error_message=state["error"],
             )
+            session_state = self._writeback_session_state(state, status="failed")
             return {
                 **state,
                 "status": "failed",
                 "reply": "",
+                "session_state": session_state,
             }
 
         if state.get("status") == "cancelled":
@@ -261,10 +295,12 @@ class TurnRuntime:
                 status="cancelled",
                 error_message=None,
             )
+            session_state = self._writeback_session_state(state, status="cancelled")
             return {
                 **state,
                 "reply": "",
                 "error": None,
+                "session_state": session_state,
             }
 
         assistant_messages = [
@@ -286,6 +322,11 @@ class TurnRuntime:
             content_type="markdown",
             raw_payload=raw_payload,
         )
+        session_state = self._writeback_session_state(
+            state,
+            status="completed",
+            assistant_reply=reply,
+        )
 
         return {
             **state,
@@ -293,7 +334,27 @@ class TurnRuntime:
             "reply_message_id": getattr(message, "id", None),
             "status": "completed",
             "error": None,
+            "session_state": session_state,
         }
+
+    def _writeback_session_state(
+        self,
+        state: TurnRuntimeState,
+        *,
+        status: str,
+        assistant_reply: str | None = None,
+    ) -> ConversationSessionState:
+        session_state = build_session_state_after_turn(
+            state.get("session_state"),
+            turn_id=state["turn_id"],
+            status=status,
+            assistant_reply=assistant_reply,
+        )
+        try:
+            self._store.update_conversation_session(state["conversation_id"], session_state)
+        except Exception:
+            logger.exception("session state writeback failed turn_id=%s", state["turn_id"])
+        return session_state
 
 
 class AgentRuntime:
@@ -323,6 +384,8 @@ class AgentRuntime:
                 "conversation_id": turn.conversation_id,
                 "trigger_message_id": getattr(turn, "trigger_message_id", None),
                 "messages": [],
+                "session_state": None,
+                "runtime_policy": None,
                 "selected_skills": [],
                 "reply": "",
                 "reply_message_id": None,
@@ -340,6 +403,8 @@ class AgentRuntime:
                 "conversation_id": turn.conversation_id,
                 "trigger_message_id": getattr(turn, "trigger_message_id", None),
                 "messages": [],
+                "session_state": None,
+                "runtime_policy": None,
                 "selected_skills": [],
                 "reply": "",
                 "reply_message_id": None,

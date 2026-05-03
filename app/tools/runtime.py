@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from collections.abc import Collection
 from typing import Any
 
 from langchain_core.messages import BaseMessage, HumanMessage
@@ -87,7 +88,8 @@ def get_tool_definition(name: str) -> ToolDefinition:
         raise ValueError(f"unknown tool: {name}") from exc
 
 
-def build_llm_tools() -> list[dict[str, Any]]:
+def build_llm_tools(*, allowed_tools: Collection[str] | None = None) -> list[dict[str, Any]]:
+    allowed = set(allowed_tools) if allowed_tools is not None else None
     return [
         {
             "type": "function",
@@ -98,6 +100,7 @@ def build_llm_tools() -> list[dict[str, Any]]:
             },
         }
         for tool in list_tool_definitions(exposed_to_llm=True)
+        if allowed is None or tool.name in allowed
     ]
 
 
@@ -186,7 +189,7 @@ def _check_shell_command(command: str) -> str | None:
         return "Rejected: shell_run_command only allows one command at a time."
     normalized = command.strip()
     if any(normalized.startswith(prefix) for prefix in _COMMAND_DENY_PREFIXES):
-        return "Rejected: this command is too risky for shell_run_command; use delegate_to_claude_code or ask explicitly."
+        return "Rejected: this command is too risky for shell_run_command; use delegate_to_codex or ask explicitly."
     path_rejection = _check_workspace_path_constraints(command)
     if path_rejection is not None:
         return path_rejection

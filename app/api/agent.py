@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from functools import lru_cache
 from threading import Lock
@@ -8,6 +9,13 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, status
 
 from app.agent_react import AgentRuntime
+from app.agent_react.session_state import (
+    ConversationSessionState,
+    dump_session_state,
+    load_session_state,
+    render_session_state,
+)
+from app.agent_react.turn_classifier import classify_turn, should_apply_session_mode_update
 from app.api.schemas import (
     ConversationCreateRequest,
     ConversationMessageCreateRequest,
@@ -79,6 +87,21 @@ class InMemoryConversationStore:
     def get_conversation(self, conversation_id: int) -> _ConversationRecord | None:
         with self._lock:
             return self._conversations.get(conversation_id)
+
+    def update_conversation_session(
+        self,
+        conversation_id: int,
+        session_state: ConversationSessionState,
+    ) -> None:
+        with self._lock:
+            conversation = self._conversations.get(conversation_id)
+            if conversation is None:
+                return
+            conversation.metadata = {
+                **conversation.metadata,
+                **dump_session_state(session_state),
+            }
+            conversation.updated_at = _now()
 
     def list_messages(self, conversation_id: int) -> list[_MessageRecord]:
         with self._lock:
@@ -476,6 +499,19 @@ class InMemoryConversationStore:
 
         turn_id: int | None = None
         if should_respond:
+            classification = classify_turn(
+                content=content,
+                session_state=load_session_state(conversation.metadata),
+            )
+            if should_apply_session_mode_update(classification) and classification.session_mode_update is not None:
+                session_state = replace(
+                    load_session_state(conversation.metadata),
+                    session_mode=classification.session_mode_update,
+                )
+                conversation.metadata = {
+                    **conversation.metadata,
+                    **dump_session_state(session_state),
+                }
             turn_id = self._next_turn_id
             self._next_turn_id += 1
             turn = _TurnRecord(
@@ -484,10 +520,18 @@ class InMemoryConversationStore:
                 trigger_message_id=message.id,
                 trigger_type=trigger_type,
                 status="queued",
-                turn_type=_turn_type(content),
+                turn_type=classification.turn_type,
                 started_by_user_id=user_id,
                 started_at=_now(),
-                metadata={"mentions": mentions},
+                metadata={
+                    "mentions": mentions,
+                    "classification": {
+                        "source": classification.source,
+                        "confidence": classification.confidence,
+                        "reason": classification.reason,
+                        "session_mode_update": classification.session_mode_update,
+                    },
+                },
             )
             self._turns[turn_id] = turn
             message.turn_id = turn_id
@@ -760,9 +804,12 @@ class InMemoryConversationStore:
         settings = get_settings()
         provider = settings.llm_provider
         model = getattr(settings, f"{provider}_model", "unknown")
+        session_report = render_session_state(load_session_state(conversation.metadata))
         status_label = "执行中" if running > 0 else "空闲"
 
         reply = (
+            f"{session_report}\n"
+            f"---\n"
             f"当前会话\n"
             f"类型: {_chat_type_label(conversation.chat_type)}\n"
             f"状态: {status_label}\n"
