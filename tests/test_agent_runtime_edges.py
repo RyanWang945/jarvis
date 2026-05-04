@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from langchain_core.messages import HumanMessage
+
 from app.agent_react import react_graph
 from app.api.agent import get_conversation_store
 from app.tools.common import ToolExecutionResult
@@ -48,6 +50,30 @@ def test_multiple_tool_calls_in_one_assistant_message_share_step_index(monkeypat
 
     messages = [message for message in store.list_messages(created["conversation_id"]) if message.turn_id == created["turn_id"]]
     assert [message.role for message in messages] == ["user", "assistant", "tool", "tool", "assistant"]
+
+
+def test_turn_reply_appends_model_and_token_usage_when_provider_reports_usage(monkeypatch) -> None:
+    client = create_agent_test_client()
+    chat = ScriptedChat([
+        {
+            "content": "usage reported",
+            "tool_calls": [],
+            "_model": "deepseek-test",
+            "_usage": {"prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13},
+        },
+    ])
+    chat.install(monkeypatch)
+    created = create_dm_turn(client, "Report usage.")
+
+    run = client.post(f"/turns/{created['turn_id']}/run")
+
+    assert run.status_code == 200
+    reply = run.json()["reply"]
+    assert reply.startswith("usage reported")
+    assert "---" in reply
+    assert "**本轮调用信息**" not in reply
+    assert "- 模型：`deepseek-test`" in reply
+    assert "- Token：输入 `10` / 输出 `3` / 合计 `13`" in reply
 
 
 def test_tool_exception_is_audited_and_returned_to_model(monkeypatch) -> None:
@@ -147,6 +173,31 @@ def test_codex_delegation_preserves_edit_commit_push_contract(monkeypatch) -> No
     assert tool_calls[0].input["allow_push"] is True
 
 
+def test_codex_contract_repair_does_not_upgrade_diagnosis_plan_request() -> None:
+    original_args = {
+        "instruction": (
+            "在 jarvis 项目中，查看回复渲染/格式化相关的代码。"
+            "返回找到的所有相关文件和问题的根因。"
+        ),
+        "repo_id": "jarvis",
+    }
+
+    repaired = react_graph._strengthen_codex_contract(
+        original_args,
+        [
+            HumanMessage(
+                content=(
+                    "现在你，也就是jarvis的回复中会有符号没有正常显示，"
+                    "比如:`pyproject.toml`、`uv.lock`。"
+                    "你看看具体是什么问题，先告诉我然后再告诉我修改的计划。"
+                )
+            )
+        ],
+    )
+
+    assert repaired == original_args
+
+
 def test_tavily_search_budget_rejects_third_call_in_same_turn(monkeypatch) -> None:
     client = create_agent_test_client()
     store = get_conversation_store()
@@ -186,3 +237,108 @@ def test_tavily_search_budget_rejects_third_call_in_same_turn(monkeypatch) -> No
     assert [record.step_index for record in tool_calls] == [1, 2, 3]
     assert [record.status for record in tool_calls] == ["completed", "completed", "rejected"]
     assert "tavily_search budget exceeded" in (tool_calls[-1].error_message or "")
+
+
+def test_tool_search_grant_expands_allowed_tools_with_audit_log(monkeypatch) -> None:
+    client = create_agent_test_client()
+    log_messages: list[str] = []
+    original_info = react_graph.logger.info
+
+    def _capture_info(message, *args, **kwargs):
+        log_messages.append(message % args if args else str(message))
+        return original_info(message, *args, **kwargs)
+
+    monkeypatch.setattr(react_graph.logger, "info", _capture_info)
+    chat = ScriptedChat([
+        tool_response(
+            tool_call(
+                "tool_search",
+                {
+                    "query": "search Twitter posts about Jarvis",
+                    "original_user_request": "X 上大家怎么说 Jarvis",
+                },
+                call_id="call_tool_search",
+            )
+        ),
+        final_response("grant logged"),
+    ])
+    chat.install(monkeypatch)
+    created = create_dm_turn(client, "X 上大家怎么说 Jarvis")
+
+    run = client.post(f"/turns/{created['turn_id']}/run")
+
+    assert run.status_code == 200
+    assert any("tool_search grant evaluation" in message and "x_search" in message for message in log_messages)
+    assert any("runtime allowed_tools expanded" in message and "x_search" in message for message in log_messages)
+
+
+def test_tool_search_grant_uses_original_request_for_continuation_message(monkeypatch) -> None:
+    client = create_agent_test_client()
+    seen_tool_sets: list[list[str]] = []
+
+    def _chat(messages, tools):
+        tool_names = [
+            tool["function"]["name"]
+            for tool in (tools or [])
+            if tool.get("type") == "function"
+        ]
+        seen_tool_sets.append(tool_names)
+        tool_messages = [message for message in messages if message.role == "tool"]
+        if not tool_messages:
+            return tool_response(
+                tool_call(
+                    "tool_search",
+                    {
+                        "query": "delegate_to_codex inspect file",
+                        "original_user_request": "查看 app/channels/feishu_renderer.py 文件内容",
+                    },
+                    call_id="call_tool_search",
+                )
+            )
+        if tool_messages[-1].tool_call_id == "call_tool_search":
+            assert "delegate_to_codex" in tool_names
+            return final_response("delegate now available")
+        return final_response("done")
+
+    chat = ScriptedChat([_chat, _chat])
+    chat.install(monkeypatch)
+    created = create_dm_turn(client, "好的")
+
+    run = client.post(f"/turns/{created['turn_id']}/run")
+
+    assert run.status_code == 200
+    assert "delegate_to_codex" not in seen_tool_sets[0]
+    assert "delegate_to_codex" in seen_tool_sets[1]
+
+
+def test_conversation_tool_intents_append_across_turns(monkeypatch) -> None:
+    client = create_agent_test_client()
+    store = get_conversation_store()
+    chat_id = "chat-tool-intent-append"
+    seen_tool_sets: list[list[str]] = []
+
+    def _chat(_messages, tools):
+        seen_tool_sets.append([
+            tool["function"]["name"]
+            for tool in (tools or [])
+            if tool.get("type") == "function"
+        ])
+        return final_response("done")
+
+    chat = ScriptedChat([_chat, _chat])
+    chat.install(monkeypatch)
+
+    created = create_dm_turn(client, "Please inspect app/channels/feishu_renderer.py code.", chat_id=chat_id)
+    run = client.post(f"/turns/{created['turn_id']}/run")
+
+    assert run.status_code == 200
+    conversation = store.get_conversation(created["conversation_id"])
+    assert conversation is not None
+    assert "delegate_to_codex" in conversation.metadata.get("active_tool_intents", [])
+
+    continued = create_dm_turn(client, "ok", chat_id=chat_id)
+    run = client.post(f"/turns/{continued['turn_id']}/run")
+
+    assert run.status_code == 200
+    assert "delegate_to_codex" in seen_tool_sets[0]
+    assert "delegate_to_codex" in seen_tool_sets[1]

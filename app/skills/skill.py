@@ -17,4 +17,16 @@ class Skill:
     def load_body(self) -> str:
         if self.content_path is None or not self.content_path.exists():
             return ""
-        return self.content_path.read_text(encoding="utf-8")
+        return _strip_frontmatter(self.content_path.read_text(encoding="utf-8"))
+
+
+def _strip_frontmatter(content: str) -> str:
+    if not (content.startswith("---\n") or content.startswith("---\r\n")):
+        return content
+    end = content.find("\n---", 4)
+    if end == -1:
+        return content
+    body_start = end + len("\n---")
+    while body_start < len(content) and content[body_start] in {"\r", "\n"}:
+        body_start += 1
+    return content[body_start:]

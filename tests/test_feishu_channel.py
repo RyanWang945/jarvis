@@ -150,6 +150,39 @@ def test_feishu_renderer_repairs_quad_asterisk_labels() -> None:
     assert "**资产属性** | 避险资产" in all_content
 
 
+def test_feishu_renderer_moves_model_usage_footer_to_note() -> None:
+    renderer = FeishuRenderer(title="Jarvis")
+
+    delivery = renderer.render(
+        ChannelMessage(
+            content=(
+                "这是最终回复。\n\n"
+                "---\n"
+                "- 模型：`deepseek-v4-flash`\n"
+                "- Token：输入 `4553` / 输出 `618` / 合计 `5171`"
+            ),
+            content_type="markdown",
+        )
+    )
+
+    card = json.loads(delivery.content)
+    body_content = "\n".join(
+        element["text"]["content"]
+        for element in card["elements"]
+        if element.get("tag") == "div" and "text" in element
+    )
+    assert "- 模型：" not in body_content
+    assert "- Token：" not in body_content
+    assert card["elements"][-2] == {"tag": "hr"}
+    assert card["elements"][-1]["tag"] == "note"
+    assert card["elements"][-1]["elements"] == [
+        {
+            "tag": "plain_text",
+            "content": "模型：deepseek-v4-flash · Token：输入 4553 / 输出 618 / 合计 5171",
+        }
+    ]
+
+
 def test_feishu_channel_retries_text_fallback_when_interactive_fails(monkeypatch) -> None:
     channel = FeishuChannel(app_id="app", app_secret="secret")
     attempts: list[str] = []

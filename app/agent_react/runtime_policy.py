@@ -27,7 +27,7 @@ _BASE_READ_TOOLS = (
 )
 _DISCOVERY_TOOLS = ("tool_search",)
 _ACTION_TOOLS = ("scheduled_task",)
-_WEB_TOOLS = ("tavily_search",)
+_WEB_TOOLS = ("tavily_search", "x_search")
 _KB_WRITE_TOOLS = (
     "obsidian_wiki_draft",
     "obsidian_wiki_apply",

@@ -82,7 +82,16 @@ class ChatClient:
             raise
         body = response.json()
         message = body["choices"][0]["message"]
-        return message if isinstance(message, dict) else {"content": str(message)}
+        result = dict(message) if isinstance(message, dict) else {"content": str(message)}
+        usage = body.get("usage")
+        if isinstance(usage, dict):
+            result["_usage"] = usage
+        model = body.get("model")
+        if isinstance(model, str) and model:
+            result["_model"] = model
+        else:
+            result["_model"] = self._model
+        return result
 
 
 def parse_json_content(message: dict[str, Any]) -> dict[str, Any]:

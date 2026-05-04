@@ -37,12 +37,23 @@ class SkillRegistry:
             score = 0
             name = skill.name.lower()
             description = (skill.description or "").lower()
-            manifest_text = " ".join(skill.manifest.capabilities).lower()
+            manifest_text = " ".join(
+                [
+                    skill.manifest.when_to_use or "",
+                    " ".join(skill.manifest.tags),
+                    " ".join(skill.manifest.tools),
+                    " ".join(skill.manifest.capabilities),
+                ]
+            ).lower()
 
             if name in query:
                 score += 8
             if any(capability.lower() in query for capability in skill.manifest.capabilities):
                 score += 5
+            if any(tool.lower() in query for tool in skill.manifest.tools):
+                score += 4
+            if skill.manifest.when_to_use and skill.manifest.when_to_use.lower() in query:
+                score += 3
 
             haystack_tokens = _tokens(" ".join([name, description, manifest_text]))
             overlap = query_tokens.intersection(haystack_tokens)

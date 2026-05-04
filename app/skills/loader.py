@@ -89,7 +89,7 @@ def _read_manifest(path: Path) -> SkillManifest:
 
 def _read_skill_md_frontmatter(path: Path) -> dict[str, Any]:
     content = path.read_text(encoding="utf-8")
-    if not content.startswith("---\n"):
+    if not (content.startswith("---\n") or content.startswith("---\r\n")):
         raise ValueError("SKILL.md must start with YAML frontmatter")
     end = content.find("\n---", 4)
     if end == -1:

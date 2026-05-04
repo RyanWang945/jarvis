@@ -24,6 +24,15 @@ class _ParsedTable:
     end_index: int
 
 
+@dataclass(frozen=True)
+class _ModelUsageFooter:
+    body: str
+    model: str
+    prompt_tokens: str
+    completion_tokens: str
+    total_tokens: str
+
+
 class FeishuRenderer:
     def __init__(self, *, title: str = "Jarvis") -> None:
         self._title = title
@@ -137,17 +146,26 @@ class FeishuRenderer:
         return self._render_card_from_elements(elements, update_multi=True)
 
     def render_markdown_card(self, markdown: str) -> FeishuDelivery:
-        normalized = normalize_markdown(markdown)
+        usage_footer = extract_model_usage_footer(markdown)
+        markdown_body = usage_footer.body if usage_footer is not None else markdown
+        normalized = normalize_markdown(markdown_body)
         if not normalized:
-            return self.render_text_fallback("")
+            if usage_footer is None:
+                return self.render_text_fallback("")
+            return self._render_card_from_elements(
+                [
+                    *_model_usage_elements(usage_footer),
+                ],
+                update_multi=True,
+            )
 
         blocks = split_markdown_blocks(normalized)
         if len(blocks) > _MAX_CARD_ELEMENTS:
             return self.render_text_fallback(downgrade_markdown_to_text(normalized))
-        return self._render_card_from_blocks(
-            ["**✅ Completed**", *blocks],
-            update_multi=True,
-        )
+        elements = self._blocks_to_elements(["**✅ Completed**", *blocks])
+        if usage_footer is not None:
+            elements.extend(_model_usage_elements(usage_footer))
+        return self._render_card_from_elements(elements, update_multi=True)
 
     def render_text_fallback(self, text: str) -> FeishuDelivery:
         return FeishuDelivery(
@@ -211,6 +229,30 @@ def normalize_markdown(markdown: str) -> str:
     normalized = adapt_markdown_for_feishu(normalized)
     normalized = re.sub(r"\n{3,}", "\n\n", normalized)
     return normalized
+
+
+def extract_model_usage_footer(markdown: str) -> _ModelUsageFooter | None:
+    pattern = re.compile(
+        r"""
+        (?P<body>.*?)
+        (?:\n{2,}|\A)
+        ---\s*
+        \n-\s*模型：`(?P<model>[^`]+)`\s*
+        \n-\s*Token：输入\s*`(?P<prompt>\d+)`\s*/\s*输出\s*`(?P<completion>\d+)`\s*/\s*合计\s*`(?P<total>\d+)`\s*
+        \Z
+        """,
+        flags=re.DOTALL | re.VERBOSE,
+    )
+    match = pattern.match(markdown.strip())
+    if match is None:
+        return None
+    return _ModelUsageFooter(
+        body=match.group("body").rstrip(),
+        model=match.group("model").strip(),
+        prompt_tokens=match.group("prompt").strip(),
+        completion_tokens=match.group("completion").strip(),
+        total_tokens=match.group("total").strip(),
+    )
 
 
 def split_markdown_blocks(markdown: str) -> list[str]:
@@ -478,6 +520,24 @@ def _command_elements(command: str) -> list[dict]:
                 "tag": "plain_text",
                 "content": _truncate_card_text(command, 1600),
             },
+        },
+    ]
+
+
+def _model_usage_elements(footer: _ModelUsageFooter) -> list[dict]:
+    return [
+        {"tag": "hr"},
+        {
+            "tag": "note",
+            "elements": [
+                {
+                    "tag": "plain_text",
+                    "content": (
+                        f"模型：{footer.model} · "
+                        f"Token：输入 {footer.prompt_tokens} / 输出 {footer.completion_tokens} / 合计 {footer.total_tokens}"
+                    ),
+                }
+            ],
         },
     ]
 

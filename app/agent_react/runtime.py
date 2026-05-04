@@ -18,6 +18,12 @@ from app.agent_react.session_state import (
     build_session_state_after_turn,
     load_session_state,
 )
+from app.agent_react.tool_intent_state import (
+    append_conversation_tool_intents,
+    merge_tool_intents,
+    persistable_tool_intents,
+    tool_intents_from_metadata,
+)
 from app.config import get_settings
 
 if TYPE_CHECKING:
@@ -146,6 +152,8 @@ class TurnRuntimeState(TypedDict):
     status: str
     step_count: int
     token_budget: int | None
+    token_usage: dict[str, int] | None
+    model: str | None
     error: str | None
 
 class TurnRuntime:
@@ -174,6 +182,8 @@ class TurnRuntime:
                 "status": running["status"],
                 "step_count": running["step_count"],
                 "token_budget": running["token_budget"],
+                "token_usage": running.get("token_usage"),
+                "model": running.get("model"),
                 "allowed_tools": list(allowed_tools),
                 "max_steps": runtime_policy.max_steps if runtime_policy is not None else 8,
                 "search_budget": runtime_policy.search_budget if runtime_policy is not None else None,
@@ -205,6 +215,30 @@ class TurnRuntime:
             list(runtime_policy.allowed_tools),
             _requested_capabilities_from_turn(turn),
         )
+        conversation_tool_intents = (
+            tool_intents_from_metadata(conversation.metadata if conversation is not None else None)
+            if _should_merge_conversation_tool_intents(runtime_policy)
+            else []
+        )
+        runtime_policy_tools = list(runtime_policy.allowed_tools)
+        allowed_tools = merge_tool_intents(runtime_policy_tools, conversation_tool_intents)
+        policy_intents = persistable_tool_intents(runtime_policy_tools)
+        if policy_intents:
+            added_intents = append_conversation_tool_intents(self._store, turn.conversation_id, policy_intents)
+            if added_intents:
+                logger.info(
+                    "conversation tool intents appended from runtime policy turn_id=%s added_tools=%s active_tools=%s",
+                    turn_id,
+                    added_intents,
+                    merge_tool_intents(conversation_tool_intents, added_intents),
+                )
+        if conversation_tool_intents:
+            logger.info(
+                "runtime allowed_tools merged conversation intents turn_id=%s conversation_tools=%s allowed_tools=%s",
+                turn_id,
+                conversation_tool_intents,
+                allowed_tools,
+            )
 
         lc_messages, skill_names = self._context_manager.build_initial_messages(
             self._store.list_messages(turn.conversation_id),
@@ -223,13 +257,15 @@ class TurnRuntime:
             "session_state": session_state,
             "runtime_policy": runtime_policy,
             "selected_skills": skill_names,
-            "allowed_tools": list(runtime_policy.allowed_tools),
+            "allowed_tools": allowed_tools,
             "reply": "",
             "reply_message_id": None,
             "cancelled": False,
             "status": "running",
             "step_count": 0,
             "token_budget": self._token_budget,
+            "token_usage": state.get("token_usage"),
+            "model": state.get("model"),
             "error": None,
         }
 
@@ -244,11 +280,16 @@ class TurnRuntime:
                 "error": str(exc),
             }
 
+        token_usage = llm_state.get("token_usage", state.get("token_usage"))
+        model = llm_state.get("model", state.get("model"))
+
         if llm_state.get("status") == "failed":
             return {
                 **state,
                 "messages": llm_state["messages"],
                 "step_count": llm_state["step_count"],
+                "token_usage": token_usage,
+                "model": model,
                 "status": "failed",
                 "error": "llm call failed",
             }
@@ -258,6 +299,8 @@ class TurnRuntime:
                 **state,
                 "messages": llm_state["messages"],
                 "step_count": llm_state["step_count"],
+                "token_usage": token_usage,
+                "model": model,
                 "cancelled": True,
                 "status": "cancelled",
                 "error": None,
@@ -284,6 +327,8 @@ class TurnRuntime:
                         **state,
                         "messages": next_state["messages"] + [AIMessage(content=question)],
                         "step_count": next_state["step_count"],
+                        "token_usage": next_state.get("token_usage", token_usage),
+                        "model": next_state.get("model", model),
                         "allowed_tools": next_state.get("allowed_tools", state.get("allowed_tools")),
                         "cancelled": bool(next_state.get("cancelled")),
                         "status": "completed",
@@ -297,6 +342,8 @@ class TurnRuntime:
                     **state,
                     "messages": next_state["messages"] + [AIMessage(content=coder_reply)],
                     "step_count": next_state["step_count"],
+                    "token_usage": next_state.get("token_usage", token_usage),
+                    "model": next_state.get("model", model),
                     "allowed_tools": next_state.get("allowed_tools", state.get("allowed_tools")),
                     "cancelled": bool(next_state.get("cancelled")),
                     "status": "completed",
@@ -306,6 +353,8 @@ class TurnRuntime:
                 **state,
                 "messages": next_state["messages"],
                 "step_count": next_state["step_count"],
+                "token_usage": next_state.get("token_usage", token_usage),
+                "model": next_state.get("model", model),
                 "allowed_tools": next_state.get("allowed_tools", state.get("allowed_tools")),
                 "cancelled": bool(next_state.get("cancelled")),
                 "status": "cancelled" if next_state.get("cancelled") else "running",
@@ -316,6 +365,8 @@ class TurnRuntime:
             **state,
             "messages": llm_state["messages"],
             "step_count": llm_state["step_count"],
+            "token_usage": token_usage,
+            "model": model,
             "cancelled": bool(llm_state.get("cancelled")),
             "status": "cancelled" if llm_state.get("cancelled") else "completed",
                 "error": state.get("error"),
@@ -335,6 +386,8 @@ class TurnRuntime:
                 **state,
                 "messages": summary_state["messages"],
                 "step_count": summary_state["step_count"],
+                "token_usage": summary_state.get("token_usage", state.get("token_usage")),
+                "model": summary_state.get("model", state.get("model")),
                 "cancelled": bool(summary_state.get("cancelled")),
                 "status": "failed",
                 "error": summary_state.get("error") or "failed to summarize Codex result",
@@ -343,6 +396,8 @@ class TurnRuntime:
             **state,
             "messages": summary_state["messages"],
             "step_count": summary_state["step_count"],
+            "token_usage": summary_state.get("token_usage", state.get("token_usage")),
+            "model": summary_state.get("model", state.get("model")),
             "allowed_tools": summary_state.get("allowed_tools", state.get("allowed_tools")),
             "cancelled": bool(summary_state.get("cancelled")),
             "status": "completed",
@@ -430,8 +485,17 @@ class TurnRuntime:
             if isinstance(m, AIMessage) and (m.content or "").strip()
         ]
         reply = assistant_messages[-1].content if assistant_messages else ""
+        reply = _append_token_usage_footer(
+            str(reply),
+            token_usage=state.get("token_usage"),
+            model=state.get("model"),
+        )
 
         raw_payload: dict[str, Any] = {"source": "turn_runtime"}
+        if state.get("token_usage") is not None:
+            raw_payload["token_usage"] = state["token_usage"]
+        if state.get("model"):
+            raw_payload["model"] = state["model"]
         if assistant_messages:
             reasoning = assistant_messages[-1].response_metadata.get("reasoning_content") if assistant_messages[-1].response_metadata else None
             if reasoning is not None:
@@ -508,6 +572,7 @@ class AgentRuntime:
         self._graph = TurnRuntime(store, token_budget=token_budget)
 
     def run_turn(self, turn_id: int) -> TurnResult:
+        settings = get_settings()
         turn = self._store.get_turn(turn_id)
         if turn is None:
             raise ValueError(f"Turn not found: {turn_id}")
@@ -530,6 +595,8 @@ class AgentRuntime:
                 "status": "running",
                 "step_count": 0,
                 "token_budget": self._token_budget,
+                "token_usage": None,
+                "model": settings.deepseek_model,
                 "error": None,
             })
         except Exception as exc:
@@ -550,6 +617,8 @@ class AgentRuntime:
                 "status": "failed",
                 "step_count": 0,
                 "token_budget": self._token_budget,
+                "token_usage": None,
+                "model": settings.deepseek_model,
                 "error": str(exc),
             }
 
@@ -585,3 +654,32 @@ def _requested_capabilities_from_turn(turn: TurnRecord) -> tuple[str, ...]:
         if isinstance(item, str) and item not in capabilities:
             capabilities.append(item)
     return tuple(capabilities)
+
+
+def _should_merge_conversation_tool_intents(runtime_policy: RuntimePolicy) -> bool:
+    return runtime_policy.mode not in {"command", "image_generation"}
+
+
+def _append_token_usage_footer(
+    content: str,
+    *,
+    token_usage: dict[str, int] | None,
+    model: str | None,
+) -> str:
+    if not token_usage:
+        return content
+    prompt = int(token_usage.get("prompt_tokens", 0) or 0)
+    completion = int(token_usage.get("completion_tokens", 0) or 0)
+    total = int(token_usage.get("total_tokens", 0) or 0)
+    if prompt <= 0 and completion <= 0 and total <= 0:
+        return content
+    if total <= 0:
+        total = prompt + completion
+    model_text = model or "unknown"
+    footer = (
+        "---\n"
+        f"- 模型：`{model_text}`\n"
+        f"- Token：输入 `{prompt}` / 输出 `{completion}` / 合计 `{total}`"
+    )
+    stripped = content.rstrip()
+    return f"{stripped}\n\n{footer}" if stripped else footer

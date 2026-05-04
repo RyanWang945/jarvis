@@ -1,0 +1,337 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="1040" viewBox="0 0 1400 1040" role="img" aria-labelledby="title desc">
+  <title id="title">Jarvis 个人 AI 助手架构图</title>
+  <desc id="desc">一个上下分层的 Jarvis 架构 SVG 图，包含用户界面层、核心引擎层、工具层、存储层和模型层，并用箭头标明数据流向。</desc>
+
+  <defs>
+    <linearGradient id="pageGradient" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f7fbfd"/>
+      <stop offset="100%" stop-color="#eef6f8"/>
+    </linearGradient>
+
+    <filter id="softShadow" x="-10%" y="-20%" width="120%" height="150%">
+      <feDropShadow dx="0" dy="8" stdDeviation="9" flood-color="#0f2f3f" flood-opacity="0.11"/>
+    </filter>
+
+    <marker id="arrowPrimary" markerWidth="14" markerHeight="14" refX="11" refY="7" orient="auto" markerUnits="strokeWidth">
+      <path d="M 1 1 L 12 7 L 1 13 z" fill="#1e7d91"/>
+    </marker>
+
+    <marker id="arrowMuted" markerWidth="14" markerHeight="14" refX="11" refY="7" orient="auto" markerUnits="strokeWidth">
+      <path d="M 1 1 L 12 7 L 1 13 z" fill="#668496"/>
+    </marker>
+
+    <style>
+      .bg {
+        fill: url(#pageGradient);
+      }
+
+      .title {
+        font-family: "Noto Sans CJK SC", "Microsoft YaHei", "PingFang SC", "Source Han Sans SC", Arial, sans-serif;
+        font-size: 34px;
+        font-weight: 700;
+        fill: #153747;
+        letter-spacing: 0;
+      }
+
+      .subtitle {
+        font-family: "Noto Sans CJK SC", "Microsoft YaHei", "PingFang SC", "Source Han Sans SC", Arial, sans-serif;
+        font-size: 15px;
+        fill: #607887;
+        letter-spacing: 0;
+      }
+
+      .layer {
+        fill: rgba(255, 255, 255, 0.82);
+        stroke: #c9dce4;
+        stroke-width: 1.5;
+        rx: 18;
+        filter: url(#softShadow);
+      }
+
+      .layerHeader {
+        fill: #e1f0f4;
+      }
+
+      .layerTitle {
+        font-family: "Noto Sans CJK SC", "Microsoft YaHei", "PingFang SC", "Source Han Sans SC", Arial, sans-serif;
+        font-size: 19px;
+        font-weight: 700;
+        fill: #173b4b;
+        letter-spacing: 0;
+      }
+
+      .layerNote {
+        font-family: "Noto Sans CJK SC", "Microsoft YaHei", "PingFang SC", "Source Han Sans SC", Arial, sans-serif;
+        font-size: 12px;
+        fill: #6f8794;
+        letter-spacing: 0;
+      }
+
+      .module {
+        fill: #ffffff;
+        stroke: #bfd5de;
+        stroke-width: 1.4;
+        rx: 12;
+      }
+
+      .moduleAccent {
+        fill: #dff5f7;
+      }
+
+      .moduleText {
+        font-family: "Noto Sans CJK SC", "Microsoft YaHei", "PingFang SC", "Source Han Sans SC", Arial, sans-serif;
+        font-size: 16px;
+        font-weight: 650;
+        fill: #1e4554;
+        letter-spacing: 0;
+      }
+
+      .moduleSubText {
+        font-family: "Noto Sans CJK SC", "Microsoft YaHei", "PingFang SC", "Source Han Sans SC", Arial, sans-serif;
+        font-size: 12px;
+        fill: #6a8190;
+        letter-spacing: 0;
+      }
+
+      .core {
+        fill: #f5fcfd;
+        stroke: #4aa4b5;
+        stroke-width: 2;
+        rx: 16;
+      }
+
+      .coreTitle {
+        font-family: "Noto Sans CJK SC", "Microsoft YaHei", "PingFang SC", "Source Han Sans SC", Arial, sans-serif;
+        font-size: 21px;
+        font-weight: 800;
+        fill: #115365;
+        letter-spacing: 0;
+      }
+
+      .arrow {
+        fill: none;
+        stroke: #1e7d91;
+        stroke-width: 2.4;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        marker-end: url(#arrowPrimary);
+      }
+
+      .arrowMuted {
+        fill: none;
+        stroke: #668496;
+        stroke-width: 2;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        stroke-dasharray: 7 7;
+        marker-end: url(#arrowMuted);
+      }
+
+      .flowLabel {
+        font-family: "Noto Sans CJK SC", "Microsoft YaHei", "PingFang SC", "Source Han Sans SC", Arial, sans-serif;
+        font-size: 12px;
+        font-weight: 600;
+        fill: #315b6d;
+        letter-spacing: 0;
+      }
+
+      .labelPill {
+        fill: #ffffff;
+        stroke: #d7e5eb;
+        stroke-width: 1;
+        rx: 10;
+      }
+    </style>
+  </defs>
+
+  <rect class="bg" width="1400" height="1040"/>
+
+  <g transform="translate(70 42)">
+    <text class="title" x="0" y="0" dominant-baseline="hanging">Jarvis 个人 AI 助手架构</text>
+    <text class="subtitle" x="0" y="48" dominant-baseline="hanging">分层架构 · 意图驱动 · 工具编排 · 本地与业务知识增强</text>
+  </g>
+
+  <!-- 用户界面层 -->
+  <g id="ui-layer" transform="translate(70 112)">
+    <rect class="layer" x="0" y="0" width="1260" height="132" rx="18"/>
+    <rect class="layerHeader" x="0" y="0" width="210" height="132" rx="18"/>
+    <text class="layerTitle" x="30" y="46">用户界面层</text>
+    <text class="layerNote" x="30" y="75">Input / Output</text>
+
+    <g transform="translate(330 34)">
+      <rect class="module" x="0" y="0" width="260" height="64" rx="12"/>
+      <rect class="moduleAccent" x="0" y="0" width="8" height="64" rx="4"/>
+      <text class="moduleText" x="28" y="27">终端 / 聊天界面</text>
+      <text class="moduleSubText" x="28" y="48">文本输入、任务反馈、结果展示</text>
+    </g>
+
+    <g transform="translate(680 34)">
+      <rect class="module" x="0" y="0" width="260" height="64" rx="12"/>
+      <rect class="moduleAccent" x="0" y="0" width="8" height="64" rx="4"/>
+      <text class="moduleText" x="28" y="27">语音交互</text>
+      <text class="moduleSubText" x="28" y="48">语音识别、语音播报、唤醒入口</text>
+    </g>
+  </g>
+
+  <!-- 核心引擎层 -->
+  <g id="core-layer" transform="translate(70 294)">
+    <rect class="layer" x="0" y="0" width="1260" height="170" rx="18"/>
+    <rect class="layerHeader" x="0" y="0" width="210" height="170" rx="18"/>
+    <text class="layerTitle" x="30" y="60">核心引擎层</text>
+    <text class="layerNote" x="30" y="89">Jarvis Core</text>
+
+    <g transform="translate(265 28)">
+      <rect class="core" x="0" y="0" width="820" height="114" rx="16"/>
+      <text class="coreTitle" x="410" y="26" text-anchor="middle">Jarvis Core</text>
+
+      <g transform="translate(48 52)">
+        <rect class="module" x="0" y="0" width="205" height="42" rx="10"/>
+        <text class="moduleText" x="102.5" y="26" text-anchor="middle">意图路由</text>
+      </g>
+      <g transform="translate(307 52)">
+        <rect class="module" x="0" y="0" width="205" height="42" rx="10"/>
+        <text class="moduleText" x="102.5" y="26" text-anchor="middle">上下文管理</text>
+      </g>
+      <g transform="translate(566 52)">
+        <rect class="module" x="0" y="0" width="205" height="42" rx="10"/>
+        <text class="moduleText" x="102.5" y="26" text-anchor="middle">工具调度</text>
+      </g>
+    </g>
+  </g>
+
+  <!-- 工具层 -->
+  <g id="tools-layer" transform="translate(70 514)">
+    <rect class="layer" x="0" y="0" width="1260" height="176" rx="18"/>
+    <rect class="layerHeader" x="0" y="0" width="210" height="176" rx="18"/>
+    <text class="layerTitle" x="30" y="61">工具层</text>
+    <text class="layerNote" x="30" y="90">Tools &amp; Plugins</text>
+
+    <g transform="translate(250 34)">
+      <rect class="module" x="0" y="0" width="174" height="74" rx="12"/>
+      <text class="moduleText" x="87" y="31" text-anchor="middle">Codex</text>
+      <text class="moduleSubText" x="87" y="52" text-anchor="middle">仓库操作</text>
+    </g>
+
+    <g transform="translate(450 34)">
+      <rect class="module" x="0" y="0" width="174" height="74" rx="12"/>
+      <text class="moduleText" x="87" y="31" text-anchor="middle">Obsidian</text>
+      <text class="moduleSubText" x="87" y="52" text-anchor="middle">Wiki 查询</text>
+    </g>
+
+    <g transform="translate(650 34)">
+      <rect class="module" x="0" y="0" width="194" height="74" rx="12"/>
+      <text class="moduleText" x="97" y="31" text-anchor="middle">Business Knowledge</text>
+      <text class="moduleSubText" x="97" y="52" text-anchor="middle">业务知识搜索</text>
+    </g>
+
+    <g transform="translate(870 34)">
+      <rect class="module" x="0" y="0" width="154" height="74" rx="12"/>
+      <text class="moduleText" x="77" y="31" text-anchor="middle">定时任务</text>
+      <text class="moduleSubText" x="77" y="52" text-anchor="middle">计划与触发</text>
+    </g>
+
+    <g transform="translate(1050 34)">
+      <rect class="module" x="0" y="0" width="154" height="74" rx="12"/>
+      <text class="moduleText" x="77" y="31" text-anchor="middle">Shell 执行</text>
+      <text class="moduleSubText" x="77" y="52" text-anchor="middle">命令运行</text>
+    </g>
+  </g>
+
+  <!-- 存储层 -->
+  <g id="storage-layer" transform="translate(70 738)">
+    <rect class="layer" x="0" y="0" width="1260" height="156" rx="18"/>
+    <rect class="layerHeader" x="0" y="0" width="210" height="156" rx="18"/>
+    <text class="layerTitle" x="30" y="52">存储层</text>
+    <text class="layerNote" x="30" y="81">Storage &amp; Memory</text>
+
+    <g transform="translate(250 42)">
+      <rect class="module" x="0" y="0" width="200" height="68" rx="12"/>
+      <text class="moduleText" x="100" y="29" text-anchor="middle">本地文件系统</text>
+      <text class="moduleSubText" x="100" y="50" text-anchor="middle">代码、配置、日志</text>
+    </g>
+
+    <g transform="translate(480 42)">
+      <rect class="module" x="0" y="0" width="200" height="68" rx="12"/>
+      <text class="moduleText" x="100" y="29" text-anchor="middle">Obsidian 知识库</text>
+      <text class="moduleSubText" x="100" y="50" text-anchor="middle">个人 Wiki / Vault</text>
+    </g>
+
+    <g transform="translate(710 42)">
+      <rect class="module" x="0" y="0" width="230" height="68" rx="12"/>
+      <text class="moduleText" x="115" y="29" text-anchor="middle">业务知识库</text>
+      <text class="moduleSubText" x="115" y="50" text-anchor="middle">OpenSearch 索引</text>
+    </g>
+
+    <g transform="translate(970 42)">
+      <rect class="module" x="0" y="0" width="220" height="68" rx="12"/>
+      <text class="moduleText" x="110" y="29" text-anchor="middle">会话上下文</text>
+      <text class="moduleSubText" x="110" y="50" text-anchor="middle">短期记忆 / 状态</text>
+    </g>
+  </g>
+
+  <!-- 模型层 -->
+  <g id="model-layer" transform="translate(70 932)">
+    <rect class="layer" x="0" y="0" width="1260" height="84" rx="18"/>
+    <rect class="layerHeader" x="0" y="0" width="210" height="84" rx="18"/>
+    <text class="layerTitle" x="30" y="28">模型层</text>
+    <text class="layerNote" x="30" y="55">Models</text>
+
+    <g transform="translate(420 18)">
+      <rect class="module" x="0" y="0" width="220" height="48" rx="12"/>
+      <text class="moduleText" x="110" y="30" text-anchor="middle">本地模型</text>
+    </g>
+
+    <g transform="translate(760 18)">
+      <rect class="module" x="0" y="0" width="220" height="48" rx="12"/>
+      <text class="moduleText" x="110" y="30" text-anchor="middle">API 模型</text>
+    </g>
+  </g>
+
+  <!-- 主数据流 -->
+  <path class="arrow" d="M 530 210 C 530 250, 530 268, 530 294"/>
+  <path class="arrow" d="M 810 210 C 810 250, 810 268, 810 294"/>
+  <rect class="labelPill" x="615" y="248" width="170" height="26" rx="10"/>
+  <text class="flowLabel" x="700" y="266" text-anchor="middle">用户请求 / 多模态输入</text>
+
+  <path class="arrow" d="M 700 464 C 700 490, 700 498, 700 514"/>
+  <rect class="labelPill" x="631" y="479" width="138" height="26" rx="10"/>
+  <text class="flowLabel" x="700" y="497" text-anchor="middle">意图解析与调度</text>
+
+  <path class="arrow" d="M 700 690 C 700 716, 700 724, 700 738"/>
+  <rect class="labelPill" x="638" y="704" width="124" height="26" rx="10"/>
+  <text class="flowLabel" x="700" y="722" text-anchor="middle">读写数据与记忆</text>
+
+  <path class="arrow" d="M 670 894 C 670 914, 582 913, 550 932"/>
+  <path class="arrow" d="M 730 894 C 730 914, 818 913, 870 932"/>
+  <rect class="labelPill" x="612" y="902" width="176" height="26" rx="10"/>
+  <text class="flowLabel" x="700" y="920" text-anchor="middle">检索增强 / 推理生成</text>
+
+  <!-- 模块间关系 -->
+  <path class="arrowMuted" d="M 498 380 L 568 380"/>
+  <path class="arrowMuted" d="M 757 380 L 827 380"/>
+
+  <path class="arrowMuted" d="M 917 406 C 1116 406, 1175 482, 1127 548"/>
+  <rect class="labelPill" x="1048" y="421" width="112" height="24" rx="10"/>
+  <text class="flowLabel" x="1104" y="438" text-anchor="middle">命令执行</text>
+
+  <path class="arrowMuted" d="M 657 406 C 566 454, 548 584, 580 780"/>
+  <rect class="labelPill" x="498" y="600" width="112" height="24" rx="10"/>
+  <text class="flowLabel" x="554" y="617" text-anchor="middle">上下文读写</text>
+
+  <path class="arrowMuted" d="M 886 406 C 985 474, 1057 614, 1080 780"/>
+  <rect class="labelPill" x="1015" y="600" width="112" height="24" rx="10"/>
+  <text class="flowLabel" x="1071" y="617" text-anchor="middle">状态更新</text>
+
+  <path class="arrowMuted" d="M 337 622 C 337 680, 350 710, 350 780"/>
+  <path class="arrowMuted" d="M 537 622 C 537 680, 580 710, 580 780"/>
+  <path class="arrowMuted" d="M 747 622 C 747 680, 825 710, 825 780"/>
+  <path class="arrowMuted" d="M 1127 622 C 1127 680, 1080 710, 1080 780"/>
+
+  <path class="arrowMuted" d="M 530 932 C 515 900, 482 810, 350 806"/>
+  <path class="arrowMuted" d="M 870 932 C 910 894, 960 820, 1080 806"/>
+
+  <!-- 返回路径 -->
+  <path class="arrowMuted" d="M 1244 358 C 1326 358, 1326 170, 940 170"/>
+  <rect class="labelPill" x="1164" y="250" width="122" height="24" rx="10"/>
+  <text class="flowLabel" x="1225" y="267" text-anchor="middle">结果返回</text>
+</svg>

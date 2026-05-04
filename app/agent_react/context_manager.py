@@ -12,6 +12,7 @@ from app.agent_react.session_state import ConversationSessionState, render_sessi
 from app.llm.client import LLMMessage
 from app.repositories import RepositoryRegistryError, get_repository_registry
 from app.skills.bootstrap import get_skill_registry
+from utils.token_counter import count_text_tokens
 
 SYSTEM_PROMPT = _SYSTEM_PROMPT = """
 你是 Jarvis，一个本地运行的个人 AI 助手。
@@ -24,6 +25,8 @@ SYSTEM_PROMPT = _SYSTEM_PROMPT = """
 3. 对用户明确要求的任务，应尽量完成；不要在信息足够时反复追问。
 4. 不确定、不完整或工具失败时，必须如实说明。
 5. 不要编造搜索结果、文件内容、工具输出、执行状态或系统能力。
+6. 最终回复内容是给人类用户阅读的，应清晰、自然、可执行；不要输出内部协议、调试字段、隐藏状态或机器可读包装。
+7. 不要自行编写 token usage、模型名或系统统计信息；这些由 Jarvis runtime 在消息末尾统一追加。
 
 工具使用规则：
 1. 只能使用当前 runtime 明确允许的工具。
@@ -45,6 +48,10 @@ SYSTEM_PROMPT = _SYSTEM_PROMPT = """
 2. 不要声称已经执行未实际执行的操作。
 3. 不要绕过工具权限、runtime policy 或用户授权边界。
 """
+
+_MAX_SELECTED_SKILLS = 3
+_MAX_SKILL_BODY_TOKENS = 800
+_MAX_TOTAL_SKILL_TOKENS = 1800
 
 
 def slice_records_through_trigger(records: list, trigger_message_id: int | None) -> list:
@@ -196,27 +203,11 @@ class ContextManager:
         if not skill_names:
             return messages
 
-        registry = get_skill_registry()
-        sections: list[str] = []
-        for skill_name in skill_names:
-            try:
-                skill = registry.get(skill_name)
-            except ValueError:
-                continue
-            body = skill.load_body().strip()
-            if not body:
-                continue
-            sections.append(f"[Skill: {skill.name}]\n{body}")
-
-        if not sections:
+        rendered = self._render_selected_skills(skill_names)
+        if rendered is None:
             return messages
 
-        skill_message = SystemMessage(
-            content=(
-                "Selected skills for this turn. Use them as procedural guidance when relevant.\n\n"
-                + "\n\n".join(sections)
-            )
-        )
+        skill_message = SystemMessage(content=rendered)
         return [skill_message, *messages]
 
     def build_context_header(
@@ -251,12 +242,24 @@ class ContextManager:
 
         registry = get_skill_registry()
         sections: list[str] = []
-        for skill_name in skill_names:
-            skill = registry.get(skill_name)
-            body = skill.load_body().strip()
+        total_tokens = 0
+        for skill_name in skill_names[:_MAX_SELECTED_SKILLS]:
+            try:
+                skill = registry.get(skill_name)
+            except ValueError:
+                continue
+            body = self._bounded_skill_body(skill.load_body().strip())
             if not body:
                 continue
-            sections.append(f"[Skill: {skill.name}]\n{body}")
+            section = f"[Skill: {skill.name}]\n{body}"
+            section_tokens = self.estimate_text_tokens(section)
+            if total_tokens and total_tokens + section_tokens > _MAX_TOTAL_SKILL_TOKENS:
+                break
+            if section_tokens > _MAX_TOTAL_SKILL_TOKENS:
+                section = self._truncate_text_by_tokens(section, _MAX_TOTAL_SKILL_TOKENS)
+                section_tokens = self.estimate_text_tokens(section)
+            sections.append(section)
+            total_tokens += section_tokens
 
         if not sections:
             return None
@@ -265,6 +268,17 @@ class ContextManager:
             "Selected skills for this turn. Use them as procedural guidance when relevant.\n\n"
             + "\n\n".join(sections)
         )
+
+    def _bounded_skill_body(self, body: str) -> str:
+        if not body:
+            return ""
+        return self._truncate_text_by_tokens(body, _MAX_SKILL_BODY_TOKENS)
+
+    def _truncate_text_by_tokens(self, text: str, max_tokens: int) -> str:
+        if self.estimate_text_tokens(text) <= max_tokens:
+            return text
+        max_chars = max(0, max_tokens * 4)
+        return text[:max_chars].rstrip() + "\n\n[Skill content truncated by Jarvis token budget.]"
 
     def _render_repository_context(
         self,
@@ -367,11 +381,7 @@ class ContextManager:
         return [header, *lc_messages], skill_names
 
     def estimate_text_tokens(self, text: str) -> int:
-        if not text:
-            return 0
-        # Lightweight heuristic: mixed Chinese/English text tends to average
-        # around 3-4 chars per token once prompt overhead is included.
-        return max(1, (len(text) + 3) // 4)
+        return count_text_tokens(text)
 
     def estimate_message_tokens(self, message: BaseMessage) -> int:
         content = str(message.content or "")

@@ -55,6 +55,8 @@ class Settings(BaseSettings):
     gemini_model: str = "gemini-2.5-flash"
     tavily_api_key: str | None = None
     tavily_base_url: str = "https://api.tavily.com"
+    xai_api_key: str | None = None
+    xai_base_url: str = "https://api.x.ai/v1"
     feishu_app_id: str | None = None
     feishu_app_secret: str | None = None
     feishu_bot_name: str = "Jarvis"

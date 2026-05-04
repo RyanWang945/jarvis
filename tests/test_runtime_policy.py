@@ -10,6 +10,7 @@ def test_research_policy_exposes_research_tools_and_budget() -> None:
 
     assert policy.mode == "research"
     assert "tavily_search" in policy.allowed_tools
+    assert "x_search" in policy.allowed_tools
     assert "business_knowledge_search" in policy.allowed_tools
     assert "delegate_to_codex" not in policy.allowed_tools
     assert policy.max_steps == 10
@@ -21,6 +22,7 @@ def test_chat_policy_does_not_expose_coder_tools() -> None:
 
     assert policy.mode == "chat"
     assert "tavily_search" not in policy.allowed_tools
+    assert "x_search" not in policy.allowed_tools
     assert "obsidian_wiki_draft" not in policy.allowed_tools
     assert "obsidian_wiki_apply" not in policy.allowed_tools
     assert "obsidian_wiki_query" in policy.allowed_tools
@@ -71,6 +73,7 @@ def test_coding_policy_exposes_search_when_web_capability_requested() -> None:
     assert policy.mode == "coding"
     assert "delegate_to_codex" in policy.allowed_tools
     assert "tavily_search" in policy.allowed_tools
+    assert "x_search" in policy.allowed_tools
     assert policy.search_budget == 2
 
 

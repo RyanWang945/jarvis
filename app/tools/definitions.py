@@ -19,6 +19,7 @@ from app.tools.scheduled_task import run_scheduled_task
 from app.tools.tavily import run_tavily_search
 from app.tools.tool_search import run_tool_search
 from app.tools.write_file import run_write_file
+from app.tools.x_search import run_x_search
 
 RiskLevel = Literal["low", "medium", "high", "critical"]
 ExecutionMode = Literal["direct", "proposal"]
@@ -448,6 +449,8 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
             description=(
                 "Search the web using Tavily AI Search API. "
                 "Use this when the user asks about current events, facts, or anything that requires up-to-date information from the internet. "
+                "It can also find indexed X/Twitter pages or web coverage of X/Twitter activity when a general web/news search is enough. "
+                "For direct live X/Twitter post search, latest tweets, named account posts, or social sentiment on X, prefer the specialized x_search tool. "
                 "Search ONCE per question. After receiving results, summarize them and reply to the user immediately. "
                 "Do NOT search the same topic multiple times."
             ),
@@ -489,6 +492,64 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
                 "required": ["query"],
             },
             handler=run_tavily_search,
+            risk_level="low",
+            execution_mode="direct",
+        ),
+        ToolDefinition(
+            name="x_search",
+            description=(
+                "Search public X/Twitter posts using the xAI Responses API with the x_search server-side tool. "
+                "This is the specialized tool for direct X/Twitter search. Prefer it when the user asks for Twitter/X search, tweets, latest tweets, X posts, "
+                "posts from named X accounts, public reactions on X/Twitter, social sentiment, or what people are saying on X. "
+                "Examples include: latest twitter, latest tweet, search Twitter, search X, 推特, 推文, X 上, Twitter 上, "
+                "马斯克的最新twitter, or what a specific account posted. Prefer handles when the user names accounts, date_from/date_to "
+                "for a time window, and include_images/include_video only when visual posts matter. Return citations to "
+                "original posts when available."
+            ),
+            args_schema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The social search query to run against X/Twitter posts.",
+                    },
+                    "handles": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional X handles to include, without @. Cannot be combined with exclude_handles.",
+                    },
+                    "exclude_handles": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional X handles to exclude, without @. Cannot be combined with handles.",
+                    },
+                    "date_from": {
+                        "type": "string",
+                        "description": "Optional inclusive start date in YYYY-MM-DD format.",
+                    },
+                    "date_to": {
+                        "type": "string",
+                        "description": "Optional inclusive end date in YYYY-MM-DD format.",
+                    },
+                    "include_images": {
+                        "type": "boolean",
+                        "description": "Enable image understanding for visual X posts when the user asks about images.",
+                        "default": False,
+                    },
+                    "include_video": {
+                        "type": "boolean",
+                        "description": "Enable video understanding for video posts when the user asks about videos.",
+                        "default": False,
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum notable posts or citations to request from the model, between 1 and 20.",
+                        "default": 8,
+                    },
+                },
+                "required": ["query"],
+            },
+            handler=run_x_search,
             risk_level="low",
             execution_mode="direct",
         ),

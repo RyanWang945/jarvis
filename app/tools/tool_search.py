@@ -69,6 +69,8 @@ def _candidate_tools(text: str) -> list[dict[str, Any]]:
         candidates.append(_candidate("delegate_to_codex", "high", "high", "Inspect or modify a registered local repository."))
     if _looks_like_web_search(lowered):
         candidates.append(_candidate("tavily_search", "high", "low", "Search the web for current or external facts."))
+    if _looks_like_social_search(lowered):
+        candidates.append(_candidate("x_search", "high", "low", "Search X/Twitter posts and public social reactions."))
     if _looks_like_wiki_write(lowered):
         candidates.append(_candidate("obsidian_wiki_draft", "medium", "medium", "Draft a wiki page or note before applying it."))
     if _looks_like_memory_query(lowered):
@@ -152,6 +154,29 @@ def _looks_like_reminder(text: str) -> bool:
 def _looks_like_repo_work(text: str) -> bool:
     if any(marker in text for marker in ("repo", "repository", "仓库", "项目", "代码", "git", "diff", "branch", "commit", "push", "未提交")):
         return True
+    if re.search(
+        r"(?<![a-z0-9_./\\-])[\w./\\-]+\."
+        r"(py|ts|tsx|js|jsx|md|rst|toml|yaml|yml|json|sql|css|html)"
+        r"(?![a-z0-9_./\\-])",
+        text,
+    ):
+        return True
+    if any(
+        marker in text
+        for marker in (
+            "app/",
+            "app\\",
+            "tests/",
+            "tests\\",
+            "scripts/",
+            "scripts\\",
+            "docs/",
+            "docs\\",
+            "utils/",
+            "utils\\",
+        )
+    ):
+        return True
     try:
         registry = get_repository_registry()
         return any(str(repo.repo_id).lower() in text or str(repo.name).lower() in text for repo in registry.list_repositories())
@@ -161,6 +186,28 @@ def _looks_like_repo_work(text: str) -> bool:
 
 def _looks_like_web_search(text: str) -> bool:
     return any(marker in text for marker in ("latest", "current news", "recent", "today", "最新", "最近", "新闻", "当前事件", "网上", "搜索网页"))
+
+
+def _looks_like_social_search(text: str) -> bool:
+    return any(
+        marker in text
+        for marker in (
+            "x/twitter",
+            "twitter",
+            "tweet",
+            "tweets",
+            "x post",
+            "x posts",
+            "on x",
+            "社交舆情",
+            "推特",
+            "推文",
+            "x上",
+            "x 上",
+            "大家怎么说",
+            "网友怎么说",
+        )
+    )
 
 
 def _looks_like_wiki_write(text: str) -> bool:

@@ -12,6 +12,7 @@ from langgraph.graph import END, StateGraph
 from typing_extensions import TypedDict
 
 from app.agent_react.context_manager import ContextManager
+from app.agent_react.tool_intent_state import append_conversation_tool_intents
 from app.config import get_settings
 from app.llm.client import ChatClient
 from app.persistence.models import TurnRecord
@@ -70,6 +71,8 @@ class TurnStore(Protocol):
 
     def list_tool_calls_by_turn(self, turn_id: int) -> list: ...
 
+    def update_conversation_metadata(self, conversation_id: int, patch: dict[str, Any]) -> None: ...
+
 
 _MAX_REACT_STEPS = 8
 
@@ -81,6 +84,8 @@ class ReActState(TypedDict):
     status: str
     step_count: int
     token_budget: int | None
+    token_usage: dict[str, int] | None
+    model: str | None
     allowed_tools: list[str]
     max_steps: int
     search_budget: int | None
@@ -91,6 +96,7 @@ _TOOL_SEARCH_GRANTABLE_TOOLS = {
     "scheduled_task",
     "delegate_to_codex",
     "tavily_search",
+    "x_search",
     "obsidian_wiki_query",
     "business_knowledge_search",
     "obsidian_wiki_draft",
@@ -139,6 +145,42 @@ def _llm_response_to_ai_message(response: dict[str, Any]) -> AIMessage:
     return AIMessage(content=content, tool_calls=tool_calls, response_metadata=response_metadata)
 
 
+def _usage_from_response(response: dict[str, Any]) -> dict[str, int] | None:
+    usage = response.get("_usage")
+    if not isinstance(usage, dict):
+        usage = response.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    prompt = _coerce_usage_int(usage.get("prompt_tokens", usage.get("input_tokens")))
+    completion = _coerce_usage_int(usage.get("completion_tokens", usage.get("output_tokens")))
+    total = _coerce_usage_int(usage.get("total_tokens"))
+    if total == 0:
+        total = prompt + completion
+    if prompt == 0 and completion == 0 and total == 0:
+        return None
+    return {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": total,
+    }
+
+
+def _coerce_usage_int(value: Any) -> int:
+    try:
+        return max(int(value or 0), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _merge_token_usage(current: dict[str, int] | None, addition: dict[str, int] | None) -> dict[str, int] | None:
+    if addition is None:
+        return current
+    merged = dict(current or {})
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        merged[key] = int(merged.get(key, 0) or 0) + int(addition.get(key, 0) or 0)
+    return merged
+
+
 def _latest_human_message_text(messages: list[BaseMessage]) -> str:
     for message in reversed(messages):
         if isinstance(message, HumanMessage):
@@ -173,6 +215,8 @@ def _strengthen_codex_contract(tool_args: dict[str, Any], messages: list[BaseMes
         user_requested_commit = False
         user_requested_push = False
     user_requested_edit = _has_pattern(latest_user_text, _EDIT_INTENT_PATTERN)
+    if _looks_like_diagnosis_or_plan_only_request(latest_user_text):
+        user_requested_edit = False
     user_requested_execution = user_requested_edit or user_requested_commit or user_requested_push
     instruction = str(tool_args.get("instruction") or "").strip()
     needs_contract_rewrite = _codex_instruction_was_downgraded(
@@ -200,7 +244,7 @@ def _strengthen_codex_contract(tool_args: dict[str, Any], messages: list[BaseMes
                 "Original user request:",
                 latest_user_text,
                 "",
-                "Planner-provided draft instruction, for context only:",
+                "Model-provided delegate instruction, for context only:",
                 instruction or "(empty)",
             ]
         )
@@ -232,6 +276,37 @@ def _looks_like_uncommitted_status_request(text: str) -> bool:
     if not any(marker in lowered for marker in ("未提交", "uncommitted", "not committed", "not yet committed")):
         return False
     return any(marker in lowered for marker in ("多少", "几个", "哪些", "内容", "状态", "status", "changes", "diff", "有"))
+
+
+def _looks_like_diagnosis_or_plan_only_request(text: str) -> bool:
+    lowered = text.lower()
+    if any(marker in lowered for marker in ("commit", "push")):
+        return False
+    execution_markers = (
+        "do it",
+        "apply it",
+        "implement it",
+        "fix it",
+        "make the change",
+    )
+    if any(marker in lowered for marker in execution_markers):
+        return False
+    planning_markers = (
+        "plan",
+        "root cause",
+        "diagnose",
+        "tell me",
+        "show me",
+        "explain",
+        "先告诉我",
+        "告诉我",
+        "看看具体是什么问题",
+        "什么问题",
+        "修改的计划",
+        "修改计划",
+        "修复计划",
+    )
+    return any(marker in lowered for marker in planning_markers)
 
 
 def _is_turn_cancelled(store: TurnStore, turn_id: int) -> bool:
@@ -292,6 +367,21 @@ def call_llm(state: ReActState, store: TurnStore) -> ReActState:
             "step_count": state.get("step_count", 0) + 1,
         }
 
+    response_usage = _usage_from_response(response)
+    token_usage = _merge_token_usage(state.get("token_usage"), response_usage)
+    model_name = str(response.get("_model") or state.get("model") or settings.deepseek_model)
+    if response_usage is not None:
+        logger.info(
+            "llm_usage turn_id=%s step=%s model=%s prompt=%s completion=%s total=%s turn_total=%s",
+            state["turn_id"],
+            state.get("step_count", 0) + 1,
+            model_name,
+            response_usage["prompt_tokens"],
+            response_usage["completion_tokens"],
+            response_usage["total_tokens"],
+            token_usage["total_tokens"] if token_usage else 0,
+        )
+
     ai_message = _llm_response_to_ai_message(response)
     if ai_message.tool_calls:
         logger.info(
@@ -314,6 +404,8 @@ def call_llm(state: ReActState, store: TurnStore) -> ReActState:
         "status": "running",
         "messages": messages + [ai_message],
         "step_count": state.get("step_count", 0) + 1,
+        "token_usage": token_usage,
+        "model": model_name,
     }
 def _execute_single_tool(tool_name: str, tool_args: dict[str, Any]) -> tuple[bool, str]:
     tool = get_tool_definition(tool_name)
@@ -358,7 +450,12 @@ def _inject_tool_runtime_context(
     return injected
 
 
-def _tools_granted_by_tool_search(output: str, messages: list[BaseMessage]) -> list[str]:
+def _tools_granted_by_tool_search(
+    output: str,
+    messages: list[BaseMessage],
+    *,
+    original_user_request: str | None = None,
+) -> list[str]:
     try:
         payload = json.loads(output)
     except json.JSONDecodeError:
@@ -368,7 +465,7 @@ def _tools_granted_by_tool_search(output: str, messages: list[BaseMessage]) -> l
     candidates = payload.get("candidates")
     if not isinstance(candidates, list):
         return []
-    latest_user_text = _latest_human_message_text(messages)
+    latest_user_text = (original_user_request or "").strip() or _latest_human_message_text(messages)
     granted: list[str] = []
     for candidate in candidates:
         if not isinstance(candidate, dict):
@@ -393,6 +490,8 @@ def _tool_search_candidate_allowed(tool_name: str, user_text: str) -> bool:
         return _looks_like_repository_request(text)
     if tool_name == "tavily_search":
         return _looks_like_web_request(text)
+    if tool_name == "x_search":
+        return _looks_like_social_search_request(text)
     if tool_name in {"obsidian_wiki_draft", "obsidian_wiki_apply"}:
         return _looks_like_wiki_write_request(text)
     if tool_name in {"obsidian_wiki_query", "business_knowledge_search"}:
@@ -445,6 +544,28 @@ def _looks_like_repository_request(text: str) -> bool:
 
 def _looks_like_web_request(text: str) -> bool:
     return any(marker in text for marker in ("latest", "recent", "today", "current news", "最新", "最近", "新闻", "网上", "网页搜索"))
+
+
+def _looks_like_social_search_request(text: str) -> bool:
+    return any(
+        marker in text
+        for marker in (
+            "x/twitter",
+            "twitter",
+            "tweet",
+            "tweets",
+            "x post",
+            "x posts",
+            "on x",
+            "社交舆情",
+            "推特",
+            "推文",
+            "x上",
+            "x 上",
+            "大家怎么说",
+            "网友怎么说",
+        )
+    )
 
 
 def _looks_like_wiki_write_request(text: str) -> bool:
@@ -582,7 +703,20 @@ def execute_tools(state: ReActState, store: TurnStore) -> ReActState:
                     )
                 ok, output = _execute_single_tool(tool_name, execution_args)
                 if ok and tool_name == "tool_search":
-                    granted_tools.extend(_tools_granted_by_tool_search(output, state["messages"]))
+                    new_grants = _tools_granted_by_tool_search(
+                        output,
+                        state["messages"],
+                        original_user_request=str(tool_args.get("original_user_request") or ""),
+                    )
+                    logger.info(
+                        "tool_search grant evaluation turn_id=%s step=%s tool_call_id=%s granted_tools=%s output_preview=%s",
+                        state["turn_id"],
+                        step_index,
+                        tool_call_id,
+                        new_grants,
+                        repr(output[:300]),
+                    )
+                    granted_tools.extend(new_grants)
                 if not ok:
                     logger.warning(
                         "tool execution failed turn_id=%s step=%s tool=%s tool_call_id=%s output_preview=%s",
@@ -657,9 +791,20 @@ def execute_tools(state: ReActState, store: TurnStore) -> ReActState:
         tool_messages.append(ToolMessage(content=output, tool_call_id=tool_call_id))
 
     allowed_tools = list(state.get("allowed_tools") or [])
+    added_tools: list[str] = []
     for tool_name in granted_tools:
         if tool_name not in allowed_tools:
             allowed_tools.append(tool_name)
+            added_tools.append(tool_name)
+    if added_tools:
+        added_conversation_tools = append_conversation_tool_intents(store, turn.conversation_id, added_tools)
+        logger.info(
+            "runtime allowed_tools expanded turn_id=%s granted_tools=%s allowed_tools=%s conversation_added_tools=%s",
+            state["turn_id"],
+            added_tools,
+            allowed_tools,
+            added_conversation_tools,
+        )
 
     return {
         **state,
