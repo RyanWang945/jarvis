@@ -1,66 +1,33 @@
 ---
-name: x-search
-description: Search X (Twitter) posts using the xAI API. Use when the user wants to find tweets, search X/Twitter, look up what people are saying on X, or find social media posts about a topic.
-homepage: https://docs.x.ai/developers/tools/x-search
-metadata:
-  {
-    "openclaw":
-      {
-        "emoji": "𝕏",
-        "requires": { "bins": ["python3"], "env": ["XAI_API_KEY"] },
-        "primaryEnv": "XAI_API_KEY",
-        "install":
-          [
-            {
-              "id": "python-brew",
-              "kind": "brew",
-              "formula": "python",
-              "bins": ["python3"],
-              "label": "Install Python (brew)",
-            },
-          ],
-      },
-  }
+name: social-search-guide
+description: Use when answering questions about public discussion on X/Twitter or notable social posts.
+when_to_use: User asks what people are saying on X/Twitter, asks for tweets, public reactions, social sentiment, or notable posts from specific X accounts.
+tools:
+  - x_search
+tags:
+  - search
+  - social
+  - summarization
 ---
 
-# X Search
+# Social Search Guide
 
-Search X (Twitter) posts using the xAI Grok API with real-time access to X content.
+Use `x_search` when the user explicitly asks about X/Twitter posts, tweets, named X accounts, social reactions, or public sentiment on X.
 
-## Setup
+Prefer ordinary web search when the user asks for verified facts, official announcements, news coverage, or sources outside social media.
 
-1. Get your API key: https://console.x.ai
-2. Set environment variable:
-   ```bash
-   export XAI_API_KEY="xai-your-key-here"
-   ```
-3. Or set `skills."x-search".apiKey` / `skills."x-search".env.XAI_API_KEY` in `~/.openclaw/openclaw.json`
+Parameter guidance:
 
-## Usage
+- Use `handles` when the user names specific accounts.
+- Use `exclude_handles` only when the user asks to filter accounts out.
+- Do not combine `handles` and `exclude_handles`.
+- Use `date_from` and `date_to` for explicit time windows.
+- Use `include_images` or `include_video` only when visual content matters.
+- Keep `max_results` small for quick sentiment checks and larger for broader reaction scans.
 
-```bash
-python3 {baseDir}/scripts/search.py "what is trending in AI right now"
-```
+Answer guidance:
 
-Useful flags:
-
-```bash
-# Filter by handles (max 10)
-python3 {baseDir}/scripts/search.py --handles jaaneek,OpenClaw "latest posts"
-
-# Exclude handles (max 10)
-python3 {baseDir}/scripts/search.py --exclude spambot,crypto_shill "trending AI"
-
-# Date range (YYYY-MM-DD)
-python3 {baseDir}/scripts/search.py --from 2026-03-01 --to 2026-03-20 "xAI grok updates"
-
-# Enable image/video understanding in posts
-python3 {baseDir}/scripts/search.py --images --video "product demos"
-```
-
-## Notes
-
-- Uses the xAI Responses API with `x_search` tool (Grok performs the search and summarizes results)
-- Cannot use `--handles` and `--exclude` at the same time
-- Results include citations with links to original X posts
-- Present results in a readable format with post content, authors, and citations
+- Separate facts from opinions and apparent sentiment.
+- Include notable posts or cited claims when available.
+- Mention source bias: X posts are public reactions, not representative polling.
+- Include source links or citations returned by the tool.
