@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Literal
 
+from app.tools.ask_user import run_ask_user
 from app.tools.business_knowledge import run_business_knowledge_search
 from app.tools.coder import run_coder_tool
 from app.tools.codex import run_codex_coder_tool
@@ -14,7 +15,9 @@ from app.tools.obsidian_wiki import (
     run_obsidian_wiki_query,
 )
 from app.tools.shell import run_shell_command, run_shell_inspect
+from app.tools.scheduled_task import run_scheduled_task
 from app.tools.tavily import run_tavily_search
+from app.tools.tool_search import run_tool_search
 from app.tools.write_file import run_write_file
 
 RiskLevel = Literal["low", "medium", "high", "critical"]
@@ -131,9 +134,13 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
             name="delegate_to_codex",
             description=(
                 "High-privilege delegation tool backed by Codex for local repository workflows. "
-                "Use this for substantial repository inspection, architecture review, reports, tests, "
+                "Use this for repository inspection, architecture review, reports, tests, "
                 "code edits, refactors, bug fixes, and git workflows inside a registered repository. "
-                "Do not use this for simple shell commands, general factual questions, or lightweight web search. "
+                "Lightweight repository inspection is allowed when the user asks about a local repository, "
+                "branch, diff, git status, tests, or uncommitted changes, but the final answer to the user "
+                "must explain the result in plain language. Do not return raw stdout, terse shell output, "
+                "or bare numbers such as diff stats without explaining what each number means. "
+                "Do not use this for general factual questions or lightweight web search. "
                 "Pass one compact outcome-oriented task: user goal, repo_id, constraints, permissions, "
                 "and verification expectations. Codex owns planning, repository inspection, command selection, "
                 "retry strategy, and approval requests. Do not turn the task into a step-by-step shell script "
@@ -152,7 +159,9 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
                             "Outcome-oriented task contract for Codex. Include the goal, constraints, "
                             "verification expectations, and whether commit or push is permitted; avoid "
                             "enumerating shell commands or recovery steps, and avoid routine pre-confirmation prompts. "
-                            "Do not downgrade explicit edit/commit/push requests into read-only inspection."
+                            "Do not downgrade explicit edit/commit/push requests into read-only inspection. "
+                            "For read-only status/diff/count requests, instruct Codex to return a user-facing explanation "
+                            "instead of raw stdout or unexplained numeric output."
                         ),
                     },
                     "repo_id": {
@@ -191,6 +200,74 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
             execution_mode="proposal",
             can_modify_files=True,
             requires_workdir=True,
+        ),
+        ToolDefinition(
+            name="ask_user",
+            description=(
+                "Ask the user one concise clarification question when required information is missing. "
+                "Use this when Jarvis cannot safely continue without a user choice, such as an ambiguous target, "
+                "unclear time, missing recipient, missing repository, or a required preference. "
+                "Do not use ask_user for permission to perform Codex operations; Codex approvals have their own flow. "
+                "Ask only the minimum necessary question, then stop and wait for the user's reply."
+            ),
+            args_schema={
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "The exact short question to show to the user.",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Brief internal reason why the answer is needed.",
+                    },
+                    "expected_answer_type": {
+                        "type": "string",
+                        "enum": ["free_text", "yes_no", "choice"],
+                        "default": "free_text",
+                    },
+                    "choices": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional concise choices when expected_answer_type is choice.",
+                    },
+                },
+                "required": ["question"],
+            },
+            handler=run_ask_user,
+            risk_level="low",
+        ),
+        ToolDefinition(
+            name="tool_search",
+            description=(
+                "Search Jarvis's tool catalog when the currently exposed low-risk tools cannot satisfy the user's request. "
+                "This tool only discovers candidate tools; it never executes them and never grants permission by itself. "
+                "Use it before asking for a hidden capability such as reminders, web search, repository work, or wiki writes. "
+                "If the request can be answered from the current conversation without any tool, or no suitable tool exists, "
+                "return no_capable_tool rather than forcing a tool. Never use tool_search as a retry mechanism after an "
+                "unrelated tool failure unless the original user request still clearly needs another capability."
+            ),
+            args_schema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Capability search query, expanded from the user's request without adding new intent.",
+                    },
+                    "original_user_request": {
+                        "type": "string",
+                        "description": "The user's original request or the relevant quoted part of it.",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum candidate tools to return. Defaults to 3.",
+                        "default": 3,
+                    },
+                },
+                "required": ["query"],
+            },
+            handler=run_tool_search,
+            risk_level="low",
         ),
         ToolDefinition(
             name="obsidian_wiki_query",
@@ -340,6 +417,31 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
             },
             handler=run_write_file,
             risk_level="medium",
+        ),
+        ToolDefinition(
+            name="scheduled_task",
+            description=(
+                "Create, list, or remove Jarvis reminder tasks when the user asks to be reminded, "
+                "notified later, woken up, or shown/cancelled existing reminders. "
+                "Use natural-language time_text such as 今天10点 or in 20 minutes; "
+                "Jarvis parses and validates the concrete schedule. "
+                "The runtime supplies conversation_id, platform, and external_chat_id automatically; "
+                "do not ask the user for those fields."
+            ),
+            args_schema={
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["create", "list", "remove"]},
+                    "job_id": {"type": "integer"},
+                    "title": {"type": "string"},
+                    "prompt": {"type": "string"},
+                    "time_text": {"type": "string"},
+                    "timezone": {"type": "string"},
+                },
+                "required": ["action"],
+            },
+            handler=run_scheduled_task,
+            risk_level="low",
         ),
         ToolDefinition(
             name="tavily_search",

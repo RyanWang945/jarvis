@@ -32,6 +32,7 @@ SYSTEM_PROMPT = _SYSTEM_PROMPT = """
 4. 不要用相同参数重复调用已经失败的工具；如果需要重试，必须改变策略或参数。
 5. 对网页、事实、实时信息查询，使用专用搜索工具；禁止用 shell 进行网页搜索或事实查询。
 6. 对 shell、文件写入、删除、网络请求、代码执行等有副作用操作，必须严格遵守工具策略和安全边界。
+7. 用户要求提醒、定时、稍后通知、到点叫醒或取消/查看提醒时，使用 scheduled_task 工具；创建提醒后如果用户还要求当前继续做其他任务，应继续完成后续任务。
 
 上下文与任务规则：
 1. 优先基于当前对话、可见上下文和工具结果回答。
@@ -56,6 +57,69 @@ def slice_records_through_trigger(records: list, trigger_message_id: int | None)
         if getattr(record, "id", None) == trigger_message_id:
             break
     return bounded
+
+
+def select_records_for_turn(
+    records: list,
+    turn_records: list,
+    *,
+    current_turn_id: int | None,
+    trigger_message_id: int | None,
+) -> list:
+    if current_turn_id is None:
+        return slice_records_through_trigger(records, trigger_message_id)
+
+    turns_by_id = {getattr(turn, "id", None): turn for turn in turn_records}
+    current_turn = turns_by_id.get(current_turn_id)
+    if current_turn is None:
+        return slice_records_through_trigger(records, trigger_message_id)
+
+    ordered_turns = sorted(
+        [turn for turn in turn_records if getattr(turn, "id", None) is not None],
+        key=lambda turn: (str(getattr(turn, "started_at", "")), int(getattr(turn, "id", 0) or 0)),
+    )
+    current_index = next(
+        (idx for idx, turn in enumerate(ordered_turns) if getattr(turn, "id", None) == current_turn_id),
+        None,
+    )
+    if current_index is None:
+        return slice_records_through_trigger(records, trigger_message_id)
+
+    prior_completed_turn_ids = {
+        getattr(turn, "id", None)
+        for turn in ordered_turns[:current_index]
+        if getattr(turn, "status", None) == "completed"
+    }
+    trigger_limit = trigger_message_id if trigger_message_id is not None else float("inf")
+
+    background = [
+        record
+        for record in records
+        if getattr(record, "turn_id", None) is None
+        and int(getattr(record, "id", 0) or 0) <= trigger_limit
+    ]
+    prior_turn_messages: list = []
+    for turn in ordered_turns[:current_index]:
+        turn_id = getattr(turn, "id", None)
+        if turn_id not in prior_completed_turn_ids:
+            continue
+        prior_turn_messages.extend(record for record in records if getattr(record, "turn_id", None) == turn_id)
+
+    current_messages = [
+        record
+        for record in records
+        if getattr(record, "turn_id", None) == current_turn_id
+    ]
+
+    selected: list = []
+    seen: set[int] = set()
+    for record in [*background, *prior_turn_messages, *current_messages]:
+        record_id = int(getattr(record, "id", 0) or 0)
+        if record_id in seen:
+            continue
+        seen.add(record_id)
+        selected.append(record)
+    return selected
 
 
 def latest_user_text(messages: list[BaseMessage]) -> str:
@@ -279,10 +343,17 @@ class ContextManager:
         records: list,
         trigger_message_id: int | None,
         *,
+        turn_records: list | None = None,
+        current_turn_id: int | None = None,
         session_state: ConversationSessionState | None = None,
         runtime_policy: RuntimePolicy | None = None,
     ) -> tuple[list[BaseMessage], list[str]]:
-        bounded_records = slice_records_through_trigger(records, trigger_message_id)
+        bounded_records = select_records_for_turn(
+            records,
+            turn_records or [],
+            current_turn_id=current_turn_id,
+            trigger_message_id=trigger_message_id,
+        )
         lc_messages = self.records_to_lc_messages(bounded_records)
         lc_messages = self.strip_historical_tool_protocol(lc_messages)
         skill_names = [skill.name for skill in get_skill_registry().select_for_query(latest_user_text(lc_messages))]

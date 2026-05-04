@@ -23,7 +23,10 @@ class RuntimePolicy:
 _BASE_READ_TOOLS = (
     "obsidian_wiki_query",
     "business_knowledge_search",
+    "ask_user",
 )
+_DISCOVERY_TOOLS = ("tool_search",)
+_ACTION_TOOLS = ("scheduled_task",)
 _WEB_TOOLS = ("tavily_search",)
 _KB_WRITE_TOOLS = (
     "obsidian_wiki_draft",
@@ -71,9 +74,11 @@ def resolve_runtime_policy(
             writeback_strategy="basic",
         )
 
-    allowed_tools: list[str] = list(_BASE_READ_TOOLS)
+    allowed_tools: list[str] = [*_BASE_READ_TOOLS, *_DISCOVERY_TOOLS]
     context_sections: list[str] = ["session_state"]
 
+    if "reminder.manage" in capabilities:
+        allowed_tools.extend(_ACTION_TOOLS)
     if "web.search" in capabilities:
         allowed_tools.extend(_WEB_TOOLS)
     if "kb.write" in capabilities:
@@ -149,6 +154,7 @@ def render_runtime_policy_for_model(policy: RuntimePolicy) -> str:
         "Runtime policy:",
         f"Mode: {policy.mode}",
         "Allowed tools: " + (", ".join(policy.allowed_tools) if policy.allowed_tools else "-"),
+        "Hidden tools may be discovered with tool_search when the visible tools cannot satisfy an explicit user request.",
     ]
     if "research_protocol" in policy.context_sections:
         lines.extend(
@@ -159,6 +165,18 @@ def render_runtime_policy_for_model(policy: RuntimePolicy) -> str:
                 "- Prefer reliable sources and record uncertainty explicitly.",
                 "- Separate facts, interpretations, and recommendations.",
                 "- Stop searching when gathered evidence is sufficient for the current turn.",
+            ]
+        )
+    if "tool_search" in policy.allowed_tools:
+        lines.extend(
+            [
+                "",
+                "Tool discovery protocol:",
+                "- Use tool_search only when the current visible tools cannot satisfy an explicit user request.",
+                "- tool_search only discovers candidates; it does not execute or authorize them.",
+                "- If tool_search returns no_capable_tool, answer from context or ask a concise clarification.",
+                "- Do not use tool_search to add intent the user did not express.",
+                "- Use ask_user when a required slot is missing and a concise clarification is necessary.",
             ]
         )
     if "workspace_protocol" in policy.context_sections or "coding_protocol" in policy.context_sections:

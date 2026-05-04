@@ -36,9 +36,9 @@ from lark_oapi.ws.model import Response
 
 from app.agent_react import ChannelMessage, TurnResult
 from app.api.agent import get_agent_runtime, get_conversation_store
-from app.api.schemas import MessageCreateRequest, SenderInput
 from app.channels.feishu_renderer import FeishuDelivery, FeishuRenderer
 from app.config import get_settings
+from app.gateway import InboundEvent, get_gateway_service
 from app.tools.codex_app_server import approval_command_prefix, respond_to_codex_approval
 
 logger = logging.getLogger(__name__)
@@ -244,16 +244,17 @@ class FeishuChannel:
                 logger.debug("message was only an @mention, ignoring")
                 return
 
-            ingest = get_conversation_store().ingest_message(
-                MessageCreateRequest(
+            gateway_result = get_gateway_service().handle_inbound_event(
+                InboundEvent(
                     platform="feishu",
                     external_chat_id=chat_id,
-                    chat_type=_conversation_chat_type(chat_type),
-                    sender=SenderInput(platform_user_id=sender),
-                    content=text or raw_text,
                     external_message_id=message_id,
-                    reply_to_external_message_id=parent_id or root_id,
+                    chat_type=_conversation_chat_type(chat_type),
+                    sender_id=sender,
+                    sender_name=None,
+                    text=text or raw_text,
                     mentions=mentions,
+                    reply_to_external_message_id=parent_id or root_id,
                     raw_payload={
                         "chat_type": chat_type,
                         "message_type": msg_type,
@@ -268,15 +269,15 @@ class FeishuChannel:
                     },
                 )
             )
-            if not ingest.should_respond:
-                if getattr(ingest, "reset_message", None):
-                    self._send_text_message(chat_id, ingest.reset_message)
+            if not gateway_result.should_run_agent:
+                if gateway_result.immediate_reply:
+                    self._send_text_message(chat_id, gateway_result.immediate_reply)
                 logger.info(
                     "feishu message stored without response chat=%s conversation_id=%s message_id=%s status=%s",
                     chat_id,
-                    ingest.conversation_id,
-                    ingest.message_id,
-                    ingest.status,
+                    gateway_result.conversation_id,
+                    gateway_result.message_id,
+                    gateway_result.status,
                 )
                 return
 
@@ -286,8 +287,8 @@ class FeishuChannel:
                 chat_id,
                 chat_type,
                 text or raw_text,
-                ingest.conversation_id,
-                ingest.turn_id,
+                gateway_result.conversation_id,
+                gateway_result.turn_id,
             )
         except Exception:
             logger.exception("error handling feishu message")
@@ -422,6 +423,7 @@ class FeishuChannel:
         approved: bool,
         message_id: str | None = None,
     ) -> None:
+        drain_after = True
         try:
             result = respond_to_codex_approval(
                 approval_id,
@@ -478,6 +480,7 @@ class FeishuChannel:
                     language=_codex_approval_language(conversation_id),
                 )
                 self._send_delivery(chat_id, delivery)
+                drain_after = False
                 return
 
             _record_codex_approval_decision(
@@ -494,6 +497,9 @@ class FeishuChannel:
         except Exception:
             logger.exception("failed to complete codex approval approval_id=%s", approval_id)
             self._send_text_message(chat_id, "Codex approval continuation failed.")
+        finally:
+            if drain_after:
+                self._submit_next_queued_turn(conversation_id, chat_id)
 
     def _handle_agent_run(
         self,
@@ -505,6 +511,7 @@ class FeishuChannel:
         turn_id: int | None,
     ) -> None:
         thinking_message_id: str | None = None
+        drain_after = True
         try:
             logger.info(
                 "feishu agent run starting chat=%s conversation_id=%s turn_id=%s chat_type=%s sender=%s text_preview=%s",
@@ -537,6 +544,8 @@ class FeishuChannel:
                     chat_id,
                     "Sorry, something went wrong. Please try again later.",
                 )
+            if drain_after:
+                self._submit_next_queued_turn(conversation_id, chat_id)
             return
 
         logger.info(
@@ -571,6 +580,7 @@ class FeishuChannel:
                 self._update_card_message(thinking_message_id, delivery)
             else:
                 self._send_delivery(chat_id, delivery)
+            drain_after = False
             return
 
         message = self._format_result(result)
@@ -578,6 +588,46 @@ class FeishuChannel:
             self._update_channel_message(thinking_message_id, message)
         else:
             self._send_channel_message(chat_id, message)
+        if drain_after:
+            self._submit_next_queued_turn(conversation_id, chat_id)
+
+    def _submit_next_queued_turn(self, conversation_id: int, chat_id: str) -> None:
+        try:
+            store = get_conversation_store()
+            claim_next = getattr(store, "claim_next_queued_turn", None)
+            if claim_next is None:
+                return
+            turn = claim_next(conversation_id)
+            if turn is None:
+                return
+            prompt = self._prompt_for_turn(store, conversation_id, turn)
+            conversation = store.get_conversation(conversation_id)
+            chat_type = getattr(conversation, "chat_type", "")
+            logger.info(
+                "feishu queued turn claimed conversation_id=%s turn_id=%s",
+                conversation_id,
+                turn.id,
+            )
+            self._executor.submit(
+                self._handle_agent_run,
+                "queued",
+                chat_id,
+                chat_type,
+                prompt,
+                conversation_id,
+                turn.id,
+            )
+        except Exception:
+            logger.exception("failed to submit next queued turn conversation_id=%s", conversation_id)
+
+    @staticmethod
+    def _prompt_for_turn(store: Any, conversation_id: int, turn: Any) -> str:
+        trigger_message_id = getattr(turn, "trigger_message_id", None)
+        if trigger_message_id is not None:
+            for message in store.list_messages(conversation_id):
+                if getattr(message, "id", None) == trigger_message_id:
+                    return str(getattr(message, "content", "") or "")
+        return "(queued turn)"
 
     @staticmethod
     def _format_result(result: TurnResult) -> ChannelMessage:
@@ -678,6 +728,12 @@ class FeishuChannel:
             return True
         except Exception:
             return False
+
+    def send_reminder(self, *, platform: str, external_chat_id: str, text: str) -> str | None:
+        if platform != "feishu":
+            raise ValueError(f"unsupported reminder platform: {platform}")
+        payload = self._send_delivery(external_chat_id, self._renderer.render_text_fallback(text))
+        return _extract_message_id(payload)
 
 
 def build_feishu_channel() -> FeishuChannel | None:

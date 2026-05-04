@@ -25,8 +25,22 @@ def test_chat_policy_does_not_expose_coder_tools() -> None:
     assert "obsidian_wiki_apply" not in policy.allowed_tools
     assert "obsidian_wiki_query" in policy.allowed_tools
     assert "business_knowledge_search" in policy.allowed_tools
+    assert "ask_user" in policy.allowed_tools
+    assert "tool_search" in policy.allowed_tools
+    assert "scheduled_task" not in policy.allowed_tools
     assert "delegate_to_codex" not in policy.allowed_tools
     assert "shell_run_command" not in policy.allowed_tools
+
+
+def test_reminder_tool_requires_explicit_capability() -> None:
+    policy = resolve_runtime_policy(
+        session_mode="chat",
+        turn_type="chat",
+        requested_capabilities=("reminder.manage",),
+    )
+
+    assert "tool_search" in policy.allowed_tools
+    assert "scheduled_task" in policy.allowed_tools
 
 
 def test_coding_policy_exposes_coder_tools() -> None:

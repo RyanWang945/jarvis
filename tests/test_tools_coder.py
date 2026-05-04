@@ -93,6 +93,9 @@ def test_codex_tool_runs_for_explicit_code_request(monkeypatch) -> None:
     def _fake_chat(self, messages, tools=None):
         nonlocal chat_calls
         chat_calls += 1
+        last_tool = next((m for m in reversed(messages) if m.role == "tool"), None)
+        if last_tool is not None:
+            return {"content": str(last_tool.content), "tool_calls": []}
         return {
             "content": "",
             "tool_calls": [
@@ -139,9 +142,103 @@ def test_codex_tool_runs_for_explicit_code_request(monkeypatch) -> None:
     body = run.json()
     assert body["status"] == "completed"
     assert body["reply"] == "coder-ran"
-    assert chat_calls == 1
+    assert chat_calls == 2
     tool_calls = store.list_tool_calls_by_turn(created["turn_id"])
     assert len(tool_calls) == 1
     assert tool_calls[0].tool_name == "delegate_to_codex"
     assert tool_calls[0].status == "completed"
     assert tool_calls[0].output == {"result": "coder-ran"}
+
+
+def test_codex_raw_numeric_output_is_summarized_before_reply(monkeypatch) -> None:
+    client = _client(monkeypatch)
+    captured_args: list[dict] = []
+
+    def _fake_chat(self, messages, tools=None):
+        last_tool = next((m for m in reversed(messages) if m.role == "tool"), None)
+        if last_tool is not None and last_tool.tool_call_id == "call_delegation_1":
+            assert str(last_tool.content).strip() == "21\n14 580 22"
+            return {
+                "content": (
+                    "jarvis 当前有 21 个未提交条目。\n\n"
+                    "diff 统计显示：14 个文件变化，新增 580 行，删除 22 行。"
+                ),
+                "tool_calls": [],
+            }
+        if last_tool is not None and last_tool.tool_call_id == "call_tool_search_1":
+            tool_names = [
+                tool["function"]["name"]
+                for tool in (tools or [])
+                if tool.get("type") == "function"
+            ]
+            assert "delegate_to_codex" in tool_names
+            return {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_delegation_1",
+                        "type": "function",
+                        "function": {
+                            "name": "delegate_to_codex",
+                            "arguments": json.dumps(
+                                {
+                                    "instruction": "Check jarvis uncommitted changes and explain the numbers.",
+                                    "repo_id": "jarvis",
+                                }
+                            ),
+                        },
+                    }
+                ],
+            }
+        return {
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_tool_search_1",
+                    "type": "function",
+                    "function": {
+                        "name": "tool_search",
+                        "arguments": json.dumps(
+                            {
+                                "query": "inspect jarvis repository uncommitted changes",
+                                "original_user_request": "看一下jarvis当前分支有多少未提交的",
+                            }
+                        ),
+                    },
+                }
+            ],
+        }
+
+    monkeypatch.setattr(ChatClient, "chat", _fake_chat)
+
+    def _fake_execute_tool(tool, tool_args, *, timeout_seconds=30):
+        if tool.name == "tool_search":
+            from app.tools.runtime import execute_tool as real_execute_tool
+
+            return real_execute_tool(tool, tool_args, timeout_seconds=timeout_seconds)
+        captured_args.append(dict(tool_args))
+        return ToolExecutionResult(ok=True, exit_code=0, stdout="21\n14 580 22", summary="21\n14 580 22")
+
+    monkeypatch.setattr(react_graph, "execute_tool", _fake_execute_tool)
+
+    created = client.post(
+        "/messages",
+        json={
+            "platform": "feishu",
+            "external_chat_id": _unique_id("chat-dm-codex-summary"),
+            "chat_type": "dm",
+            "sender": {"platform_user_id": "ou_1", "display_name": "Ryan"},
+            "content": "看一下jarvis当前分支有多少未提交的",
+            "external_message_id": _unique_id("msg-codex-summary"),
+        },
+    ).json()
+
+    run = client.post(f"/turns/{created['turn_id']}/run")
+
+    assert run.status_code == 200
+    body = run.json()
+    assert body["status"] == "completed"
+    assert body["reply"] != "21\n14 580 22"
+    assert "14 个文件变化" in body["reply"]
+    assert captured_args
+    assert captured_args[0].get("allow_commit") is not True

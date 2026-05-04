@@ -442,6 +442,36 @@ def test_feishu_approval_completion_reports_expired_codex_session(monkeypatch) -
     assert metadata_patches[0][1]["codex_approvals"]["approval_1"]["status"] == "missing"
 
 
+def test_feishu_channel_submits_next_queued_turn(monkeypatch) -> None:
+    channel = FeishuChannel(app_id="app", app_secret="secret")
+    submitted: list[tuple[object, tuple]] = []
+
+    class FakeStore:
+        def claim_next_queued_turn(self, conversation_id: int):
+            assert conversation_id == 7
+            return SimpleNamespace(id=43, trigger_message_id=3)
+
+        def list_messages(self, conversation_id: int):
+            assert conversation_id == 7
+            return [SimpleNamespace(id=3, content="second task")]
+
+        def get_conversation(self, conversation_id: int):
+            assert conversation_id == 7
+            return SimpleNamespace(chat_type="dm")
+
+    monkeypatch.setattr("app.channels.feishu.get_conversation_store", lambda: FakeStore())
+    monkeypatch.setattr(channel._executor, "submit", lambda fn, *args: submitted.append((fn, args)))
+
+    channel._submit_next_queued_turn(7, "chat_1")
+
+    assert submitted == [
+        (
+            channel._handle_agent_run,
+            ("queued", "chat_1", "dm", "second task", 7, 43),
+        )
+    ]
+
+
 def test_extract_codex_approval_from_reply() -> None:
     approval = _extract_codex_approval_from_reply(
         "Codex requested approval (exec-approval).\n"

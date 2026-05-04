@@ -141,6 +141,19 @@ class InMemoryConversationStore:
                 if turn.conversation_id == conversation_id
             ]
 
+    def claim_next_queued_turn(self, conversation_id: int) -> _TurnRecord | None:
+        with self._lock:
+            queued = [
+                turn
+                for turn in self._turns.values()
+                if turn.conversation_id == conversation_id and turn.status == "queued"
+            ]
+            if not queued:
+                return None
+            turn = sorted(queued, key=lambda item: (item.started_at, item.id))[0]
+            turn.status = "running"
+            return turn
+
     def get_turn(self, turn_id: int) -> _TurnRecord | None:
         with self._lock:
             return self._turns.get(turn_id)
@@ -500,7 +513,9 @@ class InMemoryConversationStore:
             reply_to_message_id=reply_to_message_id,
             metadata=metadata,
         )
-        should_respond = trigger_type is not None
+        suppress_turn = bool(metadata.get("suppress_turn"))
+        should_respond = trigger_type is not None and not suppress_turn
+        active_turn_exists = should_respond and self._has_active_turn_locked(conversation.id)
 
         message = self._append_message_locked(
             conversation_id=conversation.id,
@@ -564,9 +579,10 @@ class InMemoryConversationStore:
             conversation_id=conversation.id,
             message_id=message.id,
             turn_id=turn_id,
-            should_respond=should_respond,
+            should_respond=should_respond and not active_turn_exists,
             trigger_type=trigger_type,
             status="queued" if should_respond else "stored",
+            reset_message=self._queued_message_locked(conversation.id) if active_turn_exists else None,
         )
 
     def _handle_command_locked(
@@ -720,6 +736,22 @@ class InMemoryConversationStore:
             status="reset",
             reset_message="已开始新对话。",
         )
+
+    def _has_active_turn_locked(self, conversation_id: int) -> bool:
+        return any(
+            turn.conversation_id == conversation_id and turn.status in {"running", "queued"}
+            for turn in self._turns.values()
+        )
+
+    def _queued_message_locked(self, conversation_id: int) -> str:
+        queued_count = sum(
+            1
+            for turn in self._turns.values()
+            if turn.conversation_id == conversation_id and turn.status == "queued"
+        )
+        if queued_count > 1:
+            return f"已排队，前面还有 {queued_count - 1} 个任务，当前任务完成后继续处理。"
+        return "已排队，当前任务完成后继续处理。"
 
     def _handle_cancel_command_locked(
         self,

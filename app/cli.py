@@ -11,6 +11,7 @@ from app.api.schemas import (
     MessageCreateRequest,
     SenderInput,
 )
+from app.gateway import InboundEvent, get_gateway_service
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -46,6 +47,38 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _chat(args: argparse.Namespace) -> dict[str, Any]:
+    if args.conversation_id is None:
+        gateway = get_gateway_service()
+        gateway_result = gateway.handle_inbound_event(
+            InboundEvent(
+                platform="cli",
+                external_chat_id=args.external_chat_id,
+                external_message_id=None,
+                chat_type="cli",
+                sender_id=args.user_id,
+                sender_name=None,
+                text=args.message,
+            )
+        )
+        if not gateway_result.should_run_agent:
+            return {
+                "conversation_id": gateway_result.conversation_id,
+                "message_id": gateway_result.message_id,
+                "turn_id": gateway_result.turn_id,
+                "status": gateway_result.status,
+                "reply": gateway_result.immediate_reply,
+            }
+        result = None
+        if gateway_result.turn_id is not None:
+            result = get_agent_runtime().run_turn(gateway_result.turn_id)
+        return {
+            "conversation_id": gateway_result.conversation_id,
+            "message_id": gateway_result.message_id,
+            "turn_id": gateway_result.turn_id,
+            "status": result.status if result else gateway_result.status,
+            "reply": result.reply if result else None,
+        }
+
     store = get_conversation_store()
     if args.conversation_id is not None:
         ingest = store.ingest_conversation_message(

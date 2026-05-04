@@ -8,6 +8,7 @@ from app.api.routes import router
 from app.channels.feishu import build_feishu_channel
 from app.config import get_settings
 from app.logging_config import configure_logging
+from app.scheduler.runtime import SchedulerWorker
 from app.skills.bootstrap import bootstrap_registries
 
 logger = logging.getLogger(__name__)
@@ -23,9 +24,16 @@ async def lifespan(app: FastAPI):
     if feishu_channel is not None:
         feishu_channel.start()
         app.state.feishu_channel = feishu_channel
+        scheduler_worker = SchedulerWorker(delivery=feishu_channel)
+        scheduler_worker.start()
+        app.state.scheduler_worker = scheduler_worker
+    else:
+        scheduler_worker = None
     try:
         yield
     finally:
+        if scheduler_worker is not None:
+            scheduler_worker.stop()
         if feishu_channel is not None:
             feishu_channel.stop()
 

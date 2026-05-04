@@ -367,6 +367,16 @@ def _fallback_classification(text: str, session_state: ConversationSessionState)
             reason="search fallback marker",
             source="fallback",
         )
+    if _looks_like_knowledge_write_request(text):
+        return TurnClassification(
+            turn_type="chat",
+            requested_capabilities=("kb.write",),
+            target_resources=(TargetResource(type="knowledge_base", name="wiki"),),
+            routing_basis="inferred",
+            confidence=0.75,
+            reason="knowledge write fallback marker",
+            source="fallback",
+        )
     if _looks_like_code_request(text):
         return TurnClassification(
             turn_type="coding",
@@ -617,6 +627,40 @@ def _looks_like_current_info_request(text: str) -> bool:
             "search",
         )
     )
+
+
+def _looks_like_knowledge_write_request(text: str) -> bool:
+    lowered = text.lower()
+    write_marker = any(
+        marker in lowered
+        for marker in (
+            "write",
+            "save",
+            "record",
+            "draft",
+            "apply",
+            "写入",
+            "保存",
+            "记录",
+            "记到",
+            "整理到",
+        )
+    )
+    target_marker = any(
+        marker in lowered
+        for marker in (
+            "wiki",
+            "obsidian",
+            "knowledge base",
+            "memory",
+            "note",
+            "知识库",
+            "长期记忆",
+            "记忆",
+            "笔记",
+        )
+    )
+    return write_marker and target_marker
 
 
 def _looks_like_workspace_followup(text: str) -> bool:

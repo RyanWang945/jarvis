@@ -59,6 +59,7 @@ class Settings(BaseSettings):
     feishu_app_secret: str | None = None
     feishu_bot_name: str = "Jarvis"
     obsidian_vault_path: Path | None = None
+    default_timezone: str = "Asia/Shanghai"
 
     # MySQL configuration
     mysql_host: str = "127.0.0.1"

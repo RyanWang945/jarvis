@@ -53,6 +53,19 @@ def _fmt_time(iso: str) -> str:
         return iso
 
 
+def _queued_message(conversation_id: int, conn: sa.Connection) -> str:
+    queued_count = conn.execute(
+        sa.text(
+            "SELECT COUNT(*) AS cnt FROM turns "
+            "WHERE conversation_id = :cid AND status = 'queued'"
+        ),
+        {"cid": conversation_id},
+    ).mappings().one()["cnt"] or 0
+    if queued_count > 1:
+        return f"已排队，前面还有 {queued_count - 1} 个任务，当前任务完成后继续处理。"
+    return "已排队，当前任务完成后继续处理。"
+
+
 def _chat_type_label(chat_type: str) -> str:
     if chat_type == "dm":
         return "私聊"
@@ -205,6 +218,34 @@ class MySQLConversationStore:
                 {"cid": conversation_id},
             ).mappings().all()
             return [self._turn_from_row(r) for r in rows]
+
+    def claim_next_queued_turn(self, conversation_id: int) -> TurnRecord | None:
+        now = _now()
+        with self._engine.begin() as conn:
+            row = conn.execute(
+                sa.text(
+                    "SELECT * FROM turns "
+                    "WHERE conversation_id = :cid AND status = 'queued' "
+                    "ORDER BY created_at ASC, id ASC LIMIT 1"
+                ),
+                {"cid": conversation_id},
+            ).mappings().one_or_none()
+            if row is None:
+                return None
+            result = conn.execute(
+                sa.text(
+                    "UPDATE turns SET status = 'running', updated_at = :now "
+                    "WHERE id = :id AND status = 'queued'"
+                ),
+                {"id": row["id"], "now": now},
+            )
+            if result.rowcount != 1:
+                return None
+            updated = conn.execute(
+                sa.text("SELECT * FROM turns WHERE id = :id"),
+                {"id": row["id"]},
+            ).mappings().one()
+            return self._turn_from_row(updated)
 
     def get_turn(self, turn_id: int) -> TurnRecord | None:
         with self._engine.begin() as conn:
@@ -674,6 +715,10 @@ class MySQLConversationStore:
         raw_payload: dict[str, Any],
         metadata: dict[str, Any],
     ) -> MessageIngestResponse:
+        conn.execute(
+            sa.text("SELECT id FROM conversations WHERE id = :id FOR UPDATE"),
+            {"id": conversation.id},
+        )
         # Duplicate guard by external_message_id
         if external_message_id:
             dup = conn.execute(
@@ -716,7 +761,9 @@ class MySQLConversationStore:
             reply_to_message_id=reply_to_message_id,
             metadata=metadata,
         )
-        should_respond = trigger_type is not None
+        suppress_turn = bool(metadata.get("suppress_turn"))
+        should_respond = trigger_type is not None and not suppress_turn
+        active_turn_exists = should_respond and self._has_active_turn(conn, conversation.id)
 
         message = self._append_message(
             conn,
@@ -792,9 +839,10 @@ class MySQLConversationStore:
             conversation_id=conversation.id,
             message_id=message.id,
             turn_id=turn_id,
-            should_respond=should_respond,
+            should_respond=should_respond and not active_turn_exists,
             trigger_type=trigger_type,
             status="queued" if should_respond else "stored",
+            reset_message=_queued_message(conversation.id, conn) if active_turn_exists else None,
         )
 
     def _handle_command(
@@ -1233,6 +1281,18 @@ class MySQLConversationStore:
             },
         )
         return result.lastrowid  # type: ignore[return-value]
+
+    @staticmethod
+    def _has_active_turn(conn: sa.Connection, conversation_id: int) -> bool:
+        row = conn.execute(
+            sa.text(
+                "SELECT id FROM turns "
+                "WHERE conversation_id = :cid AND status IN ('running', 'queued') "
+                "LIMIT 1"
+            ),
+            {"cid": conversation_id},
+        ).mappings().one_or_none()
+        return row is not None
 
     def _append_message(
         self,

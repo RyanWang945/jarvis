@@ -7,7 +7,8 @@ from uuid import uuid4
 from app.agent_react import AgentRuntime
 from app.agent_react import react_graph as react_graph_module
 from app.agent_react.session_state import ConversationSessionState, load_session_state
-from app.api.agent import get_conversation_store
+from app.api.agent import InMemoryConversationStore, get_conversation_store
+from app.api.schemas import MessageCreateRequest, SenderInput
 from app.config import get_settings
 from app.llm.client import ChatClient
 from app.main import create_app
@@ -248,6 +249,103 @@ def test_run_turn_uses_trigger_message_boundary(monkeypatch) -> None:
 
     second_turn = client.get(f"/turns/{second['turn_id']}").json()
     assert second_turn["status"] == "queued"
+
+
+def test_same_conversation_message_waits_behind_active_turn(monkeypatch) -> None:
+    client = _client(monkeypatch)
+    _install_fake_chat(monkeypatch)
+    chat_id = _unique_id("chat-dm-queue")
+
+    first = client.post(
+        "/messages",
+        json={
+            "platform": "feishu",
+            "external_chat_id": chat_id,
+            "chat_type": "dm",
+            "sender": {"platform_user_id": "ou_1", "display_name": "Ryan"},
+            "content": "first question",
+            "external_message_id": _unique_id("msg-queue"),
+        },
+    ).json()
+    second = client.post(
+        "/messages",
+        json={
+            "platform": "feishu",
+            "external_chat_id": chat_id,
+            "chat_type": "dm",
+            "sender": {"platform_user_id": "ou_1", "display_name": "Ryan"},
+            "content": "second question",
+            "external_message_id": _unique_id("msg-queue"),
+        },
+    ).json()
+
+    assert first["should_respond"] is True
+    assert second["should_respond"] is False
+    assert second["turn_id"] is not None
+    assert second["status"] == "queued"
+    assert "已排队" in second["reset_message"]
+
+    run = client.post(f"/turns/{first['turn_id']}/run").json()
+    assert run["status"] == "completed"
+
+    claimed = get_conversation_store().claim_next_queued_turn(first["conversation_id"])
+    assert claimed is not None
+    assert claimed.id == second["turn_id"]
+    assert claimed.status == "running"
+
+
+def test_queued_turn_context_waits_for_previous_assistant_reply(monkeypatch) -> None:
+    store = InMemoryConversationStore()
+    snapshots: list[list[tuple[str, str]]] = []
+
+    def _fake_chat(self, messages, tools=None):
+        snapshots.append(
+            [
+                (message.role, str(message.content))
+                for message in messages
+                if message.role in {"user", "assistant"}
+            ]
+        )
+        last_user = next((m.content for m in reversed(messages) if m.role == "user"), "")
+        return {"content": f"reply:{last_user}", "tool_calls": []}
+
+    monkeypatch.setattr(ChatClient, "chat", _fake_chat)
+
+    first = store.ingest_message(
+        MessageCreateRequest(
+            platform="feishu",
+            external_chat_id="oc_queue_context",
+            chat_type="dm",
+            sender=SenderInput(platform_user_id="ou_queue_user", display_name="Ryan"),
+            content="first question",
+            external_message_id="msg_queue_context_1",
+        )
+    )
+    second = store.ingest_message(
+        MessageCreateRequest(
+            platform="feishu",
+            external_chat_id="oc_queue_context",
+            chat_type="dm",
+            sender=SenderInput(platform_user_id="ou_queue_user", display_name="Ryan"),
+            content="second question",
+            external_message_id="msg_queue_context_2",
+        )
+    )
+
+    assert first.should_respond is True
+    assert second.should_respond is False
+
+    runtime = AgentRuntime(store)
+    runtime.run_turn(first.turn_id)
+    claimed = store.claim_next_queued_turn(first.conversation_id)
+    assert claimed is not None
+    runtime.run_turn(claimed.id)
+
+    assert snapshots[-1] == [
+        ("user", "first question"),
+        ("assistant", "reply:first question"),
+        ("user", "second question"),
+    ]
 
 
 def test_cancelled_turn_does_not_generate_reply(monkeypatch) -> None:
@@ -897,3 +995,273 @@ def test_tool_call_audit_records_message_relationship_for_completed_proposal(mon
 
     messages = [message for message in store.list_messages(created["conversation_id"]) if message.turn_id == created["turn_id"]]
     assert [message.role for message in messages] == ["user", "assistant", "tool", "assistant"]
+
+
+def test_scheduled_task_tool_gets_turn_runtime_context(monkeypatch) -> None:
+    store = InMemoryConversationStore()
+    captured_args = []
+    seen_tool_sets = []
+
+    def _fake_chat(self, messages, tools=None):
+        tool_names = [
+            tool["function"]["name"]
+            for tool in (tools or [])
+            if tool.get("type") == "function"
+        ]
+        seen_tool_sets.append(tool_names)
+        tool_messages = [message for message in messages if message.role == "tool"]
+        if not tool_messages:
+            assert "scheduled_task" not in tool_names
+            assert "tool_search" in tool_names
+            return {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_tool_search_1",
+                        "type": "function",
+                        "function": {
+                            "name": "tool_search",
+                            "arguments": json.dumps(
+                                {
+                                    "query": "create a reminder in 10 minutes",
+                                    "original_user_request": "10分钟后提醒我喝水",
+                                }
+                            ),
+                        },
+                    }
+                ],
+            }
+        if tool_messages[-1].tool_call_id == "call_tool_search_1":
+            assert "scheduled_task" in tool_names
+            return {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_reminder_1",
+                        "type": "function",
+                        "function": {
+                            "name": "scheduled_task",
+                            "arguments": json.dumps(
+                                {
+                                    "action": "create",
+                                    "title": "提醒喝水",
+                                    "prompt": "提醒我喝水",
+                                    "time_text": "10分钟后",
+                                }
+                            ),
+                        },
+                    }
+                ],
+            }
+        return {"content": "已设置提醒", "tool_calls": []}
+
+    def _fake_execute_tool(tool, tool_args, *, timeout_seconds=30):
+        if tool.name == "tool_search":
+            from app.tools.runtime import execute_tool as real_execute_tool
+
+            return real_execute_tool(tool, tool_args, timeout_seconds=timeout_seconds)
+        assert tool.name == "scheduled_task"
+        captured_args.append(dict(tool_args))
+        return ToolExecutionResult(ok=True, exit_code=0, stdout="Reminder created.", summary="Reminder created.")
+
+    monkeypatch.setattr(ChatClient, "chat", _fake_chat)
+    monkeypatch.setattr(react_graph_module, "execute_tool", _fake_execute_tool)
+
+    ingest = store.ingest_message(
+        MessageCreateRequest(
+            platform="feishu",
+            external_chat_id="oc_runtime_context",
+            chat_type="dm",
+            sender=SenderInput(platform_user_id="ou_runtime_user", display_name="Ryan"),
+            content="10分钟后提醒我喝水",
+            external_message_id="msg_runtime_context",
+        )
+    )
+
+    result = AgentRuntime(store).run_turn(ingest.turn_id)
+
+    assert result.status == "completed"
+    assert result.reply == "已设置提醒"
+    assert "scheduled_task" not in seen_tool_sets[0]
+    assert "tool_search" in seen_tool_sets[0]
+    assert "scheduled_task" in seen_tool_sets[1]
+    assert captured_args == [
+        {
+            "action": "create",
+            "title": "提醒喝水",
+            "prompt": "提醒我喝水",
+            "time_text": "10分钟后",
+            "conversation_id": ingest.conversation_id,
+            "created_by_user_id": 1,
+            "platform": "feishu",
+            "external_chat_id": "oc_runtime_context",
+        }
+    ]
+
+
+def test_tool_search_no_capable_tool_does_not_unlock_action_tools(monkeypatch) -> None:
+    store = InMemoryConversationStore()
+    seen_tool_sets = []
+
+    def _fake_chat(self, messages, tools=None):
+        tool_names = [
+            tool["function"]["name"]
+            for tool in (tools or [])
+            if tool.get("type") == "function"
+        ]
+        seen_tool_sets.append(tool_names)
+        tool_messages = [message for message in messages if message.role == "tool"]
+        if not tool_messages:
+            return {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_tool_search_1",
+                        "type": "function",
+                        "function": {
+                            "name": "tool_search",
+                            "arguments": json.dumps(
+                                {
+                                    "query": "git diff stat numbers meaning",
+                                    "original_user_request": "21\n14 580 22啥意思",
+                                }
+                            ),
+                        },
+                    }
+                ],
+            }
+        assert "scheduled_task" not in tool_names
+        assert "delegate_to_codex" not in tool_names
+        return {"content": "这是一段 git 统计输出。", "tool_calls": []}
+
+    monkeypatch.setattr(ChatClient, "chat", _fake_chat)
+
+    ingest = store.ingest_message(
+        MessageCreateRequest(
+            platform="feishu",
+            external_chat_id="oc_tool_search_none",
+            chat_type="dm",
+            sender=SenderInput(platform_user_id="ou_tool_search_user", display_name="Ryan"),
+            content="21\n14 580 22啥意思",
+            external_message_id="msg_tool_search_none",
+        )
+    )
+
+    result = AgentRuntime(store).run_turn(ingest.turn_id)
+
+    assert result.status == "completed"
+    assert result.reply == "这是一段 git 统计输出。"
+    assert "tool_search" in seen_tool_sets[0]
+    assert "scheduled_task" not in seen_tool_sets[0]
+    assert "delegate_to_codex" not in seen_tool_sets[1]
+
+
+def test_ask_user_completes_turn_and_records_pending_question(monkeypatch) -> None:
+    store = InMemoryConversationStore()
+    seen_tool_sets = []
+
+    def _fake_chat(self, messages, tools=None):
+        tool_names = [
+            tool["function"]["name"]
+            for tool in (tools or [])
+            if tool.get("type") == "function"
+        ]
+        seen_tool_sets.append(tool_names)
+        return {
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_ask_user_1",
+                    "type": "function",
+                    "function": {
+                        "name": "ask_user",
+                        "arguments": json.dumps(
+                            {
+                                "question": "你想检查 jarvis 还是 nltk？",
+                                "reason": "The repository target is ambiguous.",
+                                "expected_answer_type": "choice",
+                                "choices": ["jarvis", "nltk"],
+                            }
+                        ),
+                    },
+                }
+            ],
+        }
+
+    monkeypatch.setattr(ChatClient, "chat", _fake_chat)
+
+    ingest = store.ingest_message(
+        MessageCreateRequest(
+            platform="feishu",
+            external_chat_id="oc_ask_user",
+            chat_type="dm",
+            sender=SenderInput(platform_user_id="ou_ask_user", display_name="Ryan"),
+            content="检查一下当前项目 diff",
+            external_message_id="msg_ask_user",
+        )
+    )
+
+    result = AgentRuntime(store).run_turn(ingest.turn_id)
+
+    assert result.status == "completed"
+    assert result.reply == "你想检查 jarvis 还是 nltk？"
+    assert "ask_user" in seen_tool_sets[0]
+
+    state = load_session_state(store.get_conversation(ingest.conversation_id).metadata)
+    assert state.waiting_for == "user"
+    assert state.pending_user_question == "你想检查 jarvis 还是 nltk？"
+    assert state.pending_user_expected_answer_type == "choice"
+    assert state.pending_user_choices == ("jarvis", "nltk")
+    assert state.pending_user_turn_id == ingest.turn_id
+
+
+def test_pending_user_question_is_visible_to_next_turn(monkeypatch) -> None:
+    store = InMemoryConversationStore()
+    saw_pending = []
+
+    def _fake_chat(self, messages, tools=None):
+        system_text = "\n".join(m.content for m in messages if m.role == "system")
+        saw_pending.append("Question: Which repository should I inspect?" in system_text)
+        return {"content": "using jarvis", "tool_calls": []}
+
+    monkeypatch.setattr(ChatClient, "chat", _fake_chat)
+
+    first = store.ingest_message(
+        MessageCreateRequest(
+            platform="feishu",
+            external_chat_id="oc_ask_user_next",
+            chat_type="dm",
+            sender=SenderInput(platform_user_id="ou_ask_user_next", display_name="Ryan"),
+            content="which repo?",
+            external_message_id="msg_ask_user_next_1",
+        )
+    )
+    store.update_conversation_session(
+        first.conversation_id,
+        ConversationSessionState(
+            waiting_for="user",
+            pending_user_question="Which repository should I inspect?",
+            pending_user_expected_answer_type="choice",
+            pending_user_choices=("jarvis", "nltk"),
+            pending_user_turn_id=123,
+        ),
+    )
+
+    second = store.ingest_message(
+        MessageCreateRequest(
+            platform="feishu",
+            external_chat_id="oc_ask_user_next",
+            chat_type="dm",
+            sender=SenderInput(platform_user_id="ou_ask_user_next", display_name="Ryan"),
+            content="jarvis",
+            external_message_id="msg_ask_user_next_2",
+        )
+    )
+
+    result = AgentRuntime(store).run_turn(second.turn_id)
+
+    assert result.status == "completed"
+    assert saw_pending == [True]
+    state = load_session_state(store.get_conversation(second.conversation_id).metadata)
+    assert state.waiting_for is None
+    assert state.pending_user_question is None

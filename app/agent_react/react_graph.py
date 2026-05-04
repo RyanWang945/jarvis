@@ -22,6 +22,8 @@ _CONTEXT_MANAGER = ContextManager()
 
 
 class TurnStore(Protocol):
+    def get_conversation(self, conversation_id: int) -> Any | None: ...
+
     def get_turn(self, turn_id: int) -> TurnRecord | None: ...
 
     def append_assistant_message(
@@ -85,6 +87,15 @@ class ReActState(TypedDict):
 
 
 _MAX_TAVILY_CALLS_PER_TURN = 2
+_TOOL_SEARCH_GRANTABLE_TOOLS = {
+    "scheduled_task",
+    "delegate_to_codex",
+    "tavily_search",
+    "obsidian_wiki_query",
+    "business_knowledge_search",
+    "obsidian_wiki_draft",
+    "obsidian_wiki_apply",
+}
 
 _COMMIT_INTENT_PATTERN = r"(?<![A-Za-z])commit(?![A-Za-z])|提交|创建\s*commit|建立\s*commit"
 _PUSH_INTENT_PATTERN = r"(?<![A-Za-z])push(?![A-Za-z])|推送|远程|origin"
@@ -158,6 +169,9 @@ def _strengthen_codex_contract(tool_args: dict[str, Any], messages: list[BaseMes
 
     user_requested_commit = _has_pattern(latest_user_text, _COMMIT_INTENT_PATTERN)
     user_requested_push = _has_pattern(latest_user_text, _PUSH_INTENT_PATTERN)
+    if _looks_like_uncommitted_status_request(latest_user_text):
+        user_requested_commit = False
+        user_requested_push = False
     user_requested_edit = _has_pattern(latest_user_text, _EDIT_INTENT_PATTERN)
     user_requested_execution = user_requested_edit or user_requested_commit or user_requested_push
     instruction = str(tool_args.get("instruction") or "").strip()
@@ -211,6 +225,13 @@ def _strengthen_codex_contract(tool_args: dict[str, Any], messages: list[BaseMes
         repaired,
     )
     return repaired
+
+
+def _looks_like_uncommitted_status_request(text: str) -> bool:
+    lowered = text.lower()
+    if not any(marker in lowered for marker in ("未提交", "uncommitted", "not committed", "not yet committed")):
+        return False
+    return any(marker in lowered for marker in ("多少", "几个", "哪些", "内容", "状态", "status", "changes", "diff", "有"))
 
 
 def _is_turn_cancelled(store: TurnStore, turn_id: int) -> bool:
@@ -317,6 +338,123 @@ def _codex_trusted_approval_prefixes(store: TurnStore, conversation_id: int) -> 
     return [str(item) for item in prefixes if str(item).strip()]
 
 
+def _inject_tool_runtime_context(
+    tool_name: str,
+    tool_args: dict[str, Any],
+    *,
+    turn: TurnRecord,
+    store: TurnStore,
+) -> dict[str, Any]:
+    if tool_name != "scheduled_task":
+        return tool_args
+
+    injected = dict(tool_args)
+    injected.setdefault("conversation_id", getattr(turn, "conversation_id", None))
+    injected.setdefault("created_by_user_id", getattr(turn, "started_by_user_id", None))
+    conversation = store.get_conversation(turn.conversation_id)
+    if conversation is not None:
+        injected.setdefault("platform", getattr(conversation, "platform", None))
+        injected.setdefault("external_chat_id", getattr(conversation, "external_chat_id", None))
+    return injected
+
+
+def _tools_granted_by_tool_search(output: str, messages: list[BaseMessage]) -> list[str]:
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(payload, dict) or payload.get("status") != "found":
+        return []
+    candidates = payload.get("candidates")
+    if not isinstance(candidates, list):
+        return []
+    latest_user_text = _latest_human_message_text(messages)
+    granted: list[str] = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        tool_name = str(candidate.get("tool_name") or "").strip()
+        if tool_name in granted:
+            continue
+        if _tool_search_candidate_allowed(tool_name, latest_user_text):
+            granted.append(tool_name)
+        if len(granted) >= 3:
+            break
+    return granted
+
+
+def _tool_search_candidate_allowed(tool_name: str, user_text: str) -> bool:
+    if tool_name not in _TOOL_SEARCH_GRANTABLE_TOOLS:
+        return False
+    text = user_text.lower()
+    if tool_name == "scheduled_task":
+        return _looks_like_reminder_request(text)
+    if tool_name == "delegate_to_codex":
+        return _looks_like_repository_request(text)
+    if tool_name == "tavily_search":
+        return _looks_like_web_request(text)
+    if tool_name in {"obsidian_wiki_draft", "obsidian_wiki_apply"}:
+        return _looks_like_wiki_write_request(text)
+    if tool_name in {"obsidian_wiki_query", "business_knowledge_search"}:
+        return _looks_like_memory_or_knowledge_request(text)
+    return False
+
+
+def _looks_like_reminder_request(text: str) -> bool:
+    return any(
+        marker in text
+        for marker in (
+            "提醒",
+            "remind",
+            "notify me",
+            "叫醒",
+            "起床",
+            "稍后通知",
+            "到点",
+            "定时",
+            "分钟后",
+            "小时后",
+            "明天",
+            "tomorrow",
+        )
+    )
+
+
+def _looks_like_repository_request(text: str) -> bool:
+    return any(
+        marker in text
+        for marker in (
+            "repo",
+            "repository",
+            "仓库",
+            "项目",
+            "代码",
+            "git",
+            "diff",
+            "branch",
+            "commit",
+            "push",
+            "未提交",
+            ".py",
+            ".ts",
+            ".js",
+            ".md",
+        )
+    )
+
+
+def _looks_like_web_request(text: str) -> bool:
+    return any(marker in text for marker in ("latest", "recent", "today", "current news", "最新", "最近", "新闻", "网上", "网页搜索"))
+
+
+def _looks_like_wiki_write_request(text: str) -> bool:
+    return any(marker in text for marker in ("写入wiki", "写到wiki", "write to wiki", "沉淀", "记录到知识库", "保存到知识库"))
+
+
+def _looks_like_memory_or_knowledge_request(text: str) -> bool:
+    return any(marker in text for marker in ("wiki", "知识库", "长期记忆", "之前", "设计记录", "业务知识", "公司知识", "研报", "财报"))
+
+
 def _tool_output_payload(output: str) -> dict[str, Any]:
     trimmed = output[:2000]
     return {"result": trimmed} if trimmed else {}
@@ -353,6 +491,7 @@ def execute_tools(state: ReActState, store: TurnStore) -> ReActState:
         return state
 
     tool_messages: list[BaseMessage] = []
+    granted_tools: list[str] = []
     turn = store.get_turn(state["turn_id"])
     if turn is None:
         raise ValueError(f"Turn not found: {state['turn_id']}")
@@ -383,6 +522,7 @@ def execute_tools(state: ReActState, store: TurnStore) -> ReActState:
         tool_args = tool_call["args"]
         if tool_name == "delegate_to_codex":
             tool_args = _strengthen_codex_contract(dict(tool_args), state["messages"])
+        tool_args = _inject_tool_runtime_context(tool_name, dict(tool_args), turn=turn, store=store)
         tool_call_id = tool_call["id"]
         record = None
         logger.info(
@@ -441,6 +581,8 @@ def execute_tools(state: ReActState, store: TurnStore) -> ReActState:
                         turn.conversation_id,
                     )
                 ok, output = _execute_single_tool(tool_name, execution_args)
+                if ok and tool_name == "tool_search":
+                    granted_tools.extend(_tools_granted_by_tool_search(output, state["messages"]))
                 if not ok:
                     logger.warning(
                         "tool execution failed turn_id=%s step=%s tool=%s tool_call_id=%s output_preview=%s",
@@ -514,6 +656,11 @@ def execute_tools(state: ReActState, store: TurnStore) -> ReActState:
         )
         tool_messages.append(ToolMessage(content=output, tool_call_id=tool_call_id))
 
+    allowed_tools = list(state.get("allowed_tools") or [])
+    for tool_name in granted_tools:
+        if tool_name not in allowed_tools:
+            allowed_tools.append(tool_name)
+
     return {
         **state,
         "turn_id": state["turn_id"],
@@ -521,6 +668,7 @@ def execute_tools(state: ReActState, store: TurnStore) -> ReActState:
         "status": "running",
         "messages": state["messages"] + tool_messages,
         "step_count": state.get("step_count", 0),
+        "allowed_tools": allowed_tools,
     }
 
 

@@ -21,6 +21,11 @@ def test_session_state_round_trips_under_metadata_namespace() -> None:
         session_goal="compare runtime designs",
         working_summary="Keep the session state lightweight.",
         waiting_for="approval",
+        pending_user_question="Which repository should I use?",
+        pending_user_reason="Repository target is ambiguous.",
+        pending_user_expected_answer_type="choice",
+        pending_user_choices=("jarvis", "nltk"),
+        pending_user_turn_id=6,
         last_turn_id=7,
         last_turn_status="completed",
         last_assistant_summary="Session state captured.",
@@ -32,6 +37,7 @@ def test_session_state_round_trips_under_metadata_namespace() -> None:
 
     assert metadata["session"]["session_mode"] == "research"
     assert metadata["session"]["active_repo_id"] == "jarvis"
+    assert metadata["session"]["pending_user_question"] == "Which repository should I use?"
     assert loaded == state
 
 
@@ -67,6 +73,10 @@ def test_render_session_state_for_model_omits_debug_only_fields() -> None:
             active_repo_id="jarvis",
             session_goal="compare runtime designs",
             working_summary="Keep the context lightweight.",
+            waiting_for="user",
+            pending_user_question="Which repo should I inspect?",
+            pending_user_expected_answer_type="choice",
+            pending_user_choices=("jarvis", "nltk"),
             last_turn_id=7,
             last_turn_status="completed",
             last_assistant_summary="debug summary",
@@ -79,6 +89,9 @@ def test_render_session_state_for_model_omits_debug_only_fields() -> None:
     assert "Active repository: jarvis" in rendered
     assert "Goal: compare runtime designs" in rendered
     assert "Working summary: Keep the context lightweight." in rendered
+    assert "Pending user clarification:" in rendered
+    assert "Question: Which repo should I inspect?" in rendered
+    assert "Choices: jarvis, nltk" in rendered
     assert "last_turn_id" not in rendered
     assert "debug summary" not in rendered
 
@@ -106,6 +119,8 @@ def test_build_session_state_after_turn_preserves_working_summary() -> None:
     assert state.session_goal == "compare runtime designs"
     assert state.working_summary == "Do not overwrite this conservatively maintained summary."
     assert state.waiting_for is None
+    assert state.pending_user_question is None
+    assert state.pending_user_choices == ()
     assert state.last_turn_id == 12
     assert state.last_turn_status == "completed"
     assert state.last_assistant_summary == "Finished the architecture review. Next step is context hardening."

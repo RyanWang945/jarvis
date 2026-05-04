@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+import json
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
@@ -54,6 +55,8 @@ class ConversationStore(Protocol):
     def get_turn(self, turn_id: int) -> TurnRecord | None: ...
 
     def list_messages(self, conversation_id: int) -> list: ...
+
+    def list_turns(self, conversation_id: int) -> list: ...
 
     def update_conversation_session(
         self,
@@ -136,6 +139,7 @@ class TurnRuntimeState(TypedDict):
     session_state: ConversationSessionState | None
     runtime_policy: RuntimePolicy | None
     selected_skills: list[str]
+    allowed_tools: list[str]
     reply: str
     reply_message_id: int | None
     cancelled: bool
@@ -160,6 +164,9 @@ class TurnRuntime:
         running = prepared
         while running.get("status") == "running" and not running.get("cancelled"):
             runtime_policy = running.get("runtime_policy")
+            allowed_tools = running.get("allowed_tools")
+            if allowed_tools is None:
+                allowed_tools = list(runtime_policy.allowed_tools) if runtime_policy is not None else []
             react_state = {
                 "turn_id": running["turn_id"],
                 "messages": running["messages"],
@@ -167,7 +174,7 @@ class TurnRuntime:
                 "status": running["status"],
                 "step_count": running["step_count"],
                 "token_budget": running["token_budget"],
-                "allowed_tools": list(runtime_policy.allowed_tools) if runtime_policy is not None else [],
+                "allowed_tools": list(allowed_tools),
                 "max_steps": runtime_policy.max_steps if runtime_policy is not None else 8,
                 "search_budget": runtime_policy.search_budget if runtime_policy is not None else None,
             }
@@ -202,6 +209,8 @@ class TurnRuntime:
         lc_messages, skill_names = self._context_manager.build_initial_messages(
             self._store.list_messages(turn.conversation_id),
             getattr(turn, "trigger_message_id", None),
+            turn_records=self._store.list_turns(turn.conversation_id),
+            current_turn_id=turn.id,
             session_state=session_state,
             runtime_policy=runtime_policy,
         )
@@ -214,6 +223,7 @@ class TurnRuntime:
             "session_state": session_state,
             "runtime_policy": runtime_policy,
             "selected_skills": skill_names,
+            "allowed_tools": list(runtime_policy.allowed_tools),
             "reply": "",
             "reply_message_id": None,
             "cancelled": False,
@@ -266,12 +276,28 @@ class TurnRuntime:
                     "status": "failed",
                     "error": str(exc),
                 }
+            if self._should_complete_after_ask_user_tool(next_state):
+                ask_payload = self._latest_ask_user_payload(next_state["messages"]) or {}
+                question = str(ask_payload.get("question") or "").strip()
+                if question:
+                    return {
+                        **state,
+                        "messages": next_state["messages"] + [AIMessage(content=question)],
+                        "step_count": next_state["step_count"],
+                        "allowed_tools": next_state.get("allowed_tools", state.get("allowed_tools")),
+                        "cancelled": bool(next_state.get("cancelled")),
+                        "status": "completed",
+                        "error": state.get("error"),
+                    }
             if self._should_complete_after_coder_tool(state, next_state):
                 coder_reply = self._latest_tool_message_content(next_state["messages"])
+                if not self._looks_like_codex_approval_request(coder_reply):
+                    return self._summarize_after_coder_tool(state, next_state)
                 return {
                     **state,
                     "messages": next_state["messages"] + [AIMessage(content=coder_reply)],
                     "step_count": next_state["step_count"],
+                    "allowed_tools": next_state.get("allowed_tools", state.get("allowed_tools")),
                     "cancelled": bool(next_state.get("cancelled")),
                     "status": "completed",
                     "error": state.get("error"),
@@ -280,6 +306,7 @@ class TurnRuntime:
                 **state,
                 "messages": next_state["messages"],
                 "step_count": next_state["step_count"],
+                "allowed_tools": next_state.get("allowed_tools", state.get("allowed_tools")),
                 "cancelled": bool(next_state.get("cancelled")),
                 "status": "cancelled" if next_state.get("cancelled") else "running",
                 "error": state.get("error"),
@@ -291,16 +318,51 @@ class TurnRuntime:
             "step_count": llm_state["step_count"],
             "cancelled": bool(llm_state.get("cancelled")),
             "status": "cancelled" if llm_state.get("cancelled") else "completed",
+                "error": state.get("error"),
+            }
+
+    def _summarize_after_coder_tool(self, state: TurnRuntimeState, next_state: dict[str, Any]) -> TurnRuntimeState:
+        summary_state = call_llm(
+            {
+                **next_state,
+                "allowed_tools": [],
+                "max_steps": int(next_state.get("step_count", 0) or 0) + 1,
+            },
+            self._store,
+        )
+        if summary_state.get("status") == "failed":
+            return {
+                **state,
+                "messages": summary_state["messages"],
+                "step_count": summary_state["step_count"],
+                "cancelled": bool(summary_state.get("cancelled")),
+                "status": "failed",
+                "error": summary_state.get("error") or "failed to summarize Codex result",
+            }
+        return {
+            **state,
+            "messages": summary_state["messages"],
+            "step_count": summary_state["step_count"],
+            "allowed_tools": summary_state.get("allowed_tools", state.get("allowed_tools")),
+            "cancelled": bool(summary_state.get("cancelled")),
+            "status": "completed",
             "error": state.get("error"),
         }
 
     def _should_complete_after_coder_tool(self, state: TurnRuntimeState, next_state: dict[str, Any]) -> bool:
-        runtime_policy = state.get("runtime_policy")
-        if runtime_policy is None or runtime_policy.mode != "coding":
-            return False
         if not self._latest_ai_message_called_tool(next_state["messages"], "delegate_to_codex"):
             return False
         return bool(self._latest_tool_message_content(next_state["messages"]))
+
+    def _should_complete_after_ask_user_tool(self, next_state: dict[str, Any]) -> bool:
+        if not self._latest_ai_message_called_tool(next_state["messages"], "ask_user"):
+            return False
+        payload = self._latest_ask_user_payload(next_state["messages"])
+        return bool(payload and payload.get("status") == "waiting_for_user" and payload.get("question"))
+
+    @staticmethod
+    def _looks_like_codex_approval_request(content: str) -> bool:
+        return content.strip().startswith("Codex requested approval")
 
     @staticmethod
     def _latest_ai_message_called_tool(messages: list[BaseMessage], tool_name: str) -> bool:
@@ -317,6 +379,22 @@ class TurnRuntime:
                 if content:
                     return content
         return ""
+
+    @staticmethod
+    def _latest_ask_user_payload(messages: list[BaseMessage]) -> dict[str, Any] | None:
+        for message in reversed(messages):
+            if not isinstance(message, ToolMessage):
+                continue
+            content = str(message.content or "").strip()
+            if not content:
+                continue
+            try:
+                payload = json.loads(content)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict) and payload.get("status") == "waiting_for_user":
+                return payload
+        return None
 
     def _finalize(self, state: TurnRuntimeState) -> TurnRuntimeState:
         turn_id = state["turn_id"]
@@ -394,6 +472,20 @@ class TurnRuntime:
             status=status,
             assistant_reply=assistant_reply,
         )
+        ask_payload = self._latest_ask_user_payload(state.get("messages", []))
+        if status == "completed" and ask_payload is not None:
+            choices = ask_payload.get("choices")
+            if not isinstance(choices, list):
+                choices = []
+            session_state = replace(
+                session_state,
+                waiting_for="user",
+                pending_user_question=str(ask_payload.get("question") or "").strip() or None,
+                pending_user_reason=str(ask_payload.get("reason") or "").strip() or None,
+                pending_user_expected_answer_type=str(ask_payload.get("expected_answer_type") or "").strip() or None,
+                pending_user_choices=tuple(str(item).strip() for item in choices if str(item).strip())[:8],
+                pending_user_turn_id=state["turn_id"],
+            )
         try:
             self._store.update_conversation_session(state["conversation_id"], session_state)
         except Exception:
@@ -431,6 +523,7 @@ class AgentRuntime:
                 "session_state": None,
                 "runtime_policy": None,
                 "selected_skills": [],
+                "allowed_tools": [],
                 "reply": "",
                 "reply_message_id": None,
                 "cancelled": False,
@@ -450,6 +543,7 @@ class AgentRuntime:
                 "session_state": None,
                 "runtime_policy": None,
                 "selected_skills": [],
+                "allowed_tools": [],
                 "reply": "",
                 "reply_message_id": None,
                 "cancelled": False,
