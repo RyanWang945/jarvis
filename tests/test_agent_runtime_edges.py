@@ -4,6 +4,8 @@ from langchain_core.messages import HumanMessage
 
 from app.agent_react import react_graph
 from app.api.agent import get_conversation_store
+from app.config import get_settings
+from app.llm.client import ChatClient
 from app.tools.common import ToolExecutionResult
 from tests.helpers.agent_harness import (
     ScriptedChat,
@@ -12,6 +14,7 @@ from tests.helpers.agent_harness import (
     final_response,
     tool_call,
     tool_response,
+    unique_id,
 )
 
 
@@ -74,6 +77,108 @@ def test_turn_reply_appends_model_and_token_usage_when_provider_reports_usage(mo
     assert "**本轮调用信息**" not in reply
     assert "- 模型：`deepseek-test`" in reply
     assert "- Token：输入 `10` / 输出 `3` / 合计 `13`" in reply
+
+
+def test_turn_reply_replaces_model_generated_usage_footer(monkeypatch) -> None:
+    client = create_agent_test_client()
+    chat = ScriptedChat([
+        {
+            "content": (
+                "usage reported\n\n"
+                "---\n"
+                "- 模型：`deepseek-v4-flash`\n"
+                "- Token：输入 `2500` / 输出 `37` / 合计 `2537`"
+            ),
+            "tool_calls": [],
+            "_model": "deepseek-v4-pro",
+            "_usage": {"prompt_tokens": 2501, "completion_tokens": 96, "total_tokens": 2597},
+        },
+    ])
+    chat.install(monkeypatch)
+    created = create_dm_turn(client, "Report usage.")
+
+    run = client.post(f"/turns/{created['turn_id']}/run")
+
+    assert run.status_code == 200
+    reply = run.json()["reply"]
+    assert "deepseek-v4-flash" not in reply
+    assert "2500" not in reply
+    assert "- 模型：`deepseek-v4-pro`" in reply
+    assert "- Token：输入 `2501` / 输出 `96` / 合计 `2597`" in reply
+
+
+def test_agent_step_uses_active_model_profile(monkeypatch) -> None:
+    monkeypatch.setenv("JARVIS_DEEPSEEK_API_KEY", "deepseek-key")
+    get_settings.cache_clear()
+    client = create_agent_test_client()
+    chat_id = unique_id("chat-active-model-profile")
+    observed_models: list[str] = []
+
+    switched = client.post(
+        "/messages",
+        json={
+            "platform": "feishu",
+            "external_chat_id": chat_id,
+            "chat_type": "dm",
+            "sender": {"platform_user_id": "ou_1", "display_name": "Ryan"},
+            "content": "/model deepseek-v4-pro",
+            "external_message_id": unique_id("msg-switch-active-model"),
+        },
+    )
+    assert switched.status_code == 202
+    assert switched.json()["status"] == "model_updated"
+
+    def _fake_chat(
+        self,
+        messages,
+        tools=None,
+        response_format=None,
+        tool_choice=None,
+    ):
+        del messages, tools, response_format, tool_choice
+        observed_models.append(self._model)
+        return {
+            "content": "active model reply",
+            "tool_calls": [],
+            "_model": self._model,
+            "_usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+        }
+
+    monkeypatch.setattr(ChatClient, "chat", _fake_chat)
+    created = create_dm_turn(client, "hello after switch", chat_id=chat_id)
+
+    run = client.post(f"/turns/{created['turn_id']}/run")
+
+    assert run.status_code == 200
+    assert observed_models == ["deepseek-v4-pro"]
+    assert "- 模型：`deepseek-v4-pro`" in run.json()["reply"]
+    get_settings.cache_clear()
+
+
+def test_unsupported_loop_provider_fails_closed_without_llm_call(monkeypatch) -> None:
+    client = create_agent_test_client()
+    store = get_conversation_store()
+    created = create_dm_turn(client, "run with unsupported loop")
+    store.update_conversation_metadata(
+        created["conversation_id"],
+        {"runtime_profile": {"loop_provider": "plan_execute"}},
+    )
+
+    def _raise_if_called(self, messages, tools=None, response_format=None, tool_choice=None):
+        del self, messages, tools, response_format, tool_choice
+        raise AssertionError("unsupported loop provider should not call LLM")
+
+    monkeypatch.setattr(ChatClient, "chat", _raise_if_called)
+
+    run = client.post(f"/turns/{created['turn_id']}/run")
+
+    assert run.status_code == 200
+    assert run.json()["status"] == "failed"
+    assert run.json()["reply"] == ""
+    turn = store.get_turn(created["turn_id"])
+    assert turn is not None
+    assert turn.status == "failed"
+    assert turn.error_message == "Unsupported turn loop provider: plan_execute"
 
 
 def test_tool_exception_is_audited_and_returned_to_model(monkeypatch) -> None:

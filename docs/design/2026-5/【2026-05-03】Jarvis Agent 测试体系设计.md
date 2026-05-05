@@ -54,6 +54,26 @@ Jarvis agent 测试要回答的问题不是“模型这句话写得像不像”�
   - status 渲染。
   - model-facing 渲染不能泄漏 debug-only 字段。
 
+- LLM provider / model routing
+  - provider adapter 统一归一化 tool calls、usage、finish reason 和 model id。
+  - provider 返回的 tool arguments 支持 dict / JSON string / empty 三类输入。
+  - 不支持 `reasoning_content` 的 provider 不应收到该字段。
+  - `ModelRouter` 按 node override、active profile、默认 profile 顺序解析模型。
+  - `LLMNodePolicy` 对 `agent_step`、`intent_classifier`、`planner` 的 tools / JSON mode / timeout 约束稳定。
+  - 未配置 key 的 provider 不应出现在 `/model` 可切换列表。
+  - 缺少可用模型时必须 fail closed，而不是静默回落到错误 provider。
+
+- runtime profile / loop provider
+  - 默认 loop provider 为 `react`。
+  - 未支持的 loop provider 必须显式失败并写入 turn 状态。
+  - `/clear` 只清理对话上下文和 session 状态，不重置 `active_model_profile`、`runtime_profile`、`model_overrides`。
+  - `/status` 展示 Agent step、Intent classifier、Planner、Loop 的实际解析结果。
+
+- model usage hygiene
+  - runtime 追加的模型和 token footer 来自 provider usage，而不是模型正文。
+  - 历史 assistant message 进入模型上下文前应剥离旧 footer，避免模型复读或污染新回复。
+  - 飞书 renderer 只把最终 footer 移到 note，不应把旧 footer 留在正文里。
+
 - `tools.runtime`
   - shell 只读命令白名单。
   - shell 多命令拒绝。
@@ -78,6 +98,7 @@ Jarvis agent 测试要回答的问题不是“模型这句话写得像不像”�
 - `tests/test_tools_shell.py`
 - `tests/test_feishu_channel.py`
 - `tests/test_agent_context_manager_edges.py`
+- `tests/test_llm_client.py`
 
 ### 3.2 Scripted LLM Runtime 测试
 
@@ -102,6 +123,9 @@ Jarvis agent 测试要回答的问题不是“模型这句话写得像不像”�
 - `tool_calls.step_index`
 - tool output 是否进入下一轮模型上下文。
 - 工具失败、拒绝、取消是否被审计。
+- `agent_step` 是否通过 `ModelRouter` 选择当前 active model。
+- LLM 返回的 `_model` / `_usage` 是否进入 turn raw_payload 和最终 footer。
+- 模型正文中伪造或复读的 token footer 是否被 runtime 替换。
 
 这层是 Jarvis agent 工程测试的主力。
 
@@ -176,8 +200,11 @@ Jarvis agent 测试要回答的问题不是“模型这句话写得像不像”�
 - mention 触发 turn。
 - 回复 bot 消息触发 turn。
 - `/clear` 创建新 conversation generation。
+- `/clear` 保留 runtime/model preferences。
 - `/cancel` 取消 running turn。
 - `/status` 展示 session state。
+- `/model` 只展示已配置 key 的可用模型，并能切换 active model。
+- 未支持的 loop provider 返回明确失败，而不是继续执行错误 loop。
 - 飞书 thinking card 到 final card 更新。
 
 断言重点：
@@ -238,6 +265,14 @@ Jarvis agent 测试要回答的问题不是“模型这句话写得像不像”�
 - wiki 归档：应先 draft，再 apply 或等待确认。
 - 长上下文：应保留关键事实，避免引用被裁剪的旧信息。
 
+模型矩阵：
+
+- 第一版至少覆盖 `deepseek-v4-flash` 和 `deepseek-v4-pro`。
+- 后续 Kimi / Gemini 只有在 key 配置后进入 eval 矩阵。
+- 同一 case 在不同模型下分别保存 trace，不做隐式 fallback。
+- 对比指标包括工具选择、完成率、token、latency、成本和失败原因。
+- planner 节点上线后，同一任务需要分别评估 `react` 与 `plan_execute` runtime profile。
+
 输出内容：
 
 - 原始 query。
@@ -281,6 +316,10 @@ tests/helpers/agent_harness.py
 - `assert_turn_failed(...)`
 - `ScriptedChat.assert_called_with_tools(...)`
 - `ScriptedChat.last_model_messages`
+- `ScriptedChat.assert_called_with_response_format(...)`
+- `ScriptedChat.assert_called_with_model_profile(...)`
+- `assert_runtime_profile(...)`
+- `assert_model_usage_footer(...)`
 
 ### 4.2 pytest markers
 
@@ -292,9 +331,10 @@ markers = [
     "unit: pure deterministic unit tests",
     "runtime: scripted LLM runtime tests",
     "integration: safe local integration tests",
-    "real_llm: opt-in tests that call real LLM providers",
-    "real_coder: opt-in tests that run real coder backend",
-    "slow: slow tests excluded from default local loop",
+  "real_llm: opt-in tests that call real LLM providers",
+  "model_matrix: opt-in eval across configured model profiles",
+  "real_coder: opt-in tests that run real coder backend",
+  "slow: slow tests excluded from default local loop",
 ]
 ```
 
@@ -431,6 +471,16 @@ data/eval_runs/YYYY-MM-DD_HH-mm-ss_agent_eval/
 
 - Recovery correctness
   - crash / restart 后是否能恢复可见状态。
+
+- Model routing correctness
+  - `/model` 设置的 active profile 是否实际用于 `agent_step`。
+  - `intent_classifier` 是否使用 classifier node policy，而不是误用 agent step 策略。
+  - node override 是否只影响目标 node，不影响其他 node。
+  - 未配置 key / 未支持 provider / 未支持 loop 是否 fail closed。
+
+- Runtime preference persistence
+  - `/clear` 后模型、loop、node overrides 是否保留。
+  - `/clear` 后 session state、active tool intents、history 是否清空。
 
 - Workspace pollution count
   - 是否产生 `.idea/`、`.pytest_cache/`、`__pycache__/`、`.venv/` 等不期望产物。
@@ -571,6 +621,16 @@ tests/
   test_session_state.py
 ```
 
+### 6.6 模型切换测试边界
+
+模型切换必须拆成三层测，不能只靠真实聊天验证：
+
+1. provider adapter 单元测试：验证各 provider 响应被归一化成同一个内部协议。
+2. router / command 单元测试：验证 `/model`、`/status`、node override、missing-key、`/clear` 保留偏好。
+3. scripted runtime 测试：验证 `agent_step` 真实调用的是 resolved profile，并把 resolved model 写回 turn / footer。
+
+真实 LLM eval 只回答“这个模型在任务上表现好不好”，不负责证明路由代码正确。
+
 后续如果 runtime 测试继续增长，可再拆：
 
 ```text
@@ -593,6 +653,11 @@ tests/agent_runtime/
 - `tests/fixtures/agent_eval/smoke.jsonl`
 - `scripts/run_agent_eval.py`
 - `tests/test_agent_eval_runner.py`
+- `app/llm/provider_adapters.py`
+- `app/llm/model_profiles.py`
+- `app/llm/model_router.py`
+- `app/agent_react/loop_provider.py`
+- `app/agent_react/model_usage.py`
 
 覆盖：
 
@@ -603,6 +668,13 @@ tests/agent_runtime/
 - 最小 E2E smoke eval 数据集，包括 basic QA、search、wiki memory、coding、safety 五类。
 - E2E eval runner 支持 fixture 加载、真实 runtime 执行、trace 保存、自动评分和 Markdown report。
 - E2E eval runner 默认带安全闸：不设置 `JARVIS_RUN_AGENT_EVAL=1` 时不会调用真实 LLM/runtime。
+- provider adapter 归一化 tool call 参数、usage aliases、fallback tool call id。
+- `chat_normalized` 在 provider 不支持时剥离 `reasoning_content`。
+- `ModelRouter` 支持 classifier node override 和短 timeout。
+- `/model` 可列出并切换已配置模型，未配置 key 的 Kimi / Gemini 不展示。
+- DeepSeek 默认支持 `deepseek-v4-flash` 和 `deepseek-v4-pro` 两个 profile。
+- `/clear` 后保留 `active_model_profile`、`runtime_profile`、`model_overrides`。
+- runtime 追加真实 provider model/token footer，并替换模型正文里复读的旧 footer。
 
 E2E eval dry-run：
 
@@ -642,7 +714,7 @@ uv run pytest tests/test_agent_context_manager_edges.py tests/test_agent_runtime
 当前结果：
 
 ```text
-37 passed
+模型路由与 footer 相关子集已通过；完整基线需要在合并前重新跑默认本地闭环。
 ```
 
 ## 8. 后续路线
@@ -659,6 +731,10 @@ uv run pytest tests/test_agent_context_manager_edges.py tests/test_agent_runtime
 6. tool result 过长截断。
 7. repeated failed tool call 防护。
 8. session state 在多轮 turn 后更新策略。
+9. unsupported loop provider fail closed。
+10. context manager 显式剥离历史 model/token footer。
+11. `agent_step`、`intent_classifier`、`planner` node override 互不污染。
+12. MySQL conversation store 与 InMemory store 的 `/model`、`/clear` 行为一致。
 
 ### Phase 2：拆分 runtime 测试目录
 
@@ -678,6 +754,8 @@ tests/agent_runtime/
 - trace 保存。
 - 自动指标。
 - Markdown 报告。
+- model matrix。
+- runtime profile matrix。
 
 默认不进 CI。
 

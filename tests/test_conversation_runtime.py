@@ -627,6 +627,57 @@ def test_clear_command_in_dm_creates_new_conversation_generation(monkeypatch) ->
     assert any(msg["content"] == "/clear" for msg in old_messages)
 
 
+def test_clear_command_preserves_runtime_model_preferences(monkeypatch) -> None:
+    client = _client(monkeypatch)
+    chat_id = _unique_id("chat-dm-clear-model")
+
+    first = client.post(
+        "/messages",
+        json={
+            "platform": "feishu",
+            "external_chat_id": chat_id,
+            "chat_type": "dm",
+            "sender": {"platform_user_id": "ou_1", "display_name": "Ryan"},
+            "content": "hello",
+            "external_message_id": _unique_id("msg-clear-model-1"),
+        },
+    ).json()
+    store = get_conversation_store()
+    store.update_conversation_metadata(
+        first["conversation_id"],
+        {
+            "active_model_profile": "deepseek-v4-pro",
+            "runtime_profile": {
+                "loop_provider": "react",
+                "model_overrides": {"intent_classifier": "deepseek-v4-flash"},
+            },
+        },
+    )
+    store.update_conversation_session(
+        first["conversation_id"],
+        ConversationSessionState(session_mode="research", working_summary="clear this context"),
+    )
+
+    cleared = client.post(
+        "/messages",
+        json={
+            "platform": "feishu",
+            "external_chat_id": chat_id,
+            "chat_type": "dm",
+            "sender": {"platform_user_id": "ou_1", "display_name": "Ryan"},
+            "content": "/clear",
+            "external_message_id": _unique_id("msg-clear-model"),
+        },
+    ).json()
+
+    new_metadata = store.get_conversation(cleared["conversation_id"]).metadata
+    assert new_metadata["active_model_profile"] == "deepseek-v4-pro"
+    assert new_metadata["runtime_profile"]["loop_provider"] == "react"
+    assert new_metadata["runtime_profile"]["model_overrides"]["intent_classifier"] == "deepseek-v4-flash"
+    assert "session" not in new_metadata
+    assert new_metadata["cleared_from_conversation_id"] == first["conversation_id"]
+
+
 def test_duplicate_message_after_clear_does_not_trigger_new_turn(monkeypatch) -> None:
     client = _client(monkeypatch)
     chat_id = _unique_id("chat-dm-dup-after-clear")
@@ -884,6 +935,93 @@ def test_status_command_returns_conversation_stats(monkeypatch) -> None:
     assert "Working summary: Need a lightweight session state" in status["reset_message"]
     assert "消息数:" in status["reset_message"]
     assert "会话代数:" in status["reset_message"]
+    assert "Loop: react" in status["reset_message"]
+    assert "Agent step:" in status["reset_message"]
+
+
+def test_model_command_lists_and_switches_active_profile(monkeypatch) -> None:
+    monkeypatch.setenv("JARVIS_DEEPSEEK_API_KEY", "deepseek-key")
+    monkeypatch.setenv("JARVIS_KIMI_API_KEY", "kimi-key")
+    get_settings.cache_clear()
+    client = _client(monkeypatch)
+    chat_id = _unique_id("chat-dm-model")
+
+    listing = client.post(
+        "/messages",
+        json={
+            "platform": "feishu",
+            "external_chat_id": chat_id,
+            "chat_type": "dm",
+            "sender": {"platform_user_id": "ou_1", "display_name": "Ryan"},
+            "content": "/model",
+            "external_message_id": _unique_id("msg-model-list"),
+        },
+    ).json()
+
+    assert listing["status"] == "model_report"
+    assert "moonshot-v1-8k" in listing["reset_message"]
+
+    switched = client.post(
+        "/messages",
+        json={
+            "platform": "feishu",
+            "external_chat_id": chat_id,
+            "chat_type": "dm",
+            "sender": {"platform_user_id": "ou_1", "display_name": "Ryan"},
+            "content": "/model moonshot-v1-8k",
+            "external_message_id": _unique_id("msg-model-switch"),
+        },
+    ).json()
+
+    assert switched["status"] == "model_updated"
+    conversation = get_conversation_store().get_conversation(switched["conversation_id"])
+    assert conversation is not None
+    assert conversation.metadata["active_model_profile"] == "moonshot-v1-8k"
+    get_settings.cache_clear()
+
+
+def test_model_command_hides_unconfigured_providers_and_switches_deepseek_pro(monkeypatch) -> None:
+    monkeypatch.setenv("JARVIS_DEEPSEEK_API_KEY", "deepseek-key")
+    monkeypatch.delenv("JARVIS_KIMI_API_KEY", raising=False)
+    monkeypatch.delenv("JARVIS_GEMINI_API_KEY", raising=False)
+    get_settings.cache_clear()
+    client = _client(monkeypatch)
+    chat_id = _unique_id("chat-dm-model-deepseek")
+
+    listing = client.post(
+        "/messages",
+        json={
+            "platform": "feishu",
+            "external_chat_id": chat_id,
+            "chat_type": "dm",
+            "sender": {"platform_user_id": "ou_1", "display_name": "Ryan"},
+            "content": "/model",
+            "external_message_id": _unique_id("msg-model-list-deepseek"),
+        },
+    ).json()
+
+    assert "deepseek-v4-flash" in listing["reset_message"]
+    assert "deepseek-v4-pro" in listing["reset_message"]
+    assert "moonshot" not in listing["reset_message"]
+    assert "gemini" not in listing["reset_message"]
+
+    switched = client.post(
+        "/messages",
+        json={
+            "platform": "feishu",
+            "external_chat_id": chat_id,
+            "chat_type": "dm",
+            "sender": {"platform_user_id": "ou_1", "display_name": "Ryan"},
+            "content": "/model deepseek-v4-pro",
+            "external_message_id": _unique_id("msg-model-switch-deepseek"),
+        },
+    ).json()
+
+    assert switched["status"] == "model_updated"
+    conversation = get_conversation_store().get_conversation(switched["conversation_id"])
+    assert conversation is not None
+    assert conversation.metadata["active_model_profile"] == "deepseek-v4-pro"
+    get_settings.cache_clear()
 
 
 def test_repos_command_returns_registered_repositories(monkeypatch) -> None:

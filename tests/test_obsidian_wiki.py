@@ -182,7 +182,7 @@ def test_draft_can_compile_structured_page_from_source(tmp_path: Path) -> None:
     assert "Source Ref: `doc://structured`" in page_text
 
 
-def test_apply_refreshes_root_index_and_related_links(tmp_path: Path) -> None:
+def test_apply_refreshes_root_index_without_all_to_all_related_links(tmp_path: Path) -> None:
     service = ObsidianWikiService(tmp_path / "JarvisWiki")
     first_source = service.create_raw_source(
         source_type="documents",
@@ -220,5 +220,7 @@ def test_apply_refreshes_root_index_and_related_links(tmp_path: Path) -> None:
 
     assert "[[projects/jarvis/designs/first-design]]" in index_text
     assert "[[projects/jarvis/designs/second-design]]" in index_text
-    assert "[[projects/jarvis/designs/second-design]]" in first_page
-    assert "[[projects/jarvis/designs/first-design]]" in second_page
+    assert "[[index]]" in first_page
+    assert "[[index]]" in second_page
+    assert "[[projects/jarvis/designs/second-design]]" not in first_page
+    assert "[[projects/jarvis/designs/first-design]]" not in second_page

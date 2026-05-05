@@ -48,7 +48,11 @@ class ObsidianWikiService:
             self.workspace_path / "README.md",
             "# Obsidian Wiki Workspace\n\nOpen `vault/` as the Obsidian vault. `system/` stores raw sources, drafts, schema, and logs.\n",
         )
-        self._write_if_missing(self.vault_path / "index.md", "# Wiki Index\n")
+        self._write_if_missing(
+            self.vault_path / "index.md",
+            _render_frontmatter({"title": "Jarvis Wiki", "page_type": "index", "status": "active", "source_ids": [], "source_mode": "manual"})
+            + "\n# Wiki Index\n",
+        )
         self._write_if_missing(self.system_path / "schema" / "page-types.md", "\n".join(sorted(PAGE_TYPES)) + "\n")
         self._write_if_missing(self.system_path / "schema" / "naming.md", "# Naming\n")
         self._write_if_missing(self.system_path / "schema" / "writing-rules.md", "# Writing Rules\n")
@@ -254,31 +258,27 @@ class ObsidianWikiService:
         raise ValueError(f"unknown source_id: {source_id}")
 
     def _related_links(self, target_page: str) -> list[str]:
-        links = ["index"]
         target_path = self.vault_path / target_page
-        sibling_dir = target_path.parent
-        if sibling_dir.exists():
-            for sibling in sorted(sibling_dir.glob("*.md")):
-                if sibling == target_path:
-                    continue
-                links.append(sibling.relative_to(self.vault_path).with_suffix("").as_posix())
+        return self._context_links_for_page(target_path)
+
+    def _refresh_related_links(self, page_path: Path) -> None:
+        text = page_path.read_text(encoding="utf-8")
+        frontmatter, body = _parse_markdown(text)
+        current_link = page_path.relative_to(self.vault_path).with_suffix("").as_posix()
+        links = [link for link in self._context_links_for_page(page_path) if link != current_link]
+        updated_body = _replace_related_section(body, links)
+        page_path.write_text(_render_frontmatter(frontmatter) + "\n" + updated_body.strip() + "\n", encoding="utf-8")
+
+    def _context_links_for_page(self, page_path: Path) -> list[str]:
+        links = ["index"]
+        collection_index = page_path.parent.with_suffix(".md")
+        if collection_index.exists() and collection_index != page_path:
+            links.append(collection_index.relative_to(self.vault_path).with_suffix("").as_posix())
         seen: list[str] = []
         for link in links:
             if link not in seen:
                 seen.append(link)
         return seen
-
-    def _refresh_related_links(self, page_path: Path) -> None:
-        pages = [path for path in sorted(page_path.parent.glob("*.md")) if path.is_file()]
-        links = ["index"] + [path.relative_to(self.vault_path).with_suffix("").as_posix() for path in pages]
-        for path in pages:
-            text = path.read_text(encoding="utf-8")
-            frontmatter, body = _parse_markdown(text)
-            updated_body = _replace_related_section(
-                body,
-                [link for link in links if link != path.relative_to(self.vault_path).with_suffix("").as_posix()],
-            )
-            path.write_text(_render_frontmatter(frontmatter) + "\n" + updated_body.strip() + "\n", encoding="utf-8")
 
     def _refresh_root_index(self) -> None:
         sections: list[str] = ["# Jarvis Wiki", "", "这个 vault 用来沉淀 Jarvis 的长期知识页。当前主入口如下：", ""]
@@ -310,7 +310,8 @@ class ObsidianWikiService:
                 "- `inbox/` 放暂未归类但值得保留的页面",
             ]
         )
-        (self.vault_path / "index.md").write_text("\n".join(sections).strip() + "\n", encoding="utf-8")
+        frontmatter = {"title": "Jarvis Wiki", "page_type": "index", "status": "active", "source_ids": [], "source_mode": "generated"}
+        (self.vault_path / "index.md").write_text(_render_frontmatter(frontmatter) + "\n" + "\n".join(sections).strip() + "\n", encoding="utf-8")
 
 
 @dataclass(frozen=True)

@@ -9,7 +9,9 @@ from typing import Any, Literal, TypeAlias
 
 from app.agent_react.session_state import ConversationSessionState, SessionMode
 from app.config import get_settings
-from app.llm.client import ChatClient, LLMMessage, parse_json_content
+from app.llm.client import LLMMessage, parse_json_content
+from app.llm.model_profiles import LLMNode
+from app.llm.model_router import ModelRouter
 from app.repositories import RepositoryRegistryError, get_repository_registry
 
 logger = logging.getLogger(__name__)
@@ -92,6 +94,7 @@ def classify_turn(
     *,
     content: str,
     session_state: ConversationSessionState | None,
+    conversation_metadata: dict[str, Any] | None = None,
 ) -> TurnClassification:
     text = (content or "").strip()
     current = session_state or ConversationSessionState()
@@ -105,7 +108,7 @@ def classify_turn(
     if local is not None:
         return local
 
-    llm = _llm_classification(text, current)
+    llm = _llm_classification(text, current, conversation_metadata)
     if llm is not None:
         return _apply_local_overrides(llm, text, active_repo_id, current)
 
@@ -129,7 +132,7 @@ def should_apply_repo_update(classification: TurnClassification) -> bool:
 def _hard_rule_classification(text: str) -> TurnClassification | None:
     lowered = text.lower()
     command = lowered.split(maxsplit=1)[0] if lowered.startswith("/") else ""
-    if command in {"/status", "/cancel", "/clear", "/repos"}:
+    if command in {"/status", "/cancel", "/clear", "/repos", "/model"}:
         return TurnClassification(
             turn_type="command",
             confidence=1.0,
@@ -169,19 +172,19 @@ def _hard_rule_classification(text: str) -> TurnClassification | None:
     return None
 
 
-def _llm_classification(text: str, session_state: ConversationSessionState) -> TurnClassification | None:
+def _llm_classification(
+    text: str,
+    session_state: ConversationSessionState,
+    conversation_metadata: dict[str, Any] | None = None,
+) -> TurnClassification | None:
     settings = get_settings()
-    if not settings.deepseek_api_key:
-        return None
     if os.environ.get("PYTEST_CURRENT_TEST"):
         return None
 
-    client = ChatClient(
-        api_key=settings.deepseek_api_key,
-        base_url=settings.deepseek_base_url,
-        model=settings.deepseek_model,
-        timeout_seconds=min(float(settings.llm_timeout_seconds), 10.0),
-    )
+    resolved_llm = ModelRouter(settings).resolve(LLMNode.INTENT_CLASSIFIER, conversation_metadata)
+    if not resolved_llm.profile.api_key:
+        return None
+    client = resolved_llm.client
     messages = [
         LLMMessage(
             role="system",
@@ -224,8 +227,9 @@ def _llm_classification(text: str, session_state: ConversationSessionState) -> T
     ]
 
     try:
-        response = client.chat(messages, response_format={"type": "json_object"})
-        payload = parse_json_content(response)
+        response_format = {"type": "json_object"} if resolved_llm.profile.supports_json_object else None
+        response = client.chat_normalized(messages, response_format=response_format)
+        payload = parse_json_content({"content": response.content})
         logger.info("turn classifier llm payload=%s", json.dumps(payload, ensure_ascii=False))
     except Exception:
         logger.exception("turn classifier llm call failed")

@@ -7,6 +7,7 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
+from app.agent_react.model_usage import strip_token_usage_footer
 from app.agent_react.runtime_policy import RuntimePolicy, render_runtime_policy_for_model
 from app.agent_react.session_state import ConversationSessionState, render_session_state_for_model
 from app.llm.client import LLMMessage
@@ -477,7 +478,7 @@ class ContextManager:
                 result.append(
                     LLMMessage(
                         role="assistant",
-                        content=str(msg.content or ""),
+                        content=strip_token_usage_footer(str(msg.content or "")),
                         tool_calls=tool_calls,
                         reasoning_content=reasoning,
                     )

@@ -83,10 +83,12 @@ Kimi 与 DeepSeek V4 的返回值并不完全一致。若直接支持 `/model` �
 
 1. 支持 conversation 级模型切换。
 2. agent loop 不直接依赖某个 provider 的 raw response。
-3. classifier、agent loop 等节点都通过统一 LLM 初始化入口创建 client。
+3. classifier、agent step 等 LLM 节点都通过统一 LLM 初始化入口创建 client。
 4. provider 差异收口在 adapter 中。
 5. `/model` 只切换经过能力校验的 `ModelProfile`。
-6. 保留后续节点级模型配置空间，例如 agent loop 用强模型，classifier 用快模型。
+6. 保留后续节点级模型配置空间，例如 agent step 用强模型，classifier 用快模型，planner 用更强的规划模型。
+7. 明确区分 LLM provider 和 Turn loop provider：LLM provider 负责“怎么调用模型”，Turn loop provider 负责“怎么推进一个 turn”。
+8. 为后续核心 ReAct loop 切换、plan 节点切换预留稳定接口，但第一版不实现多个 loop。
 
 ## 非目标
 
@@ -97,6 +99,8 @@ Kimi 与 DeepSeek V4 的返回值并不完全一致。若直接支持 `/model` �
 3. 成本路由或智能模型选择。
 4. 自动 benchmark。
 5. 模型市场或管理后台。
+6. 多个核心 turn loop 并存运行。
+7. 完整 plan-execute runtime。
 
 这些可以等 provider adapter 稳定后再做。
 
@@ -155,16 +159,74 @@ class ModelProfile:
 
 ```python
 class LLMNode(str, Enum):
-    AGENT_LOOP = "agent_loop"
+    AGENT_STEP = "agent_step"
     INTENT_CLASSIFIER = "intent_classifier"
+    PLANNER = "planner"
+    PLAN_REPAIR = "plan_repair"
+    VERIFIER = "verifier"
     CONTEXT_COMPRESSION = "context_compression"
     SUMMARY = "summary"
 ```
 
 第一版只接入：
 
-1. `agent_loop`
+1. `agent_step`
 2. `intent_classifier`
+
+`planner`、`plan_repair`、`verifier` 第一版只作为配置和接口预留，不在默认 runtime 中启用。
+
+命名上不建议继续使用 `agent_loop` 表达 LLM 节点。`agent_loop` 容易和核心执行 loop 混淆。实际一次模型调用更准确地叫 `agent_step`：
+
+```text
+Turn loop = 负责推进 turn 的执行策略
+agent_step = Turn loop 内部的一次 LLM 决策节点
+```
+
+### NodePolicy
+
+每个 LLM 节点应有独立 policy，而不是只靠 profile 自己声明能力。
+
+```python
+@dataclass(frozen=True)
+class LLMNodePolicy:
+    node: LLMNode
+    requires_tools: bool = False
+    prefers_json_object: bool = False
+    allows_reasoning_content: bool = False
+    timeout_seconds: float | None = None
+    fallback_profile_id: str | None = None
+```
+
+建议第一版内置：
+
+```python
+NODE_POLICIES = {
+    LLMNode.AGENT_STEP: LLMNodePolicy(
+        node=LLMNode.AGENT_STEP,
+        requires_tools=True,
+        allows_reasoning_content=True,
+        timeout_seconds=settings.llm_timeout_seconds,
+    ),
+    LLMNode.INTENT_CLASSIFIER: LLMNodePolicy(
+        node=LLMNode.INTENT_CLASSIFIER,
+        prefers_json_object=True,
+        timeout_seconds=min(settings.llm_timeout_seconds, 10),
+        fallback_profile_id=settings.default_classifier_profile,
+    ),
+    LLMNode.PLANNER: LLMNodePolicy(
+        node=LLMNode.PLANNER,
+        prefers_json_object=True,
+        timeout_seconds=settings.llm_timeout_seconds,
+    ),
+}
+```
+
+`ModelRouter` resolve 出 profile 后，必须用 `NodePolicy` 做能力校验：
+
+1. `requires_tools=true` 时，profile 必须 `supports_tools=true`。
+2. `prefers_json_object=true` 且 profile 不支持 JSON mode 时，request builder 不传 `response_format`，但 parser 必须走容错 JSON 提取。
+3. `fallback_profile_id` 存在时，节点可回退到稳定模型；没有 fallback 时 fail closed。
+4. `allows_reasoning_content=false` 或 profile 不支持 reasoning 时，请求中必须剥离 reasoning 字段。
 
 ### ModelRouter
 
@@ -191,10 +253,95 @@ conversation metadata 第一版：
 {
   "active_model_profile": "deepseek-v4-flash",
   "model_overrides": {
-    "agent_loop": "kimi-k2",
-    "intent_classifier": "deepseek-v4-flash"
+    "agent_step": "kimi-k2",
+    "intent_classifier": "deepseek-v4-flash",
+    "planner": "deepseek-v4-pro",
+    "plan_repair": "deepseek-v4-pro",
+    "verifier": "gpt-5.5"
   }
 }
+```
+
+router 的返回值不应只是 client，还应包含本次调用实际使用的 profile 和 node policy，方便 footer、审计、测试断言：
+
+```python
+@dataclass(frozen=True)
+class ResolvedLLM:
+    node: LLMNode
+    profile: ModelProfile
+    policy: LLMNodePolicy
+    client: LLMClient
+```
+
+### TurnLoopProvider
+
+LLM provider 和核心执行 loop 必须分开。
+
+```python
+class TurnLoopProvider(str, Enum):
+    REACT = "react"
+    PLAN_EXECUTE = "plan_execute"
+    RESEARCH = "research"
+    CODING_REVIEW = "coding_review"
+```
+
+第一版只实现：
+
+```text
+react
+```
+
+但 `TurnRuntime` 的调用边界应预留成：
+
+```python
+class TurnLoop(Protocol):
+    def invoke(self, request: TurnLoopRequest) -> TurnLoopResult:
+        ...
+```
+
+`ReactLoop` 内部继续做当前逻辑：
+
+```text
+render context
+-> call LLMNode.AGENT_STEP
+-> execute tool calls
+-> append tool results
+-> continue or finalize
+```
+
+后续如果引入 plan-execute，不应修改 LLM provider adapter，而是新增一个 loop：
+
+```text
+PlanExecuteLoop
+  -> call LLMNode.PLANNER
+  -> execute planned step
+  -> call LLMNode.VERIFIER or PLAN_REPAIR
+  -> continue or finalize
+```
+
+### RuntimeProfile
+
+conversation 级别可以同时记录默认模型和 loop provider：
+
+```json
+{
+  "active_model_profile": "deepseek-v4-flash",
+  "runtime_profile": {
+    "loop_provider": "react",
+    "model_overrides": {
+      "agent_step": "kimi-k2",
+      "planner": "deepseek-v4-pro"
+    }
+  }
+}
+```
+
+第一版可以先不暴露 `/loop` 命令，也不允许用户切换 loop。只在 metadata 和代码接口上保留字段：
+
+```text
+missing loop_provider -> react
+unknown loop_provider -> fail closed or fallback react with warning
+unsupported loop_provider -> fail closed
 ```
 
 ### ProviderAdapter
@@ -233,10 +380,12 @@ adapter 职责：
 2. 标准化 tool calls。
 3. 标准化 usage。
 4. 识别 provider-specific reasoning 字段。
-5. 决定 request 中是否允许带 `reasoning_content`。
-6. 决定是否传 `response_format`。
+5. 按 profile 能力构造 provider-compatible request。
+6. 按 node policy 决定是否传 `response_format`、tools、tool_choice、reasoning_content。
 
-agent loop 只消费 `NormalizedLLMResponse`，不再直接读 provider raw 字段。
+agent step、planner、classifier 等 LLM 节点只消费 `NormalizedLLMResponse`，不再直接读 provider raw 字段。
+
+注意：`ProviderAdapter` 不负责选择模型，也不负责决定 turn loop。模型选择属于 `ModelRouter`，turn 推进属于 `TurnLoopProvider`。
 
 ## Provider 差异点
 
@@ -393,11 +542,13 @@ card action payload 示例：
 
 ```text
 LLM: active_model_profile
-Agent loop: xxx
+Loop: react
+Agent step: xxx
 Intent classifier: xxx
+Planner: xxx
 ```
 
-第一版 agent loop 与 classifier 使用同一个 active profile，因此可先展示同一个模型。
+第一版 loop 固定为 `react`。agent step 与 classifier 可以先使用同一个 active profile，但 `/status` 的展示结构应提前按节点拆开，避免后续再改用户可见格式。
 
 ## 推荐落地顺序
 
@@ -408,37 +559,49 @@ Intent classifier: xxx
 3. 定义 `NormalizedLLMResponse`、`NormalizedToolCall`、`TokenUsage`。
 4. 实现 `DeepSeekAdapter`，保持当前行为不变。
 5. 实现 `KimiAdapter`，至少处理 tool calls、usage、无 reasoning_content。
-6. agent loop 改为消费 normalized response。
+6. agent step 改为消费 normalized response。
 7. 保留当前 DeepSeek 默认配置，确保行为不变。
 
-### Phase 2：ModelRouter
+### Phase 2：ModelRouter 与 NodePolicy
 
 1. 新增 `ModelRouter.resolve(node, conversation_metadata)`。
-2. agent loop 通过 router 创建 client。
-3. classifier 通过 router 创建 client。
-4. profile capability 决定是否传 `response_format`。
-5. profile capability 决定是否回传 `reasoning_content`。
+2. 新增 `LLMNodePolicy`。
+3. agent step 通过 router 创建 client。
+4. classifier 通过 router 创建 client。
+5. profile capability + node policy 决定是否传 `response_format`。
+6. profile capability + node policy 决定是否回传 `reasoning_content`。
+7. 预留 `planner`、`plan_repair`、`verifier` 节点配置，但第一版不启用。
 
-### Phase 3：`/model` 文本命令
+### Phase 3：TurnLoopProvider 预留
+
+1. 新增 `TurnLoopProvider` enum。
+2. 新增 `TurnLoop` protocol 或等价内部接口。
+3. 当前 `TurnRuntime` 只注册 `react` loop。
+4. 不暴露用户级 loop 切换命令。
+5. unknown / unsupported loop provider fail closed。
+
+### Phase 4：`/model` 文本命令
 
 1. command handler 支持 `/model`。
 2. conversation metadata 写入 `active_model_profile`。
-3. `/status` 展示当前模型。
+3. `/status` 展示当前模型、loop、节点模型。
 4. 测试默认模型、切换模型、无效模型。
 
-### Phase 4：飞书卡片
+### Phase 5：飞书卡片
 
 1. renderer 新增 `render_model_selection_card`。
 2. card action 支持 `set_model_profile`。
 3. 点击后更新 conversation metadata。
 4. 更新原卡片展示结果。
 
-### Phase 5：节点级配置与 fallback
+### Phase 6：节点级配置与 fallback
 
-1. 支持 `model_overrides.agent_loop`。
+1. 支持 `model_overrides.agent_step`。
 2. 支持 `model_overrides.intent_classifier`。
-3. 支持 classifier fallback。
-4. 支持 provider 超时重试。
+3. 支持 `model_overrides.planner`。
+4. 支持 classifier fallback。
+5. 支持 provider 超时重试。
+6. 后续真正引入 plan-execute loop 时，再启用 planner 节点。
 
 ## 测试计划
 
@@ -454,7 +617,7 @@ Intent classifier: xxx
 
 1. DeepSeek profile 下行为与现在一致。
 2. Kimi profile 下工具调用可执行。
-3. 不支持 tools 的 profile 不应出现在 agent loop 可选列表。
+3. 不支持 tools 的 profile 不应出现在 agent step 可选列表。
 4. 模型返回空 content + tool_calls 时不失败。
 5. 模型返回 content + tool_calls 时不丢内容。
 
@@ -464,6 +627,20 @@ Intent classifier: xxx
 2. 不支持 JSON mode 时不传 `response_format`。
 3. provider 超时时 fallback 分类仍可用。
 4. classifier 使用 conversation 当前 active model。
+
+### NodePolicy / Router 测试
+
+1. `agent_step` 选择不支持 tools 的 profile 时 fail closed 或回退。
+2. `intent_classifier` 使用短 timeout。
+3. `planner` override 能被 resolve，但默认 runtime 不调用 planner。
+4. profile 不支持 reasoning 时，请求中不包含 reasoning_content。
+
+### TurnLoopProvider 测试
+
+1. metadata 缺少 loop provider 时默认 `react`。
+2. metadata 为 `react` 时走当前 ReAct loop。
+3. metadata 为未知 loop provider 时 fail closed 或明确 fallback。
+4. 第一版不暴露 loop 切换命令。
 
 ### `/model` 测试
 
@@ -495,6 +672,14 @@ DeepSeek 特有字段不能传给 Kimi。request builder 必须按 profile capab
 
 footer 中的模型名应来自 normalized response 的 model 字段。如果 provider 不返回 model，则使用 profile model。
 
+### 风险 6：LLM provider 与 loop provider 混淆
+
+Kimi、DeepSeek、OpenAI 这类 provider 只应该描述模型协议差异。ReAct、plan-execute、research 这类 loop 是 turn 执行策略。两者如果混在一起，后续会出现“为了切 planner 模型而改 agent loop”或“为了换 research loop 而改 provider adapter”的问题。
+
+### 风险 7：第一版过度设计
+
+第一版只应实现一个 loop：`react`。`TurnLoopProvider`、`planner`、`plan_repair`、`verifier` 是接口预留和配置预留，不应在第一版引入复杂 plan-execute 状态机。
+
 ## 当前结论
 
 多模型切换是一次 agent loop 级别改造，不建议先做 `/model` UI。
@@ -504,7 +689,9 @@ footer 中的模型名应来自 normalized response 的 model 字段。如果 pr
 ```text
 Provider Adapter
   -> ModelRouter
-  -> Agent loop / classifier 接入
+  -> NodePolicy
+  -> agent step / classifier 接入
+  -> TurnLoopProvider 接口预留（只实现 react）
   -> /model 文本命令
   -> 飞书选择卡片
   -> 节点级模型配置

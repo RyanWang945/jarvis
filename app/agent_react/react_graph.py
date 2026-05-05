@@ -14,7 +14,9 @@ from typing_extensions import TypedDict
 from app.agent_react.context_manager import ContextManager
 from app.agent_react.tool_intent_state import append_conversation_tool_intents
 from app.config import get_settings
-from app.llm.client import ChatClient
+from app.llm.model_profiles import LLMNode
+from app.llm.model_router import ModelRouter
+from app.llm.provider_adapters import NormalizedLLMResponse
 from app.persistence.models import TurnRecord
 from app.tools.runtime import build_llm_tools, check_tool_policy, execute_tool, get_tool_definition
 
@@ -123,26 +125,30 @@ _EXECUTION_INSTRUCTION_PATTERN = (
 )
 
 
-def _llm_response_to_ai_message(response: dict[str, Any]) -> AIMessage:
-    content = response.get("content") or ""
+def _llm_response_to_ai_message(response: NormalizedLLMResponse) -> AIMessage:
+    content = response.content or ""
     tool_calls: list[dict[str, Any]] = []
-    for tc in response.get("tool_calls", []):
-        if tc.get("type") == "function":
-            func = tc["function"]
-            try:
-                args = json.loads(func["arguments"])
-            except (json.JSONDecodeError, KeyError):
-                args = {}
-            tool_calls.append({
-                "id": tc["id"],
-                "name": func["name"],
-                "args": args,
-            })
-    reasoning_content = response.get("reasoning_content")
+    for tc in response.tool_calls:
+        tool_calls.append({
+            "id": tc.id,
+            "name": tc.name,
+            "args": tc.args,
+        })
+    reasoning_content = response.reasoning_content
     response_metadata = {}
     if reasoning_content is not None:
         response_metadata["reasoning_content"] = reasoning_content
     return AIMessage(content=content, tool_calls=tool_calls, response_metadata=response_metadata)
+
+
+def _usage_from_normalized(response: NormalizedLLMResponse) -> dict[str, int] | None:
+    if response.usage is None:
+        return None
+    return {
+        "prompt_tokens": response.usage.prompt_tokens,
+        "completion_tokens": response.usage.completion_tokens,
+        "total_tokens": response.usage.total_tokens,
+    }
 
 
 def _usage_from_response(response: dict[str, Any]) -> dict[str, int] | None:
@@ -323,12 +329,13 @@ def call_llm(state: ReActState, store: TurnStore) -> ReActState:
         }
 
     settings = get_settings()
-    client = ChatClient(
-        api_key=settings.deepseek_api_key or "",
-        base_url=settings.deepseek_base_url,
-        model=settings.deepseek_model,
-        timeout_seconds=settings.llm_timeout_seconds,
+    turn = store.get_turn(state["turn_id"])
+    conversation = store.get_conversation(turn.conversation_id) if turn is not None else None
+    resolved_llm = ModelRouter(settings).resolve(
+        LLMNode.AGENT_STEP,
+        getattr(conversation, "metadata", None) if conversation is not None else None,
     )
+    client = resolved_llm.client
 
     messages = state["messages"]
     llm_messages = _CONTEXT_MANAGER.render_for_model(messages, state.get("token_budget"))
@@ -355,7 +362,7 @@ def call_llm(state: ReActState, store: TurnStore) -> ReActState:
         )
 
     try:
-        response = client.chat(llm_messages, tools=tools)
+        response = client.chat_normalized(llm_messages, tools=tools)
     except Exception:
         logger.exception("llm call failed messages_count=%s", len(llm_messages))
         return {
@@ -367,9 +374,9 @@ def call_llm(state: ReActState, store: TurnStore) -> ReActState:
             "step_count": state.get("step_count", 0) + 1,
         }
 
-    response_usage = _usage_from_response(response)
+    response_usage = _usage_from_normalized(response)
     token_usage = _merge_token_usage(state.get("token_usage"), response_usage)
-    model_name = str(response.get("_model") or state.get("model") or settings.deepseek_model)
+    model_name = response.model or resolved_llm.profile.model or state.get("model") or settings.deepseek_model
     if response_usage is not None:
         logger.info(
             "llm_usage turn_id=%s step=%s model=%s prompt=%s completion=%s total=%s turn_total=%s",

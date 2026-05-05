@@ -29,6 +29,7 @@ from app.api.schemas import (
     SenderInput,
 )
 from app.config import get_settings
+from app.llm.model_profiles import model_command_response, render_model_status, runtime_preferences_metadata
 from app.persistence.models import (
     ConversationRecord,
     MessageRecord,
@@ -784,6 +785,7 @@ class MySQLConversationStore:
             classification = classify_turn(
                 content=content,
                 session_state=load_session_state(conversation.metadata),
+                conversation_metadata=conversation.metadata,
             )
             classification_metadata = classification_to_metadata(classification)
             logger.info(
@@ -865,6 +867,10 @@ class MySQLConversationStore:
             )
         if cmd == "/status":
             return self._handle_status_command(
+                conn, conversation=conversation, user_id=user_id, request=request
+            )
+        if cmd == "/model":
+            return self._handle_model_command(
                 conn, conversation=conversation, user_id=user_id, request=request
             )
         if cmd == "/repos":
@@ -973,6 +979,10 @@ class MySQLConversationStore:
 
         # Create new conversation with incremented generation.
         new_gen = conversation.clear_generation + 1
+        new_metadata = {
+            **runtime_preferences_metadata(conversation.metadata),
+            "cleared_from_conversation_id": conversation.id,
+        }
         result = conn.execute(
             sa.text(
                 "INSERT INTO conversations (platform, external_chat_id, chat_type, title, owner_user_id, created_by_user_id, "
@@ -987,7 +997,7 @@ class MySQLConversationStore:
                 "owner": conversation.owner_user_id,
                 "created_by": conversation.created_by_user_id,
                 "gen": new_gen,
-                "meta": json.dumps({"cleared_from_conversation_id": conversation.id}),
+                "meta": json.dumps(new_metadata),
                 "now": now,
             },
         )
@@ -1174,8 +1184,7 @@ class MySQLConversationStore:
         ).mappings().one()
 
         settings = get_settings()
-        provider = settings.llm_provider
-        model = getattr(settings, f"{provider}_model", "unknown")
+        model_status = render_model_status(conversation.metadata, settings)
         session_report = render_session_state(load_session_state(conversation.metadata))
 
         running_count = turn_stats["running"] or 0
@@ -1193,7 +1202,7 @@ class MySQLConversationStore:
             f"---\n"
             f"系统参数\n"
             f"App: {settings.app_name} ({settings.environment})\n"
-            f"LLM: {provider} / {model}\n"
+            f"{model_status}\n"
             f"超时: {settings.llm_timeout_seconds}s\n"
             f"Bot: {settings.feishu_bot_name}"
         )
@@ -1210,6 +1219,78 @@ class MySQLConversationStore:
             should_respond=False,
             trigger_type="command",
             status="status_report",
+            reset_message=reply,
+        )
+
+    def _handle_model_command(
+        self,
+        conn: sa.Connection,
+        *,
+        conversation: ConversationRecord,
+        user_id: int,
+        request: MessageCreateRequest,
+    ) -> MessageIngestResponse:
+        if request.external_message_id:
+            dup = conn.execute(
+                sa.text(
+                    "SELECT id, turn_id FROM messages WHERE conversation_id = :cid AND external_message_id = :eid"
+                ),
+                {"cid": conversation.id, "eid": request.external_message_id},
+            ).mappings().one_or_none()
+            if dup is not None:
+                turn_id = dup["turn_id"]
+                trigger_type = None
+                if turn_id:
+                    trow = conn.execute(
+                        sa.text("SELECT trigger_type FROM turns WHERE id = :id"),
+                        {"id": turn_id},
+                    ).mappings().one_or_none()
+                    trigger_type = trow["trigger_type"] if trow else None
+                return MessageIngestResponse(
+                    conversation_id=conversation.id,
+                    message_id=dup["id"],
+                    turn_id=turn_id,
+                    should_respond=turn_id is not None,
+                    trigger_type=trigger_type,
+                    status="duplicate",
+                )
+
+        now = _now()
+        message = self._append_message(
+            conn,
+            conversation_id=conversation.id,
+            turn_id=None,
+            sender_type="user",
+            user_id=user_id,
+            role="user",
+            content=request.content,
+            content_type=request.content_type,
+            external_message_id=request.external_message_id,
+            reply_to_message_id=None,
+            raw_payload=dict(request.raw_payload),
+        )
+        status, reply, patch = model_command_response(request.content, conversation.metadata, get_settings())
+        if patch:
+            conn.execute(
+                sa.text(
+                    "UPDATE conversations "
+                    "SET metadata = JSON_MERGE_PATCH(COALESCE(metadata, '{}'), :patch), updated_at = :now "
+                    "WHERE id = :id"
+                ),
+                {"patch": json.dumps(patch), "now": now, "id": conversation.id},
+            )
+        else:
+            conn.execute(
+                sa.text("UPDATE conversations SET updated_at = :now WHERE id = :id"),
+                {"now": now, "id": conversation.id},
+            )
+        return MessageIngestResponse(
+            conversation_id=conversation.id,
+            message_id=message.id,
+            turn_id=None,
+            should_respond=False,
+            trigger_type="command",
+            status=status,
             reset_message=reply,
         )
 

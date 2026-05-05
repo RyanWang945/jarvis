@@ -11,6 +11,8 @@ from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 from typing_extensions import TypedDict
 
 from app.agent_react.context_manager import ContextManager
+from app.agent_react.loop_provider import TurnLoopProvider, resolve_turn_loop_provider
+from app.agent_react.model_usage import strip_token_usage_footer
 from app.agent_react.react_graph import call_llm, execute_tools, should_continue
 from app.agent_react.runtime_policy import RuntimePolicy, resolve_runtime_policy
 from app.agent_react.session_state import (
@@ -154,6 +156,7 @@ class TurnRuntimeState(TypedDict):
     token_budget: int | None
     token_usage: dict[str, int] | None
     model: str | None
+    loop_provider: str | None
     error: str | None
 
 class TurnRuntime:
@@ -202,6 +205,20 @@ class TurnRuntime:
             }
 
         conversation = self._store.get_conversation(turn.conversation_id)
+        try:
+            loop_provider = resolve_turn_loop_provider(conversation.metadata if conversation is not None else None)
+        except ValueError as exc:
+            return {
+                **state,
+                "status": "failed",
+                "error": str(exc),
+            }
+        if loop_provider is not TurnLoopProvider.REACT:
+            return {
+                **state,
+                "status": "failed",
+                "error": f"Unsupported turn loop provider: {loop_provider.value}",
+            }
         session_state = load_session_state(conversation.metadata if conversation is not None else None)
         runtime_policy = resolve_runtime_policy(
             session_mode=session_state.session_mode,
@@ -266,6 +283,7 @@ class TurnRuntime:
             "token_budget": self._token_budget,
             "token_usage": state.get("token_usage"),
             "model": state.get("model"),
+            "loop_provider": loop_provider.value,
             "error": None,
         }
 
@@ -496,6 +514,8 @@ class TurnRuntime:
             raw_payload["token_usage"] = state["token_usage"]
         if state.get("model"):
             raw_payload["model"] = state["model"]
+        if state.get("loop_provider"):
+            raw_payload["loop_provider"] = state["loop_provider"]
         if assistant_messages:
             reasoning = assistant_messages[-1].response_metadata.get("reasoning_content") if assistant_messages[-1].response_metadata else None
             if reasoning is not None:
@@ -597,6 +617,7 @@ class AgentRuntime:
                 "token_budget": self._token_budget,
                 "token_usage": None,
                 "model": settings.deepseek_model,
+                "loop_provider": None,
                 "error": None,
             })
         except Exception as exc:
@@ -619,6 +640,7 @@ class AgentRuntime:
                 "token_budget": self._token_budget,
                 "token_usage": None,
                 "model": settings.deepseek_model,
+                "loop_provider": None,
                 "error": str(exc),
             }
 
@@ -666,6 +688,7 @@ def _append_token_usage_footer(
     token_usage: dict[str, int] | None,
     model: str | None,
 ) -> str:
+    content = strip_token_usage_footer(content)
     if not token_usage:
         return content
     prompt = int(token_usage.get("prompt_tokens", 0) or 0)

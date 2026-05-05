@@ -5,6 +5,8 @@ from typing import Any, Literal
 import httpx
 from pydantic import BaseModel
 
+from app.llm.provider_adapters import NormalizedLLMResponse, normalize_response
+
 logger = logging.getLogger(__name__)
 
 LLMRole = Literal["system", "user", "assistant", "tool"]
@@ -26,11 +28,15 @@ class ChatClient:
         base_url: str,
         model: str,
         timeout_seconds: float,
+        provider: str = "deepseek",
+        supports_reasoning_content: bool = True,
     ) -> None:
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
         self._model = model
         self._timeout_seconds = timeout_seconds
+        self._provider = provider
+        self._supports_reasoning_content = supports_reasoning_content
 
     def chat(
         self,
@@ -50,7 +56,7 @@ class ChatClient:
                 d["tool_call_id"] = msg.tool_call_id
             if msg.tool_calls is not None:
                 d["tool_calls"] = msg.tool_calls
-            if msg.reasoning_content is not None:
+            if self._supports_reasoning_content and msg.reasoning_content is not None:
                 d["reasoning_content"] = msg.reasoning_content
             return d
 
@@ -92,6 +98,28 @@ class ChatClient:
         else:
             result["_model"] = self._model
         return result
+
+    def chat_normalized(
+        self,
+        messages: list[LLMMessage],
+        *,
+        response_format: dict[str, str] | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+    ) -> NormalizedLLMResponse:
+        kwargs: dict[str, Any] = {}
+        if response_format is not None:
+            kwargs["response_format"] = response_format
+        if tools is not None:
+            kwargs["tools"] = tools
+        if tool_choice is not None:
+            kwargs["tool_choice"] = tool_choice
+        response = self.chat(messages, **kwargs)
+        return normalize_response(
+            response,
+            provider=self._provider,
+            fallback_model=self._model,
+        )
 
 
 def parse_json_content(message: dict[str, Any]) -> dict[str, Any]:
