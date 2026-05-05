@@ -11,6 +11,7 @@ from app.knowledge_base.eval import GeneratedQuery, KnowledgeBaseEvaluationServi
 from app.knowledge_base.indexing import KnowledgeBaseIndexService
 from app.knowledge_base.parsers.alibaba_pdf import AlibabaDocumentAnalyzeClient
 from app.knowledge_base.repositories import get_knowledge_base_db
+from app.knowledge_base.reranking import RerankerClient
 from app.knowledge_base.sec_chunking import chunk_sec_blocks
 from app.knowledge_base.sec_blocks import normalize_aliyun_markdown
 from app.knowledge_base.sec_parse import SecFilingParseService
@@ -803,6 +804,93 @@ def test_rrf_search_combines_bm25_and_vector_ranks() -> None:
     )
 
     assert [hit.chunk_id for hit in hits] == ["c2", "c1", "c3"]
+
+
+def test_reranker_client_posts_hits_and_maps_scores() -> None:
+    captured_body: dict | None = None
+
+    def handler(request: Request) -> Response:
+        nonlocal captured_body
+        captured_body = json.loads(request.content.decode("utf-8"))
+        return Response(
+            200,
+            json={
+                "provider": "flag_embedding",
+                "model": "/models/bge-reranker-v2-m3",
+                "latency_ms": 12,
+                "results": [
+                    {"id": "c2", "score": 6.5, "rank": 1},
+                    {"id": "c1", "score": 1.25, "rank": 2},
+                ],
+            },
+        )
+
+    client = RerankerClient(
+        base_url="http://127.0.0.1:8000",
+        http_client=MockHttpxClient(handler),
+    )
+    hits = [
+        type("Hit", (), {"chunk_id": "c1", "doc_id": "d1", "score": 0.2, "source": {"content": "alpha"}})(),
+        type("Hit", (), {"chunk_id": "c2", "doc_id": "d2", "score": 0.1, "source": {"content": "beta"}})(),
+    ]
+
+    reranked = client.rerank_hits(query="query", hits=hits, top_n=2)
+
+    assert captured_body is not None
+    assert captured_body["documents"][0]["id"] == "c1"
+    assert captured_body["documents"][0]["text"] == "alpha"
+    assert [hit.chunk_id for hit in reranked] == ["c2", "c1"]
+    assert reranked[0].score == 6.5
+    assert reranked[0].source["retrieval_score"] == 0.1
+    assert reranked[0].source["reranker_provider"] == "flag_embedding"
+
+
+def test_rrf_v2_rerank_search_falls_back_when_reranker_fails() -> None:
+    class FakeEmbeddingClient:
+        def embed_texts(self, texts):
+            return type(
+                "EmbeddingResult",
+                (),
+                {
+                    "vectors": [type("Vector", (), {"embedding": [0.1, 0.2, 0.3]})()],
+                },
+            )()
+
+    class FakeOpenSearchClient:
+        def index_name(self, *, language: str, chunk_profile_id: str, source_type: str | None = None):
+            return f"kb_wikipedia_{language}_{chunk_profile_id}"
+
+        def bm25_search(self, *, index_name: str, query: str, top_k: int, filters=None):
+            return [
+                type("Hit", (), {"chunk_id": "c1", "doc_id": "d1", "score": 10.0, "source": {"content": "alpha"}})()
+            ]
+
+        def vector_search(self, *, index_name: str, query_vector: list[float], top_k: int, filters=None):
+            return [
+                type("Hit", (), {"chunk_id": "c2", "doc_id": "d2", "score": 9.0, "source": {"content": "beta"}})()
+            ]
+
+    class FailingReranker:
+        def rerank_hits(self, **kwargs):
+            raise RuntimeError("reranker unavailable")
+
+    service = KnowledgeBaseIndexService(
+        db=object(),
+        embedding_client=FakeEmbeddingClient(),
+        opensearch_client=FakeOpenSearchClient(),
+        reranker_client=FailingReranker(),
+        rerank_input_top_k=50,
+    )
+
+    hits = service.search(
+        query="query",
+        language="zh",
+        chunk_profile_id="medium_overlap_v1",
+        mode="rrf_v2_rerank",
+        top_k=2,
+    )
+
+    assert [hit.chunk_id for hit in hits] == ["c1", "c2"]
 
 
 def test_eval_run_persists_rrf_v2_params(tmp_path) -> None:

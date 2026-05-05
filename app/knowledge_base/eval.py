@@ -11,6 +11,7 @@ from typing import Any
 
 from app.config import Settings
 from app.knowledge_base.embedding import DashScopeEmbeddingClient
+from app.knowledge_base.reranking import RerankerClient
 from app.knowledge_base.search import OpenSearchClient
 from app.knowledge_base.search import SearchHit
 from app.llm.client import ChatClient, LLMMessage, parse_json_content
@@ -176,6 +177,7 @@ class KnowledgeBaseEvaluationService:
         self._kb_service = kb_service
         self._generator = QueryGenerationService(settings)
         self._opensearch_client_instance: OpenSearchClient | None = None
+        self._reranker_client_instance: RerankerClient | None = None
 
     def generate_dataset(
         self,
@@ -450,6 +452,16 @@ class KnowledgeBaseEvaluationService:
             bm25_top_k = int((retrieval_params or {}).get("bm25_candidate_k", 20))
             vector_top_k = int((retrieval_params or {}).get("vector_candidate_k", 20))
             rrf_k = int((retrieval_params or {}).get("rrf_k", 60))
+        elif retrieval_mode == "rrf_v2_rerank":
+            rerank_input_top_k = int(
+                (retrieval_params or {}).get(
+                    "rerank_input_top_k",
+                    self._settings.knowledge_reranker_input_top_k,
+                )
+            )
+            bm25_top_k = int((retrieval_params or {}).get("bm25_candidate_k", rerank_input_top_k))
+            vector_top_k = int((retrieval_params or {}).get("vector_candidate_k", rerank_input_top_k))
+            rrf_k = int((retrieval_params or {}).get("rrf_k", 60))
         else:
             raise ValueError(f"Unsupported retrieval mode: {retrieval_mode}")
         bm25_hits = opensearch_client.bm25_search(
@@ -488,6 +500,39 @@ class KnowledgeBaseEvaluationService:
                 top_k=top_k,
                 k=rrf_k,
             )
+        if retrieval_mode == "rrf_v2_rerank":
+            from app.knowledge_base.search import combine_rrf_hits
+
+            rerank_input_top_k = int(
+                (retrieval_params or {}).get(
+                    "rerank_input_top_k",
+                    self._settings.knowledge_reranker_input_top_k,
+                )
+            )
+            candidates = combine_rrf_hits(
+                bm25_hits=bm25_hits,
+                vector_hits=vector_hits,
+                top_k=rerank_input_top_k,
+                k=rrf_k,
+            )
+            reranker = self._reranker_client()
+            if reranker is None:
+                return candidates[:top_k]
+            try:
+                reranked = reranker.rerank_hits(
+                    query=query["query_text"],
+                    hits=candidates,
+                    top_n=top_k,
+                    max_length=int(
+                        (retrieval_params or {}).get(
+                            "rerank_max_length",
+                            self._settings.knowledge_reranker_max_length,
+                        )
+                    ),
+                )
+            except Exception:
+                return candidates[:top_k]
+            return reranked or candidates[:top_k]
         raise ValueError(f"Unsupported retrieval mode: {retrieval_mode}")
 
     def _resolve_retrieval_params(
@@ -497,13 +542,20 @@ class KnowledgeBaseEvaluationService:
         top_k: int,
         retrieval_params: dict[str, Any] | None,
     ) -> dict[str, Any] | None:
-        if retrieval_mode != "rrf_v2":
+        if retrieval_mode not in {"rrf_v2", "rrf_v2_rerank"}:
             return retrieval_params
         params = dict(retrieval_params or {})
-        params.setdefault("bm25_candidate_k", 20)
-        params.setdefault("vector_candidate_k", 20)
+        if retrieval_mode == "rrf_v2_rerank":
+            candidate_default = int(params.get("rerank_input_top_k", self._settings.knowledge_reranker_input_top_k))
+        else:
+            candidate_default = 20
+        params.setdefault("bm25_candidate_k", candidate_default)
+        params.setdefault("vector_candidate_k", candidate_default)
         params.setdefault("rrf_k", 60)
         params.setdefault("final_top_k", top_k)
+        if retrieval_mode == "rrf_v2_rerank":
+            params.setdefault("rerank_input_top_k", candidate_default)
+            params.setdefault("rerank_max_length", self._settings.knowledge_reranker_max_length)
         return params
 
     def _opensearch_client(self) -> OpenSearchClient:
@@ -515,6 +567,16 @@ class KnowledgeBaseEvaluationService:
                 password=self._settings.opensearch_password,
             )
         return self._opensearch_client_instance
+
+    def _reranker_client(self) -> RerankerClient | None:
+        if not self._settings.knowledge_reranker_base_url:
+            return None
+        if self._reranker_client_instance is None:
+            self._reranker_client_instance = RerankerClient(
+                base_url=self._settings.knowledge_reranker_base_url,
+                timeout_seconds=self._settings.knowledge_reranker_timeout_seconds,
+            )
+        return self._reranker_client_instance
 
     def get_run_summary(self, eval_run_id: str) -> EvalRunSummary:
         run = self._db.eval_runs.get(eval_run_id)

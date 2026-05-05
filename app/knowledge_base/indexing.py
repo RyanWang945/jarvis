@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 from app.knowledge_base.embedding import DashScopeEmbeddingClient, EmbeddingBatchResult, EmbeddingVector
 from app.knowledge_base.repositories import KnowledgeBaseDB
+from app.knowledge_base.reranking import RerankerClient
 from app.knowledge_base.search import OpenSearchClient, SearchHit, combine_hybrid_hits, combine_rrf_hits
 
 
@@ -27,10 +28,16 @@ class KnowledgeBaseIndexService:
         db: KnowledgeBaseDB,
         embedding_client: DashScopeEmbeddingClient,
         opensearch_client: OpenSearchClient,
+        reranker_client: RerankerClient | None = None,
+        rerank_input_top_k: int = 50,
+        rerank_max_length: int = 1024,
     ) -> None:
         self._db = db
         self._embedding_client = embedding_client
         self._opensearch_client = opensearch_client
+        self._reranker_client = reranker_client
+        self._rerank_input_top_k = rerank_input_top_k
+        self._rerank_max_length = rerank_max_length
 
     def index_source(
         self,
@@ -314,7 +321,52 @@ class KnowledgeBaseIndexService:
                 top_k=top_k,
                 k=60,
             )
+        if mode == "rrf_v2_rerank":
+            candidate_top_k = max(top_k, self._rerank_input_top_k)
+            bm25_hits = self._opensearch_client.bm25_search(
+                index_name=index_name,
+                query=query,
+                top_k=candidate_top_k,
+                filters=filters,
+            )
+            vector_hits = self._opensearch_client.vector_search(
+                index_name=index_name,
+                query_vector=query_vector,
+                top_k=candidate_top_k,
+                filters=filters,
+            )
+            candidates = combine_rrf_hits(
+                bm25_hits=bm25_hits,
+                vector_hits=vector_hits,
+                top_k=candidate_top_k,
+                k=60,
+            )
+            return self._rerank_or_fallback(
+                query=query,
+                candidates=candidates,
+                top_k=top_k,
+            )
         raise ValueError(f"Unsupported search mode: {mode}")
+
+    def _rerank_or_fallback(
+        self,
+        *,
+        query: str,
+        candidates: list[SearchHit],
+        top_k: int,
+    ) -> list[SearchHit]:
+        if self._reranker_client is None:
+            return candidates[:top_k]
+        try:
+            reranked = self._reranker_client.rerank_hits(
+                query=query,
+                hits=candidates,
+                top_n=top_k,
+                max_length=self._rerank_max_length,
+            )
+        except Exception:
+            return candidates[:top_k]
+        return reranked or candidates[:top_k]
 
 
 def _build_index_document(

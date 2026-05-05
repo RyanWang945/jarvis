@@ -7,7 +7,7 @@ from app.config import get_settings
 from app.knowledge_base.service import KnowledgeBaseService
 from app.tools.common import ToolExecutionRequest, ToolExecutionResult
 
-_ALLOWED_MODES = {"bm25", "vector", "hybrid", "rrf", "rrf_v2"}
+_ALLOWED_MODES = {"bm25", "vector", "hybrid", "rrf", "rrf_v2", "rrf_v2_rerank"}
 
 
 def run_business_knowledge_search(request: ToolExecutionRequest) -> ToolExecutionResult:

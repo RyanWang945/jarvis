@@ -362,7 +362,7 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
                     "query": {"type": "string"},
                     "mode": {
                         "type": "string",
-                        "enum": ["bm25", "vector", "hybrid", "rrf", "rrf_v2"],
+                        "enum": ["bm25", "vector", "hybrid", "rrf", "rrf_v2", "rrf_v2_rerank"],
                         "default": "rrf_v2",
                     },
                     "language": {

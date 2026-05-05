@@ -91,3 +91,32 @@ def test_business_knowledge_search_tool_defaults_sec_filing_profile(monkeypatch)
     assert calls[0]["filters"]["ticker"] == "MSFT"
     assert calls[0]["filters"]["form_type"] == "10-K"
     assert calls[0]["filters"]["fiscal_year"] == 2025
+
+
+def test_business_knowledge_search_tool_allows_rerank_mode(monkeypatch) -> None:
+    calls: list[dict] = []
+
+    class FakeService:
+        def search(self, **kwargs):
+            calls.append(kwargs)
+            return []
+
+    import app.tools.business_knowledge as business_knowledge
+
+    monkeypatch.setattr(
+        business_knowledge,
+        "get_business_knowledge_service",
+        lambda: FakeService(),
+    )
+
+    tool = get_tool_definition("business_knowledge_search")
+    result = execute_tool(
+        tool,
+        {
+            "query": "数学应用",
+            "mode": "rrf_v2_rerank",
+        },
+    )
+
+    assert result.ok is True
+    assert calls[0]["mode"] == "rrf_v2_rerank"

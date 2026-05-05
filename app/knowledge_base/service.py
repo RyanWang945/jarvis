@@ -8,6 +8,7 @@ from app.knowledge_base.ingest import IngestResult, WikipediaIngestService
 from app.knowledge_base.indexing import IndexResult, KnowledgeBaseIndexService
 from app.knowledge_base.parsers.alibaba_pdf import AlibabaDocumentAnalyzeClient
 from app.knowledge_base.repositories import KnowledgeBaseDB, get_knowledge_base_db
+from app.knowledge_base.reranking import RerankerClient
 from app.knowledge_base.sec_ingest import SecFilingIngestService
 from app.knowledge_base.sec_parse import SecParseBatchResult, SecFilingParseService
 from app.knowledge_base.search import OpenSearchClient, SearchHit
@@ -28,6 +29,7 @@ class KnowledgeBaseService:
         self._db: KnowledgeBaseDB = get_knowledge_base_db(self._db_path)
         self._embedding_client_instance: DashScopeEmbeddingClient | None = None
         self._opensearch_client_instance: OpenSearchClient | None = None
+        self._reranker_client_instance: RerankerClient | None = None
 
     @property
     def db_path(self) -> Path:
@@ -81,6 +83,9 @@ class KnowledgeBaseService:
             db=self._db,
             embedding_client=self._embedding_client(),
             opensearch_client=self._opensearch_client(),
+            reranker_client=self._reranker_client(),
+            rerank_input_top_k=self._settings.knowledge_reranker_input_top_k,
+            rerank_max_length=self._settings.knowledge_reranker_max_length,
         )
         return service.index_source(
             source_id=source_id,
@@ -99,6 +104,9 @@ class KnowledgeBaseService:
             db=self._db,
             embedding_client=self._embedding_client(),
             opensearch_client=self._opensearch_client(),
+            reranker_client=self._reranker_client(),
+            rerank_input_top_k=self._settings.knowledge_reranker_input_top_k,
+            rerank_max_length=self._settings.knowledge_reranker_max_length,
         )
         return service.index_ingest_job(
             ingest_job_id=ingest_job_id,
@@ -134,6 +142,9 @@ class KnowledgeBaseService:
             db=self._db,
             embedding_client=self._embedding_client(),
             opensearch_client=self._opensearch_client(),
+            reranker_client=self._reranker_client(),
+            rerank_input_top_k=self._settings.knowledge_reranker_input_top_k,
+            rerank_max_length=self._settings.knowledge_reranker_max_length,
         )
         return service.search(
             query=query,
@@ -302,6 +313,16 @@ class KnowledgeBaseService:
                 bulk_max_retries=self._settings.opensearch_bulk_max_retries,
             )
         return self._opensearch_client_instance
+
+    def _reranker_client(self) -> RerankerClient | None:
+        if not self._settings.knowledge_reranker_base_url:
+            return None
+        if self._reranker_client_instance is None:
+            self._reranker_client_instance = RerankerClient(
+                base_url=self._settings.knowledge_reranker_base_url,
+                timeout_seconds=self._settings.knowledge_reranker_timeout_seconds,
+            )
+        return self._reranker_client_instance
 
     def _document_analyze_client(self) -> AlibabaDocumentAnalyzeClient:
         if not self._settings.aliyun_opensearch_api_key:

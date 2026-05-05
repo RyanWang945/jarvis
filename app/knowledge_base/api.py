@@ -59,7 +59,7 @@ class KnowledgeBaseIndexResponse(BaseModel):
 
 class KnowledgeBaseSearchRequest(BaseModel):
     query: str = Field(min_length=1)
-    mode: str = Field(pattern="^(bm25|vector|hybrid|rrf|rrf_v2)$")
+    mode: str = Field(pattern="^(bm25|vector|hybrid|rrf|rrf_v2|rrf_v2_rerank)$")
     language: str | None = None
     chunk_profile_id: str | None = None
     top_k: int = Field(default=5, ge=1, le=50)
@@ -93,10 +93,11 @@ class KnowledgeBaseEvalDatasetResponse(BaseModel):
 
 class KnowledgeBaseEvalRunRequest(BaseModel):
     dataset_id: str = Field(min_length=1)
-    retrieval_mode: str = Field(pattern="^(bm25|vector|hybrid|rrf|rrf_v2)$")
+    retrieval_mode: str = Field(pattern="^(bm25|vector|hybrid|rrf|rrf_v2|rrf_v2_rerank)$")
     top_k: int = Field(default=5, ge=1, le=50)
     language: str | None = None
     chunk_profile_id: str | None = None
+    retrieval_params: dict | None = None
 
 
 class KnowledgeBaseEvalRunResponse(BaseModel):
@@ -173,7 +174,7 @@ class KnowledgeBaseSecIndexRequest(BaseModel):
 
 class KnowledgeBaseSecSearchRequest(BaseModel):
     query: str = Field(min_length=1)
-    mode: str = Field(pattern="^(bm25|vector|hybrid|rrf|rrf_v2)$")
+    mode: str = Field(pattern="^(bm25|vector|hybrid|rrf|rrf_v2|rrf_v2_rerank)$")
     top_k: int = Field(default=5, ge=1, le=50)
     chunk_profile_id: str = "sec_filing_medium_v1"
     ticker: str | None = None
@@ -290,6 +291,7 @@ def knowledge_base_run_eval(
         top_k=request.top_k,
         language=request.language,
         chunk_profile_id=request.chunk_profile_id,
+        retrieval_params=request.retrieval_params,
     )
     return KnowledgeBaseEvalRunResponse(**summary.__dict__)
 
