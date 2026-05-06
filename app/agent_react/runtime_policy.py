@@ -55,6 +55,9 @@ def resolve_runtime_policy(
     capabilities = _normalize_capabilities(requested_capabilities)
     mode = _mode_for_turn(turn_type)
 
+    if mode == "command" and "reminder.manage" in capabilities:
+        mode = "chat"
+
     if mode == "command":
         return RuntimePolicy(
             mode="command",

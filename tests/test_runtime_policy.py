@@ -45,6 +45,18 @@ def test_reminder_tool_requires_explicit_capability() -> None:
     assert "scheduled_task" in policy.allowed_tools
 
 
+def test_reminder_capability_overrides_command_no_tools_policy() -> None:
+    policy = resolve_runtime_policy(
+        session_mode="chat",
+        turn_type="command",
+        requested_capabilities=("reminder.manage",),
+    )
+
+    assert policy.mode == "chat"
+    assert "scheduled_task" in policy.allowed_tools
+    assert policy.max_steps > 1
+
+
 def test_coding_policy_exposes_coder_tools() -> None:
     policy = resolve_runtime_policy(
         session_mode="chat",

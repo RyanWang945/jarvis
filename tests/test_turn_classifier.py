@@ -124,6 +124,36 @@ def test_llm_classifier_accepts_missing_confidence_and_enriches_current_info(mon
     get_settings.cache_clear()
 
 
+def test_llm_classifier_accepts_reminder_capability(monkeypatch) -> None:
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setenv("JARVIS_DEEPSEEK_API_KEY", "test-key")
+    get_settings.cache_clear()
+
+    def _fake_chat(self, messages, response_format=None, tools=None, tool_choice=None):
+        system_prompt = messages[0].content
+        assert "reminder.manage" in system_prompt
+        return {
+            "content": (
+                '{"turn_type":"command","session_mode_update":null,'
+                '"requested_capabilities":["reminder.manage"],'
+                '"routing_basis":"explicit","confidence":0.93,"reason":"explicit reminder"}'
+            )
+        }
+
+    monkeypatch.setattr(ChatClient, "chat", _fake_chat)
+
+    classification = classify_turn(
+        content="2 分钟之后提醒我喝水",
+        session_state=ConversationSessionState(),
+    )
+
+    assert classification.turn_type == "command"
+    assert classification.requested_capabilities == ("reminder.manage",)
+    assert classification.routing_basis == "explicit"
+    assert classification.source == "llm"
+    get_settings.cache_clear()
+
+
 def test_registered_repo_code_request_overrides_chat_llm(monkeypatch, tmp_path) -> None:
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
     monkeypatch.setenv("JARVIS_DEEPSEEK_API_KEY", "test-key")

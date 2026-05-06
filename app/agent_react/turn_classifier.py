@@ -32,6 +32,7 @@ Capability: TypeAlias = Literal[
     "code.test",
     "research.deep",
     "image.generate",
+    "reminder.manage",
 ]
 TargetResourceType: TypeAlias = Literal["repository", "knowledge_base", "conversation", "external_service"]
 
@@ -51,6 +52,7 @@ _CAPABILITIES = {
     "code.test",
     "research.deep",
     "image.generate",
+    "reminder.manage",
 }
 _TARGET_RESOURCE_TYPES = {"repository", "knowledge_base", "conversation", "external_service"}
 _CONFIDENCE_THRESHOLD = 0.65
@@ -194,7 +196,9 @@ def _llm_classification(
                 "summary, command, image_generation. Allowed session_mode_update values: "
                 "chat, research, coding, or null. Return requested_capabilities as labels "
                 "from: web.search, kb.search, kb.write, workspace.inspect, workspace.edit, "
-                "workspace.test, workspace.report, research.deep, image.generate. "
+                "workspace.test, workspace.report, research.deep, image.generate, reminder.manage. "
+                "Use reminder.manage for explicit reminder, timed notification, wake-up, "
+                "reminder list, or reminder cancellation requests. "
                 "Use workspace.inspect for reading local repositories, source code, logs, "
                 "project docs, architecture, runtime design, or prior local work products. "
                 "Use workspace.report when the user asks for a local project report/review. "
