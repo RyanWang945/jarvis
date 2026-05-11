@@ -1,8 +1,13 @@
 from __future__ import annotations
 
-from langchain_core.messages import HumanMessage
+from pathlib import Path
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from types import SimpleNamespace
 
 from app.agent_react import react_graph
+from app.agent_react.artifacts import resolve_channel_attachments
+from app.agent_react.runtime import TurnRuntime
+from app.tools.common import ToolArtifact
 from app.api.agent import get_conversation_store
 from app.config import get_settings
 from app.llm.client import ChatClient
@@ -19,7 +24,7 @@ from tests.helpers.agent_harness import (
 
 
 def test_multiple_tool_calls_in_one_assistant_message_share_step_index(monkeypatch) -> None:
-    client = create_agent_test_client()
+    client = create_agent_test_client(monkeypatch)
     store = get_conversation_store()
     chat = ScriptedChat([
         tool_response(
@@ -56,7 +61,7 @@ def test_multiple_tool_calls_in_one_assistant_message_share_step_index(monkeypat
 
 
 def test_turn_reply_appends_model_and_token_usage_when_provider_reports_usage(monkeypatch) -> None:
-    client = create_agent_test_client()
+    client = create_agent_test_client(monkeypatch)
     chat = ScriptedChat([
         {
             "content": "usage reported",
@@ -80,7 +85,7 @@ def test_turn_reply_appends_model_and_token_usage_when_provider_reports_usage(mo
 
 
 def test_turn_reply_replaces_model_generated_usage_footer(monkeypatch) -> None:
-    client = create_agent_test_client()
+    client = create_agent_test_client(monkeypatch)
     chat = ScriptedChat([
         {
             "content": (
@@ -110,7 +115,7 @@ def test_turn_reply_replaces_model_generated_usage_footer(monkeypatch) -> None:
 def test_agent_step_uses_active_model_profile(monkeypatch) -> None:
     monkeypatch.setenv("JARVIS_DEEPSEEK_API_KEY", "deepseek-key")
     get_settings.cache_clear()
-    client = create_agent_test_client()
+    client = create_agent_test_client(monkeypatch)
     chat_id = unique_id("chat-active-model-profile")
     observed_models: list[str] = []
 
@@ -156,7 +161,7 @@ def test_agent_step_uses_active_model_profile(monkeypatch) -> None:
 
 
 def test_unsupported_loop_provider_fails_closed_without_llm_call(monkeypatch) -> None:
-    client = create_agent_test_client()
+    client = create_agent_test_client(monkeypatch)
     store = get_conversation_store()
     created = create_dm_turn(client, "run with unsupported loop")
     store.update_conversation_metadata(
@@ -182,7 +187,7 @@ def test_unsupported_loop_provider_fails_closed_without_llm_call(monkeypatch) ->
 
 
 def test_tool_exception_is_audited_and_returned_to_model(monkeypatch) -> None:
-    client = create_agent_test_client()
+    client = create_agent_test_client(monkeypatch)
     store = get_conversation_store()
     chat = ScriptedChat([
         tool_response(tool_call("obsidian_wiki_query", {"query": "runtime"}, call_id="call_explodes")),
@@ -236,8 +241,310 @@ def test_codex_tool_result_is_passed_through_without_error_wrapper(monkeypatch) 
     assert "older command stderr" not in output
 
 
+def test_direct_tool_artifacts_are_bound_to_current_turn(monkeypatch) -> None:
+    def _fake_execute_tool(tool, tool_args, *, timeout_seconds=30):
+        return ToolExecutionResult(
+            ok=True,
+            exit_code=0,
+            stdout="created image",
+            tool_artifacts=[
+                ToolArtifact(
+                    artifact_id="image-1",
+                    kind="image",
+                    path="diagram.png",
+                    source_tool="",
+                )
+            ],
+        )
+
+    monkeypatch.setattr(react_graph, "execute_tool", _fake_execute_tool)
+
+    outcome = react_graph._execute_single_tool(
+        "delegate_to_codex",
+        {"instruction": "generate image"},
+        turn_id=123,
+        tool_call_id="call_image",
+    )
+
+    assert outcome.artifacts[0].turn_id == 123
+    assert outcome.artifacts[0].tool_call_id == "call_image"
+    assert outcome.artifacts[0].source_tool == "delegate_to_codex"
+
+
+def test_tool_artifacts_flow_to_channel_message_attachments(monkeypatch) -> None:
+    client = create_agent_test_client(monkeypatch)
+    store = get_conversation_store()
+    artifact_dir = Path(".pytest_tmp_artifacts_flow") / unique_id("run")
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    image_path = artifact_dir / "diagram.png"
+    image_path.write_bytes(b"\x89PNG\r\n\x1a\nfake-png")
+    chat = ScriptedChat([
+        tool_response(
+            tool_call(
+                "delegate_to_codex",
+                {"instruction": "Generate a PNG diagram.", "repo_id": "jarvis"},
+                call_id="call_codex_image",
+            )
+        ),
+        final_response("generated image"),
+    ])
+    chat.install(monkeypatch)
+
+    def _fake_registry():
+        return SimpleNamespace(
+            list_repositories=lambda: [
+                SimpleNamespace(canonical_root_path=artifact_dir.resolve()),
+            ],
+            resolve_repo=lambda repo_id: SimpleNamespace(canonical_root_path=artifact_dir.resolve()),
+        )
+
+    def _fake_execute_tool(tool, tool_args, *, timeout_seconds=30):
+        return ToolExecutionResult(
+            ok=True,
+            exit_code=0,
+            stdout="created diagram",
+            artifacts=[str(image_path)],
+            summary="created diagram",
+        )
+
+    monkeypatch.setattr("app.agent_react.artifacts.get_repository_registry", _fake_registry)
+    monkeypatch.setattr(react_graph, "execute_tool", _fake_execute_tool)
+    created = create_dm_turn(client, "Please fix the bug in app/channels/feishu.py and generate a PNG.")
+
+    try:
+        run = client.post(f"/turns/{created['turn_id']}/run")
+    finally:
+        try:
+            image_path.unlink()
+            artifact_dir.rmdir()
+            artifact_dir.parent.rmdir()
+        except OSError:
+            pass
+
+    assert run.status_code == 200
+    body = run.json()
+    assert body["reply"] == "generated image"
+    assert body["attachments"][0]["kind"] == "image"
+    assert body["attachments"][0]["path"] == str(image_path.resolve())
+    assert body["attachments"][0]["mime_type"] == "image/png"
+
+    tool_message = next(
+        message
+        for message in store.list_messages(created["conversation_id"])
+        if message.role == "tool" and message.turn_id == created["turn_id"]
+    )
+    assert tool_message.raw_payload["artifacts"][0]["path"] == str(image_path.resolve())
+
+
+def test_svg_artifact_resolves_to_png_preview_attachment(monkeypatch) -> None:
+    artifact_dir = Path(".pytest_tmp_svg_preview") / unique_id("run")
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    svg_path = artifact_dir / "diagram.svg"
+    svg_path.write_text("<svg xmlns='http://www.w3.org/2000/svg' width='10' height='10'></svg>", encoding="utf-8")
+
+    def _fake_registry():
+        return SimpleNamespace(
+            list_repositories=lambda: [
+                SimpleNamespace(canonical_root_path=artifact_dir.resolve()),
+            ],
+        )
+
+    class FakeCairoSvg:
+        @staticmethod
+        def svg2png(*, url: str, write_to: str) -> None:
+            assert url == str(svg_path.resolve())
+            Path(write_to).write_bytes(b"\x89PNG\r\n\x1a\npreview")
+
+    monkeypatch.setattr("app.agent_react.artifacts.get_repository_registry", _fake_registry)
+    monkeypatch.setattr("app.agent_react.artifacts.importlib.import_module", lambda name: FakeCairoSvg)
+
+    try:
+        result = resolve_channel_attachments([
+            ToolArtifact(
+                artifact_id="turn:call:svg",
+                kind="file",
+                path=str(svg_path),
+                mime_type="image/svg+xml",
+                filename="diagram.svg",
+                size_bytes=svg_path.stat().st_size,
+                source_tool="delegate_to_codex",
+            )
+        ])
+    finally:
+        try:
+            svg_path.unlink()
+            artifact_dir.rmdir()
+            artifact_dir.parent.rmdir()
+        except OSError:
+            pass
+
+    assert len(result.attachments) == 1
+    attachment = result.attachments[0]
+    assert attachment.artifact_id == "turn:call:svg:preview:png"
+    assert attachment.kind == "image"
+    assert attachment.mime_type == "image/png"
+    assert attachment.filename == "diagram.preview.png"
+    assert attachment.metadata["source_path"].endswith("diagram.svg")
+    assert result.rejected == ()
+    try:
+        Path(attachment.path).unlink()
+    except OSError:
+        pass
+
+
+def test_artifact_resolver_rejects_artifacts_from_other_turn(monkeypatch) -> None:
+    artifact_dir = Path(".pytest_tmp_turn_artifact_scope") / unique_id("run")
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    image_path = artifact_dir / "old-turn.png"
+    image_path.write_bytes(b"\x89PNG\r\n\x1a\nfake-png")
+
+    def _fake_registry():
+        return SimpleNamespace(
+            list_repositories=lambda: [
+                SimpleNamespace(canonical_root_path=artifact_dir.resolve()),
+            ],
+        )
+
+    monkeypatch.setattr("app.agent_react.artifacts.get_repository_registry", _fake_registry)
+
+    try:
+        result = resolve_channel_attachments(
+            [
+                ToolArtifact(
+                    artifact_id="old-turn:image",
+                    kind="image",
+                    turn_id=10,
+                    tool_call_id="call_old",
+                    path=str(image_path),
+                    mime_type="image/png",
+                    filename="old-turn.png",
+                    size_bytes=image_path.stat().st_size,
+                    source_tool="delegate_to_codex",
+                )
+            ],
+            turn_id=11,
+        )
+    finally:
+        try:
+            image_path.unlink()
+            artifact_dir.rmdir()
+            artifact_dir.parent.rmdir()
+        except OSError:
+            pass
+
+    assert result.attachments == ()
+    assert result.rejected[0].reason == "artifact_turn_mismatch"
+
+
+def test_svg_artifact_rejects_when_preview_renderer_unavailable(monkeypatch) -> None:
+    artifact_dir = Path(".pytest_tmp_svg_preview_missing") / unique_id("run")
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    svg_path = artifact_dir / "diagram.svg"
+    svg_path.write_text("<svg xmlns='http://www.w3.org/2000/svg'></svg>", encoding="utf-8")
+
+    def _fake_registry():
+        return SimpleNamespace(
+            list_repositories=lambda: [
+                SimpleNamespace(canonical_root_path=artifact_dir.resolve()),
+            ],
+        )
+
+    def _missing_module(name: str):
+        raise ImportError(name)
+
+    monkeypatch.setattr("app.agent_react.artifacts.get_repository_registry", _fake_registry)
+    monkeypatch.setattr("app.agent_react.artifacts.importlib.import_module", _missing_module)
+    monkeypatch.setattr("app.agent_react.artifacts._find_svg_preview_browser", lambda: None)
+
+    try:
+        result = resolve_channel_attachments([
+            ToolArtifact(
+                artifact_id="turn:call:svg",
+                kind="file",
+                path=str(svg_path),
+                mime_type="image/svg+xml",
+                filename="diagram.svg",
+                size_bytes=svg_path.stat().st_size,
+                source_tool="delegate_to_codex",
+            )
+        ])
+    finally:
+        try:
+            svg_path.unlink()
+            artifact_dir.rmdir()
+            artifact_dir.parent.rmdir()
+        except OSError:
+            pass
+
+    assert result.attachments == ()
+    assert result.rejected[0].reason == "svg_preview_unavailable"
+
+
+def test_svg_artifact_uses_browser_preview_fallback(monkeypatch) -> None:
+    artifact_dir = Path(".pytest_tmp_svg_preview_browser") / unique_id("run")
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    svg_path = artifact_dir / "diagram.svg"
+    svg_path.write_text(
+        "<svg xmlns='http://www.w3.org/2000/svg' width='640' height='360'></svg>",
+        encoding="utf-8",
+    )
+    browser_path = artifact_dir / "browser.exe"
+    browser_path.write_text("", encoding="utf-8")
+
+    def _fake_registry():
+        return SimpleNamespace(
+            list_repositories=lambda: [
+                SimpleNamespace(canonical_root_path=artifact_dir.resolve()),
+            ],
+        )
+
+    def _missing_module(name: str):
+        raise ImportError(name)
+
+    def _fake_run(command, **kwargs):
+        screenshot_arg = next(item for item in command if str(item).startswith("--screenshot="))
+        Path(str(screenshot_arg).split("=", 1)[1]).write_bytes(b"\x89PNG\r\n\x1a\npreview")
+        assert "--window-size=640,360" in command
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("app.agent_react.artifacts.get_repository_registry", _fake_registry)
+    monkeypatch.setattr("app.agent_react.artifacts.importlib.import_module", _missing_module)
+    monkeypatch.setattr("app.agent_react.artifacts._find_svg_preview_browser", lambda: browser_path)
+    monkeypatch.setattr("app.agent_react.artifacts.subprocess.run", _fake_run)
+
+    try:
+        result = resolve_channel_attachments([
+            ToolArtifact(
+                artifact_id="turn:call:svg",
+                kind="file",
+                path=str(svg_path),
+                mime_type="image/svg+xml",
+                filename="diagram.svg",
+                size_bytes=svg_path.stat().st_size,
+                source_tool="delegate_to_codex",
+            )
+        ])
+    finally:
+        try:
+            svg_path.unlink()
+            browser_path.unlink()
+            artifact_dir.rmdir()
+            artifact_dir.parent.rmdir()
+        except OSError:
+            pass
+
+    assert len(result.attachments) == 1
+    assert result.attachments[0].artifact_id == "turn:call:svg:preview:png"
+    assert result.attachments[0].mime_type == "image/png"
+    assert result.rejected == ()
+    try:
+        Path(result.attachments[0].path).unlink()
+    except OSError:
+        pass
+
+
 def test_codex_delegation_preserves_edit_commit_push_contract(monkeypatch) -> None:
-    client = create_agent_test_client()
+    client = create_agent_test_client(monkeypatch)
     store = get_conversation_store()
     captured_args: list[dict] = []
     chat = ScriptedChat([
@@ -303,13 +610,80 @@ def test_codex_contract_repair_does_not_upgrade_diagnosis_plan_request() -> None
     assert repaired == original_args
 
 
-def test_tavily_search_budget_rejects_third_call_in_same_turn(monkeypatch) -> None:
-    client = create_agent_test_client()
+def test_codex_summary_step_injects_fact_only_guardrails(monkeypatch) -> None:
+    captured_messages = []
+
+    def _fake_call_llm(state, store):
+        del store
+        captured_messages.extend(state["messages"])
+        return {
+            **state,
+            "messages": [*state["messages"], AIMessage(content="summary")],
+            "status": "running",
+            "step_count": int(state.get("step_count", 0) or 0) + 1,
+        }
+
+    monkeypatch.setattr("app.agent_react.runtime.call_llm", _fake_call_llm)
+    runtime = TurnRuntime(store=object())
+    base_state = {
+        "turn_id": 123,
+        "conversation_id": 456,
+        "trigger_message_id": 1,
+        "messages": [],
+        "artifacts": [],
+        "session_state": None,
+        "runtime_policy": None,
+        "allowed_tools": [],
+        "reply": "",
+        "cancelled": False,
+        "status": "running",
+        "step_count": 1,
+        "token_budget": None,
+        "token_usage": None,
+        "model": None,
+        "loop_provider": "react",
+        "error": None,
+    }
+    next_state = {
+        **base_state,
+        "messages": [
+            SystemMessage(content="base system"),
+            HumanMessage(content="看下nltk项目的状态"),
+            AIMessage(
+                content="",
+                tool_calls=[{"id": "call_codex", "name": "delegate_to_codex", "args": {}}],
+            ),
+            ToolMessage(
+                content="Remote status: ahead of origin by 1 commit\nWorking tree: clean.",
+                tool_call_id="call_codex",
+            ),
+        ],
+    }
+
+    result = runtime._summarize_after_coder_tool(base_state, next_state)
+
+    assert result["status"] == "completed"
+    assert captured_messages
+    system_content = captured_messages[0].content
+    assert "Summarize only facts explicitly present in the delegate_to_codex tool output" in system_content
+    assert "Do not offer to commit, push, edit, or run follow-up actions" in system_content
+    assert "unless the original user request explicitly asked for that action" in system_content
+
+
+def test_tavily_search_budget_rejects_eleventh_call_in_same_turn(monkeypatch) -> None:
+    client = create_agent_test_client(monkeypatch)
     store = get_conversation_store()
     chat = ScriptedChat([
-        tool_response(tool_call("tavily_search", {"query": "Jarvis agent tests"}, call_id="call_search_1")),
-        tool_response(tool_call("tavily_search", {"query": "Jarvis ReAct audit"}, call_id="call_search_2")),
-        tool_response(tool_call("tavily_search", {"query": "Jarvis runtime edges"}, call_id="call_search_3")),
+        tool_response(
+            *[
+                tool_call(
+                    "tavily_search",
+                    {"query": f"Jarvis agent tests {index}"},
+                    call_id=f"call_search_{index}",
+                )
+                for index in range(1, 12)
+            ]
+        ),
         final_response("search budget handled"),
     ])
     chat.install(monkeypatch)
@@ -331,21 +705,19 @@ def test_tavily_search_budget_rejects_third_call_in_same_turn(monkeypatch) -> No
 
     assert run.status_code == 200
     assert run.json()["reply"] == "search budget handled"
-    assert executed_queries == ["Jarvis agent tests", "Jarvis ReAct audit"]
+    assert executed_queries == [f"Jarvis agent tests {index}" for index in range(1, 11)]
 
     tool_calls = store.list_tool_calls_by_turn(created["turn_id"])
     assert [record.provider_tool_call_id for record in tool_calls] == [
-        "call_search_1",
-        "call_search_2",
-        "call_search_3",
+        f"call_search_{index}" for index in range(1, 12)
     ]
-    assert [record.step_index for record in tool_calls] == [1, 2, 3]
-    assert [record.status for record in tool_calls] == ["completed", "completed", "rejected"]
+    assert [record.step_index for record in tool_calls] == [1] * 11
+    assert [record.status for record in tool_calls] == ["completed"] * 10 + ["rejected"]
     assert "tavily_search budget exceeded" in (tool_calls[-1].error_message or "")
 
 
 def test_tool_search_grant_expands_allowed_tools_with_audit_log(monkeypatch) -> None:
-    client = create_agent_test_client()
+    client = create_agent_test_client(monkeypatch)
     log_messages: list[str] = []
     original_info = react_graph.logger.info
 
@@ -378,7 +750,7 @@ def test_tool_search_grant_expands_allowed_tools_with_audit_log(monkeypatch) -> 
 
 
 def test_tool_search_grant_uses_original_request_for_continuation_message(monkeypatch) -> None:
-    client = create_agent_test_client()
+    client = create_agent_test_client(monkeypatch)
     seen_tool_sets: list[list[str]] = []
 
     def _chat(messages, tools):
@@ -416,8 +788,65 @@ def test_tool_search_grant_uses_original_request_for_continuation_message(monkey
     assert "delegate_to_codex" in seen_tool_sets[1]
 
 
+def test_load_skill_guidance_injects_turn_scoped_reminder(monkeypatch) -> None:
+    skill_root = Path("sandbox") / unique_id("skill-guidance")
+    skill_dir = skill_root / "release-checklist"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: release-checklist\n"
+        "description: Release workflow guidance.\n"
+        "when_to_use: User asks for release workflow.\n"
+        "capabilities:\n"
+        "  - release\n"
+        "---\n\n"
+        "Use this release checklist before delegating work.\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("JARVIS_SKILL_PATH", str(skill_root))
+    client = create_agent_test_client(monkeypatch)
+    seen_tool_sets: list[list[str]] = []
+
+    def _first(messages, tools):
+        del messages
+        tool_names = [
+            tool["function"]["name"]
+            for tool in (tools or [])
+            if tool.get("type") == "function"
+        ]
+        seen_tool_sets.append(tool_names)
+        assert "load_skill_guidance" in tool_names
+        return tool_response(
+            tool_call(
+                "load_skill_guidance",
+                {"query": "release workflow", "intent": "repository workflow"},
+                call_id="call_skill_guidance",
+            )
+        )
+
+    def _second(messages, tools):
+        del tools
+        reminder_messages = [
+            message.content
+            for message in messages
+            if message.role == "user" and "<system-reminder>" in str(message.content)
+        ]
+        assert any("[Skill: release-checklist]" in content for content in reminder_messages)
+        assert any("Use this release checklist before delegating work." in content for content in reminder_messages)
+        return final_response("skill guidance loaded")
+
+    chat = ScriptedChat([_first, _second])
+    chat.install(monkeypatch)
+    created = create_dm_turn(client, "做一下这个任务")
+
+    run = client.post(f"/turns/{created['turn_id']}/run")
+
+    assert run.status_code == 200
+    assert run.json()["reply"] == "skill guidance loaded"
+
+
 def test_conversation_tool_intents_append_across_turns(monkeypatch) -> None:
-    client = create_agent_test_client()
+    client = create_agent_test_client(monkeypatch)
     store = get_conversation_store()
     chat_id = "chat-tool-intent-append"
     seen_tool_sets: list[list[str]] = []

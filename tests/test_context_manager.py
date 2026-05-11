@@ -42,6 +42,28 @@ def test_context_header_keeps_session_state_in_protected_system_message() -> Non
     assert "Conversation session state:" in str(fitted[0].content)
 
 
+def test_context_header_includes_runtime_temporal_context() -> None:
+    messages, _ = ContextManager().build_initial_messages(
+        [
+            SimpleNamespace(
+                id=1,
+                role="user",
+                content="看下今天的金价",
+                raw_payload={},
+            )
+        ],
+        trigger_message_id=1,
+    )
+
+    content = str(messages[0].content)
+    assert "Runtime temporal context:" in content
+    assert "- Current date:" in content
+    assert "- Current time:" in content
+    assert "- Timezone: Asia/Shanghai" in content
+    assert "今天, 当前, 最新, 最近, today, current, latest, and recent" in content
+    assert "必须以 Runtime temporal context 中的当前日期" in content
+
+
 def test_coding_context_includes_active_registered_repository(monkeypatch, tmp_path) -> None:
     repo = tmp_path / "nltk"
     repo.mkdir()
@@ -152,3 +174,21 @@ def test_initial_context_strips_persisted_tool_protocol() -> None:
     assert not any(isinstance(message, AIMessage) and message.tool_calls for message in messages)
     assert any(isinstance(message, AIMessage) and message.content == "I will inspect it." for message in messages)
     assert not any("DSML" in str(message.content) for message in messages)
+
+
+def test_initial_context_hides_clear_command_audit_message() -> None:
+    records = [
+        SimpleNamespace(
+            id=1,
+            role="system",
+            content="Conversation cleared from 1 by user 2 at 2026-05-05T08:30:18+00:00",
+            raw_payload={"source": "clear_command", "previous_conversation_id": 1},
+        ),
+        SimpleNamespace(id=2, role="user", content="用codex给我个jarvis项目当前架构的svg图", raw_payload={}),
+    ]
+
+    messages, _ = ContextManager().build_initial_messages(records, trigger_message_id=2)
+
+    assert len([message for message in messages if isinstance(message, SystemMessage)]) == 1
+    assert not any("Conversation cleared from" in str(message.content) for message in messages)
+    assert any(str(message.content) == "用codex给我个jarvis项目当前架构的svg图" for message in messages)

@@ -25,7 +25,8 @@ _BASE_READ_TOOLS = (
     "business_knowledge_search",
     "ask_user",
 )
-_DISCOVERY_TOOLS = ("tool_search",)
+_BASE_DISCOVERY_TOOLS = ("tool_search",)
+_WORKFLOW_GUIDANCE_TOOLS = ("load_skill_guidance",)
 _ACTION_TOOLS = ("scheduled_task",)
 _WEB_TOOLS = ("tavily_search", "x_search")
 _KB_WRITE_TOOLS = (
@@ -61,23 +62,23 @@ def resolve_runtime_policy(
     if mode == "command":
         return RuntimePolicy(
             mode="command",
-            allowed_tools=(),
+            allowed_tools=_BASE_DISCOVERY_TOOLS,
             context_sections=("session_state",),
-            max_steps=1,
+            max_steps=3,
             search_budget=0,
             writeback_strategy="none",
         )
     if mode == "image_generation":
         return RuntimePolicy(
             mode="image_generation",
-            allowed_tools=(),
+            allowed_tools=_BASE_DISCOVERY_TOOLS,
             context_sections=("session_state",),
             max_steps=4,
             search_budget=0,
             writeback_strategy="basic",
         )
 
-    allowed_tools: list[str] = [*_BASE_READ_TOOLS, *_DISCOVERY_TOOLS]
+    allowed_tools: list[str] = [*_BASE_READ_TOOLS, *_BASE_DISCOVERY_TOOLS, *_WORKFLOW_GUIDANCE_TOOLS]
     context_sections: list[str] = ["session_state"]
 
     if "reminder.manage" in capabilities:
@@ -139,9 +140,7 @@ def _max_steps(mode: str, capabilities: set[str]) -> int:
 def _search_budget(mode: str, capabilities: set[str]) -> int:
     if "web.search" not in capabilities:
         return 0
-    if mode == "research" or "research.deep" in capabilities:
-        return 4
-    return 2
+    return 10
 
 
 def _writeback_strategy(mode: str) -> WritebackStrategy:
@@ -157,8 +156,15 @@ def render_runtime_policy_for_model(policy: RuntimePolicy) -> str:
         "Runtime policy:",
         f"Mode: {policy.mode}",
         "Allowed tools: " + (", ".join(policy.allowed_tools) if policy.allowed_tools else "-"),
-        "Hidden tools may be discovered with tool_search when the visible tools cannot satisfy an explicit user request.",
     ]
+    if "tool_search" in policy.allowed_tools:
+        lines.append(
+            "tool_search is an internal fallback for discovering a missing capability; never mention tool_search, hidden tools, visible tools, or tool discovery to the user."
+        )
+    if "load_skill_guidance" in policy.allowed_tools:
+        lines.append(
+            "Task-specific procedural guidance may be loaded with load_skill_guidance when no relevant <system-reminder> skill is already present."
+        )
     if "research_protocol" in policy.context_sections:
         lines.extend(
             [
@@ -177,9 +183,32 @@ def render_runtime_policy_for_model(policy: RuntimePolicy) -> str:
                 "Tool discovery protocol:",
                 "- Use tool_search only when the current visible tools cannot satisfy an explicit user request.",
                 "- tool_search only discovers candidates; it does not execute or authorize them.",
-                "- If tool_search returns no_capable_tool, answer from context or ask a concise clarification.",
+                "- Keep tool discovery entirely internal: do not tell the user you are searching for tools, checking available tools, or looking for a capability.",
+                "- If tool_search returns no_capable_tool, answer from context, state the limitation plainly, or ask a concise clarification.",
+                "- If a capability is found, continue with the appropriate tool; do not narrate the discovery step.",
                 "- Do not use tool_search to add intent the user did not express.",
                 "- Use ask_user when a required slot is missing and a concise clarification is necessary.",
+            ]
+        )
+    if any(tool in policy.allowed_tools for tool in _WEB_TOOLS):
+        lines.extend(
+            [
+                "",
+                "Web search protocol:",
+                "- For current, latest, today, or real-time facts, verify that source dates are fresh enough for the user's request.",
+                "- If search results are stale or disagree materially, search again with a more precise query or a more authoritative source.",
+                "- Keep simple lookup answers concise after verification: state the value, timestamp/date, source, and uncertainty if any.",
+            ]
+        )
+    if "load_skill_guidance" in policy.allowed_tools:
+        lines.extend(
+            [
+                "",
+                "Skill guidance protocol:",
+                "- If a task involves a specialized workflow and no relevant <system-reminder> skill is already present, call load_skill_guidance before delegating to Codex or using external tools.",
+                "- Use load_skill_guidance for reusable procedures such as artifact generation, channel delivery, repository workflows, wiki workflows, or other multi-step tool orchestration.",
+                "- load_skill_guidance only loads turn-scoped instructions; it does not execute the task or grant additional permissions.",
+                "- After skill guidance is loaded, follow it as procedural guidance and continue the task with the appropriate allowed tools.",
             ]
         )
     if "workspace_protocol" in policy.context_sections or "coding_protocol" in policy.context_sections:

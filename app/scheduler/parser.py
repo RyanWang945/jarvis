@@ -21,6 +21,8 @@ _RELATIVE_PATTERN = re.compile(r"(?P<num>\d+)\s*(?P<unit>分钟|分鐘|分|小�
 _CLOCK_PATTERN = re.compile(r"(?P<hour>\d{1,2})\s*(?:点|點|:|：)\s*(?P<minute>\d{1,2}|半)?")
 
 
+
+
 def parse_one_shot_time(
     time_text: str,
     *,

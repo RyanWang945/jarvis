@@ -5,12 +5,15 @@ from __future__ import annotations
 import json
 import logging
 import re
+from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any, Protocol
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langgraph.graph import END, StateGraph
 from typing_extensions import TypedDict
 
+from app.agent_react.artifacts import artifact_to_payload, legacy_artifact_to_tool_artifact
 from app.agent_react.context_manager import ContextManager
 from app.agent_react.tool_intent_state import append_conversation_tool_intents
 from app.config import get_settings
@@ -18,6 +21,8 @@ from app.llm.model_profiles import LLMNode
 from app.llm.model_router import ModelRouter
 from app.llm.provider_adapters import NormalizedLLMResponse
 from app.persistence.models import TurnRecord
+from app.repositories import RepositoryRegistryError, get_repository_registry
+from app.tools.common import ToolArtifact
 from app.tools.runtime import build_llm_tools, check_tool_policy, execute_tool, get_tool_definition
 
 logger = logging.getLogger(__name__)
@@ -82,6 +87,7 @@ _MAX_REACT_STEPS = 8
 class ReActState(TypedDict):
     turn_id: int
     messages: list[BaseMessage]
+    artifacts: list[ToolArtifact]
     cancelled: bool
     status: str
     step_count: int
@@ -93,7 +99,7 @@ class ReActState(TypedDict):
     search_budget: int | None
 
 
-_MAX_TAVILY_CALLS_PER_TURN = 2
+_MAX_TAVILY_CALLS_PER_TURN = 10
 _TOOL_SEARCH_GRANTABLE_TOOLS = {
     "scheduled_task",
     "delegate_to_codex",
@@ -123,6 +129,18 @@ _EXECUTION_INSTRUCTION_PATTERN = (
     r"\b(update|modify|change|edit|add|create|write|fix|delete|commit|push)\b"
     r"|更新|修改|增加|新增|创建|写入|修复|删除|提交|推送"
 )
+
+
+@dataclass(frozen=True)
+class ToolExecutionOutcome:
+    ok: bool
+    output: str
+    artifacts: tuple[ToolArtifact, ...] = ()
+
+    def __iter__(self):
+        # Compatibility for older tests and call sites that unpack `(ok, output)`.
+        yield self.ok
+        yield self.output
 
 
 def _llm_response_to_ai_message(response: NormalizedLLMResponse) -> AIMessage:
@@ -414,16 +432,112 @@ def call_llm(state: ReActState, store: TurnStore) -> ReActState:
         "token_usage": token_usage,
         "model": model_name,
     }
-def _execute_single_tool(tool_name: str, tool_args: dict[str, Any]) -> tuple[bool, str]:
+def _execute_single_tool(
+    tool_name: str,
+    tool_args: dict[str, Any],
+    *,
+    turn_id: int = 0,
+    tool_call_id: str = "",
+) -> ToolExecutionOutcome:
     tool = get_tool_definition(tool_name)
     result = execute_tool(tool, tool_args, timeout_seconds=30)
+    artifacts = _tool_result_artifacts(
+        result.tool_artifacts,
+        result.artifacts,
+        turn_id=turn_id,
+        tool_call_id=tool_call_id,
+        source_tool=tool_name,
+        tool_args=tool_args,
+    )
     if result.ok:
-        return True, result.stdout or result.summary or "Completed successfully."
+        return ToolExecutionOutcome(
+            ok=True,
+            output=result.stdout or result.summary or "Completed successfully.",
+            artifacts=artifacts,
+        )
     if tool_name == "delegate_to_codex":
         output = result.stdout or result.summary or result.stderr
         if output:
-            return True, output
-    return False, f"Error (exit_code={result.exit_code}): {result.stderr or result.summary}"
+            return ToolExecutionOutcome(ok=True, output=output, artifacts=artifacts)
+    return ToolExecutionOutcome(
+        ok=False,
+        output=f"Error (exit_code={result.exit_code}): {result.stderr or result.summary}",
+        artifacts=artifacts,
+    )
+
+
+def _tool_result_artifacts(
+    tool_artifacts: list[ToolArtifact],
+    legacy_artifacts: list[str],
+    *,
+    turn_id: int,
+    tool_call_id: str,
+    source_tool: str,
+    tool_args: dict[str, Any],
+) -> tuple[ToolArtifact, ...]:
+    artifacts: list[ToolArtifact] = [
+        _bind_tool_artifact_to_turn(
+            artifact,
+            turn_id=turn_id,
+            tool_call_id=tool_call_id,
+            source_tool=source_tool,
+        )
+        for artifact in tool_artifacts
+    ]
+    base_dir = _artifact_base_dir(tool_args)
+    for legacy in legacy_artifacts:
+        artifact = legacy_artifact_to_tool_artifact(
+            legacy,
+            turn_id=turn_id,
+            tool_call_id=tool_call_id,
+            source_tool=source_tool,
+            base_dir=base_dir,
+        )
+        if artifact is not None:
+            artifacts.append(artifact)
+    deduped: list[ToolArtifact] = []
+    seen: set[str] = set()
+    for artifact in artifacts:
+        if artifact.artifact_id in seen:
+            continue
+        seen.add(artifact.artifact_id)
+        deduped.append(artifact)
+    return tuple(deduped)
+
+
+def _bind_tool_artifact_to_turn(
+    artifact: ToolArtifact,
+    *,
+    turn_id: int,
+    tool_call_id: str,
+    source_tool: str,
+) -> ToolArtifact:
+    updates: dict[str, Any] = {}
+    if artifact.turn_id is None:
+        updates["turn_id"] = turn_id
+    if not artifact.tool_call_id:
+        updates["tool_call_id"] = tool_call_id
+    if not artifact.source_tool:
+        updates["source_tool"] = source_tool
+    if not updates:
+        return artifact
+    return replace(artifact, **updates)
+
+
+def _artifact_base_dir(tool_args: dict[str, Any]) -> Path | None:
+    repo_id = str(tool_args.get("repo_id") or "").strip()
+    if repo_id:
+        try:
+            return get_repository_registry().resolve_repo(repo_id).canonical_root_path
+        except RepositoryRegistryError:
+            return None
+    workdir = str(tool_args.get("workdir") or "").strip()
+    if workdir:
+        try:
+            return Path(workdir).resolve(strict=True)
+        except OSError:
+            return None
+    return get_settings().workspace_root
 
 
 def _codex_trusted_approval_prefixes(store: TurnStore, conversation_id: int) -> list[str]:
@@ -485,6 +599,33 @@ def _tools_granted_by_tool_search(
         if len(granted) >= 3:
             break
     return granted
+
+
+def _skill_names_loaded_by_guidance(output: str, messages: list[BaseMessage]) -> list[str]:
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(payload, dict) or payload.get("status") != "loaded":
+        return []
+    skills = payload.get("skills")
+    if not isinstance(skills, list):
+        return []
+
+    existing_content = "\n".join(str(message.content or "") for message in messages)
+    names: list[str] = []
+    for item in skills:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name or name in names:
+            continue
+        if f"[Skill: {name}]" in existing_content:
+            continue
+        names.append(name)
+        if len(names) >= 3:
+            break
+    return names
 
 
 def _tool_search_candidate_allowed(tool_name: str, user_text: str) -> bool:
@@ -619,6 +760,8 @@ def execute_tools(state: ReActState, store: TurnStore) -> ReActState:
         return state
 
     tool_messages: list[BaseMessage] = []
+    skill_reminder_messages: list[BaseMessage] = []
+    collected_artifacts: list[ToolArtifact] = []
     granted_tools: list[str] = []
     turn = store.get_turn(state["turn_id"])
     if turn is None:
@@ -653,6 +796,7 @@ def execute_tools(state: ReActState, store: TurnStore) -> ReActState:
         tool_args = _inject_tool_runtime_context(tool_name, dict(tool_args), turn=turn, store=store)
         tool_call_id = tool_call["id"]
         record = None
+        outcome = ToolExecutionOutcome(ok=False, output="")
         logger.info(
             "tool execution requested turn_id=%s step=%s tool=%s tool_call_id=%s args=%s",
             state["turn_id"],
@@ -708,7 +852,24 @@ def execute_tools(state: ReActState, store: TurnStore) -> ReActState:
                         store,
                         turn.conversation_id,
                     )
-                ok, output = _execute_single_tool(tool_name, execution_args)
+                outcome = _execute_single_tool(
+                    tool_name,
+                    execution_args,
+                    turn_id=state["turn_id"],
+                    tool_call_id=tool_call_id,
+                )
+                ok = outcome.ok
+                output = outcome.output
+                if outcome.artifacts:
+                    collected_artifacts.extend(outcome.artifacts)
+                    logger.info(
+                        "tool artifacts collected turn_id=%s step=%s tool=%s tool_call_id=%s artifact_count=%s",
+                        state["turn_id"],
+                        step_index,
+                        tool_name,
+                        tool_call_id,
+                        len(outcome.artifacts),
+                    )
                 if ok and tool_name == "tool_search":
                     new_grants = _tools_granted_by_tool_search(
                         output,
@@ -724,6 +885,21 @@ def execute_tools(state: ReActState, store: TurnStore) -> ReActState:
                         repr(output[:300]),
                     )
                     granted_tools.extend(new_grants)
+                if ok and tool_name == "load_skill_guidance":
+                    skill_names = _skill_names_loaded_by_guidance(
+                        output,
+                        [*state["messages"], *tool_messages, *skill_reminder_messages],
+                    )
+                    skill_reminder = _CONTEXT_MANAGER.build_skill_reminder_message(skill_names)
+                    if skill_reminder is not None:
+                        skill_reminder_messages.append(skill_reminder)
+                        logger.info(
+                            "skill guidance injected turn_id=%s step=%s tool_call_id=%s skills=%s",
+                            state["turn_id"],
+                            step_index,
+                            tool_call_id,
+                            skill_names,
+                        )
                 if not ok:
                     logger.warning(
                         "tool execution failed turn_id=%s step=%s tool=%s tool_call_id=%s output_preview=%s",
@@ -793,6 +969,7 @@ def execute_tools(state: ReActState, store: TurnStore) -> ReActState:
                 "tool_name": tool_name,
                 "assistant_message_id": getattr(assistant_message, "id", None),
                 "step_index": step_index,
+                "artifacts": [artifact_to_payload(item) for item in outcome.artifacts],
             },
         )
         tool_messages.append(ToolMessage(content=output, tool_call_id=tool_call_id))
@@ -818,7 +995,8 @@ def execute_tools(state: ReActState, store: TurnStore) -> ReActState:
         "turn_id": state["turn_id"],
         "cancelled": False,
         "status": "running",
-        "messages": state["messages"] + tool_messages,
+        "messages": state["messages"] + tool_messages + skill_reminder_messages,
+        "artifacts": [*state.get("artifacts", []), *collected_artifacts],
         "step_count": state.get("step_count", 0),
         "allowed_tools": allowed_tools,
     }

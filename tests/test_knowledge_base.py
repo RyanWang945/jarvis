@@ -302,6 +302,72 @@ def test_ingest_wikipedia_continues_existing_source(tmp_path) -> None:
     assert len(documents) == 3
 
 
+def test_ingest_wikipedia_can_add_chunks_for_new_profile_when_document_unchanged(tmp_path) -> None:
+    sample_path = tmp_path / "sample.jsonl"
+    sample_path.write_text(
+        json.dumps(
+            {
+                "id": "13",
+                "url": "https://example.com/13",
+                "title": "title-13",
+                "text": "第一段介绍主题。第二段补充背景。第三段说明影响。",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    from app.knowledge_base.service import KnowledgeBaseService
+
+    service = KnowledgeBaseService(get_settings().model_copy(update={"data_dir": tmp_path}))
+    service.db.chunk_profiles.save(
+        {
+            "chunk_profile_id": "wiki_heading_context_v2",
+            "name": "wiki heading context",
+            "language": "zh",
+            "chunker_version": "v2",
+            "target_size": 80,
+            "soft_min_size": 20,
+            "hard_max_size": 120,
+            "overlap_size": 10,
+            "boundary_rules_json": {"heading_context": True},
+            "normalization_rules_json": {},
+            "is_active": 1,
+        }
+    )
+
+    first = service.ingest_wikipedia(
+        file_path=str(sample_path),
+        source_id="wiki_profile_test",
+        limit_n=1,
+        chunk_profile_id="medium_overlap_v1",
+    )
+    second = service.ingest_wikipedia(
+        file_path=str(sample_path),
+        source_id="wiki_profile_test",
+        limit_n=1,
+        chunk_profile_id="wiki_heading_context_v2",
+    )
+
+    document = service.db.documents.get_by_source_external("wiki_profile_test", "13")
+    legacy_chunks = service.db.chunks.list_by_document(
+        document["doc_id"],
+        chunk_profile_id="medium_overlap_v1",
+    )
+    profile_chunks = service.db.chunks.list_by_document(
+        document["doc_id"],
+        chunk_profile_id="wiki_heading_context_v2",
+    )
+
+    assert first.documents_inserted == 1
+    assert second.documents_skipped == 1
+    assert second.chunks_created >= 1
+    assert legacy_chunks[0]["chunk_id"] == "wiki_profile_test:13:chunk:0000"
+    assert profile_chunks[0]["chunk_id"].startswith(
+        "wiki_profile_test:13:profile:wiki_heading_context_v2:chunk:"
+    )
+
+
 def test_knowledge_base_ingest_route_runs_end_to_end(tmp_path, monkeypatch) -> None:
     sample_path = tmp_path / "sample.jsonl"
     sample_path.write_text(
@@ -1246,6 +1312,10 @@ def test_eval_dataset_generation_and_run_with_heuristic(tmp_path) -> None:
         chunks_per_document=1,
     )
     assert dataset.generated_queries == 1
+    queries = db.eval_queries.list_by_dataset(dataset.dataset_id)
+    evidence = json.loads(queries[0]["gold_evidence_json"])
+    assert evidence["version"] == "span_v1"
+    assert evidence["evidence"][0]["source_chunk_id"] == "src1:13:chunk:0000"
 
     summary = service.run_evaluation(
         dataset_id=dataset.dataset_id,
@@ -1258,6 +1328,376 @@ def test_eval_dataset_generation_and_run_with_heuristic(tmp_path) -> None:
     assert summary.recall_at_k == 1.0
     assert summary.mrr == 1.0
     assert summary.chunk_hit_rate == 1.0
+
+
+def test_eval_span_hit_allows_different_chunk_profile(tmp_path) -> None:
+    db = get_knowledge_base_db(tmp_path / "knowledge.db")
+    db.sources.save(
+        {
+            "source_id": "src1",
+            "name": "wikipedia",
+            "source_type": "wikipedia",
+            "language": "zh",
+            "dataset_version": "sample",
+            "file_path": "sample.jsonl",
+            "description": "sample",
+        }
+    )
+    db.chunk_profiles.save(
+        {
+            "chunk_profile_id": "wiki_heading_context_v2",
+            "name": "wiki heading context",
+            "language": "zh",
+            "chunker_version": "v2",
+            "target_size": 100,
+            "soft_min_size": 20,
+            "hard_max_size": 160,
+            "overlap_size": 20,
+            "boundary_rules_json": {"heading_context": True},
+            "normalization_rules_json": {},
+            "is_active": 1,
+        }
+    )
+    db.documents.save(
+        {
+            "doc_id": "src1:13",
+            "source_id": "src1",
+            "external_id": "13",
+            "title": "数学",
+            "url": "https://example.com/math",
+            "text": "x" * 200,
+            "text_hash": "doc-hash",
+            "char_count": 200,
+            "language": "zh",
+            "metadata_json": None,
+            "ingest_job_id": "job-1",
+        }
+    )
+    db.chunks.save(
+        {
+            "chunk_id": "src1:13:chunk:0000",
+            "doc_id": "src1:13",
+            "chunk_profile_id": "medium_overlap_v1",
+            "chunk_index": 0,
+            "chunker_version": "v1",
+            "section_path": None,
+            "raw_content": "x" * 100,
+            "normalized_content": "x" * 100,
+            "content_hash": "chunk-hash-old",
+            "char_start": 20,
+            "char_end": 120,
+            "char_count": 100,
+            "token_estimate": 100,
+            "overlap_prev_chars": 0,
+            "metadata_json": None,
+        }
+    )
+    db.chunks.save(
+        {
+            "chunk_id": "src1:13:profile:wiki_heading_context_v2:chunk:0000",
+            "doc_id": "src1:13",
+            "chunk_profile_id": "wiki_heading_context_v2",
+            "chunk_index": 0,
+            "chunker_version": "v2",
+            "section_path": None,
+            "raw_content": "x" * 160,
+            "normalized_content": "x" * 160,
+            "content_hash": "chunk-hash-new",
+            "char_start": 0,
+            "char_end": 160,
+            "char_count": 160,
+            "token_estimate": 160,
+            "overlap_prev_chars": 0,
+            "metadata_json": None,
+        }
+    )
+    db.eval_datasets.save(
+        {
+            "dataset_id": "ds-1",
+            "name": "src1:span:test",
+            "source_id": "src1",
+            "generation_method": "test",
+            "query_model": None,
+            "sample_doc_count": 1,
+        }
+    )
+    db.eval_queries.save(
+        {
+            "query_id": "q-1",
+            "dataset_id": "ds-1",
+            "doc_id": "src1:13",
+            "target_chunk_id": "src1:13:chunk:0000",
+            "query_text": "数学是什么",
+            "query_type": "fact",
+            "difficulty": "easy",
+            "gold_answer": "数学",
+            "gold_evidence_json": {
+                "version": "span_v1",
+                "evidence": [
+                    {
+                        "type": "span",
+                        "doc_id": "src1:13",
+                        "char_start": 20,
+                        "char_end": 120,
+                        "source_chunk_id": "src1:13:chunk:0000",
+                    }
+                ],
+            },
+            "generated_by": "test",
+            "review_status": "generated",
+        }
+    )
+
+    service = KnowledgeBaseEvaluationService(
+        settings=get_settings().model_copy(update={"data_dir": tmp_path}),
+        db=db,
+        kb_service=object(),
+    )
+
+    class FakeOpenSearchClient:
+        def index_name(self, *, language: str, chunk_profile_id: str) -> str:
+            return f"kb_wikipedia_{language}_{chunk_profile_id}"
+
+        def bm25_search(self, *, index_name: str, query: str, top_k: int):
+            return [
+                type(
+                    "Hit",
+                    (),
+                    {
+                        "chunk_id": "src1:13:profile:wiki_heading_context_v2:chunk:0000",
+                        "doc_id": "src1:13",
+                        "score": 1.0,
+                        "source": {"title": "数学"},
+                    },
+                )()
+            ]
+
+    service._opensearch_client_instance = FakeOpenSearchClient()
+
+    summary = service.run_evaluation(
+        dataset_id="ds-1",
+        retrieval_mode="bm25",
+        top_k=5,
+        chunk_profile_id="wiki_heading_context_v2",
+        language="zh",
+    )
+
+    assert summary.recall_at_k == 1.0
+    assert summary.span_hit_rate == 1.0
+    assert summary.doc_hit_rate == 1.0
+    assert summary.chunk_hit_rate == 0.0
+    assert summary.mrr == 1.0
+    persisted_summary = service.get_run_summary(summary.eval_run_id)
+    assert persisted_summary.span_hit_rate == 1.0
+    assert persisted_summary.doc_hit_rate == 1.0
+    assert persisted_summary.chunk_hit_rate == 0.0
+
+
+def test_migrate_eval_queries_to_span_v1_updates_legacy_gold(tmp_path) -> None:
+    from scripts.migrate_eval_queries_to_span_v1 import migrate_eval_queries_to_span_v1
+
+    db = get_knowledge_base_db(tmp_path / "knowledge.db")
+    db.sources.save(
+        {
+            "source_id": "src1",
+            "name": "wikipedia",
+            "source_type": "wikipedia",
+            "language": "zh",
+            "dataset_version": "sample",
+            "file_path": "sample.jsonl",
+            "description": "sample",
+        }
+    )
+    db.documents.save(
+        {
+            "doc_id": "src1:13",
+            "source_id": "src1",
+            "external_id": "13",
+            "title": "数学",
+            "url": "https://example.com/math",
+            "text": "数学是研究数量、结构与变化的学科。",
+            "text_hash": "doc-hash",
+            "char_count": 18,
+            "language": "zh",
+            "metadata_json": None,
+            "ingest_job_id": "job-1",
+        }
+    )
+    db.chunks.save(
+        {
+            "chunk_id": "src1:13:chunk:0000",
+            "doc_id": "src1:13",
+            "chunk_profile_id": "medium_overlap_v1",
+            "chunk_index": 0,
+            "chunker_version": "v1",
+            "section_path": None,
+            "raw_content": "数学是研究数量、结构与变化的学科。",
+            "normalized_content": "数学是研究数量、结构与变化的学科。",
+            "content_hash": "chunk-hash",
+            "char_start": 0,
+            "char_end": 18,
+            "char_count": 18,
+            "token_estimate": 18,
+            "overlap_prev_chars": 0,
+            "metadata_json": None,
+        }
+    )
+    db.eval_datasets.save(
+        {
+            "dataset_id": "ds-1",
+            "name": "src1:medium_overlap_v1:test",
+            "source_id": "src1",
+            "generation_method": "test",
+            "query_model": None,
+            "sample_doc_count": 1,
+        }
+    )
+    db.eval_queries.save(
+        {
+            "query_id": "q-1",
+            "dataset_id": "ds-1",
+            "doc_id": "src1:13",
+            "target_chunk_id": "src1:13:chunk:0000",
+            "query_text": "数学是什么",
+            "query_type": "fact",
+            "difficulty": "easy",
+            "gold_answer": "数学",
+            "gold_evidence_json": ["src1:13:chunk:0000"],
+            "generated_by": "test",
+            "review_status": "generated",
+        }
+    )
+    db.conn.close()
+
+    summary = migrate_eval_queries_to_span_v1(tmp_path / "knowledge.db", create_backup=False)
+    second_summary = migrate_eval_queries_to_span_v1(tmp_path / "knowledge.db", create_backup=False)
+    migrated_db = get_knowledge_base_db(tmp_path / "knowledge.db")
+    query = migrated_db.eval_queries.list_by_dataset("ds-1")[0]
+    payload = json.loads(query["gold_evidence_json"])
+
+    assert summary.updated_queries == 1
+    assert second_summary.updated_queries == 0
+    assert second_summary.already_span_v1 == 1
+    assert payload["version"] == "span_v1"
+    assert payload["migration"]["from"] == "chunk_legacy"
+    assert payload["evidence"][0]["doc_id"] == "src1:13"
+    assert payload["evidence"][0]["char_start"] == 0
+    assert payload["evidence"][0]["char_end"] == 18
+    assert payload["evidence"][0]["source_chunk_id"] == "src1:13:chunk:0000"
+
+
+def test_refine_eval_gold_span_preserves_legacy_chunk_role() -> None:
+    from scripts.refine_eval_gold_spans_with_llm import refine_payload_with_answer_text
+
+    payload = {
+        "version": "span_v1",
+        "evidence": [
+            {
+                "evidence_id": "q-1:evidence:0",
+                "type": "span",
+                "doc_id": "doc-1",
+                "char_start": 100,
+                "char_end": 130,
+                "source_chunk_id": "doc-1:chunk:0000",
+                "source_chunk_profile_id": "medium_overlap_v1",
+                "source_chunk_index": 0,
+                "evidence_text": "数学是研究数量、结构以及空间等概念及其变化的一门学科。",
+            }
+        ],
+    }
+
+    result = refine_payload_with_answer_text(
+        payload=payload,
+        query_text="数学研究什么",
+        gold_answer="数量、结构以及空间等概念及其变化",
+        model="deepseek-v4-flash",
+        llm_answer={
+            "answer_text": "数量、结构以及空间等概念及其变化",
+            "confidence": 0.94,
+            "reason": "direct evidence",
+        },
+    )
+
+    evidence = result.payload["evidence"]
+
+    assert result.status == "refined"
+    assert evidence[0]["role"] == "answer"
+    assert evidence[0]["char_start"] == 105
+    assert evidence[0]["char_end"] == 121
+    assert evidence[0]["source_chunk_id"] == "doc-1:chunk:0000"
+    assert evidence[1]["role"] == "legacy_chunk"
+    assert evidence[1]["char_start"] == 100
+    assert evidence[1]["char_end"] == 130
+
+
+def test_refine_eval_gold_span_marks_unmatched_answer_for_review() -> None:
+    from scripts.refine_eval_gold_spans_with_llm import refine_payload_with_answer_text
+
+    payload = {
+        "version": "span_v1",
+        "evidence": [
+            {
+                "evidence_id": "q-1:evidence:0",
+                "type": "span",
+                "doc_id": "doc-1",
+                "char_start": 0,
+                "char_end": 10,
+                "source_chunk_id": "doc-1:chunk:0000",
+                "evidence_text": "数学是一门学科。",
+            }
+        ],
+    }
+
+    result = refine_payload_with_answer_text(
+        payload=payload,
+        query_text="数学研究什么",
+        gold_answer="数量",
+        model="deepseek-v4-flash",
+        llm_answer={"answer_text": "数量", "confidence": 0.2},
+    )
+
+    assert result.status == "needs_review"
+    assert result.reason == "answer_text_not_found"
+    assert result.payload["refinement"]["status"] == "needs_review"
+    assert result.payload["evidence"][0]["role"] == "legacy_chunk"
+
+
+def test_eval_gold_span_resolver_filters_evidence_role() -> None:
+    from app.knowledge_base.eval import _resolve_gold_evidence_spans
+
+    query = {
+        "gold_evidence_json": {
+            "version": "span_v1",
+            "evidence": [
+                {
+                    "type": "span",
+                    "role": "answer",
+                    "doc_id": "doc-1",
+                    "char_start": 10,
+                    "char_end": 20,
+                },
+                {
+                    "type": "span",
+                    "role": "legacy_chunk",
+                    "doc_id": "doc-1",
+                    "char_start": 0,
+                    "char_end": 100,
+                    "source_chunk_id": "doc-1:chunk:0000",
+                },
+            ],
+        },
+        "target_chunk_id": "doc-1:chunk:0000",
+    }
+
+    answer_spans = _resolve_gold_evidence_spans(db=object(), query=query, evidence_role="answer")
+    legacy_spans = _resolve_gold_evidence_spans(db=object(), query=query, evidence_role="legacy_chunk")
+    all_spans = _resolve_gold_evidence_spans(db=object(), query=query, evidence_role="any")
+
+    assert [(span.role, span.char_start, span.char_end) for span in answer_spans] == [("answer", 10, 20)]
+    assert [(span.role, span.char_start, span.char_end) for span in legacy_spans] == [
+        ("legacy_chunk", 0, 100)
+    ]
+    assert len(all_spans) == 2
 
 
 def test_eval_recall_at_10_counts_tenth_rank_hit(tmp_path) -> None:

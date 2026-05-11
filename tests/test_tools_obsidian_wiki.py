@@ -1,7 +1,24 @@
 import json
 from pathlib import Path
 
+from app.config import get_settings
 from app.tools.runtime import execute_tool, get_tool_definition
+
+
+def test_obsidian_wiki_tool_uses_default_workspace_config(monkeypatch, tmp_path: Path) -> None:
+    workspace = tmp_path / "ConfiguredWiki"
+    monkeypatch.setenv("JARVIS_OBSIDIAN_WORKSPACE_PATH", str(workspace))
+    get_settings.cache_clear()
+    try:
+        query_tool = get_tool_definition("obsidian_wiki_query")
+
+        result = execute_tool(query_tool, {"query": "anything", "query_mode": "wiki_only"})
+
+        assert result.ok is True
+        assert (workspace / "vault" / "index.md").exists()
+        assert (workspace / "system" / "schema" / "page-types.md").exists()
+    finally:
+        get_settings.cache_clear()
 
 
 def test_obsidian_wiki_draft_and_apply_tools(tmp_path: Path) -> None:

@@ -54,7 +54,7 @@ def run_scheduled_task(request: ToolExecutionRequest) -> ToolExecutionResult:
                 stderr="external_chat_id is required",
                 summary="Missing external_chat_id.",
             )
-        job, reply = service.create_reminder(
+        response = service.create_reminder(
             CreateReminderRequest(
                 conversation_id=conversation_id,
                 created_by_user_id=_optional_int(request.args.get("created_by_user_id")),
@@ -67,10 +67,10 @@ def run_scheduled_task(request: ToolExecutionRequest) -> ToolExecutionResult:
             )
         )
         return ToolExecutionResult(
-            ok=job is not None,
-            exit_code=0 if job is not None else None,
-            stdout=reply,
-            summary=reply,
+            ok=response.job is not None,
+            exit_code=0 if response.job is not None else None,
+            stdout=response.message,
+            summary=response.message,
         )
 
     return ToolExecutionResult(ok=False, exit_code=None, stderr=f"unsupported action: {action}", summary="Unsupported action.")

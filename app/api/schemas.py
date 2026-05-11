@@ -117,3 +117,4 @@ class RunTurnResponse(BaseModel):
     status: str
     reply: str
     content_type: str = "text"
+    attachments: list[dict[str, Any]] = Field(default_factory=list)

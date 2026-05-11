@@ -16,6 +16,7 @@ from app.tools.obsidian_wiki import (
 )
 from app.tools.shell import run_shell_command, run_shell_inspect
 from app.tools.scheduled_task import run_scheduled_task
+from app.tools.skill_guidance import run_load_skill_guidance
 from app.tools.tavily import run_tavily_search
 from app.tools.tool_search import run_tool_search
 from app.tools.write_file import run_write_file
@@ -243,6 +244,7 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
             description=(
                 "Search Jarvis's tool catalog when the currently exposed low-risk tools cannot satisfy the user's request. "
                 "This tool only discovers candidate tools; it never executes them and never grants permission by itself. "
+                "Tool discovery is internal: never tell the user you are searching available tools or looking up related tools. "
                 "Use it before asking for a hidden capability such as reminders, web search, repository work, or wiki writes. "
                 "If the request can be answered from the current conversation without any tool, or no suitable tool exists, "
                 "return no_capable_tool rather than forcing a tool. Never use tool_search as a retry mechanism after an "
@@ -271,6 +273,37 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
             risk_level="low",
         ),
         ToolDefinition(
+            name="load_skill_guidance",
+            description=(
+                "Load task-specific procedural guidance from Jarvis skills. "
+                "Use this before delegating to Codex, generating artifacts, operating on external channels, "
+                "or performing a multi-step workflow when no relevant <system-reminder> skill is already present. "
+                "This tool only loads guidance for the current turn; it does not execute the task, change files, "
+                "call Codex, upload attachments, or grant permissions."
+            ),
+            args_schema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The user task or workflow capability to match against installed Jarvis skills.",
+                    },
+                    "intent": {
+                        "type": "string",
+                        "description": "Optional normalized intent, such as image artifact generation or repository workflow.",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum skills to load. Defaults to 3.",
+                        "default": 3,
+                    },
+                },
+                "required": ["query"],
+            },
+            handler=run_load_skill_guidance,
+            risk_level="low",
+        ),
+        ToolDefinition(
             name="obsidian_wiki_query",
             description=(
                 "Query the obsidian_wiki long-term knowledge store. "
@@ -285,7 +318,14 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
                         "enum": ["wiki_only", "wiki_then_raw", "raw_only"],
                         "default": "wiki_then_raw",
                     },
-                    "vault_path": {"type": "string"},
+                    "workspace_path": {
+                        "type": "string",
+                        "description": "Obsidian wiki workspace root containing vault/ and system/. Defaults to data/obsidian_wiki.",
+                    },
+                    "vault_path": {
+                        "type": "string",
+                        "description": "Deprecated alias for workspace_path.",
+                    },
                 },
                 "required": ["query"],
             },
@@ -311,7 +351,14 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
                         "items": {"type": "string"},
                     },
                     "target_hint": {"type": "string"},
-                    "vault_path": {"type": "string"},
+                    "workspace_path": {
+                        "type": "string",
+                        "description": "Obsidian wiki workspace root containing vault/ and system/. Defaults to data/obsidian_wiki.",
+                    },
+                    "vault_path": {
+                        "type": "string",
+                        "description": "Deprecated alias for workspace_path.",
+                    },
                 },
                 "required": ["title", "page_type", "content"],
             },
@@ -328,7 +375,14 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
                 "properties": {
                     "draft_id": {"type": "string"},
                     "target_page": {"type": "string"},
-                    "vault_path": {"type": "string"},
+                    "workspace_path": {
+                        "type": "string",
+                        "description": "Obsidian wiki workspace root containing vault/ and system/. Defaults to data/obsidian_wiki.",
+                    },
+                    "vault_path": {
+                        "type": "string",
+                        "description": "Deprecated alias for workspace_path.",
+                    },
                 },
                 "required": ["draft_id"],
             },
@@ -342,7 +396,14 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
             args_schema={
                 "type": "object",
                 "properties": {
-                    "vault_path": {"type": "string"},
+                    "workspace_path": {
+                        "type": "string",
+                        "description": "Obsidian wiki workspace root containing vault/ and system/. Defaults to data/obsidian_wiki.",
+                    },
+                    "vault_path": {
+                        "type": "string",
+                        "description": "Deprecated alias for workspace_path.",
+                    },
                 },
             },
             handler=run_obsidian_wiki_maintain,
@@ -436,7 +497,8 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
                     "job_id": {"type": "integer"},
                     "title": {"type": "string"},
                     "prompt": {"type": "string"},
-                    "time_text": {"type": "string"},
+                    "run_at": {"type": "string"},
+                    "source_time_text": {"type": "string"},
                     "timezone": {"type": "string"},
                 },
                 "required": ["action"],

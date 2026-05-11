@@ -111,6 +111,8 @@ class KnowledgeBaseEvalRunResponse(BaseModel):
     mrr: float
     ndcg: float
     chunk_hit_rate: float
+    span_hit_rate: float | None = None
+    doc_hit_rate: float | None = None
     boundary_spill_rate: float
     p95_latency_ms: int
     avg_latency_ms: int

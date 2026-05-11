@@ -61,6 +61,10 @@ class ModelRouter:
         override = _model_override(metadata, node)
         if override:
             return override
+        if node is LLMNode.INTENT_CLASSIFIER:
+            classifier_profile = getattr(self._settings, "default_classifier_profile", None)
+            if isinstance(classifier_profile, str) and classifier_profile.strip():
+                return classifier_profile.strip()
         return active_profile_id(metadata, self._settings)
 
 

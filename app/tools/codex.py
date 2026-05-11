@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 from pathlib import Path
@@ -18,6 +19,9 @@ from app.tools.coder_common import (
 )
 from app.tools.codex_app_server import CodexAppServerRunResult, run_codex_app_server_turn
 from app.tools.common import ToolExecutionRequest, ToolExecutionResult
+
+
+logger = logging.getLogger(__name__)
 
 
 def run_codex_coder_tool(request: ToolExecutionRequest) -> ToolExecutionResult:
@@ -82,7 +86,10 @@ def run_codex_coder_tool(request: ToolExecutionRequest) -> ToolExecutionResult:
                 parse_errors=[app_server_result.error] if app_server_result.error else None,
             ),
         )
-        artifacts = postflight_artifacts(postflight)
+        artifacts = postflight_artifacts(
+            postflight,
+            files_modified=_current_run_modified_files(preflight, postflight),
+        )
         artifacts.append(f"codex_events:{events_path}")
         artifacts.append(f"codex_run:{run_dir}")
         artifacts.append(f"jarvis_audit:{audit_path}")
@@ -143,7 +150,10 @@ def run_codex_coder_tool(request: ToolExecutionRequest) -> ToolExecutionResult:
             parse_errors=parsed["parse_errors"],
         ),
     )
-    artifacts = postflight_artifacts(postflight)
+    artifacts = postflight_artifacts(
+        postflight,
+        files_modified=_current_run_modified_files(preflight, postflight),
+    )
     artifacts.append(f"codex_events:{events_path}")
     artifacts.append(f"codex_run:{run_dir}")
     artifacts.append(f"jarvis_audit:{audit_path}")
@@ -195,6 +205,22 @@ def _trusted_command_prefixes(args: dict[str, object]) -> list[str]:
     if not isinstance(raw, list):
         return []
     return [str(item) for item in raw if str(item).strip()]
+
+
+def _current_run_modified_files(preflight: dict[str, object], postflight: dict[str, object]) -> list[str] | None:
+    if not preflight.get("git_available") or not postflight.get("git_available"):
+        logger.warning(
+            "codex artifact dirty-file baseline unavailable; falling back to all postflight dirty files "
+            "preflight_exit=%s postflight_exit=%s preflight_stderr=%r postflight_stderr=%r",
+            preflight.get("status_exit_code"),
+            postflight.get("status_exit_code"),
+            preflight.get("status_stderr"),
+            postflight.get("status_stderr"),
+        )
+        return None
+
+    baseline = {str(path) for path in preflight.get("files_modified") or []}
+    return [str(path) for path in postflight.get("files_modified") or [] if str(path) not in baseline]
 
 
 def _run_codex_process(

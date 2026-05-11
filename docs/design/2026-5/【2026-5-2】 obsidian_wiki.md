@@ -221,7 +221,7 @@ Schema 不是一份抽象说明，而是一组可执行约束：
 
 v1 需要明确区分两个概念：
 
-- `workspace/`：模块工作区根目录，包含系统内部状态和人类可读知识页
+- `data/obsidian_wiki/`：默认模块工作区根目录，包含系统内部状态和人类可读知识页
 - `vault/`：真正给 Obsidian 打开的目录，只包含人类可读页面
 
 也就是说，**不要把 raw / drafts / schema 直接暴露在 Obsidian 主 vault 里**。否则图谱会被 `src_*`、`draft_*`、规则文件和日志污染，不适合人类使用。
@@ -229,7 +229,7 @@ v1 需要明确区分两个概念：
 推荐目录如下：
 
 ```text
-JarvisWikiWorkspace/
+data/obsidian_wiki/
   README.md
 
   vault/
@@ -273,8 +273,8 @@ JarvisWikiWorkspace/
 
 其中：
 
-- Obsidian 客户端应打开 `workspace/vault/`
-- Jarvis 模块应持有 `workspace/` 根路径
+- Obsidian 客户端应打开 `data/obsidian_wiki/vault/`
+- Jarvis 模块应持有 workspace 根路径，默认是 `data/obsidian_wiki/`
 - `vault/` 与 `system/` 必须一起管理，但面向不同角色
 
 这样做的直接收益是：

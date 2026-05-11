@@ -324,6 +324,36 @@ def test_codex_allows_worktree_changes_without_commit(monkeypatch, tmp_path: Pat
     assert "git_file:README.md" in result.artifacts
 
 
+def test_codex_artifacts_include_only_current_run_dirty_files(monkeypatch, tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    run_root = tmp_path / "runs"
+    (repo / "preexisting.txt").write_text("dirty before codex\n", encoding="utf-8")
+
+    _install_registry(monkeypatch, repo)
+    monkeypatch.setattr("app.tools.codex._resolve_codex_command", lambda: ["codex"])
+    monkeypatch.setattr("app.tools.codex._coder_run_dir", lambda run_id: run_root / run_id)
+
+    def _fake_run(*, provider_command, workdir, run_dir, instruction, timeout_seconds, trusted_command_prefixes=None):
+        (workdir / "current-run.txt").write_text("created by codex\n", encoding="utf-8")
+        stdout = json.dumps({"type": "agent_message", "message": "Created current-run.txt."})
+        return CodexAppServerRunResult(status="completed", raw_events=stdout, exit_code=0, final_text="Created current-run.txt.")
+
+    monkeypatch.setattr("app.tools.codex._run_codex_app_server", _fake_run)
+
+    result = run_codex_coder_tool(
+        ToolExecutionRequest(
+            tool_name="delegate_to_codex",
+            workdir=str(repo),
+            args={"instruction": "Create current-run.txt.", "repo_id": "jarvis"},
+            timeout_seconds=30,
+        )
+    )
+
+    assert result.ok is True
+    assert "git_file:current-run.txt" in result.artifacts
+    assert "git_file:preexisting.txt" not in result.artifacts
+
+
 def test_codex_coder_fails_when_commit_created_without_permission(monkeypatch, tmp_path: Path) -> None:
     repo = _init_repo(tmp_path / "repo")
     run_root = tmp_path / "runs"

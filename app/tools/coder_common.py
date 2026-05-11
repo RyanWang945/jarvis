@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 
 def build_coder_instruction(instruction: str, request_args: dict[str, Any]) -> str:
@@ -133,7 +133,11 @@ def run_git(workdir: Path, *args: str) -> dict[str, object]:
     }
 
 
-def postflight_artifacts(postflight: dict[str, object]) -> list[str]:
+def postflight_artifacts(
+    postflight: dict[str, object],
+    *,
+    files_modified: Iterable[str] | None = None,
+) -> list[str]:
     artifacts: list[str] = []
     if postflight.get("commit"):
         artifacts.append(f"git_commit:{postflight['commit']}")
@@ -145,7 +149,8 @@ def postflight_artifacts(postflight: dict[str, object]) -> list[str]:
         artifacts.append("git_worktree:dirty")
     if postflight.get("synced_with_upstream"):
         artifacts.append("git_upstream:synced")
-    for path in postflight.get("files_modified") or []:
+    artifact_files = files_modified if files_modified is not None else postflight.get("files_modified") or []
+    for path in artifact_files:
         artifacts.append(f"git_file:{path}")
     return artifacts
 

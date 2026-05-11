@@ -14,11 +14,11 @@ from app.llm.client import ChatClient
 from app.main import create_app
 from app.skills.bootstrap import reset_registries_for_tests
 from app.tools.common import ToolExecutionResult
+from tests.helpers.mysql import prepare_test_mysql_database
 
 
 def _client(monkeypatch) -> TestClient:
-    get_conversation_store.cache_clear()
-    get_settings.cache_clear()
+    prepare_test_mysql_database(monkeypatch)
     reset_registries_for_tests()
     return TestClient(create_app())
 
@@ -49,8 +49,8 @@ def _install_history_count_chat(monkeypatch) -> None:
 
 def _install_skill_echo_chat(monkeypatch) -> None:
     def _fake_chat(self, messages, tools=None):
-        system_messages = [m.content for m in messages if m.role == "system"]
-        selected = next((content for content in system_messages if "Selected skills for this turn." in content), "")
+        user_messages = [m.content for m in messages if m.role == "user"]
+        selected = next((content for content in user_messages if "<system-reminder>" in content), "")
         return {"content": "skill-loaded" if "release checklist" in selected.lower() else "skill-missing", "tool_calls": []}
 
     monkeypatch.setattr(ChatClient, "chat", _fake_chat)

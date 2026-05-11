@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import logging
 import json
+from collections import Counter
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
-from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, SystemMessage, ToolMessage
 from typing_extensions import TypedDict
 
+from app.agent_react.artifacts import ChannelAttachment, artifact_to_payload, resolve_channel_attachments
 from app.agent_react.context_manager import ContextManager
 from app.agent_react.loop_provider import TurnLoopProvider, resolve_turn_loop_provider
 from app.agent_react.model_usage import strip_token_usage_footer
@@ -27,6 +29,7 @@ from app.agent_react.tool_intent_state import (
     tool_intents_from_metadata,
 )
 from app.config import get_settings
+from app.tools.common import ToolArtifact
 
 if TYPE_CHECKING:
     from app.persistence.models import ConversationRecord
@@ -34,12 +37,20 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_CODEX_SUMMARY_INSTRUCTION = """Codex result summarization rules:
+- Summarize only facts explicitly present in the delegate_to_codex tool output.
+- Preserve the user's language.
+- Do not add subjective status labels, inferred conclusions, or next-step suggestions.
+- Do not offer to commit, push, edit, or run follow-up actions unless the original user request explicitly asked for that action.
+- If the tool output is already concise and user-facing, keep the summary close to the original wording."""
+
 
 @dataclass(frozen=True)
 class ChannelMessage:
     content: str
     content_type: Literal["text", "markdown"] = "text"
     summary: str | None = None
+    attachments: tuple[ChannelAttachment, ...] = ()
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -144,12 +155,11 @@ class TurnRuntimeState(TypedDict):
     conversation_id: int
     trigger_message_id: int | None
     messages: list[BaseMessage]
+    artifacts: list[ToolArtifact]
     session_state: ConversationSessionState | None
     runtime_policy: RuntimePolicy | None
-    selected_skills: list[str]
     allowed_tools: list[str]
     reply: str
-    reply_message_id: int | None
     cancelled: bool
     status: str
     step_count: int
@@ -181,6 +191,7 @@ class TurnRuntime:
             react_state = {
                 "turn_id": running["turn_id"],
                 "messages": running["messages"],
+                "artifacts": running.get("artifacts", []),
                 "cancelled": running["cancelled"],
                 "status": running["status"],
                 "step_count": running["step_count"],
@@ -257,7 +268,7 @@ class TurnRuntime:
                 allowed_tools,
             )
 
-        lc_messages, skill_names = self._context_manager.build_initial_messages(
+        lc_messages, _ = self._context_manager.build_initial_messages(
             self._store.list_messages(turn.conversation_id),
             getattr(turn, "trigger_message_id", None),
             turn_records=self._store.list_turns(turn.conversation_id),
@@ -271,12 +282,11 @@ class TurnRuntime:
             "conversation_id": turn.conversation_id,
             "trigger_message_id": getattr(turn, "trigger_message_id", None),
             "messages": lc_messages,
+            "artifacts": list(state.get("artifacts", [])),
             "session_state": session_state,
             "runtime_policy": runtime_policy,
-            "selected_skills": skill_names,
             "allowed_tools": allowed_tools,
             "reply": "",
-            "reply_message_id": None,
             "cancelled": False,
             "status": "running",
             "step_count": 0,
@@ -344,6 +354,7 @@ class TurnRuntime:
                     return {
                         **state,
                         "messages": next_state["messages"] + [AIMessage(content=question)],
+                        "artifacts": next_state.get("artifacts", state.get("artifacts", [])),
                         "step_count": next_state["step_count"],
                         "token_usage": next_state.get("token_usage", token_usage),
                         "model": next_state.get("model", model),
@@ -352,13 +363,14 @@ class TurnRuntime:
                         "status": "completed",
                         "error": state.get("error"),
                     }
-            if self._should_complete_after_coder_tool(state, next_state):
+            if self._should_complete_after_coder_tool(next_state):
                 coder_reply = self._latest_tool_message_content(next_state["messages"])
                 if not self._looks_like_codex_approval_request(coder_reply):
                     return self._summarize_after_coder_tool(state, next_state)
                 return {
                     **state,
                     "messages": next_state["messages"] + [AIMessage(content=coder_reply)],
+                    "artifacts": next_state.get("artifacts", state.get("artifacts", [])),
                     "step_count": next_state["step_count"],
                     "token_usage": next_state.get("token_usage", token_usage),
                     "model": next_state.get("model", model),
@@ -370,6 +382,7 @@ class TurnRuntime:
             return {
                 **state,
                 "messages": next_state["messages"],
+                "artifacts": next_state.get("artifacts", state.get("artifacts", [])),
                 "step_count": next_state["step_count"],
                 "token_usage": next_state.get("token_usage", token_usage),
                 "model": next_state.get("model", model),
@@ -382,37 +395,43 @@ class TurnRuntime:
         return {
             **state,
             "messages": llm_state["messages"],
+            "artifacts": llm_state.get("artifacts", state.get("artifacts", [])),
             "step_count": llm_state["step_count"],
             "token_usage": token_usage,
             "model": model,
             "cancelled": bool(llm_state.get("cancelled")),
             "status": "cancelled" if llm_state.get("cancelled") else "completed",
-                "error": state.get("error"),
-            }
+            "error": state.get("error"),
+        }
 
     def _summarize_after_coder_tool(self, state: TurnRuntimeState, next_state: dict[str, Any]) -> TurnRuntimeState:
-        summary_state = call_llm(
-            {
-                **next_state,
-                "allowed_tools": [],
-                "max_steps": int(next_state.get("step_count", 0) or 0) + 1,
-            },
-            self._store,
-        )
+        try:
+            summary_state = call_llm(
+                {
+                    **next_state,
+                    "messages": self._messages_with_coder_summary_instruction(next_state["messages"]),
+                    "allowed_tools": [],
+                    "max_steps": int(next_state.get("step_count", 0) or 0) + 1,
+                },
+                self._store,
+            )
+        except Exception as exc:
+            logger.exception("turn runtime Codex summary step failed")
+            return self._complete_with_coder_tool_reply(state, next_state, summary_error=str(exc))
         if summary_state.get("status") == "failed":
-            return {
-                **state,
-                "messages": summary_state["messages"],
-                "step_count": summary_state["step_count"],
-                "token_usage": summary_state.get("token_usage", state.get("token_usage")),
-                "model": summary_state.get("model", state.get("model")),
-                "cancelled": bool(summary_state.get("cancelled")),
-                "status": "failed",
-                "error": summary_state.get("error") or "failed to summarize Codex result",
-            }
+            logger.warning(
+                "turn runtime Codex summary failed; falling back to tool output turn_id=%s",
+                state["turn_id"],
+            )
+            return self._complete_with_coder_tool_reply(
+                state,
+                next_state,
+                summary_error=str(summary_state.get("error") or "failed to summarize Codex result"),
+            )
         return {
             **state,
             "messages": summary_state["messages"],
+            "artifacts": summary_state.get("artifacts", state.get("artifacts", [])),
             "step_count": summary_state["step_count"],
             "token_usage": summary_state.get("token_usage", state.get("token_usage")),
             "model": summary_state.get("model", state.get("model")),
@@ -422,7 +441,33 @@ class TurnRuntime:
             "error": state.get("error"),
         }
 
-    def _should_complete_after_coder_tool(self, state: TurnRuntimeState, next_state: dict[str, Any]) -> bool:
+    def _complete_with_coder_tool_reply(
+        self,
+        state: TurnRuntimeState,
+        next_state: dict[str, Any],
+        *,
+        summary_error: str,
+    ) -> TurnRuntimeState:
+        coder_reply = self._latest_tool_message_content(next_state["messages"])
+        logger.info(
+            "Codex tool output used as final reply after summary failure turn_id=%s error=%s",
+            state["turn_id"],
+            summary_error,
+        )
+        return {
+            **state,
+            "messages": next_state["messages"] + [AIMessage(content=coder_reply)],
+            "artifacts": next_state.get("artifacts", state.get("artifacts", [])),
+            "step_count": next_state["step_count"],
+            "token_usage": next_state.get("token_usage", state.get("token_usage")),
+            "model": next_state.get("model", state.get("model")),
+            "allowed_tools": next_state.get("allowed_tools", state.get("allowed_tools")),
+            "cancelled": bool(next_state.get("cancelled")),
+            "status": "completed",
+            "error": None,
+        }
+
+    def _should_complete_after_coder_tool(self, next_state: dict[str, Any]) -> bool:
         if not self._latest_ai_message_called_tool(next_state["messages"], "delegate_to_codex"):
             return False
         return bool(self._latest_tool_message_content(next_state["messages"]))
@@ -436,6 +481,20 @@ class TurnRuntime:
     @staticmethod
     def _looks_like_codex_approval_request(content: str) -> bool:
         return content.strip().startswith("Codex requested approval")
+
+    @staticmethod
+    def _messages_with_coder_summary_instruction(messages: list[BaseMessage]) -> list[BaseMessage]:
+        if messages and isinstance(messages[0], SystemMessage):
+            first = messages[0]
+            return [
+                SystemMessage(
+                    content=f"{first.content}\n\n{_CODEX_SUMMARY_INSTRUCTION}",
+                    response_metadata=first.response_metadata,
+                    additional_kwargs=first.additional_kwargs,
+                ),
+                *messages[1:],
+            ]
+        return [SystemMessage(content=_CODEX_SUMMARY_INSTRUCTION), *messages]
 
     @staticmethod
     def _latest_ai_message_called_tool(messages: list[BaseMessage], tool_name: str) -> bool:
@@ -520,6 +579,27 @@ class TurnRuntime:
             reasoning = assistant_messages[-1].response_metadata.get("reasoning_content") if assistant_messages[-1].response_metadata else None
             if reasoning is not None:
                 raw_payload["reasoning_content"] = reasoning
+        raw_payload["artifacts"] = [artifact_to_payload(item) for item in state.get("artifacts", [])]
+
+        resolution = resolve_channel_attachments(state.get("artifacts", []), turn_id=turn_id)
+        attachments = resolution.attachments
+        if attachments:
+            raw_payload["attachments"] = [attachment.__dict__ for attachment in attachments]
+        if resolution.rejected:
+            raw_payload["artifact_rejections"] = [item.__dict__ for item in resolution.rejected]
+            rejection_reasons = Counter(item.reason for item in resolution.rejected)
+            logger.info(
+                "artifact attachment rejections turn_id=%s reasons=%s",
+                turn_id,
+                dict(rejection_reasons),
+            )
+        logger.info(
+            "artifact attachments resolved turn_id=%s artifact_count=%s attachment_count=%s rejected_count=%s",
+            turn_id,
+            len(state.get("artifacts", [])),
+            len(attachments),
+            len(resolution.rejected),
+        )
 
         message = self._store.finalize_turn_success(
             turn_id=turn_id,
@@ -537,7 +617,7 @@ class TurnRuntime:
         return {
             **state,
             "reply": reply,
-            "reply_message_id": getattr(message, "id", None),
+            "attachments": attachments,
             "status": "completed",
             "error": None,
             "session_state": session_state,
@@ -605,12 +685,11 @@ class AgentRuntime:
                 "conversation_id": turn.conversation_id,
                 "trigger_message_id": getattr(turn, "trigger_message_id", None),
                 "messages": [],
+                "artifacts": [],
                 "session_state": None,
                 "runtime_policy": None,
-                "selected_skills": [],
                 "allowed_tools": [],
                 "reply": "",
-                "reply_message_id": None,
                 "cancelled": False,
                 "status": "running",
                 "step_count": 0,
@@ -628,12 +707,11 @@ class AgentRuntime:
                 "conversation_id": turn.conversation_id,
                 "trigger_message_id": getattr(turn, "trigger_message_id", None),
                 "messages": [],
+                "artifacts": [],
                 "session_state": None,
                 "runtime_policy": None,
-                "selected_skills": [],
                 "allowed_tools": [],
                 "reply": "",
-                "reply_message_id": None,
                 "cancelled": False,
                 "status": "failed",
                 "step_count": 0,
@@ -659,6 +737,7 @@ class AgentRuntime:
                 content=reply,
                 content_type="markdown",
                 summary=reply,
+                attachments=tuple(result.get("attachments", ()) or ()),
             ),
         )
 

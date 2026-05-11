@@ -95,15 +95,13 @@ def run_obsidian_wiki_maintain(request: ToolExecutionRequest) -> ToolExecutionRe
 
 
 def _service_from_request(request: ToolExecutionRequest) -> ObsidianWikiService:
-    vault_arg = request.args.get("vault_path")
-    if vault_arg:
-        vault_path = Path(str(vault_arg))
+    workspace_arg = request.args.get("workspace_path") or request.args.get("vault_path")
+    if workspace_arg:
+        workspace_path = Path(str(workspace_arg))
     else:
         settings = get_settings()
-        if settings.obsidian_vault_path is None:
-            raise ValueError("obsidian_vault_path is not configured")
-        vault_path = settings.obsidian_vault_path
-    return ObsidianWikiService(vault_path)
+        workspace_path = settings.obsidian_workspace_path or settings.obsidian_vault_path or Path("data/obsidian_wiki")
+    return ObsidianWikiService(workspace_path)
 
 
 def _json_result(payload: dict, *, ok: bool = True, summary: str = "") -> ToolExecutionResult:

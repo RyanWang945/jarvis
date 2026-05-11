@@ -5,10 +5,13 @@ import base64
 import http
 import json
 import logging
+import os
 import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -34,7 +37,7 @@ from lark_oapi.ws.const import (
 from lark_oapi.ws.enum import MessageType
 from lark_oapi.ws.model import Response
 
-from app.agent_react import ChannelMessage, TurnResult
+from app.agent_react import ChannelAttachment, ChannelMessage, TurnResult
 from app.api.agent import get_agent_runtime, get_conversation_store
 from app.channels.feishu_renderer import FeishuDelivery, FeishuRenderer
 from app.config import get_settings
@@ -42,6 +45,20 @@ from app.gateway import InboundEvent, get_gateway_service
 from app.tools.codex_app_server import approval_command_prefix, respond_to_codex_approval
 
 logger = logging.getLogger(__name__)
+
+_FEISHU_NO_PROXY_HOSTS = (
+    "open.feishu.cn",
+    "msg-frontier.feishu.cn",
+    ".feishu.cn",
+)
+
+
+@dataclass
+class _ArtifactDeliveryState:
+    status: str
+    upload_key: str | None = None
+    external_message_id: str | None = None
+    error_message: str | None = None
 
 
 class _JarvisFeishuWsClient(ws.Client):
@@ -117,6 +134,7 @@ class FeishuChannel:
         self._tenant_access_token: str | None = None
         self._token_expires_at: float = 0.0
         self._renderer = FeishuRenderer(title=bot_name)
+        self._artifact_deliveries: dict[tuple[str, str], _ArtifactDeliveryState] = {}
 
     def start(self) -> None:
         with self._lock:
@@ -149,6 +167,7 @@ class FeishuChannel:
             raise
 
     def _run_ws_in_thread(self) -> None:
+        _ensure_feishu_no_proxy()
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         lark_ws_client.loop = loop
@@ -580,12 +599,14 @@ class FeishuChannel:
                 self._update_card_message(thinking_message_id, delivery)
             else:
                 self._send_delivery(chat_id, delivery)
+            self._send_message_attachments(chat_id, result.message)
             drain_after = False
             return
 
         message = self._format_result(result)
         if thinking_message_id:
             self._update_channel_message(thinking_message_id, message)
+            self._send_message_attachments(chat_id, message)
         else:
             self._send_channel_message(chat_id, message)
         if drain_after:
@@ -653,8 +674,10 @@ class FeishuChannel:
 
     def _send_channel_message(self, receive_id: str, message: ChannelMessage) -> None:
         delivery = self._renderer.render(message)
+        sent_main = False
         try:
             self._send_delivery(receive_id, delivery)
+            sent_main = True
         except Exception:
             logger.exception(
                 "failed to send feishu delivery receive_id=%s msg_type=%s, retrying text fallback",
@@ -664,14 +687,19 @@ class FeishuChannel:
             fallback = self._renderer.render_text_fallback(message.content)
             try:
                 self._send_delivery(receive_id, fallback)
+                sent_main = True
             except Exception:
                 logger.exception("failed to send feishu fallback text to %s", receive_id)
+        if sent_main:
+            self._send_message_attachments(receive_id, message)
 
     def _update_channel_message(self, message_id: str, message: ChannelMessage) -> None:
         delivery = self._renderer.render(message)
         if delivery.msg_type != "interactive":
             raise RuntimeError("Only interactive card messages can be updated.")
         self._update_card_message(message_id, delivery)
+        # Thinking-card updates do not carry chat_id. The caller sends attachments
+        # after update when it has the receive_id available.
 
     def _send_thinking_card(self, receive_id: str, prompt: str) -> str | None:
         try:
@@ -706,6 +734,105 @@ class FeishuChannel:
             delivery.msg_type,
         )
         return payload
+
+    def _send_message_attachments(self, receive_id: str, message: ChannelMessage) -> None:
+        for attachment in message.attachments:
+            if attachment.kind != "image":
+                logger.info(
+                    "feishu attachment skipped receive_id=%s artifact_id=%s kind=%s reason=unsupported_kind",
+                    receive_id,
+                    attachment.artifact_id,
+                    attachment.kind,
+                )
+                continue
+            try:
+                self._send_image_attachment(receive_id, attachment)
+            except Exception as exc:
+                logger.exception(
+                    "feishu attachment send failed receive_id=%s artifact_id=%s path=%s",
+                    receive_id,
+                    attachment.artifact_id,
+                    attachment.path,
+                )
+                try:
+                    self._send_text_message(
+                        receive_id,
+                        f"图片已生成到本地，但上传飞书失败：{attachment.filename}\n本地路径：{attachment.path}",
+                    )
+                except Exception:
+                    logger.exception("failed to send feishu attachment fallback text receive_id=%s", receive_id)
+                self._artifact_deliveries[(receive_id, attachment.artifact_id)] = _ArtifactDeliveryState(
+                    status="failed",
+                    error_message=str(exc),
+                )
+
+    def _send_image_attachment(self, receive_id: str, attachment: ChannelAttachment) -> None:
+        delivery_key = (receive_id, attachment.artifact_id)
+        state = self._artifact_deliveries.get(delivery_key)
+        if state is not None and state.status == "sent":
+            logger.info(
+                "feishu attachment delivery skipped receive_id=%s artifact_id=%s reason=already_sent",
+                receive_id,
+                attachment.artifact_id,
+            )
+            return
+
+        image_key = state.upload_key if state is not None and state.status == "uploaded" else None
+        if not image_key:
+            logger.info(
+                "feishu attachment upload starting receive_id=%s artifact_id=%s path=%s",
+                receive_id,
+                attachment.artifact_id,
+                attachment.path,
+            )
+            image_key = self._upload_image(attachment)
+            self._artifact_deliveries[delivery_key] = _ArtifactDeliveryState(
+                status="uploaded",
+                upload_key=image_key,
+            )
+            logger.info(
+                "feishu attachment upload completed receive_id=%s artifact_id=%s image_key=%s",
+                receive_id,
+                attachment.artifact_id,
+                image_key,
+            )
+
+        payload = self._send_delivery(
+            receive_id,
+            FeishuDelivery(
+                msg_type="image",
+                content=json.dumps({"image_key": image_key}, ensure_ascii=False),
+            ),
+        )
+        self._artifact_deliveries[delivery_key] = _ArtifactDeliveryState(
+            status="sent",
+            upload_key=image_key,
+            external_message_id=_extract_message_id(payload),
+        )
+
+    def _upload_image(self, attachment: ChannelAttachment) -> str:
+        token = self._ensure_token()
+        path = Path(attachment.path)
+        with path.open("rb") as fh:
+            resp = self._http.post(
+                "https://open.feishu.cn/open-apis/im/v1/images",
+                headers={"Authorization": f"Bearer {token}"},
+                data={"image_type": "message"},
+                files={"image": (attachment.filename, fh, attachment.mime_type)},
+            )
+        try:
+            payload = resp.json()
+        except ValueError:
+            payload = {"status_code": resp.status_code, "body": resp.text}
+        if resp.status_code >= 400:
+            log_id = resp.headers.get("x-tt-logid") or resp.headers.get("X-Tt-Logid")
+            raise RuntimeError(f"feishu image upload http_error status={resp.status_code} log_id={log_id} payload={payload}")
+        if payload.get("code") != 0:
+            raise RuntimeError(f"feishu image upload failed: {payload}")
+        data = payload.get("data")
+        if not isinstance(data, dict) or not data.get("image_key"):
+            raise RuntimeError(f"feishu image upload missing image_key: {payload}")
+        return str(data["image_key"])
 
     def _update_card_message(self, message_id: str, delivery: FeishuDelivery) -> None:
         if delivery.msg_type != "interactive":
@@ -746,6 +873,25 @@ def build_feishu_channel() -> FeishuChannel | None:
         app_secret=settings.feishu_app_secret,
         bot_name=settings.feishu_bot_name or "Jarvis",
     )
+
+
+def _ensure_feishu_no_proxy() -> None:
+    """Keep lark_oapi's long-lived Feishu WebSocket off generic HTTP proxies."""
+    values: list[str] = []
+    lowered: set[str] = set()
+    for env_name in ("NO_PROXY", "no_proxy"):
+        for item in os.environ.get(env_name, "").split(","):
+            host = item.strip()
+            if host and host.lower() not in lowered:
+                values.append(host)
+                lowered.add(host.lower())
+    for host in _FEISHU_NO_PROXY_HOSTS:
+        if host.lower() not in lowered:
+            values.append(host)
+            lowered.add(host.lower())
+    merged = ",".join(values)
+    os.environ["NO_PROXY"] = merged
+    os.environ["no_proxy"] = merged
 
 
 def _conversation_chat_type(feishu_chat_type: str) -> str:

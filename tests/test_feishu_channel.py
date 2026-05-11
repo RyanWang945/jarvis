@@ -1,8 +1,15 @@
 import json
+import os
+from pathlib import Path
 from types import SimpleNamespace
 
-from app.agent_react import ChannelMessage
-from app.channels.feishu import FeishuChannel, _extract_message_id, _extract_codex_approval_from_reply
+from app.agent_react import ChannelAttachment, ChannelMessage, TurnResult
+from app.channels.feishu import (
+    FeishuChannel,
+    _ensure_feishu_no_proxy,
+    _extract_codex_approval_from_reply,
+    _extract_message_id,
+)
 from app.channels.feishu_renderer import FeishuRenderer
 from app.tools.codex_app_server import CodexApprovalContinuationResult
 
@@ -39,6 +46,21 @@ def test_feishu_renderer_renders_thinking_card() -> None:
     assert "**🟡 Jarvis Thinking**" in content
     assert "正在整理问题" in content
     assert "architecture tradeoffs" not in content
+
+
+def test_feishu_no_proxy_includes_ws_hosts(monkeypatch) -> None:
+    monkeypatch.delenv("no_proxy", raising=False)
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    monkeypatch.setenv("NO_PROXY", "localhost,127.0.0.1")
+
+    _ensure_feishu_no_proxy()
+
+    hosts = {item.strip() for item in os.environ["NO_PROXY"].split(",")}
+    assert "localhost" in hosts
+    assert "127.0.0.1" in hosts
+    assert "open.feishu.cn" in hosts
+    assert "msg-frontier.feishu.cn" in hosts
+    assert ".feishu.cn" in hosts
 
 
 def test_feishu_renderer_renders_codex_approval_buttons() -> None:
@@ -227,6 +249,162 @@ def test_feishu_channel_updates_thinking_card(monkeypatch) -> None:
     assert thinking_id == "om_thinking"
     assert sent == [("chat_1", "interactive")]
     assert updated == [("om_thinking", "interactive")]
+
+
+def test_feishu_channel_sends_image_attachments_once(monkeypatch) -> None:
+    channel = FeishuChannel(app_id="app", app_secret="secret")
+    image_dir = Path(".pytest_tmp_feishu_attachments")
+    image_dir.mkdir(exist_ok=True)
+    image_path = image_dir / "diagram.png"
+    image_path.write_bytes(b"image")
+    sent: list[tuple[str, str, str]] = []
+    uploads: list[str] = []
+
+    def fake_send(receive_id: str, delivery) -> dict:
+        sent.append((receive_id, delivery.msg_type, delivery.content))
+        return {"code": 0, "data": {"message_id": f"om_{delivery.msg_type}_{len(sent)}"}}
+
+    def fake_upload(attachment: ChannelAttachment) -> str:
+        uploads.append(attachment.path)
+        return "img_key_1"
+
+    monkeypatch.setattr(channel, "_send_delivery", fake_send)
+    monkeypatch.setattr(channel, "_upload_image", fake_upload)
+
+    message = ChannelMessage(
+        content="# Final\n\nDone",
+        content_type="markdown",
+        attachments=(
+            ChannelAttachment(
+                artifact_id="turn:call:image",
+                kind="image",
+                path=str(image_path),
+                mime_type="image/png",
+                filename="diagram.png",
+                size_bytes=image_path.stat().st_size,
+                source_tool="delegate_to_codex",
+            ),
+        ),
+    )
+
+    try:
+        channel._send_channel_message("chat_1", message)
+        channel._send_message_attachments("chat_1", message)
+    finally:
+        try:
+            image_path.unlink()
+            image_dir.rmdir()
+        except OSError:
+            pass
+
+    assert uploads == [str(image_path)]
+    assert [item[1] for item in sent] == ["interactive", "image"]
+    assert json.loads(sent[1][2]) == {"image_key": "img_key_1"}
+
+
+def test_feishu_channel_sends_attachments_when_codex_requests_approval(monkeypatch) -> None:
+    channel = FeishuChannel(app_id="app", app_secret="secret")
+    updated: list[tuple[str, str]] = []
+    sent_attachments: list[tuple[str, tuple[ChannelAttachment, ...]]] = []
+    metadata_patches: list[tuple[int, dict]] = []
+    attachment = ChannelAttachment(
+        artifact_id="turn:call:svg:preview:png",
+        kind="image",
+        path="data/artifact_previews/preview.png",
+        mime_type="image/png",
+        filename="preview.png",
+        size_bytes=100,
+        source_tool="delegate_to_codex",
+    )
+
+    class FakeRuntime:
+        def run_turn(self, turn_id: int) -> TurnResult:
+            return TurnResult(
+                turn_id=turn_id,
+                conversation_id=7,
+                status="completed",
+                message=ChannelMessage(
+                    content=(
+                        "Codex requested approval (item/commandExecution/requestApproval).\n"
+                        "Approval ID: approval_1\n"
+                        "Command: Remove-Item tmp\n"
+                        "Reason: Cleanup temp file."
+                    ),
+                    content_type="markdown",
+                    attachments=(attachment,),
+                ),
+            )
+
+    class FakeStore:
+        def update_conversation_metadata(self, conversation_id: int, patch: dict) -> None:
+            metadata_patches.append((conversation_id, patch))
+
+    monkeypatch.setattr("app.channels.feishu.get_agent_runtime", lambda: FakeRuntime())
+    monkeypatch.setattr("app.channels.feishu.get_conversation_store", lambda: FakeStore())
+    monkeypatch.setattr(channel, "_send_thinking_card", lambda chat_id, text: "om_thinking")
+    monkeypatch.setattr(channel, "_update_card_message", lambda message_id, delivery: updated.append((message_id, delivery.msg_type)))
+    monkeypatch.setattr(
+        channel,
+        "_send_message_attachments",
+        lambda chat_id, message: sent_attachments.append((chat_id, message.attachments)),
+    )
+
+    channel._handle_agent_run("ou_1", "chat_1", "dm", "生成 svg 图", 7, 42)
+
+    assert updated == [("om_thinking", "interactive")]
+    assert sent_attachments == [("chat_1", (attachment,))]
+    assert metadata_patches[0][1]["codex_approvals"]["approval_1"]["status"] == "pending"
+
+
+def test_feishu_image_upload_error_includes_response_payload(monkeypatch) -> None:
+    channel = FeishuChannel(app_id="app", app_secret="secret")
+    image_dir = Path(".pytest_tmp_feishu_upload_error_case")
+    image_dir.mkdir(exist_ok=True)
+    image_path = image_dir / "preview.png"
+    image_path.write_bytes(b"\x89PNG\r\n\x1a\npreview")
+
+    class FakeResponse:
+        status_code = 400
+        text = '{"code":99991672,"msg":"Access denied."}'
+        headers = {"x-tt-logid": "log_1"}
+
+        def json(self):
+            return {"code": 99991672, "msg": "Access denied."}
+
+    class FakeHttp:
+        def post(self, *args, **kwargs):
+            return FakeResponse()
+
+    monkeypatch.setattr(channel, "_ensure_token", lambda: "token")
+    channel._http = FakeHttp()
+
+    try:
+        channel._upload_image(
+            ChannelAttachment(
+                artifact_id="artifact_1",
+                kind="image",
+                path=str(image_path),
+                mime_type="image/png",
+                filename="preview.png",
+                size_bytes=image_path.stat().st_size,
+                source_tool="delegate_to_codex",
+            )
+        )
+    except RuntimeError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("expected upload failure")
+    finally:
+        try:
+            image_path.unlink()
+            image_dir.rmdir()
+        except OSError:
+            pass
+
+    assert "status=400" in message
+    assert "log_1" in message
+    assert "99991672" in message
+    assert "Access denied" in message
 
 
 def test_feishu_card_action_updates_approval_card(monkeypatch) -> None:

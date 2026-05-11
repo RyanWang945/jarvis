@@ -11,6 +11,9 @@ from app.knowledge_base.chunking import chunk_text, normalize_text
 from app.knowledge_base.repositories import KnowledgeBaseDB
 
 
+LEGACY_WIKIPEDIA_CHUNK_PROFILE_IDS = {"medium_overlap_v1"}
+
+
 @dataclass(frozen=True)
 class IngestResult:
     job_id: str
@@ -174,15 +177,22 @@ class WikipediaIngestService(BaseIngestService):
                 )
                 if existing and existing["text_hash"] == document["text_hash"]:
                     documents_skipped += 1
-                    continue
+                    document = existing
+                    existing_chunks = self._db.chunks.list_by_document(
+                        document["doc_id"],
+                        chunk_profile_id=chunk_profile_id,
+                    )
+                    if existing_chunks:
+                        continue
 
-                if existing:
+                elif existing:
                     documents_updated += 1
+                    self._db.documents.save(document)
+                    self._db.chunks.delete_by_document(document["doc_id"], chunk_profile_id=chunk_profile_id)
                 else:
                     documents_inserted += 1
+                    self._db.documents.save(document)
 
-                self._db.documents.save(document)
-                self._db.chunks.delete_by_document(document["doc_id"], chunk_profile_id=chunk_profile_id)
                 chunk_records = chunk_text(
                     document["text"],
                     target_size=profile["target_size"],
@@ -194,7 +204,11 @@ class WikipediaIngestService(BaseIngestService):
                 for chunk in chunk_records:
                     self._db.chunks.save(
                         {
-                            "chunk_id": f"{document['doc_id']}:chunk:{chunk.chunk_index:04d}",
+                            "chunk_id": build_wikipedia_chunk_id(
+                                doc_id=document["doc_id"],
+                                chunk_profile_id=chunk_profile_id,
+                                chunk_index=chunk.chunk_index,
+                            ),
                             "doc_id": document["doc_id"],
                             "chunk_profile_id": chunk_profile_id,
                             "chunk_index": chunk.chunk_index,
@@ -293,6 +307,12 @@ def _build_document(
         "metadata_json": None,
         "ingest_job_id": ingest_job_id,
     }
+
+
+def build_wikipedia_chunk_id(*, doc_id: str, chunk_profile_id: str, chunk_index: int) -> str:
+    if chunk_profile_id in LEGACY_WIKIPEDIA_CHUNK_PROFILE_IDS:
+        return f"{doc_id}:chunk:{chunk_index:04d}"
+    return f"{doc_id}:profile:{chunk_profile_id}:chunk:{chunk_index:04d}"
 
 
 def _sha256(content: str) -> str:

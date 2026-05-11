@@ -53,7 +53,7 @@ def node_policy(node: LLMNode, settings: Settings) -> LLMNodePolicy:
         return LLMNodePolicy(
             node=node,
             prefers_json_object=True,
-            timeout_seconds=min(float(settings.llm_timeout_seconds), 10.0),
+            timeout_seconds=min(float(settings.llm_timeout_seconds), 30.0),
             fallback_profile_id=getattr(settings, "default_classifier_profile", None),
         )
     if node is LLMNode.PLANNER:
@@ -144,7 +144,7 @@ def render_model_status(metadata: dict[str, Any] | None, settings: Settings) -> 
     active = profiles.get(active_id) or profiles.get(default_profile_id(settings))
     active_text = active.id if active is not None else active_id
     agent_step = _override_or_active(metadata, LLMNode.AGENT_STEP, active_text)
-    classifier = _override_or_active(metadata, LLMNode.INTENT_CLASSIFIER, active_text)
+    classifier = _override_or_classifier_default(metadata, settings, active_text)
     planner = _override_or_active(metadata, LLMNode.PLANNER, active_text)
     loop = runtime_loop_provider(metadata)
     return (
@@ -227,6 +227,16 @@ def _override_or_active(metadata: dict[str, Any] | None, node: LLMNode, active: 
         value = overrides.get(node.value)
         if isinstance(value, str) and value.strip():
             return value.strip()
+    return active
+
+
+def _override_or_classifier_default(metadata: dict[str, Any] | None, settings: Settings, active: str) -> str:
+    override = _override_or_active(metadata, LLMNode.INTENT_CLASSIFIER, "")
+    if override:
+        return override
+    configured = getattr(settings, "default_classifier_profile", None)
+    if isinstance(configured, str) and configured.strip():
+        return configured.strip()
     return active
 
 

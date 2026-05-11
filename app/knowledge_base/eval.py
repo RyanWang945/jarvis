@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import json
+import math
 import time
 import uuid
 from dataclasses import dataclass
@@ -46,9 +47,21 @@ class EvalRunSummary:
     mrr: float
     ndcg: float
     chunk_hit_rate: float
+    span_hit_rate: float | None
+    doc_hit_rate: float | None
     boundary_spill_rate: float
     p95_latency_ms: int
     avg_latency_ms: int
+
+
+@dataclass(frozen=True)
+class EvalEvidenceSpan:
+    doc_id: str
+    char_start: int
+    char_end: int
+    source_chunk_id: str | None = None
+    evidence_id: str | None = None
+    role: str | None = None
 
 
 class QueryGenerationService:
@@ -270,7 +283,7 @@ class KnowledgeBaseEvaluationService:
                 "query_type": generated.query_type,
                 "difficulty": generated.difficulty,
                 "gold_answer": generated.gold_answer,
-                "gold_evidence_json": [chunk["chunk_id"]],
+                "gold_evidence_json": _build_span_gold_evidence(chunk),
                 "generated_by": generated.generated_by,
                 "review_status": "generated",
             }
@@ -320,8 +333,14 @@ class KnowledgeBaseEvaluationService:
         mrr_values: list[float] = []
         ndcg_values: list[float] = []
         hits = 0
+        chunk_hits = 0
+        span_hits = 0
+        span_query_count = 0
+        doc_hits = 0
+        doc_query_count = 0
         boundary_spills = 0
         precision_values: list[float] = []
+        evidence_role = _resolve_evidence_role(resolved_params)
         for query in queries:
             started = time.perf_counter()
             search_hits = self._search_query(
@@ -336,7 +355,37 @@ class KnowledgeBaseEvaluationService:
             latency_ms = int((time.perf_counter() - started) * 1000)
             latencies.append(latency_ms)
             target_chunk_id = query["target_chunk_id"]
-            hit_rank = _find_hit_rank(search_hits, target_chunk_id)
+            chunk_hit_rank = _find_hit_rank(search_hits, target_chunk_id)
+            chunk_hits += 1 if chunk_hit_rank is not None else 0
+
+            evidence_spans = _resolve_gold_evidence_spans(
+                db=self._db,
+                query=query,
+                evidence_role=evidence_role,
+            )
+            span_hit_rank = None
+            if evidence_spans:
+                span_query_count += 1
+                span_hit_rank = _find_span_hit_rank(
+                    db=self._db,
+                    hits=search_hits,
+                    evidence_spans=evidence_spans,
+                )
+                span_hits += 1 if span_hit_rank is not None else 0
+
+            target_doc_ids = _target_doc_ids(query=query, evidence_spans=evidence_spans)
+            doc_hit_rank = None
+            if target_doc_ids:
+                doc_query_count += 1
+                doc_hit_rank = _find_doc_hit_rank(
+                    db=self._db,
+                    hits=search_hits,
+                    target_doc_ids=target_doc_ids,
+                )
+                doc_hits += 1 if doc_hit_rank is not None else 0
+
+            uses_span_primary = evidence_role in {"answer", "legacy_chunk", "any"} or bool(evidence_spans)
+            hit_rank = span_hit_rank if uses_span_primary else chunk_hit_rank
             hit = 1 if hit_rank is not None else 0
             hits += hit
             precision_values.append((1.0 / top_k) if hit else 0.0)
@@ -390,7 +439,9 @@ class KnowledgeBaseEvaluationService:
             precision_at_k=sum(precision_values) / query_count if query_count else 0.0,
             mrr=sum(mrr_values) / query_count if query_count else 0.0,
             ndcg=sum(ndcg_values) / query_count if query_count else 0.0,
-            chunk_hit_rate=hits / query_count if query_count else 0.0,
+            chunk_hit_rate=chunk_hits / query_count if query_count else 0.0,
+            span_hit_rate=span_hits / span_query_count if span_query_count else None,
+            doc_hit_rate=doc_hits / doc_query_count if doc_query_count else None,
             boundary_spill_rate=boundary_spills / query_count if query_count else 0.0,
             p95_latency_ms=_p95(latencies),
             avg_latency_ms=int(sum(latencies) / query_count) if query_count else 0,
@@ -585,6 +636,12 @@ class KnowledgeBaseEvaluationService:
         results = self._db.eval_results.list_by_run(eval_run_id)
         query_count = len(results)
         hits = sum(int(item["hit"]) for item in results)
+        run_params = _load_json_value(run.get("params_json"))
+        hit_rates = _calculate_persisted_hit_rates(
+            self._db,
+            results,
+            evidence_role=_resolve_evidence_role(run_params),
+        )
         latencies = [int(item["latency_ms"]) for item in results]
         return EvalRunSummary(
             eval_run_id=eval_run_id,
@@ -596,7 +653,9 @@ class KnowledgeBaseEvaluationService:
             precision_at_k=(hits / query_count / int(run["top_k"])) if query_count else 0.0,
             mrr=sum(float(item["mrr_score"]) for item in results) / query_count if query_count else 0.0,
             ndcg=sum(float(item["ndcg_score"]) for item in results) / query_count if query_count else 0.0,
-            chunk_hit_rate=hits / query_count if query_count else 0.0,
+            chunk_hit_rate=hit_rates["chunk_hit_rate"],
+            span_hit_rate=hit_rates["span_hit_rate"],
+            doc_hit_rate=hit_rates["doc_hit_rate"],
             boundary_spill_rate=_boundary_spill_rate(self._db, results),
             p95_latency_ms=_p95(latencies),
             avg_latency_ms=int(sum(latencies) / query_count) if query_count else 0,
@@ -608,6 +667,275 @@ def _find_hit_rank(hits: list[SearchHit], target_chunk_id: str | None) -> int | 
         return None
     for index, hit in enumerate(hits, start=1):
         if hit.chunk_id == target_chunk_id:
+            return index
+    return None
+
+
+def _calculate_persisted_hit_rates(
+    db: Any,
+    results: list[dict[str, Any]],
+    *,
+    evidence_role: str | None,
+) -> dict[str, float | None]:
+    query_count = len(results)
+    if query_count == 0:
+        return {
+            "chunk_hit_rate": 0.0,
+            "span_hit_rate": None,
+            "doc_hit_rate": None,
+        }
+
+    chunk_hits = 0
+    span_hits = 0
+    span_query_count = 0
+    doc_hits = 0
+    doc_query_count = 0
+    for result in results:
+        query = _query_for_result(db=db, result=result)
+        if query is None:
+            continue
+        hits = _hits_from_result(db=db, result=result)
+        if _find_hit_rank(hits, query.get("target_chunk_id")) is not None:
+            chunk_hits += 1
+
+        evidence_spans = _resolve_gold_evidence_spans(
+            db=db,
+            query=query,
+            evidence_role=evidence_role,
+        )
+        if evidence_spans:
+            span_query_count += 1
+            if _find_span_hit_rank(db=db, hits=hits, evidence_spans=evidence_spans) is not None:
+                span_hits += 1
+
+        target_doc_ids = _target_doc_ids(query=query, evidence_spans=evidence_spans)
+        if target_doc_ids:
+            doc_query_count += 1
+            if _find_doc_hit_rank(db=db, hits=hits, target_doc_ids=target_doc_ids) is not None:
+                doc_hits += 1
+
+    return {
+        "chunk_hit_rate": chunk_hits / query_count,
+        "span_hit_rate": span_hits / span_query_count if span_query_count else None,
+        "doc_hit_rate": doc_hits / doc_query_count if doc_query_count else None,
+    }
+
+
+def _query_for_result(*, db: Any, result: dict[str, Any]) -> dict[str, Any] | None:
+    row = db.conn.execute(
+        "SELECT * FROM kb_eval_queries WHERE query_id = ?",
+        (result["query_id"],),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def _hits_from_result(*, db: Any, result: dict[str, Any]) -> list[SearchHit]:
+    hit_ids = json.loads(result["retrieved_chunk_ids_json"])
+    hits: list[SearchHit] = []
+    for chunk_id in hit_ids:
+        chunk = db.chunks.get(chunk_id)
+        hits.append(
+            SearchHit(
+                chunk_id=chunk_id,
+                doc_id=chunk["doc_id"] if chunk else "",
+                score=0.0,
+                source={},
+            )
+        )
+    return hits
+
+
+def _build_span_gold_evidence(chunk: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "version": "span_v1",
+        "evidence": [
+            {
+                "evidence_id": f"{chunk['chunk_id']}:span:0",
+                "type": "span",
+                "doc_id": chunk["doc_id"],
+                "char_start": int(chunk["char_start"]),
+                "char_end": int(chunk["char_end"]),
+                "source_chunk_id": chunk["chunk_id"],
+            }
+        ],
+    }
+
+
+def _resolve_gold_evidence_spans(
+    *,
+    db: Any,
+    query: dict[str, Any],
+    evidence_role: str | None = None,
+) -> list[EvalEvidenceSpan]:
+    payload = _load_json_value(query.get("gold_evidence_json"))
+    spans = _evidence_spans_from_payload(payload, evidence_role=evidence_role)
+    if spans:
+        return spans
+    if evidence_role == "answer":
+        return []
+
+    chunk_ids = _legacy_gold_chunk_ids(payload)
+    target_chunk_id = query.get("target_chunk_id")
+    if target_chunk_id:
+        chunk_ids.append(target_chunk_id)
+
+    resolved: list[EvalEvidenceSpan] = []
+    seen: set[str] = set()
+    for chunk_id in chunk_ids:
+        if not chunk_id or chunk_id in seen:
+            continue
+        seen.add(chunk_id)
+        chunk = db.chunks.get(chunk_id)
+        if chunk is None:
+            continue
+        resolved.append(
+            EvalEvidenceSpan(
+                doc_id=chunk["doc_id"],
+                char_start=int(chunk["char_start"]),
+                char_end=int(chunk["char_end"]),
+                source_chunk_id=chunk["chunk_id"],
+                evidence_id=f"{chunk['chunk_id']}:legacy-span",
+                role="legacy_chunk",
+            )
+        )
+    return resolved
+
+
+def _load_json_value(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return value
+
+
+def _evidence_spans_from_payload(payload: Any, *, evidence_role: str | None) -> list[EvalEvidenceSpan]:
+    evidence_items: list[Any]
+    if isinstance(payload, dict):
+        evidence_items = list(payload.get("evidence") or [])
+    elif isinstance(payload, list):
+        evidence_items = payload
+    else:
+        return []
+
+    spans: list[EvalEvidenceSpan] = []
+    for item in evidence_items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type", "span") != "span":
+            continue
+        role = str(item["role"]) if item.get("role") else None
+        if evidence_role and evidence_role != "any" and role != evidence_role:
+            continue
+        try:
+            doc_id = str(item["doc_id"])
+            char_start = int(item["char_start"])
+            char_end = int(item["char_end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if char_end <= char_start:
+            continue
+        spans.append(
+            EvalEvidenceSpan(
+                doc_id=doc_id,
+                char_start=char_start,
+                char_end=char_end,
+                source_chunk_id=str(item["source_chunk_id"]) if item.get("source_chunk_id") else None,
+                evidence_id=str(item["evidence_id"]) if item.get("evidence_id") else None,
+                role=role,
+            )
+        )
+    return spans
+
+
+def _legacy_gold_chunk_ids(payload: Any) -> list[str]:
+    if not isinstance(payload, list):
+        return []
+    return [item for item in payload if isinstance(item, str)]
+
+
+def _resolve_evidence_role(retrieval_params: Any) -> str | None:
+    if not isinstance(retrieval_params, dict):
+        return None
+    role = retrieval_params.get("evidence_role")
+    if not isinstance(role, str):
+        return None
+    normalized = role.strip()
+    if normalized in {"answer", "legacy_chunk", "any"}:
+        return normalized
+    return None
+
+
+def _find_span_hit_rank(
+    *,
+    db: Any,
+    hits: list[SearchHit],
+    evidence_spans: list[EvalEvidenceSpan],
+) -> int | None:
+    for index, hit in enumerate(hits, start=1):
+        candidate = _candidate_span_for_hit(db=db, hit=hit)
+        if candidate is None:
+            continue
+        for evidence in evidence_spans:
+            if candidate.doc_id != evidence.doc_id:
+                continue
+            overlap = _overlap_chars(
+                candidate.char_start,
+                candidate.char_end,
+                evidence.char_start,
+                evidence.char_end,
+            )
+            if overlap >= _required_span_overlap(evidence):
+                return index
+    return None
+
+
+def _candidate_span_for_hit(*, db: Any, hit: SearchHit) -> EvalEvidenceSpan | None:
+    chunk = db.chunks.get(hit.chunk_id)
+    if chunk is not None:
+        return EvalEvidenceSpan(
+            doc_id=chunk["doc_id"],
+            char_start=int(chunk["char_start"]),
+            char_end=int(chunk["char_end"]),
+            source_chunk_id=chunk["chunk_id"],
+        )
+    source = getattr(hit, "source", {}) or {}
+    try:
+        doc_id = str(getattr(hit, "doc_id", None) or source["doc_id"])
+        char_start = int(source["char_start"])
+        char_end = int(source["char_end"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if char_end <= char_start:
+        return None
+    return EvalEvidenceSpan(doc_id=doc_id, char_start=char_start, char_end=char_end, source_chunk_id=hit.chunk_id)
+
+
+def _overlap_chars(left_start: int, left_end: int, right_start: int, right_end: int) -> int:
+    return max(0, min(left_end, right_end) - max(left_start, right_start))
+
+
+def _required_span_overlap(evidence: EvalEvidenceSpan) -> int:
+    span_length = max(1, evidence.char_end - evidence.char_start)
+    return max(1, min(80, math.ceil(span_length * 0.3)))
+
+
+def _target_doc_ids(*, query: dict[str, Any], evidence_spans: list[EvalEvidenceSpan]) -> set[str]:
+    doc_ids = {span.doc_id for span in evidence_spans}
+    query_doc_id = query.get("doc_id")
+    if query_doc_id:
+        doc_ids.add(str(query_doc_id))
+    return doc_ids
+
+
+def _find_doc_hit_rank(*, db: Any, hits: list[SearchHit], target_doc_ids: set[str]) -> int | None:
+    for index, hit in enumerate(hits, start=1):
+        doc_id = getattr(hit, "doc_id", None)
+        if not doc_id:
+            chunk = db.chunks.get(hit.chunk_id)
+            doc_id = chunk["doc_id"] if chunk else None
+        if doc_id in target_doc_ids:
             return index
     return None
 

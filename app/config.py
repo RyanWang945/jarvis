@@ -1,7 +1,7 @@
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -42,7 +42,7 @@ class Settings(BaseSettings):
     knowledge_reranker_max_length: int = 1024
     llm_provider: str = "deepseek"
     default_model_profile: str | None = None
-    default_classifier_profile: str | None = None
+    default_classifier_profile: str | None = "deepseek-v4-flash"
     llm_timeout_seconds: float = 60.0
     llm_max_context_tokens: int = 12000
     llm_max_output_tokens: int = 2000
@@ -69,6 +69,7 @@ class Settings(BaseSettings):
     feishu_app_id: str | None = None
     feishu_app_secret: str | None = None
     feishu_bot_name: str = "Jarvis"
+    obsidian_workspace_path: Path | None = None
     obsidian_vault_path: Path | None = None
     default_timezone: str = "Asia/Shanghai"
 
@@ -85,6 +86,13 @@ class Settings(BaseSettings):
         env_prefix="JARVIS_",
         extra="ignore",
     )
+
+    @field_validator("obsidian_workspace_path", "obsidian_vault_path", mode="before")
+    @classmethod
+    def _empty_path_as_none(cls, value: object) -> object:
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
 
 
 @lru_cache

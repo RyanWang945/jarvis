@@ -66,7 +66,7 @@ JARVIS_GEMINI_API_KEY=...
 JARVIS_GEMINI_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai
 JARVIS_GEMINI_MODEL=gemini-2.5-flash
 JARVIS_TAVILY_API_KEY=tvly-...
-JARVIS_OBSIDIAN_VAULT_PATH=E:\path\to\vault
+JARVIS_OBSIDIAN_WORKSPACE_PATH=data/obsidian_wiki
 ```
 
 Run a local agent task:
@@ -83,6 +83,8 @@ Invoke-RestMethod http://127.0.0.1:8000/agent/run `
 `JARVIS_WORKER_MODE=thread` enables the experimental threaded worker client and starts the in-process dispatcher that resumes agent threads when workers finish.
 
 `JARVIS_TAVILY_API_KEY` enables the external `tavily_search` skill when installed under `data/skills/`.
+
+`JARVIS_OBSIDIAN_WORKSPACE_PATH` controls the Obsidian wiki workspace. The default is `data/obsidian_wiki`; open `data/obsidian_wiki/vault/` in Obsidian. `JARVIS_OBSIDIAN_VAULT_PATH` is kept as a deprecated compatibility alias for older local configs.
 
 `JARVIS_DASHSCOPE_API_KEY` and the related DashScope settings are reserved for the knowledge base embedding pipeline. The default model is `text-embedding-v4` and the default base URL is the Beijing region endpoint.
 

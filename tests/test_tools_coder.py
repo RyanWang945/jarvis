@@ -10,10 +10,11 @@ from app.llm.client import ChatClient
 from app.main import create_app
 from app.skills.bootstrap import reset_registries_for_tests
 from app.tools.common import ToolExecutionResult
+from tests.helpers.mysql import prepare_test_mysql_database
 
 
 def _client(monkeypatch) -> TestClient:
-    get_conversation_store.cache_clear()
+    prepare_test_mysql_database(monkeypatch)
     reset_registries_for_tests()
     return TestClient(create_app())
 
@@ -148,6 +149,70 @@ def test_codex_tool_runs_for_explicit_code_request(monkeypatch) -> None:
     assert tool_calls[0].tool_name == "delegate_to_codex"
     assert tool_calls[0].status == "completed"
     assert tool_calls[0].output == {"result": "coder-ran"}
+
+
+def test_codex_tool_reply_is_used_when_summary_llm_fails(monkeypatch) -> None:
+    client = _client(monkeypatch)
+    store = get_conversation_store()
+    chat_calls = 0
+
+    def _fake_chat(self, messages, tools=None):
+        nonlocal chat_calls
+        chat_calls += 1
+        if chat_calls == 1:
+            return {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_delegation_1",
+                        "type": "function",
+                        "function": {
+                            "name": "delegate_to_codex",
+                            "arguments": json.dumps(
+                                {
+                                    "instruction": "Fix the bug in app/channels/feishu_renderer.py.",
+                                    "workdir": str(Path.cwd()),
+                                    "allow_commit": False,
+                                    "allow_push": False,
+                                }
+                            ),
+                        },
+                    }
+                ],
+            }
+        raise RuntimeError("summary model unavailable")
+
+    monkeypatch.setattr(ChatClient, "chat", _fake_chat)
+
+    def _fake_execute_tool(tool, tool_args, *, timeout_seconds=30):
+        return ToolExecutionResult(ok=True, exit_code=0, stdout="coder-ran", summary="coder-ran")
+
+    monkeypatch.setattr(react_graph, "execute_tool", _fake_execute_tool)
+
+    created = client.post(
+        "/messages",
+        json={
+            "platform": "feishu",
+            "external_chat_id": _unique_id("chat-dm-codex-summary-fail"),
+            "chat_type": "dm",
+            "sender": {"platform_user_id": "ou_1", "display_name": "Ryan"},
+            "content": "Please fix the bug in feishu_renderer.py",
+            "external_message_id": _unique_id("msg-codex-summary-fail"),
+        },
+    ).json()
+
+    run = client.post(f"/turns/{created['turn_id']}/run")
+
+    assert run.status_code == 200
+    body = run.json()
+    assert body["status"] == "completed"
+    assert body["reply"] == "coder-ran"
+    assert chat_calls == 2
+    turn = store.get_turn(created["turn_id"])
+    assert turn is not None
+    assert turn.status == "completed"
+    tool_calls = store.list_tool_calls_by_turn(created["turn_id"])
+    assert tool_calls[0].status == "completed"
 
 
 def test_codex_raw_numeric_output_is_summarized_before_reply(monkeypatch) -> None:

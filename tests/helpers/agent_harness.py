@@ -8,20 +8,18 @@ from uuid import uuid4
 
 from fastapi.testclient import TestClient
 
-from app.api.agent import get_conversation_store
-from app.config import get_settings
 from app.llm.client import ChatClient, LLMMessage
 from app.main import create_app
 from app.skills.bootstrap import reset_registries_for_tests
+from tests.helpers.mysql import prepare_test_mysql_database
 
 
 def unique_id(prefix: str) -> str:
     return f"{prefix}-{uuid4().hex[:8]}"
 
 
-def create_agent_test_client() -> TestClient:
-    get_conversation_store.cache_clear()
-    get_settings.cache_clear()
+def create_agent_test_client(monkeypatch: Any) -> TestClient:
+    prepare_test_mysql_database(monkeypatch)
     reset_registries_for_tests()
     return TestClient(create_app())
 

@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
 from app.agent_react.model_usage import strip_token_usage_footer
 from app.agent_react.runtime_policy import RuntimePolicy, render_runtime_policy_for_model
 from app.agent_react.session_state import ConversationSessionState, render_session_state_for_model
+from app.config import get_settings
 from app.llm.client import LLMMessage
 from app.repositories import RepositoryRegistryError, get_repository_registry
 from app.skills.bootstrap import get_skill_registry
@@ -28,6 +31,8 @@ SYSTEM_PROMPT = _SYSTEM_PROMPT = """
 5. 不要编造搜索结果、文件内容、工具输出、执行状态或系统能力。
 6. 最终回复内容是给人类用户阅读的，应清晰、自然、可执行；不要输出内部协议、调试字段、隐藏状态或机器可读包装。
 7. 不要自行编写 token usage、模型名或系统统计信息；这些由 Jarvis runtime 在消息末尾统一追加。
+8. 对“今天、当前、最新、最近、today、current、latest”等相对时间表达，必须以 Runtime temporal context 中的当前日期、时间和时区为准；不要从模型记忆或历史对话推断当前日期。
+9. 不要把内部工具发现、工具搜索、可用工具检查、runtime policy 或 hidden/visible tools 描述给用户；这些只能作为内部执行步骤。
 
 工具使用规则：
 1. 只能使用当前 runtime 明确允许的工具。
@@ -37,6 +42,8 @@ SYSTEM_PROMPT = _SYSTEM_PROMPT = """
 5. 对网页、事实、实时信息查询，使用专用搜索工具；禁止用 shell 进行网页搜索或事实查询。
 6. 对 shell、文件写入、删除、网络请求、代码执行等有副作用操作，必须严格遵守工具策略和安全边界。
 7. 用户要求提醒、定时、稍后通知、到点叫醒或取消/查看提醒时，使用 scheduled_task 工具；创建提醒后如果用户还要求当前继续做其他任务，应继续完成后续任务。
+8. 对实时事实或网页搜索，如果用户使用相对时间表达，应在搜索意图中使用 Runtime temporal context 的具体日期；历史消息中的旧日期不得覆盖当前日期。
+9. 如果缺少完成任务所需的能力，直接说明当前无法完成或询问必要澄清；不要说“我先搜索可用工具/相关工具”。
 
 上下文与任务规则：
 1. 优先基于当前对话、可见上下文和工具结果回答。
@@ -53,6 +60,30 @@ SYSTEM_PROMPT = _SYSTEM_PROMPT = """
 _MAX_SELECTED_SKILLS = 3
 _MAX_SKILL_BODY_TOKENS = 800
 _MAX_TOTAL_SKILL_TOKENS = 1800
+
+
+def _render_runtime_temporal_context(now: datetime | None = None) -> str:
+    settings = get_settings()
+    timezone_name = settings.default_timezone
+    tz = _resolve_timezone(timezone_name)
+    current = now.astimezone(tz) if now is not None else datetime.now(tz)
+    return (
+        "Runtime temporal context:\n"
+        f"- Current date: {current.date().isoformat()}\n"
+        f"- Current time: {current.isoformat(timespec='seconds')}\n"
+        f"- Timezone: {timezone_name}\n"
+        "- Interpret relative date/time words such as 今天, 当前, 最新, 最近, today, current, latest, and recent "
+        "relative to this context."
+    )
+
+
+def _resolve_timezone(timezone_name: str):
+    try:
+        return ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        if timezone_name in {"Asia/Shanghai", "Asia/Chongqing"}:
+            return timezone(timedelta(hours=8), name=timezone_name)
+        return UTC
 
 
 def slice_records_through_trigger(records: list, trigger_message_id: int | None) -> list:
@@ -151,6 +182,8 @@ class ContextManager:
             role = getattr(msg, "role", None)
             content = getattr(msg, "content", "") or ""
             raw = getattr(msg, "raw_payload", {}) or {}
+            if role == "system" and raw.get("source") == "clear_command":
+                continue
             if role == "user":
                 lc.append(HumanMessage(content=content))
             elif role == "assistant":
@@ -204,12 +237,12 @@ class ContextManager:
         if not skill_names:
             return messages
 
-        rendered = self._render_selected_skills(skill_names)
-        if rendered is None:
+        skill_message = self._build_skill_reminder_message(skill_names)
+        if skill_message is None:
             return messages
 
-        skill_message = SystemMessage(content=rendered)
-        return [skill_message, *messages]
+        insert_at = 1 if messages and isinstance(messages[0], SystemMessage) else 0
+        return [*messages[:insert_at], skill_message, *messages[insert_at:]]
 
     def build_context_header(
         self,
@@ -219,6 +252,7 @@ class ContextManager:
         runtime_policy: RuntimePolicy | None = None,
     ) -> SystemMessage:
         sections = [SYSTEM_PROMPT.strip()]
+        sections.append(_render_runtime_temporal_context())
 
         if session_state is not None:
             rendered_session = render_session_state_for_model(session_state)
@@ -231,11 +265,16 @@ class ContextManager:
             if rendered_repositories is not None:
                 sections.append(rendered_repositories)
 
-        rendered_skills = self._render_selected_skills(skill_names)
-        if rendered_skills is not None:
-            sections.append(rendered_skills)
-
         return SystemMessage(content="\n\n".join(sections))
+
+    def build_skill_reminder_message(self, skill_names: list[str]) -> HumanMessage | None:
+        rendered = self._render_selected_skills(skill_names)
+        if rendered is None:
+            return None
+        return HumanMessage(content=f"<system-reminder>\n{rendered}\n</system-reminder>")
+
+    def _build_skill_reminder_message(self, skill_names: list[str]) -> HumanMessage | None:
+        return self.build_skill_reminder_message(skill_names)
 
     def _render_selected_skills(self, skill_names: list[str]) -> str | None:
         if not skill_names:
@@ -379,7 +418,7 @@ class ContextManager:
             skill_names=skill_names,
             runtime_policy=runtime_policy,
         )
-        return [header, *lc_messages], skill_names
+        return self.inject_selected_skills([header, *lc_messages], skill_names), skill_names
 
     def estimate_text_tokens(self, text: str) -> int:
         return count_text_tokens(text)

@@ -1130,6 +1130,7 @@ def run_turn(turn_id: int) -> RunTurnResponse:
         status=result.status,
         reply=result.reply,
         content_type=result.message.content_type,
+        attachments=[attachment.__dict__ for attachment in result.message.attachments],
     )
 
 
