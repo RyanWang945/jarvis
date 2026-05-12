@@ -126,6 +126,61 @@ CREATE TABLE tool_calls (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 -- ------------------------------------------------------------------
+-- artifacts
+-- ------------------------------------------------------------------
+CREATE TABLE artifacts (
+    id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
+    artifact_id VARCHAR(255) NOT NULL,
+    conversation_id BIGINT UNSIGNED NOT NULL,
+    turn_id BIGINT UNSIGNED NULL,
+    tool_call_id VARCHAR(128) NULL,
+    source_tool VARCHAR(128) NOT NULL DEFAULT '',
+    kind VARCHAR(32) NOT NULL,
+    path TEXT,
+    mime_type VARCHAR(255),
+    filename VARCHAR(255),
+    size_bytes BIGINT UNSIGNED NULL,
+    status VARCHAR(32) NOT NULL DEFAULT 'available',
+    metadata JSON,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+    UNIQUE KEY uk_artifacts_artifact_id (artifact_id),
+    KEY idx_artifacts_conversation_created (conversation_id, created_at),
+    KEY idx_artifacts_conversation_turn (conversation_id, turn_id),
+    KEY idx_artifacts_source_created (source_tool, created_at),
+    KEY idx_artifacts_status_updated (status, updated_at),
+    CONSTRAINT fk_artifacts_conversation FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE,
+    CONSTRAINT fk_artifacts_turn FOREIGN KEY (turn_id) REFERENCES turns(id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+-- ------------------------------------------------------------------
+-- delivery_records
+-- ------------------------------------------------------------------
+CREATE TABLE delivery_records (
+    id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
+    delivery_id VARCHAR(128) NOT NULL,
+    artifact_id VARCHAR(255) NOT NULL,
+    conversation_id BIGINT UNSIGNED NULL,
+    turn_id BIGINT UNSIGNED NULL,
+    channel VARCHAR(32) NOT NULL,
+    external_chat_id VARCHAR(128) NOT NULL,
+    purpose VARCHAR(32) NOT NULL,
+    status VARCHAR(32) NOT NULL DEFAULT 'pending',
+    upload_key VARCHAR(512),
+    external_message_id VARCHAR(128),
+    error_message TEXT,
+    attempt_count INT UNSIGNED NOT NULL DEFAULT 1,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+    UNIQUE KEY uk_delivery_records_delivery_id (delivery_id),
+    KEY idx_delivery_records_artifact (artifact_id),
+    KEY idx_delivery_records_dedupe (channel, external_chat_id, artifact_id, purpose, status),
+    KEY idx_delivery_records_conversation_created (conversation_id, created_at),
+    CONSTRAINT fk_delivery_records_conversation FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE SET NULL,
+    CONSTRAINT fk_delivery_records_turn FOREIGN KEY (turn_id) REFERENCES turns(id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+-- ------------------------------------------------------------------
 -- Resolve circular FK: messages -> turns
 -- ------------------------------------------------------------------
 ALTER TABLE messages

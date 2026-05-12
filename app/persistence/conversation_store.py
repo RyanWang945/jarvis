@@ -31,7 +31,9 @@ from app.api.schemas import (
 from app.config import get_settings
 from app.llm.model_profiles import model_command_response, render_model_status, runtime_preferences_metadata
 from app.persistence.models import (
+    ArtifactRecord,
     ConversationRecord,
+    DeliveryRecord,
     MessageRecord,
     ToolCallRecord,
     TurnRecord,
@@ -125,7 +127,70 @@ class MySQLConversationStore:
         )
         self._engine = create_engine(url, pool_pre_ping=True, pool_recycle=3600)
         logger.info("mysql store initialized host=%s db=%s", settings.mysql_host, settings.mysql_database)
+        self._ensure_extension_schema()
         self._reset_stale_turns()
+
+    def _ensure_extension_schema(self) -> None:
+        """Create append-only extension tables that may be absent in older local databases."""
+        statements = [
+            """
+            CREATE TABLE IF NOT EXISTS artifacts (
+                id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
+                artifact_id VARCHAR(255) NOT NULL,
+                conversation_id BIGINT UNSIGNED NOT NULL,
+                turn_id BIGINT UNSIGNED NULL,
+                tool_call_id VARCHAR(128) NULL,
+                source_tool VARCHAR(128) NOT NULL DEFAULT '',
+                kind VARCHAR(32) NOT NULL,
+                path TEXT,
+                mime_type VARCHAR(255),
+                filename VARCHAR(255),
+                size_bytes BIGINT UNSIGNED NULL,
+                status VARCHAR(32) NOT NULL DEFAULT 'available',
+                metadata JSON,
+                created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+                updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+                UNIQUE KEY uk_artifacts_artifact_id (artifact_id),
+                KEY idx_artifacts_conversation_created (conversation_id, created_at),
+                KEY idx_artifacts_conversation_turn (conversation_id, turn_id),
+                KEY idx_artifacts_source_created (source_tool, created_at),
+                KEY idx_artifacts_status_updated (status, updated_at),
+                CONSTRAINT fk_artifacts_conversation FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE,
+                CONSTRAINT fk_artifacts_turn FOREIGN KEY (turn_id) REFERENCES turns(id) ON DELETE SET NULL
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS delivery_records (
+                id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
+                delivery_id VARCHAR(128) NOT NULL,
+                artifact_id VARCHAR(255) NOT NULL,
+                conversation_id BIGINT UNSIGNED NULL,
+                turn_id BIGINT UNSIGNED NULL,
+                channel VARCHAR(32) NOT NULL,
+                external_chat_id VARCHAR(128) NOT NULL,
+                purpose VARCHAR(32) NOT NULL,
+                status VARCHAR(32) NOT NULL DEFAULT 'pending',
+                upload_key VARCHAR(512),
+                external_message_id VARCHAR(128),
+                error_message TEXT,
+                attempt_count INT UNSIGNED NOT NULL DEFAULT 1,
+                created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+                updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+                UNIQUE KEY uk_delivery_records_delivery_id (delivery_id),
+                KEY idx_delivery_records_artifact (artifact_id),
+                KEY idx_delivery_records_dedupe (channel, external_chat_id, artifact_id, purpose, status),
+                KEY idx_delivery_records_conversation_created (conversation_id, created_at),
+                CONSTRAINT fk_delivery_records_conversation FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE SET NULL,
+                CONSTRAINT fk_delivery_records_turn FOREIGN KEY (turn_id) REFERENCES turns(id) ON DELETE SET NULL
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+            """,
+        ]
+        try:
+            with self._engine.begin() as conn:
+                for statement in statements:
+                    conn.execute(sa.text(statement))
+        except Exception:
+            logger.exception("failed to ensure extension schema")
 
     def _reset_stale_turns(self) -> None:
         """Mark any leftover 'running' turns as failed on startup."""
@@ -533,6 +598,199 @@ class MySQLConversationStore:
                 {"tid": turn_id},
             ).mappings().all()
             return [self._tool_call_from_row(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # artifacts
+    # ------------------------------------------------------------------
+
+    def upsert_artifact(self, artifact: Any, *, conversation_id: int) -> ArtifactRecord:
+        now = _now()
+        with self._engine.begin() as conn:
+            conn.execute(
+                sa.text(
+                    "INSERT INTO artifacts "
+                    "(artifact_id, conversation_id, turn_id, tool_call_id, source_tool, kind, path, mime_type, "
+                    "filename, size_bytes, status, metadata, created_at, updated_at) "
+                    "VALUES (:artifact_id, :conversation_id, :turn_id, :tool_call_id, :source_tool, :kind, :path, "
+                    ":mime_type, :filename, :size_bytes, 'available', :metadata, :now, :now) "
+                    "ON DUPLICATE KEY UPDATE "
+                    "conversation_id = VALUES(conversation_id), turn_id = VALUES(turn_id), "
+                    "tool_call_id = VALUES(tool_call_id), source_tool = VALUES(source_tool), kind = VALUES(kind), "
+                    "path = VALUES(path), mime_type = VALUES(mime_type), filename = VALUES(filename), "
+                    "size_bytes = VALUES(size_bytes), status = 'available', metadata = VALUES(metadata), updated_at = :now"
+                ),
+                {
+                    "artifact_id": artifact.artifact_id,
+                    "conversation_id": conversation_id,
+                    "turn_id": artifact.turn_id,
+                    "tool_call_id": artifact.tool_call_id,
+                    "source_tool": artifact.source_tool,
+                    "kind": artifact.kind,
+                    "path": artifact.path,
+                    "mime_type": artifact.mime_type,
+                    "filename": artifact.filename,
+                    "size_bytes": artifact.size_bytes,
+                    "metadata": json.dumps(artifact.metadata),
+                    "now": now,
+                },
+            )
+            row = conn.execute(
+                sa.text("SELECT * FROM artifacts WHERE artifact_id = :artifact_id"),
+                {"artifact_id": artifact.artifact_id},
+            ).mappings().one()
+            return self._artifact_from_row(row)
+
+    def get_artifact(self, artifact_id: str) -> ArtifactRecord | None:
+        with self._engine.begin() as conn:
+            row = conn.execute(
+                sa.text("SELECT * FROM artifacts WHERE artifact_id = :artifact_id"),
+                {"artifact_id": artifact_id},
+            ).mappings().one_or_none()
+            return self._artifact_from_row(row) if row else None
+
+    def list_artifacts_by_turn(self, turn_id: int) -> list[ArtifactRecord]:
+        with self._engine.begin() as conn:
+            rows = conn.execute(
+                sa.text("SELECT * FROM artifacts WHERE turn_id = :turn_id ORDER BY created_at ASC"),
+                {"turn_id": turn_id},
+            ).mappings().all()
+            return [self._artifact_from_row(row) for row in rows]
+
+    def update_artifact_status(self, artifact_id: str, *, status: str, metadata_patch: dict[str, Any] | None = None) -> None:
+        with self._engine.begin() as conn:
+            patch = json.dumps(metadata_patch or {})
+            conn.execute(
+                sa.text(
+                    "UPDATE artifacts SET status = :status, "
+                    "metadata = JSON_MERGE_PATCH(COALESCE(metadata, '{}'), :patch), updated_at = :now "
+                    "WHERE artifact_id = :artifact_id"
+                ),
+                {"artifact_id": artifact_id, "status": status, "patch": patch, "now": _now()},
+            )
+
+    # ------------------------------------------------------------------
+    # delivery_records
+    # ------------------------------------------------------------------
+
+    def find_sent_delivery(
+        self,
+        *,
+        channel: str,
+        external_chat_id: str,
+        artifact_id: str,
+        purposes: tuple[str, ...],
+    ) -> DeliveryRecord | None:
+        if not purposes:
+            return None
+        placeholders = ", ".join(f":purpose_{idx}" for idx, _ in enumerate(purposes))
+        params = {
+            "channel": channel,
+            "external_chat_id": external_chat_id,
+            "artifact_id": artifact_id,
+            **{f"purpose_{idx}": purpose for idx, purpose in enumerate(purposes)},
+        }
+        with self._engine.begin() as conn:
+            row = conn.execute(
+                sa.text(
+                    "SELECT * FROM delivery_records "
+                    "WHERE channel = :channel AND external_chat_id = :external_chat_id "
+                    "AND artifact_id = :artifact_id AND purpose IN (" + placeholders + ") "
+                    "AND status = 'sent' ORDER BY updated_at DESC LIMIT 1"
+                ),
+                params,
+            ).mappings().one_or_none()
+            return self._delivery_from_row(row) if row else None
+
+    def create_delivery_record(
+        self,
+        *,
+        delivery_id: str,
+        artifact_id: str,
+        conversation_id: int | None,
+        turn_id: int | None,
+        channel: str,
+        external_chat_id: str,
+        purpose: str,
+        status: str,
+    ) -> DeliveryRecord:
+        now = _now()
+        with self._engine.begin() as conn:
+            result = conn.execute(
+                sa.text(
+                    "INSERT INTO delivery_records "
+                    "(delivery_id, artifact_id, conversation_id, turn_id, channel, external_chat_id, purpose, status, attempt_count, created_at, updated_at) "
+                    "VALUES (:delivery_id, :artifact_id, :conversation_id, :turn_id, :channel, :external_chat_id, :purpose, :status, 1, :now, :now)"
+                ),
+                {
+                    "delivery_id": delivery_id,
+                    "artifact_id": artifact_id,
+                    "conversation_id": conversation_id,
+                    "turn_id": turn_id,
+                    "channel": channel,
+                    "external_chat_id": external_chat_id,
+                    "purpose": purpose,
+                    "status": status,
+                    "now": now,
+                },
+            )
+            return DeliveryRecord(
+                id=result.lastrowid,  # type: ignore[arg-type]
+                delivery_id=delivery_id,
+                artifact_id=artifact_id,
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                channel=channel,
+                external_chat_id=external_chat_id,
+                purpose=purpose,
+                status=status,
+                upload_key=None,
+                external_message_id=None,
+                error_message=None,
+                attempt_count=1,
+                created_at=now,
+                updated_at=now,
+            )
+
+    def mark_delivery_uploaded(self, delivery_id: str, *, upload_key: str) -> None:
+        self._update_delivery(delivery_id, status="uploaded", upload_key=upload_key)
+
+    def mark_delivery_sent(
+        self,
+        delivery_id: str,
+        *,
+        upload_key: str | None = None,
+        external_message_id: str | None = None,
+    ) -> None:
+        self._update_delivery(delivery_id, status="sent", upload_key=upload_key, external_message_id=external_message_id)
+
+    def mark_delivery_failed(self, delivery_id: str, *, error_message: str) -> None:
+        self._update_delivery(delivery_id, status="failed", error_message=error_message)
+
+    def _update_delivery(
+        self,
+        delivery_id: str,
+        *,
+        status: str,
+        upload_key: str | None = None,
+        external_message_id: str | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        updates = ["status = :status", "updated_at = :now"]
+        params: dict[str, Any] = {"delivery_id": delivery_id, "status": status, "now": _now()}
+        if upload_key is not None:
+            updates.append("upload_key = :upload_key")
+            params["upload_key"] = upload_key
+        if external_message_id is not None:
+            updates.append("external_message_id = :external_message_id")
+            params["external_message_id"] = external_message_id
+        if error_message is not None:
+            updates.append("error_message = :error_message")
+            params["error_message"] = error_message
+        with self._engine.begin() as conn:
+            conn.execute(
+                sa.text("UPDATE delivery_records SET " + ", ".join(updates) + " WHERE delivery_id = :delivery_id"),
+                params,
+            )
 
     def ingest_message(self, request: MessageCreateRequest) -> MessageIngestResponse:
         with self._engine.begin() as conn:
@@ -1500,6 +1758,46 @@ class MySQLConversationStore:
             started_at=_iso(row["started_at"]) if row["started_at"] else None,
             finished_at=_iso(row["finished_at"]) if row["finished_at"] else None,
             created_at=_iso(row["created_at"]),
+        )
+
+    @staticmethod
+    def _artifact_from_row(row: sa.RowMapping) -> ArtifactRecord:
+        return ArtifactRecord(
+            id=row["id"],
+            artifact_id=row["artifact_id"],
+            conversation_id=row["conversation_id"],
+            turn_id=row["turn_id"],
+            tool_call_id=row["tool_call_id"],
+            source_tool=row["source_tool"] or "",
+            kind=row["kind"],
+            path=row["path"],
+            mime_type=row["mime_type"],
+            filename=row["filename"],
+            size_bytes=row["size_bytes"],
+            status=row["status"],
+            metadata=json.loads(row["metadata"] or "{}"),
+            created_at=_iso(row["created_at"]),
+            updated_at=_iso(row["updated_at"]),
+        )
+
+    @staticmethod
+    def _delivery_from_row(row: sa.RowMapping) -> DeliveryRecord:
+        return DeliveryRecord(
+            id=row["id"],
+            delivery_id=row["delivery_id"],
+            artifact_id=row["artifact_id"],
+            conversation_id=row["conversation_id"],
+            turn_id=row["turn_id"],
+            channel=row["channel"],
+            external_chat_id=row["external_chat_id"],
+            purpose=row["purpose"],
+            status=row["status"],
+            upload_key=row["upload_key"],
+            external_message_id=row["external_message_id"],
+            error_message=row["error_message"],
+            attempt_count=row["attempt_count"] or 0,
+            created_at=_iso(row["created_at"]),
+            updated_at=_iso(row["updated_at"]),
         )
 
     @staticmethod

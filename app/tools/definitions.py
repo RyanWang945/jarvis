@@ -8,6 +8,8 @@ from app.tools.business_knowledge import run_business_knowledge_search
 from app.tools.coder import run_coder_tool
 from app.tools.codex import run_codex_coder_tool
 from app.tools.common import ToolExecutionRequest, ToolExecutionResult
+from app.tools.deliver_file import run_deliver_file
+from app.tools.file_read import run_read_file, run_search_files
 from app.tools.obsidian_wiki import (
     run_obsidian_wiki_apply,
     run_obsidian_wiki_draft,
@@ -20,7 +22,6 @@ from app.tools.skill_guidance import run_load_skill_guidance
 from app.tools.tavily import run_tavily_search
 from app.tools.tool_search import run_tool_search
 from app.tools.write_file import run_write_file
-from app.tools.x_search import run_x_search
 
 RiskLevel = Literal["low", "medium", "high", "critical"]
 ExecutionMode = Literal["direct", "proposal"]
@@ -43,6 +44,69 @@ class ToolDefinition:
 
 def builtin_tool_definitions() -> list[ToolDefinition]:
     return [
+        ToolDefinition(
+            name="read_file",
+            description=(
+                "Read a known local workspace file by path for lightweight inspection. "
+                "Use this for file content snippets, logs, configuration files, and existence checks when a specific path is known. "
+                "This tool is read-only and returns bounded text content plus file metadata. "
+                "Do not use it for code review, architecture analysis, edits, tests, or multi-file reasoning; use delegate_to_codex for those."
+            ),
+            args_schema={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Workspace-relative file path such as app/tools/runtime.py.",
+                    },
+                    "start_line": {
+                        "type": "integer",
+                        "description": "1-based line number to start reading from. Defaults to 1.",
+                        "default": 1,
+                    },
+                    "max_lines": {
+                        "type": "integer",
+                        "description": "Maximum lines to return, capped by the runtime. Defaults to 200.",
+                        "default": 200,
+                    },
+                },
+                "required": ["path"],
+            },
+            handler=run_read_file,
+            risk_level="low",
+        ),
+        ToolDefinition(
+            name="search_files",
+            description=(
+                "Search local workspace files without invoking shell commands. "
+                "Use mode=path to find files by path/name or check exact path existence; use mode=content for bounded text search. "
+                "This tool is read-only and returns matching paths plus small metadata or previews. "
+                "Do not use it for code review, architecture analysis, edits, tests, or multi-file reasoning; use delegate_to_codex for those."
+            ),
+            args_schema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Path/name/content query to search inside the workspace.",
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["path", "content"],
+                        "description": "path searches file paths and exact existence; content searches file text.",
+                        "default": "path",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum results to return, capped by the runtime.",
+                        "default": 20,
+                    },
+                },
+                "required": ["query"],
+            },
+            handler=run_search_files,
+            risk_level="low",
+        ),
         ToolDefinition(
             name="shell_inspect",
             description=(
@@ -136,15 +200,17 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
             name="delegate_to_codex",
             description=(
                 "High-privilege delegation tool backed by Codex for local repository workflows. "
-                "Use this for repository inspection, architecture review, reports, tests, "
-                "code edits, refactors, bug fixes, and git workflows inside a registered repository. "
-                "Lightweight repository inspection is allowed when the user asks about a local repository, "
-                "branch, diff, git status, tests, or uncommitted changes, but the final answer to the user "
-                "must explain the result in plain language. Do not return raw stdout, terse shell output, "
-                "or bare numbers such as diff stats without explaining what each number means. "
+                "Use this for multi-file repository reasoning, architecture review, code review, reports, tests, "
+                "code edits, refactors, bug fixes, git workflows, and repo-local visual artifacts "
+                "such as architecture diagrams or generated PNG/WebP/SVG files inside a registered repository. "
+                "Do not use this to list files, check whether a file exists, read a known file, or run bounded text search; "
+                "use read_file or search_files for those lightweight workspace file tasks. "
+                "For image generation requests, instruct Codex to preserve the requested output format and "
+                "copy any final raster image from Codex's generated-images area into the repository workspace "
+                "before finishing, so Jarvis can discover and deliver it as an artifact. "
                 "Do not use this for general factual questions or lightweight web search. "
                 "Pass one compact outcome-oriented task: user goal, repo_id, constraints, permissions, "
-                "and verification expectations. Codex owns planning, repository inspection, command selection, "
+                "and verification expectations. Codex owns planning, repository reasoning, command selection, "
                 "retry strategy, and approval requests. Do not turn the task into a step-by-step shell script "
                 "or prescribe recovery commands unless the user explicitly requested exact commands. "
                 "Preserve the user's full repository outcome: if the user asks to edit/update/create, the "
@@ -159,11 +225,13 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
                         "type": "string",
                         "description": (
                             "Outcome-oriented task contract for Codex. Include the goal, constraints, "
+                            "expected artifact path/format when generating a visual artifact, "
                             "verification expectations, and whether commit or push is permitted; avoid "
                             "enumerating shell commands or recovery steps, and avoid routine pre-confirmation prompts. "
                             "Do not downgrade explicit edit/commit/push requests into read-only inspection. "
-                            "For read-only status/diff/count requests, instruct Codex to return a user-facing explanation "
-                            "instead of raw stdout or unexplained numeric output."
+                            "Do not silently change raster image-generation requests into SVG-only artifacts. "
+                            "For lightweight file existence, path lookup, known-file reading, or bounded text search, "
+                            "do not use Codex; use read_file or search_files."
                         ),
                     },
                     "repo_id": {
@@ -507,12 +575,45 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
             risk_level="low",
         ),
         ToolDefinition(
+            name="deliver_file",
+            description=(
+                "Deliver a previously generated local artifact or an explicitly requested workspace file "
+                "to the current conversation channel. Use only when the user explicitly asks to send, "
+                "resend, upload, or deliver a file/image. Do not use this as part of ordinary image "
+                "generation; generated artifacts are delivered automatically by the runtime. Prefer "
+                "artifact_id for historical artifacts and use path only when the user explicitly names a file. "
+                "The runtime supplies conversation_id, turn_id, platform, and external_chat_id automatically."
+            ),
+            args_schema={
+                "type": "object",
+                "properties": {
+                    "artifact_id": {
+                        "type": "string",
+                        "description": "Preferred artifact id to deliver or redeliver.",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Workspace-local file path fallback when artifact_id is unavailable.",
+                    },
+                    "filename": {
+                        "type": "string",
+                        "description": "Optional display filename.",
+                    },
+                },
+                "anyOf": [
+                    {"required": ["artifact_id"]},
+                    {"required": ["path"]},
+                ],
+            },
+            handler=run_deliver_file,
+            risk_level="medium",
+        ),
+        ToolDefinition(
             name="tavily_search",
             description=(
                 "Search the web using Tavily AI Search API. "
                 "Use this when the user asks about current events, facts, or anything that requires up-to-date information from the internet. "
                 "It can also find indexed X/Twitter pages or web coverage of X/Twitter activity when a general web/news search is enough. "
-                "For direct live X/Twitter post search, latest tweets, named account posts, or social sentiment on X, prefer the specialized x_search tool. "
                 "Search ONCE per question. After receiving results, summarize them and reply to the user immediately. "
                 "Do NOT search the same topic multiple times."
             ),
@@ -554,64 +655,6 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
                 "required": ["query"],
             },
             handler=run_tavily_search,
-            risk_level="low",
-            execution_mode="direct",
-        ),
-        ToolDefinition(
-            name="x_search",
-            description=(
-                "Search public X/Twitter posts using the xAI Responses API with the x_search server-side tool. "
-                "This is the specialized tool for direct X/Twitter search. Prefer it when the user asks for Twitter/X search, tweets, latest tweets, X posts, "
-                "posts from named X accounts, public reactions on X/Twitter, social sentiment, or what people are saying on X. "
-                "Examples include: latest twitter, latest tweet, search Twitter, search X, 推特, 推文, X 上, Twitter 上, "
-                "马斯克的最新twitter, or what a specific account posted. Prefer handles when the user names accounts, date_from/date_to "
-                "for a time window, and include_images/include_video only when visual posts matter. Return citations to "
-                "original posts when available."
-            ),
-            args_schema={
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "The social search query to run against X/Twitter posts.",
-                    },
-                    "handles": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Optional X handles to include, without @. Cannot be combined with exclude_handles.",
-                    },
-                    "exclude_handles": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Optional X handles to exclude, without @. Cannot be combined with handles.",
-                    },
-                    "date_from": {
-                        "type": "string",
-                        "description": "Optional inclusive start date in YYYY-MM-DD format.",
-                    },
-                    "date_to": {
-                        "type": "string",
-                        "description": "Optional inclusive end date in YYYY-MM-DD format.",
-                    },
-                    "include_images": {
-                        "type": "boolean",
-                        "description": "Enable image understanding for visual X posts when the user asks about images.",
-                        "default": False,
-                    },
-                    "include_video": {
-                        "type": "boolean",
-                        "description": "Enable video understanding for video posts when the user asks about videos.",
-                        "default": False,
-                    },
-                    "max_results": {
-                        "type": "integer",
-                        "description": "Maximum notable posts or citations to request from the model, between 1 and 20.",
-                        "default": 8,
-                    },
-                },
-                "required": ["query"],
-            },
-            handler=run_x_search,
             risk_level="low",
             execution_mode="direct",
         ),

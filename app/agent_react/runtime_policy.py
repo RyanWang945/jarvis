@@ -23,23 +23,31 @@ class RuntimePolicy:
 _BASE_READ_TOOLS = (
     "obsidian_wiki_query",
     "business_knowledge_search",
+    "read_file",
+    "search_files",
     "ask_user",
 )
 _BASE_DISCOVERY_TOOLS = ("tool_search",)
 _WORKFLOW_GUIDANCE_TOOLS = ("load_skill_guidance",)
 _ACTION_TOOLS = ("scheduled_task",)
-_WEB_TOOLS = ("tavily_search", "x_search")
+_WEB_TOOLS = ("tavily_search",)
 _KB_WRITE_TOOLS = (
     "obsidian_wiki_draft",
     "obsidian_wiki_apply",
 )
-_WORKSPACE_TOOLS = ("delegate_to_codex",)
-_WORKSPACE_CAPABILITIES = {
+_WORKSPACE_FILE_TOOLS = ("read_file", "search_files")
+_WORKSPACE_FILE_CAPABILITIES = {
+    "workspace.read_file",
+    "workspace.search_files",
+}
+_WORKSPACE_CODE_TOOLS = ("delegate_to_codex",)
+_WORKSPACE_CODE_CAPABILITIES = {
     "workspace.inspect",
     "workspace.edit",
     "workspace.test",
     "workspace.report",
 }
+_WORKSPACE_CAPABILITIES = _WORKSPACE_FILE_CAPABILITIES | _WORKSPACE_CODE_CAPABILITIES
 _CODE_CAPABILITY_ALIASES = {
     "code.inspect": "workspace.inspect",
     "code.edit": "workspace.edit",
@@ -71,8 +79,8 @@ def resolve_runtime_policy(
     if mode == "image_generation":
         return RuntimePolicy(
             mode="image_generation",
-            allowed_tools=_BASE_DISCOVERY_TOOLS,
-            context_sections=("session_state",),
+            allowed_tools=(*_BASE_DISCOVERY_TOOLS, *_WORKFLOW_GUIDANCE_TOOLS, *_WORKSPACE_CODE_TOOLS),
+            context_sections=("session_state", "workspace_protocol"),
             max_steps=4,
             search_budget=0,
             writeback_strategy="basic",
@@ -87,8 +95,11 @@ def resolve_runtime_policy(
         allowed_tools.extend(_WEB_TOOLS)
     if "kb.write" in capabilities:
         allowed_tools.extend(_KB_WRITE_TOOLS)
-    if capabilities & _WORKSPACE_CAPABILITIES:
-        allowed_tools.extend(_WORKSPACE_TOOLS)
+    if capabilities & _WORKSPACE_FILE_CAPABILITIES:
+        allowed_tools.extend(_WORKSPACE_FILE_TOOLS)
+        context_sections.append("workspace_file_protocol")
+    if capabilities & _WORKSPACE_CODE_CAPABILITIES:
+        allowed_tools.extend(_WORKSPACE_CODE_TOOLS)
         context_sections.append("workspace_protocol")
 
     if mode == "research" or "research.deep" in capabilities:
@@ -211,18 +222,30 @@ def render_runtime_policy_for_model(policy: RuntimePolicy) -> str:
                 "- After skill guidance is loaded, follow it as procedural guidance and continue the task with the appropriate allowed tools.",
             ]
         )
+    if "workspace_file_protocol" in policy.context_sections:
+        lines.extend(
+            [
+                "",
+                "Workspace file protocol:",
+                "- Use read_file only for bounded reading of a known workspace file path.",
+                "- Use search_files only for workspace path lookup, existence checks, or bounded text search.",
+                "- These tools are read-only and do not perform code review, architecture analysis, edits, tests, or git workflows.",
+                "- Use delegate_to_codex only when the task requires repository reasoning, code review, reports, tests, edits, or git workflows.",
+            ]
+        )
     if "workspace_protocol" in policy.context_sections or "coding_protocol" in policy.context_sections:
         lines.extend(
             [
                 "",
                 "Workspace protocol:",
-                "- Use delegate_to_codex for local repository inspection, reports, tests, and edits.",
+                "- Use delegate_to_codex for multi-file repository reasoning, code review, reports, tests, edits, artifact generation, and git workflows.",
+                "- Do not use delegate_to_codex for listing files, checking file existence, reading a known file, or bounded text search; use read_file/search_files for those.",
                 "- Trust Codex to handle routine repository work inside the registered workspace.",
                 "- Preserve the user's full repository outcome when delegating. If the user asks to update/edit/create, delegate an execution task, not a read-only preview.",
                 "- If the user asks to commit, set allow_commit=true. If the user asks to push, set allow_commit=true and allow_push=true.",
                 "- Delegate compact outcome-oriented tasks to Codex; do not prescribe shell commands, "
                 "recovery steps, or old stderr unless the user explicitly asks.",
-                "- Codex owns repository inspection, planning, retries, and approval requests.",
+                "- Codex owns repository reasoning, planning, retries, and approval requests.",
                 "- Do not ask Codex to confirm routine details such as commit messages; let Codex choose and proceed.",
                 "- Let Codex request approval for elevated actions; do not pre-split ordinary repo work into micro approvals.",
                 "- Prefer delegate_to_codex with repo_id; do not guess unregistered workdirs.",

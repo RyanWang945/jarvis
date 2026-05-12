@@ -37,7 +37,9 @@ from app.api.schemas import (
 from app.config import get_settings
 from app.llm.model_profiles import model_command_response, render_model_status, runtime_preferences_metadata
 from app.persistence.models import (
+    ArtifactRecord as _ArtifactRecord,
     ConversationRecord as _ConversationRecord,
+    DeliveryRecord as _DeliveryRecord,
     MessageRecord as _MessageRecord,
     ToolCallRecord as _ToolCallRecord,
     TurnRecord as _TurnRecord,
@@ -74,6 +76,8 @@ class InMemoryConversationStore:
         self._next_message_id = 1
         self._next_turn_id = 1
         self._next_tool_call_id = 1
+        self._next_artifact_id = 1
+        self._next_delivery_id = 1
         self._users: dict[int, _UserRecord] = {}
         self._users_by_external: dict[tuple[str, str], int] = {}
         self._conversations: dict[int, _ConversationRecord] = {}
@@ -82,6 +86,8 @@ class InMemoryConversationStore:
         self._messages_by_external: dict[tuple[int, str], int] = {}
         self._turns: dict[int, _TurnRecord] = {}
         self._tool_calls: dict[int, _ToolCallRecord] = {}
+        self._artifacts: dict[str, _ArtifactRecord] = {}
+        self._deliveries: dict[str, _DeliveryRecord] = {}
 
     def create_conversation(self, request: ConversationCreateRequest) -> _ConversationRecord:
         with self._lock:
@@ -354,6 +360,150 @@ class InMemoryConversationStore:
                 for record in sorted(self._tool_calls.values(), key=lambda item: item.created_at)
                 if record.turn_id == turn_id
             ]
+
+    def upsert_artifact(self, artifact, *, conversation_id: int) -> _ArtifactRecord:
+        with self._lock:
+            now = _now()
+            existing = self._artifacts.get(artifact.artifact_id)
+            record_id = existing.id if existing is not None else self._next_artifact_id
+            created_at = existing.created_at if existing is not None else now
+            if existing is None:
+                self._next_artifact_id += 1
+            record = _ArtifactRecord(
+                id=record_id,
+                artifact_id=artifact.artifact_id,
+                conversation_id=conversation_id,
+                turn_id=artifact.turn_id,
+                tool_call_id=artifact.tool_call_id,
+                source_tool=artifact.source_tool,
+                kind=artifact.kind,
+                path=artifact.path,
+                mime_type=artifact.mime_type,
+                filename=artifact.filename,
+                size_bytes=artifact.size_bytes,
+                status="available",
+                metadata=dict(artifact.metadata),
+                created_at=created_at,
+                updated_at=now,
+            )
+            self._artifacts[artifact.artifact_id] = record
+            return record
+
+    def get_artifact(self, artifact_id: str) -> _ArtifactRecord | None:
+        with self._lock:
+            return self._artifacts.get(artifact_id)
+
+    def list_artifacts_by_turn(self, turn_id: int) -> list[_ArtifactRecord]:
+        with self._lock:
+            return [
+                record
+                for record in sorted(self._artifacts.values(), key=lambda item: item.created_at)
+                if record.turn_id == turn_id
+            ]
+
+    def update_artifact_status(self, artifact_id: str, *, status: str, metadata_patch: dict[str, Any] | None = None) -> None:
+        with self._lock:
+            record = self._artifacts.get(artifact_id)
+            if record is None:
+                return
+            record.status = status
+            if metadata_patch:
+                record.metadata = _merge_metadata_patch(record.metadata, metadata_patch)
+            record.updated_at = _now()
+
+    def find_sent_delivery(
+        self,
+        *,
+        channel: str,
+        external_chat_id: str,
+        artifact_id: str,
+        purposes: tuple[str, ...],
+    ) -> _DeliveryRecord | None:
+        with self._lock:
+            matches = [
+                record
+                for record in self._deliveries.values()
+                if record.channel == channel
+                and record.external_chat_id == external_chat_id
+                and record.artifact_id == artifact_id
+                and record.purpose in purposes
+                and record.status == "sent"
+            ]
+            if not matches:
+                return None
+            return sorted(matches, key=lambda item: item.updated_at)[-1]
+
+    def create_delivery_record(
+        self,
+        *,
+        delivery_id: str,
+        artifact_id: str,
+        conversation_id: int | None,
+        turn_id: int | None,
+        channel: str,
+        external_chat_id: str,
+        purpose: str,
+        status: str,
+    ) -> _DeliveryRecord:
+        with self._lock:
+            now = _now()
+            record = _DeliveryRecord(
+                id=self._next_delivery_id,
+                delivery_id=delivery_id,
+                artifact_id=artifact_id,
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                channel=channel,
+                external_chat_id=external_chat_id,
+                purpose=purpose,
+                status=status,
+                upload_key=None,
+                external_message_id=None,
+                error_message=None,
+                attempt_count=1,
+                created_at=now,
+                updated_at=now,
+            )
+            self._next_delivery_id += 1
+            self._deliveries[delivery_id] = record
+            return record
+
+    def mark_delivery_uploaded(self, delivery_id: str, *, upload_key: str) -> None:
+        self._update_delivery(delivery_id, status="uploaded", upload_key=upload_key)
+
+    def mark_delivery_sent(
+        self,
+        delivery_id: str,
+        *,
+        upload_key: str | None = None,
+        external_message_id: str | None = None,
+    ) -> None:
+        self._update_delivery(delivery_id, status="sent", upload_key=upload_key, external_message_id=external_message_id)
+
+    def mark_delivery_failed(self, delivery_id: str, *, error_message: str) -> None:
+        self._update_delivery(delivery_id, status="failed", error_message=error_message)
+
+    def _update_delivery(
+        self,
+        delivery_id: str,
+        *,
+        status: str,
+        upload_key: str | None = None,
+        external_message_id: str | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        with self._lock:
+            record = self._deliveries.get(delivery_id)
+            if record is None:
+                return
+            record.status = status
+            if upload_key is not None:
+                record.upload_key = upload_key
+            if external_message_id is not None:
+                record.external_message_id = external_message_id
+            if error_message is not None:
+                record.error_message = error_message
+            record.updated_at = _now()
 
     def ingest_message(self, request: MessageCreateRequest) -> MessageIngestResponse:
         with self._lock:

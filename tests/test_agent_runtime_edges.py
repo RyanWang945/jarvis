@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from app.agent_react import react_graph
 from app.agent_react.artifacts import resolve_channel_attachments
 from app.agent_react.runtime import TurnRuntime
+from app.agent_react.turn_classifier import TurnClassification
 from app.tools.common import ToolArtifact
 from app.api.agent import get_conversation_store
 from app.config import get_settings
@@ -334,6 +335,11 @@ def test_tool_artifacts_flow_to_channel_message_attachments(monkeypatch) -> None
         if message.role == "tool" and message.turn_id == created["turn_id"]
     )
     assert tool_message.raw_payload["artifacts"][0]["path"] == str(image_path.resolve())
+    artifact_record = store.get_artifact(tool_message.raw_payload["artifacts"][0]["artifact_id"])
+    assert artifact_record is not None
+    assert artifact_record.conversation_id == created["conversation_id"]
+    assert artifact_record.turn_id == created["turn_id"]
+    assert artifact_record.path == str(image_path.resolve())
 
 
 def test_svg_artifact_resolves_to_png_preview_attachment(monkeypatch) -> None:
@@ -673,6 +679,15 @@ def test_codex_summary_step_injects_fact_only_guardrails(monkeypatch) -> None:
 def test_tavily_search_budget_rejects_eleventh_call_in_same_turn(monkeypatch) -> None:
     client = create_agent_test_client(monkeypatch)
     store = get_conversation_store()
+    monkeypatch.setattr(
+        "app.persistence.conversation_store.classify_turn",
+        lambda **_kwargs: TurnClassification(
+            turn_type="chat",
+            requested_capabilities=("web.search",),
+            confidence=0.9,
+            source="llm",
+        ),
+    )
     chat = ScriptedChat([
         tool_response(
             *[
@@ -714,6 +729,32 @@ def test_tavily_search_budget_rejects_eleventh_call_in_same_turn(monkeypatch) ->
     assert [record.step_index for record in tool_calls] == [1] * 11
     assert [record.status for record in tool_calls] == ["completed"] * 10 + ["rejected"]
     assert "tavily_search budget exceeded" in (tool_calls[-1].error_message or "")
+
+
+def test_tavily_intent_in_new_turn_gets_fresh_budget(monkeypatch) -> None:
+    client = create_agent_test_client(monkeypatch)
+    store = get_conversation_store()
+    chat = ScriptedChat([
+        tool_response(tool_call("tavily_search", {"query": "US Iran gold conflict"}, call_id="call_search")),
+        final_response("used fresh search budget"),
+    ])
+    chat.install(monkeypatch)
+    executed_queries: list[str] = []
+
+    def _fake_execute_tool(tool, tool_args, *, timeout_seconds=30):
+        executed_queries.append(tool_args["query"])
+        return ToolExecutionResult(ok=True, exit_code=0, stdout="fresh result", summary="ok")
+
+    monkeypatch.setattr(react_graph, "execute_tool", _fake_execute_tool)
+    created = create_dm_turn(client, "你觉得美伊战争和这个有关系吗")
+    store.update_conversation_metadata(created["conversation_id"], {"active_tool_intents": ["tavily_search"]})
+
+    run = client.post(f"/turns/{created['turn_id']}/run")
+
+    assert run.status_code == 200
+    assert executed_queries == ["US Iran gold conflict"]
+    tool_calls = store.list_tool_calls_by_turn(created["turn_id"])
+    assert tool_calls[0].status == "completed"
 
 
 def test_tool_search_grant_expands_allowed_tools_with_audit_log(monkeypatch) -> None:

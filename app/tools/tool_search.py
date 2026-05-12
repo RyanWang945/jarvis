@@ -4,7 +4,6 @@ import json
 import re
 from typing import Any
 
-from app.repositories import RepositoryRegistryError, get_repository_registry
 from app.tools.common import ToolExecutionRequest, ToolExecutionResult
 
 
@@ -65,12 +64,10 @@ def _candidate_tools(text: str) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     if _looks_like_reminder(lowered):
         candidates.append(_candidate("scheduled_task", "high", "low", "Create, list, or remove reminders from explicit reminder intent."))
-    if _looks_like_repo_work(lowered):
-        candidates.append(_candidate("delegate_to_codex", "high", "high", "Inspect or modify a registered local repository."))
-    if _looks_like_web_search(lowered):
+    if _looks_like_file_delivery(lowered):
+        candidates.append(_candidate("deliver_file", "high", "medium", "Deliver or resend a generated artifact or explicitly named workspace file."))
+    if _looks_like_web_search(lowered) or _looks_like_social_search(lowered):
         candidates.append(_candidate("tavily_search", "high", "low", "Search the web for current or external facts."))
-    if _looks_like_social_search(lowered):
-        candidates.append(_candidate("x_search", "high", "low", "Search X/Twitter posts and public social reactions."))
     if _looks_like_wiki_write(lowered):
         candidates.append(_candidate("obsidian_wiki_draft", "medium", "medium", "Draft a wiki page or note before applying it."))
     if _looks_like_memory_query(lowered):
@@ -151,37 +148,43 @@ def _looks_like_reminder(text: str) -> bool:
     )
 
 
-def _looks_like_repo_work(text: str) -> bool:
-    if any(marker in text for marker in ("repo", "repository", "仓库", "项目", "代码", "git", "diff", "branch", "commit", "push", "未提交")):
-        return True
-    if re.search(
-        r"(?<![a-z0-9_./\\-])[\w./\\-]+\."
-        r"(py|ts|tsx|js|jsx|md|rst|toml|yaml|yml|json|sql|css|html)"
-        r"(?![a-z0-9_./\\-])",
-        text,
-    ):
-        return True
-    if any(
+def _looks_like_file_delivery(text: str) -> bool:
+    action = any(
         marker in text
         for marker in (
-            "app/",
-            "app\\",
-            "tests/",
-            "tests\\",
-            "scripts/",
-            "scripts\\",
-            "docs/",
-            "docs\\",
-            "utils/",
-            "utils\\",
+            "发给我",
+            "发送",
+            "重发",
+            "重新发",
+            "再发",
+            "上传",
+            "交付",
+            "send me",
+            "send",
+            "resend",
+            "upload",
+            "deliver",
         )
-    ):
-        return True
-    try:
-        registry = get_repository_registry()
-        return any(str(repo.repo_id).lower() in text or str(repo.name).lower() in text for repo in registry.list_repositories())
-    except RepositoryRegistryError:
-        return False
+    )
+    target = any(
+        marker in text
+        for marker in (
+            "文件",
+            "图片",
+            "图",
+            "artifact",
+            "file",
+            "image",
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".webp",
+            ".gif",
+            ".svg",
+            ".pdf",
+        )
+    )
+    return action and target
 
 
 def _looks_like_web_search(text: str) -> bool:

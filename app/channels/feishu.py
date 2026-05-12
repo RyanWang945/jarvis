@@ -38,10 +38,12 @@ from lark_oapi.ws.enum import MessageType
 from lark_oapi.ws.model import Response
 
 from app.agent_react import ChannelAttachment, ChannelMessage, TurnResult
+from app.agent_react.delivery import DeliveryManager, register_delivery_handler
 from app.api.agent import get_agent_runtime, get_conversation_store
 from app.channels.feishu_renderer import FeishuDelivery, FeishuRenderer
 from app.config import get_settings
 from app.gateway import InboundEvent, get_gateway_service
+from app.persistence.models import DeliveryRecord
 from app.tools.codex_app_server import approval_command_prefix, respond_to_codex_approval
 
 logger = logging.getLogger(__name__)
@@ -135,6 +137,7 @@ class FeishuChannel:
         self._token_expires_at: float = 0.0
         self._renderer = FeishuRenderer(title=bot_name)
         self._artifact_deliveries: dict[tuple[str, str], _ArtifactDeliveryState] = {}
+        self.channel = "feishu"
 
     def start(self) -> None:
         with self._lock:
@@ -145,6 +148,7 @@ class FeishuChannel:
 
         logger.info("feishu channel starting app_id=%s", self._app_id)
         try:
+            register_delivery_handler(self)
             event_handler = _install_event_diagnostics(
                 EventDispatcherHandler.builder("", "")
                 .register_p2_im_message_receive_v1(self._on_message)
@@ -736,35 +740,163 @@ class FeishuChannel:
         return payload
 
     def _send_message_attachments(self, receive_id: str, message: ChannelMessage) -> None:
-        for attachment in message.attachments:
-            if attachment.kind != "image":
-                logger.info(
-                    "feishu attachment skipped receive_id=%s artifact_id=%s kind=%s reason=unsupported_kind",
-                    receive_id,
-                    attachment.artifact_id,
-                    attachment.kind,
-                )
-                continue
-            try:
-                self._send_image_attachment(receive_id, attachment)
-            except Exception as exc:
-                logger.exception(
-                    "feishu attachment send failed receive_id=%s artifact_id=%s path=%s",
-                    receive_id,
-                    attachment.artifact_id,
-                    attachment.path,
-                )
-                try:
-                    self._send_text_message(
-                        receive_id,
-                        f"图片已生成到本地，但上传飞书失败：{attachment.filename}\n本地路径：{attachment.path}",
-                    )
-                except Exception:
-                    logger.exception("failed to send feishu attachment fallback text receive_id=%s", receive_id)
-                self._artifact_deliveries[(receive_id, attachment.artifact_id)] = _ArtifactDeliveryState(
-                    status="failed",
-                    error_message=str(exc),
-                )
+        try:
+            store = get_conversation_store()
+        except Exception:
+            logger.exception("delivery store unavailable; falling back to in-memory attachment send")
+            store = self
+        manager = DeliveryManager(store, self)
+        metadata = message.metadata or {}
+        if _coerce_int(metadata.get("conversation_id")) is None:
+            store = self
+            manager = DeliveryManager(store, self)
+        try:
+            manager.deliver_attachments(
+                external_chat_id=receive_id,
+                attachments=message.attachments,
+                conversation_id=_coerce_int(metadata.get("conversation_id")),
+                turn_id=_coerce_int(metadata.get("turn_id")),
+                purpose=str(metadata.get("delivery_purpose") or "auto"),
+            )
+        except Exception:
+            if store is self:
+                raise
+            logger.exception("persistent delivery manager failed; retrying with in-memory delivery state")
+            DeliveryManager(self, self).deliver_attachments(
+                external_chat_id=receive_id,
+                attachments=message.attachments,
+                conversation_id=_coerce_int(metadata.get("conversation_id")),
+                turn_id=_coerce_int(metadata.get("turn_id")),
+                purpose=str(metadata.get("delivery_purpose") or "auto"),
+            )
+
+    def upload_attachment(self, attachment: ChannelAttachment) -> str | None:
+        if attachment.kind != "image":
+            raise RuntimeError(f"unsupported attachment kind for feishu: {attachment.kind}")
+        return self._upload_image(attachment)
+
+    def send_attachment(self, external_chat_id: str, attachment: ChannelAttachment, upload_key: str | None) -> str | None:
+        if attachment.kind != "image":
+            raise RuntimeError(f"unsupported attachment kind for feishu: {attachment.kind}")
+        if not upload_key:
+            raise RuntimeError("image upload key is required")
+        payload = self._send_delivery(
+            external_chat_id,
+            FeishuDelivery(
+                msg_type="image",
+                content=json.dumps({"image_key": upload_key}, ensure_ascii=False),
+            ),
+        )
+        return _extract_message_id(payload)
+
+    def send_failure_notice(self, external_chat_id: str, attachment: ChannelAttachment, error_message: str) -> None:
+        self._send_text_message(
+            external_chat_id,
+            f"图片已生成到本地，但上传飞书失败：{attachment.filename}\n本地路径：{attachment.path}",
+        )
+
+    def find_sent_delivery(
+        self,
+        *,
+        channel: str,
+        external_chat_id: str,
+        artifact_id: str,
+        purposes: tuple[str, ...],
+    ) -> DeliveryRecord | None:
+        state = self._artifact_deliveries.get((external_chat_id, artifact_id))
+        if state is None or state.status != "sent":
+            return None
+        return DeliveryRecord(
+            id=0,
+            delivery_id=f"memory:{external_chat_id}:{artifact_id}",
+            artifact_id=artifact_id,
+            conversation_id=None,
+            turn_id=None,
+            channel=channel,
+            external_chat_id=external_chat_id,
+            purpose=purposes[0] if purposes else "auto",
+            status="sent",
+            upload_key=state.upload_key,
+            external_message_id=state.external_message_id,
+            error_message=state.error_message,
+            attempt_count=1,
+            created_at="",
+            updated_at="",
+        )
+
+    def create_delivery_record(
+        self,
+        *,
+        delivery_id: str,
+        artifact_id: str,
+        conversation_id: int | None,
+        turn_id: int | None,
+        channel: str,
+        external_chat_id: str,
+        purpose: str,
+        status: str,
+    ) -> DeliveryRecord:
+        self._artifact_deliveries[(external_chat_id, artifact_id)] = _ArtifactDeliveryState(status=status)
+        return DeliveryRecord(
+            id=0,
+            delivery_id=delivery_id,
+            artifact_id=artifact_id,
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+            channel=channel,
+            external_chat_id=external_chat_id,
+            purpose=purpose,
+            status=status,
+            upload_key=None,
+            external_message_id=None,
+            error_message=None,
+            attempt_count=1,
+            created_at="",
+            updated_at="",
+        )
+
+    def mark_delivery_uploaded(self, delivery_id: str, *, upload_key: str) -> None:
+        self._update_memory_delivery(delivery_id, status="uploaded", upload_key=upload_key)
+
+    def mark_delivery_sent(
+        self,
+        delivery_id: str,
+        *,
+        upload_key: str | None = None,
+        external_message_id: str | None = None,
+    ) -> None:
+        self._update_memory_delivery(delivery_id, status="sent", upload_key=upload_key, external_message_id=external_message_id)
+
+    def mark_delivery_failed(self, delivery_id: str, *, error_message: str) -> None:
+        self._update_memory_delivery(delivery_id, status="failed", error_message=error_message)
+
+    def _update_memory_delivery(
+        self,
+        delivery_id: str,
+        *,
+        status: str,
+        upload_key: str | None = None,
+        external_message_id: str | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        prefix, _, suffix = delivery_id.partition(":")
+        if prefix != "memory" or not suffix:
+            # DeliveryManager-generated UUIDs are not reversible. Use the only
+            # pending in-memory delivery when running without the persistent store.
+            keys = [key for key, value in self._artifact_deliveries.items() if value.status in {"pending", "uploaded"}]
+            if not keys:
+                return
+            key = keys[-1]
+        else:
+            chat_id, _, artifact_id = suffix.partition(":")
+            key = (chat_id, artifact_id)
+        previous = self._artifact_deliveries.get(key)
+        self._artifact_deliveries[key] = _ArtifactDeliveryState(
+            status=status,
+            upload_key=upload_key or (previous.upload_key if previous else None),
+            external_message_id=external_message_id or (previous.external_message_id if previous else None),
+            error_message=error_message or (previous.error_message if previous else None),
+        )
 
     def _send_image_attachment(self, receive_id: str, attachment: ChannelAttachment) -> None:
         delivery_key = (receive_id, attachment.artifact_id)

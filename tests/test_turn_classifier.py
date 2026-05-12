@@ -17,29 +17,29 @@ def test_hard_rule_research_command_updates_session_mode() -> None:
     assert should_apply_session_mode_update(classification) is True
 
 
-def test_continue_uses_current_research_session_mode() -> None:
+def test_non_command_fallback_does_not_preserve_research_by_keyword() -> None:
     classification = classify_turn(
         content="继续",
         session_state=ConversationSessionState(session_mode="research"),
     )
 
-    assert classification.turn_type == "research"
+    assert classification.turn_type == "chat"
     assert classification.session_mode_update is None
     assert classification.source == "fallback"
 
 
-def test_classifier_fallback_preserves_active_coding_session() -> None:
+def test_non_command_fallback_does_not_preserve_coding_by_keyword() -> None:
     classification = classify_turn(
         content="把文件提交commit然后推送吧",
         session_state=ConversationSessionState(session_mode="coding", active_repo_id="nltk"),
     )
 
-    assert classification.turn_type == "coding"
-    assert classification.session_mode_update == "coding"
-    assert classification.active_repo_id_update == "nltk"
-    assert classification.target_resources[0].id == "nltk"
+    assert classification.turn_type == "chat"
+    assert classification.session_mode_update is None
+    assert classification.active_repo_id_update is None
+    assert classification.target_resources == ()
     assert classification.source == "fallback"
-    assert classification.routing_basis == "contextual"
+    assert classification.routing_basis == "fallback"
 
 
 def test_low_confidence_fallback_does_not_force_session_update() -> None:
@@ -53,7 +53,22 @@ def test_low_confidence_fallback_does_not_force_session_update() -> None:
     assert should_apply_session_mode_update(classification) is False
 
 
-def test_current_info_request_exits_coding_session() -> None:
+def test_current_info_request_uses_llm_classification(monkeypatch) -> None:
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setenv("JARVIS_DEEPSEEK_API_KEY", "test-key")
+    get_settings.cache_clear()
+
+    def _fake_chat(self, messages, response_format=None, tools=None, tool_choice=None):
+        return {
+            "content": (
+                '{"turn_type":"chat","session_mode_update":"chat",'
+                '"requested_capabilities":["web.search"],'
+                '"routing_basis":"explicit","confidence":0.9,"reason":"current information"}'
+            )
+        }
+
+    monkeypatch.setattr(ChatClient, "chat", _fake_chat)
+
     classification = classify_turn(
         content="不看项目了，查查最新国际金价",
         session_state=ConversationSessionState(session_mode="coding", active_repo_id="nltk"),
@@ -66,6 +81,7 @@ def test_current_info_request_exits_coding_session() -> None:
     assert classification.routing_basis == "explicit"
     assert classification.confidence >= 0.75
     assert should_apply_session_mode_update(classification) is True
+    get_settings.cache_clear()
 
 
 def test_llm_classifier_json_result_is_used(monkeypatch) -> None:
@@ -98,7 +114,7 @@ def test_llm_classifier_json_result_is_used(monkeypatch) -> None:
     get_settings.cache_clear()
 
 
-def test_llm_classifier_accepts_missing_confidence_and_enriches_current_info(monkeypatch) -> None:
+def test_llm_classifier_accepts_missing_confidence_without_local_enrichment(monkeypatch) -> None:
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
     monkeypatch.setenv("JARVIS_DEEPSEEK_API_KEY", "test-key")
     get_settings.cache_clear()
@@ -120,7 +136,7 @@ def test_llm_classifier_accepts_missing_confidence_and_enriches_current_info(mon
 
     assert classification.turn_type == "chat"
     assert classification.confidence == 0.8
-    assert classification.requested_capabilities == ("web.search",)
+    assert classification.requested_capabilities == ()
     get_settings.cache_clear()
 
 
@@ -154,7 +170,37 @@ def test_llm_classifier_accepts_reminder_capability(monkeypatch) -> None:
     get_settings.cache_clear()
 
 
-def test_registered_repo_code_request_overrides_chat_llm(monkeypatch, tmp_path) -> None:
+def test_llm_classifier_accepts_workspace_file_capabilities(monkeypatch) -> None:
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setenv("JARVIS_DEEPSEEK_API_KEY", "test-key")
+    get_settings.cache_clear()
+
+    def _fake_chat(self, messages, response_format=None, tools=None, tool_choice=None):
+        system_prompt = messages[0].content
+        assert "workspace.read_file" in system_prompt
+        assert "workspace.search_files" in system_prompt
+        return {
+            "content": (
+                '{"turn_type":"coding","session_mode_update":"coding",'
+                '"requested_capabilities":["workspace.read_file","workspace.search_files"],'
+                '"routing_basis":"explicit","confidence":0.9,"reason":"lightweight workspace file lookup"}'
+            )
+        }
+
+    monkeypatch.setattr(ChatClient, "chat", _fake_chat)
+
+    classification = classify_turn(
+        content="inspect app/tools/runtime.py",
+        session_state=ConversationSessionState(),
+    )
+
+    assert classification.turn_type == "coding"
+    assert classification.requested_capabilities == ("workspace.read_file", "workspace.search_files")
+    assert classification.source == "llm"
+    get_settings.cache_clear()
+
+
+def test_registered_repo_code_request_uses_llm_workspace_capabilities(monkeypatch, tmp_path) -> None:
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
     monkeypatch.setenv("JARVIS_DEEPSEEK_API_KEY", "test-key")
     get_settings.cache_clear()
@@ -175,8 +221,9 @@ def test_registered_repo_code_request_overrides_chat_llm(monkeypatch, tmp_path) 
     def _fake_chat(self, messages, response_format=None, tools=None, tool_choice=None):
         return {
             "content": (
-                '{"turn_type":"chat","session_mode_update":null,'
-                '"confidence":0.92,"reason":"misclassified"}'
+                '{"turn_type":"coding","session_mode_update":"coding",'
+                '"requested_capabilities":["workspace.edit"],'
+                '"confidence":0.92,"reason":"repository code edit"}'
             )
         }
 
@@ -193,13 +240,13 @@ def test_registered_repo_code_request_overrides_chat_llm(monkeypatch, tmp_path) 
     assert "workspace.edit" in classification.requested_capabilities
     assert classification.target_resources[0].type == "repository"
     assert classification.target_resources[0].id == "nltk"
-    assert classification.source == "local_override"
+    assert classification.source == "llm"
     assert should_apply_session_mode_update(classification) is True
-    assert should_apply_repo_update(classification) is True
+    assert should_apply_repo_update(classification) is False
     get_settings.cache_clear()
 
 
-def test_registered_repo_design_request_overrides_chat_llm(monkeypatch, tmp_path) -> None:
+def test_registered_repo_design_request_uses_llm_workspace_inspect(monkeypatch, tmp_path) -> None:
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
     monkeypatch.setenv("JARVIS_DEEPSEEK_API_KEY", "test-key")
     get_settings.cache_clear()
@@ -220,8 +267,8 @@ def test_registered_repo_design_request_overrides_chat_llm(monkeypatch, tmp_path
     def _fake_chat(self, messages, response_format=None, tools=None, tool_choice=None):
         return {
             "content": (
-                '{"turn_type":"chat","session_mode_update":null,'
-                '"requested_capabilities":[],"target_resources":[]}'
+                '{"turn_type":"coding","session_mode_update":"coding",'
+                '"requested_capabilities":["workspace.inspect"],"target_resources":[]}'
             )
         }
 
@@ -234,7 +281,7 @@ def test_registered_repo_design_request_overrides_chat_llm(monkeypatch, tmp_path
 
     assert classification.turn_type == "coding"
     assert classification.session_mode_update == "coding"
-    assert classification.active_repo_id_update == "jarvis"
+    assert classification.active_repo_id_update is None
     assert "workspace.inspect" in classification.requested_capabilities
     assert classification.target_resources[0].id == "jarvis"
     get_settings.cache_clear()
@@ -289,7 +336,7 @@ def test_research_followup_inherits_active_workspace_for_design_comparison(monke
         return {
             "content": (
                 '{"turn_type":"research","session_mode_update":"research",'
-                '"requested_capabilities":["web.search"],"target_resources":[]}'
+                '"requested_capabilities":["web.search","workspace.inspect"],"target_resources":[]}'
             )
         }
 
@@ -304,11 +351,14 @@ def test_research_followup_inherits_active_workspace_for_design_comparison(monke
     assert classification.session_mode_update == "research"
     assert "web.search" in classification.requested_capabilities
     assert "workspace.inspect" in classification.requested_capabilities
-    assert classification.target_resources[0].id == "jarvis"
+    assert classification.target_resources == ()
     get_settings.cache_clear()
 
 
-def test_registered_repo_review_with_latest_release_notes_requests_code_and_web(monkeypatch, tmp_path) -> None:
+def test_registered_repo_review_with_latest_release_notes_uses_llm_capabilities(monkeypatch, tmp_path) -> None:
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setenv("JARVIS_DEEPSEEK_API_KEY", "test-key")
+    get_settings.cache_clear()
     repo = tmp_path / "nltk"
     repo.mkdir()
     registry = RepositoryRegistry(
@@ -323,6 +373,17 @@ def test_registered_repo_review_with_latest_release_notes_requests_code_and_web(
     )
     monkeypatch.setattr("app.agent_react.turn_classifier.get_repository_registry", lambda: registry)
 
+    def _fake_chat(self, messages, response_format=None, tools=None, tool_choice=None):
+        return {
+            "content": (
+                '{"turn_type":"coding","session_mode_update":"coding",'
+                '"requested_capabilities":["workspace.inspect","web.search"],'
+                '"routing_basis":"explicit","confidence":0.9,"reason":"repository review with current context"}'
+            )
+        }
+
+    monkeypatch.setattr(ChatClient, "chat", _fake_chat)
+
     classification = classify_turn(
         content="review nltk 并结合最新 release note 看兼容风险",
         session_state=ConversationSessionState(),
@@ -334,3 +395,4 @@ def test_registered_repo_review_with_latest_release_notes_requests_code_and_web(
     assert "workspace.inspect" in classification.requested_capabilities
     assert "web.search" in classification.requested_capabilities
     assert classification.target_resources[0].id == "nltk"
+    get_settings.cache_clear()

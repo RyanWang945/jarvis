@@ -61,6 +61,8 @@ class CodexAppServerSession:
         self._stdout_queue: queue.Queue[str | None] = queue.Queue()
         self._stderr_lines: list[str] = []
         self._events: list[str] = []
+        self._events_path = self._run_dir / "codex-events.jsonl"
+        self._stderr_path = self._run_dir / "codex-stderr.log"
         self._lock = threading.RLock()
         self._client_request_id = 0
         self._thread_id = ""
@@ -157,6 +159,9 @@ class CodexAppServerSession:
     def _start_process(self) -> None:
         if self._proc is not None:
             return
+        self._run_dir.mkdir(parents=True, exist_ok=True)
+        self._events_path.write_text("", encoding="utf-8")
+        self._stderr_path.write_text("", encoding="utf-8")
         env = os.environ.copy()
         env["GIT_CONFIG_COUNT"] = "1"
         env["GIT_CONFIG_KEY_0"] = "safe.directory"
@@ -187,7 +192,9 @@ class CodexAppServerSession:
 
     def _read_stderr(self, stream: Any) -> None:
         for line in stream:
-            self._stderr_lines.append(line.rstrip())
+            text = line.rstrip()
+            self._stderr_lines.append(text)
+            self._append_line(self._stderr_path, text)
 
     def _next_client_request_id(self) -> int:
         value = self._client_request_id
@@ -210,6 +217,7 @@ class CodexAppServerSession:
     ) -> CodexAppServerRunResult:
         deadline = time.monotonic() + timeout_seconds
         final_text = ""
+        last_agent_text = ""
         turn_started = instruction is None
         turn_start_id: int | None = None
 
@@ -226,6 +234,7 @@ class CodexAppServerSession:
 
             raw_line = raw_line.rstrip("\n")
             self._events.append(raw_line)
+            self._append_line(self._events_path, raw_line)
             try:
                 event = json.loads(raw_line)
             except json.JSONDecodeError:
@@ -263,6 +272,9 @@ class CodexAppServerSession:
                 return self._failed_result(final_text, _error_text(event) or "Codex turn/start failed.")
 
             method = str(event.get("method") or "")
+            agent_text = _agent_message_text_from_app_server_event(event, final_only=False)
+            if agent_text:
+                last_agent_text = agent_text
             text = _final_text_from_app_server_event(event)
             if text:
                 final_text = text
@@ -286,6 +298,18 @@ class CodexAppServerSession:
                     approval_requests=[approval],
                 )
             if method == "turn/completed":
+                completion_status = _turn_completion_status(event)
+                if completion_status and completion_status != "completed":
+                    error = _turn_completion_error(event) or f"Codex turn completed with status {completion_status}."
+                    self.close()
+                    return CodexAppServerRunResult(
+                        status="failed",
+                        raw_events=self.raw_events(),
+                        raw_stderr=self.raw_stderr(),
+                        exit_code=None,
+                        final_text=final_text or last_agent_text,
+                        error=error,
+                    )
                 self.close()
                 return CodexAppServerRunResult(
                     status="completed",
@@ -344,6 +368,13 @@ class CodexAppServerSession:
 
     def _matches_trusted_command_prefix(self, approval: dict[str, Any]) -> bool:
         return _matches_trusted_command_prefix(approval, self._trusted_command_prefixes)
+
+    def _append_line(self, path: Path, line: str) -> None:
+        try:
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+        except OSError:
+            return
 
 
 _SESSIONS: dict[str, CodexAppServerSession] = {}
@@ -462,6 +493,10 @@ def _error_text(event: dict[str, Any]) -> str:
 
 
 def _final_text_from_app_server_event(event: dict[str, Any]) -> str:
+    return _agent_message_text_from_app_server_event(event, final_only=True)
+
+
+def _agent_message_text_from_app_server_event(event: dict[str, Any], *, final_only: bool) -> str:
     method = str(event.get("method") or "")
     params = event.get("params")
     if not isinstance(params, dict):
@@ -470,10 +505,39 @@ def _final_text_from_app_server_event(event: dict[str, Any]) -> str:
     if isinstance(item, dict) and item.get("type") == "agentMessage":
         phase = str(item.get("phase") or "")
         text = str(item.get("text") or "").strip()
-        if text and phase in {"final_answer", "final"}:
+        if text and (not final_only or phase in {"final_answer", "final"}):
             return text
     if method == "item/agentMessage/delta":
         return ""
+    return ""
+
+
+def _turn_completion_status(event: dict[str, Any]) -> str:
+    if str(event.get("method") or "") != "turn/completed":
+        return ""
+    params = event.get("params")
+    if not isinstance(params, dict):
+        return ""
+    turn = params.get("turn")
+    if not isinstance(turn, dict):
+        return ""
+    return str(turn.get("status") or "").strip().lower()
+
+
+def _turn_completion_error(event: dict[str, Any]) -> str:
+    params = event.get("params")
+    if not isinstance(params, dict):
+        return ""
+    turn = params.get("turn")
+    if not isinstance(turn, dict):
+        return ""
+    error = turn.get("error")
+    if isinstance(error, dict):
+        message = error.get("message")
+        if isinstance(message, str):
+            return message.strip()
+    if isinstance(error, str):
+        return error.strip()
     return ""
 
 

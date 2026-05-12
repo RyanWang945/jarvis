@@ -85,6 +85,36 @@ def test_skill_registry_select_matches_returns_reason_and_confidence() -> None:
     assert matches[0].reason
 
 
+def test_weather_skill_is_selected_for_chinese_weather_requests(monkeypatch) -> None:
+    skill_dir = Path("data/skills/weather-1.0.0")
+    package = SkillPackageLoader([]).load_package(skill_dir)
+    registry = SkillRegistry([package.skill])
+    monkeypatch.setattr("app.agent_react.context_manager.get_skill_registry", lambda: registry)
+
+    matches = registry.select_matches("查一下上海天气")
+    messages, skill_names = ContextManager().build_initial_messages(
+        [
+            SimpleNamespace(
+                id=1,
+                role="user",
+                content="查一下上海天气",
+                raw_payload={},
+                turn_id=1,
+            )
+        ],
+        trigger_message_id=1,
+        turn_records=[],
+        current_turn_id=None,
+    )
+
+    assert matches[0].skill.name == "weather"
+    assert skill_names == ["weather"]
+    reminder_content = str(messages[1].content)
+    assert "[Skill: weather]" in reminder_content
+    assert "If `tavily_search` is available" in reminder_content
+    assert "Do not use shell tools for web searches" in reminder_content
+
+
 def test_image_artifact_planner_skill_is_selected_for_svg_requests(monkeypatch) -> None:
     skill_dir = Path("data/skills/image-artifact-planner-1.0.0")
     package = SkillPackageLoader([]).load_package(skill_dir)
@@ -112,6 +142,35 @@ def test_image_artifact_planner_skill_is_selected_for_svg_requests(monkeypatch) 
     assert reminder_content.startswith("<system-reminder>")
     assert reminder_content.endswith("</system-reminder>")
     assert "[Skill: image-artifact-planner]" in reminder_content
-    assert "Do not ask Codex to render, screenshot, convert, upload, or deliver the artifact." in reminder_content
+    assert "Preserve the user's requested format." in reminder_content
+    assert "not an SVG" in reminder_content
     assert "Jarvis Runtime owns artifact discovery" in reminder_content
     assert "[Skill: image-artifact-planner]" not in str(messages[0].content)
+
+
+def test_image_artifact_planner_skill_guides_raster_image_generation(monkeypatch) -> None:
+    skill_dir = Path("data/skills/image-artifact-planner-1.0.0")
+    package = SkillPackageLoader([]).load_package(skill_dir)
+    registry = SkillRegistry([package.skill])
+    monkeypatch.setattr("app.agent_react.context_manager.get_skill_registry", lambda: registry)
+
+    messages, skill_names = ContextManager().build_initial_messages(
+        [
+            SimpleNamespace(
+                id=1,
+                role="user",
+                content="用 image gen 画一张 jarvis 项目架构图",
+                raw_payload={},
+                turn_id=1,
+            )
+        ],
+        trigger_message_id=1,
+        turn_records=[],
+        current_turn_id=None,
+    )
+
+    assert skill_names == ["image-artifact-planner"]
+    reminder_content = str(messages[1].content)
+    assert "use its image generation capability" in reminder_content
+    assert "copy the final selected image into the Jarvis workspace" in reminder_content
+    assert "Do not silently change raster image-generation requests into SVG" not in reminder_content

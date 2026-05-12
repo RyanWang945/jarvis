@@ -77,3 +77,41 @@ class ToolCallRecord:
     started_at: str | None
     finished_at: str | None
     created_at: str
+
+
+@dataclass
+class ArtifactRecord:
+    id: int
+    artifact_id: str
+    conversation_id: int
+    turn_id: int | None
+    tool_call_id: str | None
+    source_tool: str
+    kind: str
+    path: str | None
+    mime_type: str | None
+    filename: str | None
+    size_bytes: int | None
+    status: str
+    metadata: dict[str, Any]
+    created_at: str
+    updated_at: str
+
+
+@dataclass
+class DeliveryRecord:
+    id: int
+    delivery_id: str
+    artifact_id: str
+    conversation_id: int | None
+    turn_id: int | None
+    channel: str
+    external_chat_id: str
+    purpose: str
+    status: str
+    upload_key: str | None
+    external_message_id: str | None
+    error_message: str | None
+    attempt_count: int
+    created_at: str
+    updated_at: str

@@ -39,3 +39,13 @@ def test_tool_search_finds_x_search_for_social_posts() -> None:
 
     assert payload["status"] == "found"
     assert any(candidate["tool_name"] == "x_search" for candidate in payload["candidates"])
+
+
+def test_tool_search_finds_deliver_file_for_explicit_file_delivery() -> None:
+    payload = _run_tool_search(
+        query="resend generated image",
+        original_user_request="刚才那张图片再发给我一下",
+    )
+
+    assert payload["status"] == "found"
+    assert any(candidate["tool_name"] == "deliver_file" for candidate in payload["candidates"])

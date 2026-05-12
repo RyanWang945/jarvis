@@ -52,6 +52,36 @@ def run_codex_coder_tool(request: ToolExecutionRequest) -> ToolExecutionResult:
     run_id = uuid4().hex
     run_dir = _coder_run_dir(run_id)
     run_dir.mkdir(parents=True, exist_ok=True)
+    allow_commit = bool(request.args.get("allow_commit"))
+    allow_push = bool(request.args.get("allow_push"))
+    trusted_prefixes = _trusted_command_prefixes(request.args)
+    permissions = json.dumps(
+        {
+            "allow_commit": allow_commit,
+            "allow_push": allow_push,
+            "trusted_command_prefixes": trusted_prefixes,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    logger.info(
+        "delegate_to_codex starting run_id=%s repo_id=%s workdir=%s permissions=%s timeout_seconds=%s",
+        run_id,
+        repo.repo_id,
+        str(workdir),
+        permissions,
+        settings.coder_timeout_seconds,
+    )
+    logger.info(
+        "delegate_to_codex log paths run_id=%s run_dir=%s events_path=%s audit_path=%s stderr_path=%s approval_requests_path=%s",
+        run_id,
+        str(run_dir),
+        str(run_dir / "codex-events.jsonl"),
+        str(run_dir / "jarvis-audit.log"),
+        str(run_dir / "codex-stderr.log"),
+        str(run_dir / "codex-approval-requests.json"),
+    )
 
     preflight_notes = [*repository_warnings, *prepare_workspace(workdir)]
     preflight = collect_git_state(workdir, ignored_paths=(run_dir,))
@@ -61,7 +91,7 @@ def run_codex_coder_tool(request: ToolExecutionRequest) -> ToolExecutionResult:
         run_dir=run_dir,
         instruction=instruction,
         timeout_seconds=settings.coder_timeout_seconds,
-        trusted_command_prefixes=_trusted_command_prefixes(request.args),
+        trusted_command_prefixes=trusted_prefixes,
     )
     raw_events = app_server_result.raw_events
     raw_stderr = app_server_result.raw_stderr
@@ -95,8 +125,10 @@ def run_codex_coder_tool(request: ToolExecutionRequest) -> ToolExecutionResult:
         artifacts.append(f"jarvis_audit:{audit_path}")
         if stderr_path is not None:
             artifacts.append(f"codex_stderr:{stderr_path}")
+        parsed = _parse_codex_jsonl(raw_events)
+        final_text = app_server_result.final_text or str(parsed["final_text"] or "")
         summary = (
-            app_server_result.final_text
+            final_text
             or app_server_result.error
             or raw_stderr
             or "Codex app-server failed."
@@ -126,8 +158,8 @@ def run_codex_coder_tool(request: ToolExecutionRequest) -> ToolExecutionResult:
     permission_check = check_coder_permissions(
         preflight,
         postflight,
-        allow_commit=bool(request.args.get("allow_commit")),
-        allow_push=bool(request.args.get("allow_push")),
+        allow_commit=allow_commit,
+        allow_push=allow_push,
     )
     approval_requests = parsed["approval_requests"]
     approval_path: Path | None = None
@@ -413,9 +445,16 @@ def _extract_event_text(event: object) -> str:
         text = _extract_event_text(nested_item)
         if text:
             return text
+    params = event.get("params")
+    if isinstance(params, dict):
+        nested_item = params.get("item")
+        if isinstance(nested_item, dict):
+            text = _extract_event_text(nested_item)
+            if text:
+                return text
     event_type = str(event.get("type") or event.get("event") or "").lower()
     role = str(event.get("role") or "").lower()
-    if event_type in {"agent_message", "assistant_message", "final_answer", "task_complete", "message"} or role == "assistant":
+    if event_type in {"agent_message", "agentmessage", "assistant_message", "final_answer", "task_complete", "message"} or role == "assistant":
         for key in ("message", "content", "text", "answer", "summary"):
             text = _content_to_text(event.get(key))
             if text:

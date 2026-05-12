@@ -1,6 +1,8 @@
 import json
+import shutil
 import subprocess
 from pathlib import Path
+from uuid import uuid4
 
 from langchain_core.messages import HumanMessage
 
@@ -8,6 +10,7 @@ from app.agent_react.runtime_policy import resolve_runtime_policy
 from app.repositories import RepositoryRef, RepositoryRegistry
 from app.tools.codex import run_codex_coder_tool
 from app.tools.codex_app_server import (
+    CodexAppServerSession,
     CodexAppServerRunResult,
     _approval_decision,
     _is_routine_repo_git_approval,
@@ -123,6 +126,64 @@ def test_codex_instruction_contract_overrides_generated_preconfirmation() -> Non
     assert "请在执行前让我确认 commit message" in instruction
 
 
+def test_codex_logs_startup_context_and_log_paths(monkeypatch, tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    run_root = tmp_path / "runs"
+    log_messages: list[str] = []
+
+    _install_registry(monkeypatch, repo)
+    monkeypatch.setattr("app.tools.codex._resolve_codex_command", lambda: ["codex"])
+    monkeypatch.setattr("app.tools.codex._coder_run_dir", lambda run_id: run_root / run_id)
+
+    import app.tools.codex as codex_module
+
+    original_info = codex_module.logger.info
+
+    def _capture_info(message, *args, **kwargs):
+        log_messages.append(message % args if args else str(message))
+        return original_info(message, *args, **kwargs)
+
+    monkeypatch.setattr(codex_module.logger, "info", _capture_info)
+
+    def _fake_run(*, provider_command, workdir, run_dir, instruction, timeout_seconds, trusted_command_prefixes=None):
+        del provider_command, workdir, run_dir, instruction, timeout_seconds, trusted_command_prefixes
+        return CodexAppServerRunResult(
+            status="completed",
+            raw_events='{"type":"final_answer","text":"done"}\n',
+            exit_code=0,
+            final_text="done",
+        )
+
+    monkeypatch.setattr("app.tools.codex._run_codex_app_server", _fake_run)
+
+    result = run_codex_coder_tool(
+        ToolExecutionRequest(
+            tool_name="delegate_to_codex",
+            workdir=None,
+            args={
+                "instruction": "Inspect repo.",
+                "repo_id": "jarvis",
+                "allow_commit": True,
+                "allow_push": False,
+            },
+            timeout_seconds=30,
+        )
+    )
+
+    assert result.exit_code == 0
+    startup = next(message for message in log_messages if "delegate_to_codex starting" in message)
+    assert "repo_id=jarvis" in startup
+    assert "permissions=" in startup
+    assert '"allow_commit":true' in startup
+    assert '"allow_push":false' in startup
+    assert "timeout_seconds=" in startup
+    paths = next(message for message in log_messages if "delegate_to_codex log paths" in message)
+    assert "codex-events.jsonl" in paths
+    assert "jarvis-audit.log" in paths
+    assert "codex-stderr.log" in paths
+    assert "codex-approval-requests.json" in paths
+
+
 def test_codex_surfaces_approval_requests(monkeypatch, tmp_path: Path) -> None:
     repo = _init_repo(tmp_path / "repo")
     run_root = tmp_path / "runs"
@@ -214,6 +275,157 @@ def test_codex_failed_app_server_prefers_final_text_over_stderr(monkeypatch, tmp
     assert result.stdout == "Codex final diagnosis."
     assert result.summary == "Codex final diagnosis."
     assert result.stderr == "older low-level stderr"
+
+
+def test_codex_failed_app_server_uses_last_event_text_when_no_final(monkeypatch) -> None:
+    tmp_root = _sandbox_tmp("codex-failed-event-text")
+    repo = _init_repo(tmp_root / "repo")
+    run_root = tmp_root / "runs"
+
+    _install_registry(monkeypatch, repo)
+    monkeypatch.setattr("app.tools.codex._resolve_codex_command", lambda: ["codex"])
+    monkeypatch.setattr("app.tools.codex._coder_run_dir", lambda run_id: run_root / run_id)
+
+    events = "\n".join([
+        json.dumps(
+            {
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "type": "agentMessage",
+                        "text": "Created docs/jarvis_architecture.png.",
+                        "phase": "commentary",
+                    }
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "method": "turn/completed",
+                "params": {
+                    "turn": {
+                        "status": "failed",
+                        "error": {"message": "stream disconnected before completion"},
+                    }
+                },
+            }
+        ),
+    ])
+
+    def _fake_run(*, provider_command, workdir, run_dir, instruction, timeout_seconds, trusted_command_prefixes=None):
+        return CodexAppServerRunResult(
+            status="failed",
+            raw_events=events,
+            raw_stderr="transport error",
+            exit_code=None,
+            error="stream disconnected before completion",
+        )
+
+    monkeypatch.setattr("app.tools.codex._run_codex_app_server", _fake_run)
+
+    try:
+        result = run_codex_coder_tool(
+            ToolExecutionRequest(
+                tool_name="delegate_to_codex",
+                workdir=str(repo),
+                args={"instruction": "Generate diagram.", "repo_id": "jarvis"},
+                timeout_seconds=30,
+            )
+        )
+
+        assert result.ok is False
+        assert result.stdout == "Created docs/jarvis_architecture.png."
+        assert result.summary == "Created docs/jarvis_architecture.png."
+        assert result.stderr == "transport error"
+    finally:
+        shutil.rmtree(tmp_root, ignore_errors=True)
+
+
+def test_codex_app_server_treats_failed_turn_completed_as_failure() -> None:
+    tmp_root = _sandbox_tmp("codex-failed-turn")
+    session = CodexAppServerSession(provider_command=["codex"], workdir=tmp_root, run_dir=tmp_root)
+    session._send = lambda message: None  # type: ignore[method-assign]
+    session._stdout_queue.put(
+        json.dumps(
+            {
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "type": "agentMessage",
+                        "text": "The PNG exists at docs/jarvis_architecture.png.",
+                        "phase": "commentary",
+                    }
+                },
+            }
+        )
+        + "\n"
+    )
+    session._stdout_queue.put(
+        json.dumps(
+            {
+                "method": "turn/completed",
+                "params": {
+                    "turn": {
+                        "status": "failed",
+                        "error": {"message": "stream disconnected before completion"},
+                    }
+                },
+            }
+        )
+        + "\n"
+    )
+
+    try:
+        result = session._drain_until_waiting_or_done(timeout_seconds=1)
+
+        assert result.status == "failed"
+        assert result.final_text == "The PNG exists at docs/jarvis_architecture.png."
+        assert result.error == "stream disconnected before completion"
+    finally:
+        shutil.rmtree(tmp_root, ignore_errors=True)
+
+
+def test_codex_app_server_streams_events_and_stderr_to_run_files() -> None:
+    tmp_root = _sandbox_tmp("codex-stream-files")
+    session = CodexAppServerSession(provider_command=["codex"], workdir=tmp_root, run_dir=tmp_root)
+    event = {
+        "method": "item/completed",
+        "params": {
+            "item": {
+                "type": "agentMessage",
+                "text": "Streaming status is visible.",
+                "phase": "commentary",
+            }
+        },
+    }
+    done = {
+        "method": "turn/completed",
+        "params": {
+            "turn": {
+                "status": "completed",
+            }
+        },
+    }
+    session._stdout_queue.put(json.dumps(event) + "\n")
+    session._stdout_queue.put(json.dumps(done) + "\n")
+
+    try:
+        session._read_stderr(["first stderr line\n", "second stderr line\n"])
+        result = session._drain_until_waiting_or_done(timeout_seconds=1)
+
+        assert result.status == "completed"
+        events_path = tmp_root / "codex-events.jsonl"
+        stderr_path = tmp_root / "codex-stderr.log"
+        assert events_path.read_text(encoding="utf-8").splitlines() == [
+            json.dumps(event),
+            json.dumps(done),
+        ]
+        assert stderr_path.read_text(encoding="utf-8").splitlines() == [
+            "first stderr line",
+            "second stderr line",
+        ]
+    finally:
+        shutil.rmtree(tmp_root, ignore_errors=True)
 
 
 def test_codex_approval_uses_one_time_accept_not_persistent_execpolicy() -> None:
@@ -561,6 +773,12 @@ def _install_registry(monkeypatch, repo: Path) -> None:
         ]
     )
     monkeypatch.setattr("app.tools.codex.get_repository_registry", lambda: registry)
+
+
+def _sandbox_tmp(name: str) -> Path:
+    path = Path("sandbox") / f"{name}-{uuid4().hex}"
+    path.mkdir(parents=True)
+    return path
 
 
 def _artifact_path(artifacts: list[str], name: str) -> Path:

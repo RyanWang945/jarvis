@@ -102,9 +102,8 @@ class ReActState(TypedDict):
 _MAX_TAVILY_CALLS_PER_TURN = 10
 _TOOL_SEARCH_GRANTABLE_TOOLS = {
     "scheduled_task",
-    "delegate_to_codex",
+    "deliver_file",
     "tavily_search",
-    "x_search",
     "obsidian_wiki_query",
     "business_knowledge_search",
     "obsidian_wiki_draft",
@@ -558,11 +557,12 @@ def _inject_tool_runtime_context(
     turn: TurnRecord,
     store: TurnStore,
 ) -> dict[str, Any]:
-    if tool_name != "scheduled_task":
+    if tool_name not in {"scheduled_task", "deliver_file"}:
         return tool_args
 
     injected = dict(tool_args)
     injected.setdefault("conversation_id", getattr(turn, "conversation_id", None))
+    injected.setdefault("turn_id", getattr(turn, "id", None))
     injected.setdefault("created_by_user_id", getattr(turn, "started_by_user_id", None))
     conversation = store.get_conversation(turn.conversation_id)
     if conversation is not None:
@@ -634,12 +634,10 @@ def _tool_search_candidate_allowed(tool_name: str, user_text: str) -> bool:
     text = user_text.lower()
     if tool_name == "scheduled_task":
         return _looks_like_reminder_request(text)
-    if tool_name == "delegate_to_codex":
-        return _looks_like_repository_request(text)
+    if tool_name == "deliver_file":
+        return _looks_like_file_delivery_request(text)
     if tool_name == "tavily_search":
         return _looks_like_web_request(text)
-    if tool_name == "x_search":
-        return _looks_like_social_search_request(text)
     if tool_name in {"obsidian_wiki_draft", "obsidian_wiki_apply"}:
         return _looks_like_wiki_write_request(text)
     if tool_name in {"obsidian_wiki_query", "business_knowledge_search"}:
@@ -667,31 +665,27 @@ def _looks_like_reminder_request(text: str) -> bool:
     )
 
 
-def _looks_like_repository_request(text: str) -> bool:
+def _looks_like_file_delivery_request(text: str) -> bool:
     return any(
         marker in text
         for marker in (
-            "repo",
-            "repository",
-            "仓库",
-            "项目",
-            "代码",
-            "git",
-            "diff",
-            "branch",
-            "commit",
-            "push",
-            "未提交",
-            ".py",
-            ".ts",
-            ".js",
-            ".md",
+            "发给我",
+            "发送",
+            "重发",
+            "重新发",
+            "再发",
+            "上传",
+            "交付",
+            "deliver",
+            "send me",
+            "resend",
+            "upload",
         )
-    )
+    ) and any(marker in text for marker in ("文件", "图片", "图", "artifact", "file", "image", ".png", ".jpg", ".svg", ".pdf"))
 
 
 def _looks_like_web_request(text: str) -> bool:
-    return any(marker in text for marker in ("latest", "recent", "today", "current news", "最新", "最近", "新闻", "网上", "网页搜索"))
+    return any(marker in text for marker in ("latest", "recent", "today", "current news", "最新", "最近", "新闻", "网上", "网页搜索")) or _looks_like_social_search_request(text)
 
 
 def _looks_like_social_search_request(text: str) -> bool:
@@ -862,6 +856,7 @@ def execute_tools(state: ReActState, store: TurnStore) -> ReActState:
                 output = outcome.output
                 if outcome.artifacts:
                     collected_artifacts.extend(outcome.artifacts)
+                    _persist_tool_artifacts(store, turn.conversation_id, outcome.artifacts)
                     logger.info(
                         "tool artifacts collected turn_id=%s step=%s tool=%s tool_call_id=%s artifact_count=%s",
                         state["turn_id"],
@@ -1000,6 +995,21 @@ def execute_tools(state: ReActState, store: TurnStore) -> ReActState:
         "step_count": state.get("step_count", 0),
         "allowed_tools": allowed_tools,
     }
+
+
+def _persist_tool_artifacts(store: TurnStore, conversation_id: int, artifacts: tuple[ToolArtifact, ...]) -> None:
+    upsert = getattr(store, "upsert_artifact", None)
+    if upsert is None:
+        return
+    for artifact in artifacts:
+        try:
+            upsert(artifact, conversation_id=conversation_id)
+        except Exception:
+            logger.exception(
+                "artifact persistence failed conversation_id=%s artifact_id=%s",
+                conversation_id,
+                artifact.artifact_id,
+            )
 
 
 def should_continue(state: ReActState) -> str:

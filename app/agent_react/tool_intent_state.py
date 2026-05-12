@@ -9,9 +9,7 @@ ACTIVE_TOOL_INTENTS_KEY = "active_tool_intents"
 
 PERSISTABLE_TOOL_INTENTS = {
     "scheduled_task",
-    "delegate_to_codex",
     "tavily_search",
-    "x_search",
     "obsidian_wiki_draft",
     "obsidian_wiki_apply",
 }

@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from app.persistence.models import TurnRecord
 
 logger = logging.getLogger(__name__)
+_INTENT_SEARCH_BUDGET = 10
 
 _CODEX_SUMMARY_INSTRUCTION = """Codex result summarization rules:
 - Summarize only facts explicitly present in the delegate_to_codex tool output.
@@ -250,6 +251,7 @@ class TurnRuntime:
         )
         runtime_policy_tools = list(runtime_policy.allowed_tools)
         allowed_tools = merge_tool_intents(runtime_policy_tools, conversation_tool_intents)
+        runtime_policy = _runtime_policy_with_intent_budget(runtime_policy, allowed_tools)
         policy_intents = persistable_tool_intents(runtime_policy_tools)
         if policy_intents:
             added_intents = append_conversation_tool_intents(self._store, turn.conversation_id, policy_intents)
@@ -738,6 +740,10 @@ class AgentRuntime:
                 content_type="markdown",
                 summary=reply,
                 attachments=tuple(result.get("attachments", ()) or ()),
+                metadata={
+                    "conversation_id": turn.conversation_id,
+                    "turn_id": turn_id,
+                },
             ),
         )
 
@@ -759,6 +765,14 @@ def _requested_capabilities_from_turn(turn: TurnRecord) -> tuple[str, ...]:
 
 def _should_merge_conversation_tool_intents(runtime_policy: RuntimePolicy) -> bool:
     return runtime_policy.mode not in {"command", "image_generation"}
+
+
+def _runtime_policy_with_intent_budget(runtime_policy: RuntimePolicy, allowed_tools: list[str]) -> RuntimePolicy:
+    if "tavily_search" not in allowed_tools:
+        return runtime_policy
+    if runtime_policy.search_budget is None or runtime_policy.search_budget > 0:
+        return runtime_policy
+    return replace(runtime_policy, search_budget=_INTENT_SEARCH_BUDGET)
 
 
 def _append_token_usage_footer(
