@@ -188,6 +188,45 @@ def _usage_from_response(response: dict[str, Any]) -> dict[str, int] | None:
     }
 
 
+def _preview_for_log(value: Any, max_chars: int = 500) -> str:
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            text = json.dumps(value, ensure_ascii=False, default=str)
+        except TypeError:
+            text = repr(value)
+    if len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars]}...[truncated]"
+
+
+def _tool_call_names_by_id(messages: list[BaseMessage]) -> dict[str, str]:
+    names: dict[str, str] = {}
+    for message in messages:
+        if not isinstance(message, AIMessage):
+            continue
+        for tool_call in message.tool_calls or []:
+            call_id = str(tool_call.get("id") or "")
+            tool_name = str(tool_call.get("name") or "")
+            if call_id and tool_name:
+                names[call_id] = tool_name
+    return names
+
+
+def _tool_calls_for_log(message: BaseMessage) -> list[dict[str, Any]]:
+    if not isinstance(message, AIMessage) or not message.tool_calls:
+        return []
+    return [
+        {
+            "id": tool_call.get("id"),
+            "name": tool_call.get("name"),
+            "args": _preview_for_log(tool_call.get("args") or {}, max_chars=500),
+        }
+        for tool_call in message.tool_calls
+    ]
+
+
 def _coerce_usage_int(value: Any) -> int:
     try:
         return max(int(value or 0), 0)
@@ -368,14 +407,21 @@ def call_llm(state: ReActState, store: TurnStore) -> ReActState:
         tools = None
     if force_final:
         logger.warning("forcing final text response turn_id=%s step=%s", state["turn_id"], current_step)
+    tool_call_names = _tool_call_names_by_id(llm_messages)
     for idx, message in enumerate(llm_messages):
+        tool_call_id = getattr(message, "tool_call_id", None)
+        tool_name = getattr(message, "name", None)
+        if not tool_name and tool_call_id:
+            tool_name = tool_call_names.get(str(tool_call_id))
         logger.info(
-            "llm_input msg[%s] role=%s content=%s tool_call_id=%s has_tool_calls=%s",
+            "llm_input msg[%s] role=%s tool_name=%s content=%s tool_call_id=%s tool_calls=%s has_tool_calls=%s",
             idx,
             message.role,
+            tool_name,
             repr(message.content[:120]) if message.content else "",
-            message.tool_call_id,
-            bool(message.tool_calls),
+            tool_call_id,
+            _tool_calls_for_log(message),
+            bool(getattr(message, "tool_calls", None)),
         )
 
     try:

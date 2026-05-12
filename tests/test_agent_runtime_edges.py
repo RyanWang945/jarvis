@@ -24,6 +24,32 @@ from tests.helpers.agent_harness import (
 )
 
 
+def test_llm_input_log_helpers_include_tool_names_and_args() -> None:
+    messages = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "id": "call_read",
+                    "name": "read_file",
+                    "args": {"path": "app/agent_react/react_graph.py"},
+                }
+            ],
+        ),
+        ToolMessage(content='{"content": "result"}', tool_call_id="call_read"),
+    ]
+
+    assert react_graph._tool_call_names_by_id(messages) == {"call_read": "read_file"}
+    assert react_graph._tool_calls_for_log(messages[0]) == [
+        {
+            "id": "call_read",
+            "name": "read_file",
+            "args": '{"path": "app/agent_react/react_graph.py"}',
+        }
+    ]
+    assert react_graph._tool_calls_for_log(messages[1]) == []
+
+
 def test_multiple_tool_calls_in_one_assistant_message_share_step_index(monkeypatch) -> None:
     client = create_agent_test_client(monkeypatch)
     store = get_conversation_store()
