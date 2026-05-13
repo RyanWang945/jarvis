@@ -54,6 +54,7 @@ def run_codex_coder_tool(request: ToolExecutionRequest) -> ToolExecutionResult:
     run_dir.mkdir(parents=True, exist_ok=True)
     allow_commit = bool(request.args.get("allow_commit"))
     allow_push = bool(request.args.get("allow_push"))
+    read_only = bool(request.args.get("_read_only"))
     trusted_prefixes = _trusted_command_prefixes(request.args)
     permissions = json.dumps(
         {
@@ -155,12 +156,18 @@ def run_codex_coder_tool(request: ToolExecutionRequest) -> ToolExecutionResult:
     if app_server_result.approval_requests:
         parsed["approval_requests"] = app_server_result.approval_requests
     postflight = collect_git_state(workdir, ignored_paths=(run_dir,))
+    current_run_modified_files = _current_run_modified_files(preflight, postflight)
     permission_check = check_coder_permissions(
         preflight,
         postflight,
         allow_commit=allow_commit,
         allow_push=allow_push,
     )
+    if read_only:
+        permission_check = _apply_read_only_permission_check(
+            permission_check,
+            files_modified=current_run_modified_files,
+        )
     approval_requests = parsed["approval_requests"]
     approval_path: Path | None = None
     if approval_requests:
@@ -184,7 +191,7 @@ def run_codex_coder_tool(request: ToolExecutionRequest) -> ToolExecutionResult:
     )
     artifacts = postflight_artifacts(
         postflight,
-        files_modified=_current_run_modified_files(preflight, postflight),
+        files_modified=current_run_modified_files,
     )
     artifacts.append(f"codex_events:{events_path}")
     artifacts.append(f"codex_run:{run_dir}")
@@ -211,6 +218,23 @@ def run_codex_coder_tool(request: ToolExecutionRequest) -> ToolExecutionResult:
         artifacts=artifacts,
         summary=summary,
     )
+
+
+def _apply_read_only_permission_check(
+    permission_check: dict[str, object],
+    *,
+    files_modified: list[str] | None,
+) -> dict[str, object]:
+    checked = dict(permission_check)
+    violations = list(checked.get("violations") or [])
+    modified = [str(path) for path in files_modified or [] if str(path).strip()]
+    if modified:
+        violations.append("_read_only=true but Codex modified workspace files: " + ", ".join(modified[:10]))
+    checked["violations"] = violations
+    checked["read_only"] = True
+    checked["read_only_modified_files"] = modified
+    checked["ok"] = bool(checked.get("ok")) and not modified
+    return checked
 
 
 def _run_codex_app_server(

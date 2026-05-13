@@ -97,6 +97,7 @@ class ReActState(TypedDict):
     allowed_tools: list[str]
     max_steps: int
     search_budget: int | None
+    codex_read_only: bool
 
 
 _MAX_TAVILY_CALLS_PER_TURN = 10
@@ -333,6 +334,41 @@ def _strengthen_codex_contract(tool_args: dict[str, Any], messages: list[BaseMes
     return repaired
 
 
+def _enforce_codex_read_only_contract(tool_args: dict[str, Any], messages: list[BaseMessage]) -> dict[str, Any]:
+    latest_user_text = _latest_human_message_text(messages).strip()
+    instruction = str(tool_args.get("instruction") or "").strip()
+    if not latest_user_text and "Jarvis read-only delegation contract:" in instruction:
+        return tool_args
+
+    repaired = dict(tool_args)
+    repaired["allow_commit"] = False
+    repaired["allow_push"] = False
+    repaired["_read_only"] = True
+    repaired.pop("verification_cmd", None)
+    if "Jarvis read-only delegation contract:" not in instruction:
+        repaired["instruction"] = "\n".join(
+            [
+                "Jarvis read-only delegation contract:",
+                "- Work in read-only mode: inspect, analyze, review, and report only.",
+                "- Do not edit, create, delete, rename, stage, commit, or push files.",
+                "- Do not run tests, builds, formatters, or generators when they are likely to write workspace artifacts.",
+                "- Return an inline report or design. If the user goal requires repository writes, describe the required changes and stop.",
+                "",
+                "Original user request:",
+                latest_user_text or "(unavailable)",
+                "",
+                "Model-provided delegate instruction:",
+                instruction or "(empty)",
+            ]
+        )
+    logger.info(
+        "codex delegation read-only contract enforced original_args=%s repaired_args=%s",
+        tool_args,
+        repaired,
+    )
+    return repaired
+
+
 def _looks_like_uncommitted_status_request(text: str) -> bool:
     lowered = text.lower()
     if not any(marker in lowered for marker in ("未提交", "uncommitted", "not committed", "not yet committed")):
@@ -500,7 +536,7 @@ def _execute_single_tool(
             output=result.stdout or result.summary or "Completed successfully.",
             artifacts=artifacts,
         )
-    if tool_name == "delegate_to_codex":
+    if tool_name == "delegate_to_codex" and _codex_result_is_approval_request(result):
         output = result.stdout or result.summary or result.stderr
         if output:
             return ToolExecutionOutcome(ok=True, output=output, artifacts=artifacts)
@@ -509,6 +545,11 @@ def _execute_single_tool(
         output=f"Error (exit_code={result.exit_code}): {result.stderr or result.summary}",
         artifacts=artifacts,
     )
+
+
+def _codex_result_is_approval_request(result: ToolExecutionResult) -> bool:
+    text = (result.stdout or result.summary or "").strip()
+    return text.startswith("Codex requested approval")
 
 
 def _tool_result_artifacts(
@@ -836,6 +877,8 @@ def execute_tools(state: ReActState, store: TurnStore) -> ReActState:
         tool_args = tool_call["args"]
         if tool_name == "delegate_to_codex":
             tool_args = _strengthen_codex_contract(dict(tool_args), state["messages"])
+            if bool(state.get("codex_read_only")):
+                tool_args = _enforce_codex_read_only_contract(tool_args, state["messages"])
         tool_args = _inject_tool_runtime_context(tool_name, dict(tool_args), turn=turn, store=store)
         tool_call_id = tool_call["id"]
         record = None

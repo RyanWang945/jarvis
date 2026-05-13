@@ -162,6 +162,7 @@ class TurnRuntimeState(TypedDict):
     artifacts: list[ToolArtifact]
     session_state: ConversationSessionState | None
     runtime_policy: RuntimePolicy | None
+    task_plan: dict[str, Any]
     allowed_tools: list[str]
     reply: str
     cancelled: bool
@@ -205,6 +206,10 @@ class TurnRuntime:
                 "allowed_tools": list(allowed_tools),
                 "max_steps": runtime_policy.max_steps if runtime_policy is not None else 8,
                 "search_budget": runtime_policy.search_budget if runtime_policy is not None else None,
+                "codex_read_only": (
+                    runtime_policy is not None
+                    and "workspace_read_only_protocol" in runtime_policy.context_sections
+                ),
             }
             running = self._apply_react_step(running, react_state)
         return self._finalize(running)
@@ -279,6 +284,7 @@ class TurnRuntime:
                 allowed_tools,
             )
 
+        task_plan = _task_plan_from_turn(turn)
         lc_messages, _ = self._context_manager.build_initial_messages(
             self._store.list_messages(turn.conversation_id),
             getattr(turn, "trigger_message_id", None),
@@ -286,7 +292,7 @@ class TurnRuntime:
             current_turn_id=turn.id,
             session_state=session_state,
             runtime_policy=runtime_policy,
-            task_plan=_task_plan_from_turn(turn),
+            task_plan=task_plan,
             recent_artifacts=_recent_artifact_context_from_store(self._store, turn.conversation_id),
         )
 
@@ -298,6 +304,7 @@ class TurnRuntime:
             "artifacts": list(state.get("artifacts", [])),
             "session_state": session_state,
             "runtime_policy": runtime_policy,
+            "task_plan": task_plan,
             "allowed_tools": allowed_tools,
             "reply": "",
             "cancelled": False,
@@ -376,8 +383,11 @@ class TurnRuntime:
                         "status": "completed",
                         "error": state.get("error"),
                     }
-            if self._should_complete_after_coder_tool(next_state):
-                coder_reply = self._latest_tool_message_content(next_state["messages"])
+            if self._should_complete_after_coder_tool(state, next_state):
+                coder_reply = self._latest_tool_message_content_for_latest_tool(
+                    next_state["messages"],
+                    "delegate_to_codex",
+                )
                 if not self._looks_like_codex_approval_request(coder_reply):
                     return self._summarize_after_coder_tool(state, next_state)
                 return {
@@ -480,10 +490,54 @@ class TurnRuntime:
             "error": None,
         }
 
-    def _should_complete_after_coder_tool(self, next_state: dict[str, Any]) -> bool:
+    def _should_complete_after_coder_tool(self, state: TurnRuntimeState, next_state: dict[str, Any]) -> bool:
         if not self._latest_ai_message_called_tool(next_state["messages"], "delegate_to_codex"):
             return False
-        return bool(self._latest_tool_message_content(next_state["messages"]))
+        coder_reply = self._latest_tool_message_content_for_latest_tool(next_state["messages"], "delegate_to_codex")
+        if not coder_reply:
+            return False
+        if self._looks_like_codex_approval_request(coder_reply):
+            return True
+        if self._looks_like_tool_failure(coder_reply):
+            logger.info("Codex returned a failure; continuing ReAct so the model can retry or report explicitly")
+            return False
+        if self._expects_repository_artifact(state) and not self._has_codex_workspace_file_artifact(next_state):
+            logger.info("Codex returned analysis but no workspace file artifact; continuing ReAct for artifact creation")
+            return False
+        return True
+
+    @staticmethod
+    def _expects_repository_artifact(state: TurnRuntimeState) -> bool:
+        runtime_policy = state.get("runtime_policy")
+        if runtime_policy is not None and "artifact_delivery_protocol" in runtime_policy.context_sections:
+            return True
+        task_plan = state.get("task_plan") or {}
+        final_deliverable = str(task_plan.get("final_deliverable") or "").lower()
+        if any(marker in final_deliverable for marker in ("file", "artifact", "attachment")):
+            return True
+        target_artifacts = task_plan.get("target_artifacts")
+        return isinstance(target_artifacts, list) and bool(target_artifacts)
+
+    @staticmethod
+    def _has_codex_workspace_file_artifact(next_state: dict[str, Any]) -> bool:
+        for artifact in next_state.get("artifacts", []) or []:
+            if getattr(artifact, "source_tool", "") != "delegate_to_codex":
+                continue
+            if getattr(artifact, "kind", "") not in {"file", "image"}:
+                continue
+            metadata = getattr(artifact, "metadata", {}) or {}
+            legacy = str(metadata.get("legacy") or "")
+            if legacy.startswith(("codex_events:", "jarvis_audit:", "codex_stderr:", "codex_approval_requests:")):
+                continue
+            path = str(getattr(artifact, "path", "") or "").strip()
+            if path:
+                return True
+        return False
+
+    @staticmethod
+    def _looks_like_tool_failure(content: str) -> bool:
+        text = content.strip()
+        return text.startswith("Error (exit_code=") or text.startswith("Tool execution error:")
 
     def _should_complete_after_ask_user_tool(self, next_state: dict[str, Any]) -> bool:
         if not self._latest_ai_message_called_tool(next_state["messages"], "ask_user"):
@@ -523,6 +577,30 @@ class TurnRuntime:
                 content = str(message.content or "").strip()
                 if content:
                     return content
+        return ""
+
+    @staticmethod
+    def _latest_tool_message_content_for_latest_tool(messages: list[BaseMessage], tool_name: str) -> str:
+        call_ids: set[str] = set()
+        for message in reversed(messages):
+            if not isinstance(message, AIMessage):
+                continue
+            call_ids = {
+                str(tool_call.get("id") or "")
+                for tool_call in message.tool_calls
+                if tool_call.get("name") == tool_name and str(tool_call.get("id") or "")
+            }
+            break
+        if not call_ids:
+            return ""
+        for message in reversed(messages):
+            if not isinstance(message, ToolMessage):
+                continue
+            if str(getattr(message, "tool_call_id", "") or "") not in call_ids:
+                continue
+            content = str(message.content or "").strip()
+            if content:
+                return content
         return ""
 
     @staticmethod
@@ -701,6 +779,7 @@ class AgentRuntime:
                 "artifacts": [],
                 "session_state": None,
                 "runtime_policy": None,
+                "task_plan": {},
                 "allowed_tools": [],
                 "reply": "",
                 "cancelled": False,
@@ -723,6 +802,7 @@ class AgentRuntime:
                 "artifacts": [],
                 "session_state": None,
                 "runtime_policy": None,
+                "task_plan": {},
                 "allowed_tools": [],
                 "reply": "",
                 "cancelled": False,

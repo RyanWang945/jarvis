@@ -126,6 +126,18 @@ def test_codex_instruction_contract_overrides_generated_preconfirmation() -> Non
     assert "请在执行前让我确认 commit message" in instruction
 
 
+def test_codex_instruction_contract_respects_read_only_delegation() -> None:
+    instruction = build_coder_instruction(
+        "Review the runtime policy design.",
+        {"_read_only": True, "allow_commit": True, "allow_push": True},
+    )
+
+    assert "This is a read-only task: inspect, analyze, review, and report only." in instruction
+    assert "Do not edit, create, delete, rename, stage, commit, or push files." in instruction
+    assert "Prefer direct file edits" not in instruction
+    assert "End with a concise inline report" in instruction
+
+
 def test_codex_logs_startup_context_and_log_paths(monkeypatch, tmp_path: Path) -> None:
     repo = _init_repo(tmp_path / "repo")
     run_root = tmp_path / "runs"

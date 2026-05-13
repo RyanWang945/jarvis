@@ -18,11 +18,11 @@ def test_research_policy_exposes_research_tools_and_budget() -> None:
     assert policy.search_budget == 10
 
 
-def test_chat_policy_does_not_expose_coder_tools() -> None:
+def test_chat_policy_exposes_low_risk_retrieval_but_not_coder_tools() -> None:
     policy = resolve_runtime_policy(session_mode="chat", turn_type="chat")
 
     assert policy.mode == "chat"
-    assert "tavily_search" not in policy.allowed_tools
+    assert "tavily_search" in policy.allowed_tools
     assert "x_search" not in policy.allowed_tools
     assert "obsidian_wiki_draft" not in policy.allowed_tools
     assert "obsidian_wiki_apply" not in policy.allowed_tools
@@ -36,6 +36,7 @@ def test_chat_policy_does_not_expose_coder_tools() -> None:
     assert "scheduled_task" not in policy.allowed_tools
     assert "delegate_to_codex" not in policy.allowed_tools
     assert "shell_run_command" not in policy.allowed_tools
+    assert policy.search_budget == 3
 
 
 def test_project_read_scene_exposes_file_and_codex_read_tools() -> None:
@@ -120,8 +121,8 @@ def test_image_generation_policy_can_delegate_to_codex_with_guidance() -> None:
     assert "load_skill_guidance" in policy.allowed_tools
     assert "delegate_to_codex" in policy.allowed_tools
     assert "workspace_protocol" in policy.context_sections
-    assert "tavily_search" not in policy.allowed_tools
-    assert policy.search_budget == 0
+    assert "tavily_search" in policy.allowed_tools
+    assert policy.search_budget == 3
 
     rendered = render_runtime_policy_for_model(policy)
     assert "call load_skill_guidance before delegating to Codex" in rendered
@@ -140,12 +141,15 @@ def test_coding_policy_exposes_coder_tools() -> None:
     assert "delegate_to_codex" in policy.allowed_tools
     assert "shell_inspect" not in policy.allowed_tools
     assert "shell_run_command" not in policy.allowed_tools
-    assert "tavily_search" not in policy.allowed_tools
+    assert "tavily_search" in policy.allowed_tools
+    assert "workspace_read_only_protocol" in policy.context_sections
 
     rendered = render_runtime_policy_for_model(policy)
     assert "compact outcome-oriented tasks" in rendered
     assert "do not prescribe shell commands" in rendered
     assert "call load_skill_guidance before delegating to Codex" in rendered
+    assert "Workspace read-only ceiling:" in rendered
+    assert "prefer delegate_to_codex with a read-only task contract" in rendered
 
 
 def test_workspace_read_file_policy_exposes_file_tools_without_codex() -> None:
@@ -250,14 +254,14 @@ def test_web_policy_prompts_simple_lookup_to_stay_concise() -> None:
 def test_tavily_conversation_intent_gets_fresh_turn_budget() -> None:
     policy = resolve_runtime_policy(session_mode="chat", turn_type="chat")
 
-    assert policy.search_budget == 0
+    assert policy.search_budget == 3
 
     adjusted = _runtime_policy_with_intent_budget(
         policy,
         ["obsidian_wiki_query", "tool_search", "tavily_search"],
     )
 
-    assert adjusted.search_budget == 10
+    assert adjusted.search_budget == 3
 
 
 def test_research_policy_allows_workspace_and_web_capabilities_together() -> None:

@@ -268,6 +268,25 @@ def test_codex_tool_result_is_passed_through_without_error_wrapper(monkeypatch) 
     assert "older command stderr" not in output
 
 
+def test_codex_failed_result_with_stdout_remains_failed(monkeypatch) -> None:
+    def _fake_execute_tool(tool, tool_args, *, timeout_seconds=30):
+        return ToolExecutionResult(
+            ok=False,
+            exit_code=None,
+            stdout="Partial Codex progress before stream disconnect.",
+            stderr="stream disconnected before completion",
+            summary="stream disconnected before completion",
+        )
+
+    monkeypatch.setattr(react_graph, "execute_tool", _fake_execute_tool)
+
+    outcome = react_graph._execute_single_tool("delegate_to_codex", {"instruction": "write design doc"})
+
+    assert outcome.ok is False
+    assert "stream disconnected before completion" in outcome.output
+    assert "Partial Codex progress" not in outcome.output
+
+
 def test_direct_tool_artifacts_are_bound_to_current_turn(monkeypatch) -> None:
     def _fake_execute_tool(tool, tool_args, *, timeout_seconds=30):
         return ToolExecutionResult(
@@ -640,6 +659,148 @@ def test_codex_contract_repair_does_not_upgrade_diagnosis_plan_request() -> None
     )
 
     assert repaired == original_args
+
+
+def test_codex_read_only_contract_overrides_execution_args() -> None:
+    original_args = {
+        "instruction": "Update README.md and run pytest.",
+        "repo_id": "jarvis",
+        "allow_commit": True,
+        "allow_push": True,
+        "verification_cmd": "pytest",
+    }
+
+    repaired = react_graph._enforce_codex_read_only_contract(
+        original_args,
+        [HumanMessage(content="梳理下 jarvis 的 MCP server 加载设计，给我一个设计说明")],
+    )
+
+    assert repaired["allow_commit"] is False
+    assert repaired["allow_push"] is False
+    assert repaired["_read_only"] is True
+    assert "verification_cmd" not in repaired
+    assert "Jarvis read-only delegation contract:" in repaired["instruction"]
+    assert "Do not edit, create, delete, rename, stage, commit, or push files." in repaired["instruction"]
+    assert "Update README.md and run pytest." in repaired["instruction"]
+
+
+def test_project_read_delegation_enforces_read_only_contract(monkeypatch) -> None:
+    client = create_agent_test_client(monkeypatch)
+    store = get_conversation_store()
+    captured_args: list[dict] = []
+    monkeypatch.setattr(
+        "app.persistence.conversation_store.classify_turn",
+        lambda **_kwargs: TurnClassification(
+            turn_type="coding",
+            scene="project",
+            access="read",
+            deliver=False,
+            confidence=0.95,
+            source="test",
+        ),
+    )
+    chat = ScriptedChat([
+        tool_response(
+            tool_call(
+                "delegate_to_codex",
+                {
+                    "instruction": "Create docs/mcp-design.md and commit it.",
+                    "repo_id": "jarvis",
+                    "allow_commit": True,
+                    "allow_push": True,
+                    "verification_cmd": "python -m pytest",
+                },
+                call_id="call_codex_read_only",
+            )
+        ),
+        final_response("delegated"),
+    ])
+    chat.install(monkeypatch)
+
+    def _fake_execute_tool(tool, tool_args, *, timeout_seconds=30):
+        captured_args.append(dict(tool_args))
+        return ToolExecutionResult(ok=True, exit_code=0, stdout="codex-ran", summary="codex-ran")
+
+    monkeypatch.setattr(react_graph, "execute_tool", _fake_execute_tool)
+    created = create_dm_turn(client, "在jarvis项目中看看怎么能加个mcp server的加载，给个设计文档给我")
+
+    run = client.post(f"/turns/{created['turn_id']}/run")
+
+    assert run.status_code == 200
+    assert captured_args
+    delegated = captured_args[0]
+    assert delegated["allow_commit"] is False
+    assert delegated["allow_push"] is False
+    assert delegated["_read_only"] is True
+    assert "verification_cmd" not in delegated
+    assert "Jarvis read-only delegation contract:" in delegated["instruction"]
+
+    tool_calls = store.list_tool_calls_by_turn(created["turn_id"])
+    assert tool_calls[0].input["allow_commit"] is False
+    assert tool_calls[0].input["allow_push"] is False
+    assert tool_calls[0].input["_read_only"] is True
+
+
+def test_codex_analysis_without_expected_artifact_continues_react(monkeypatch, tmp_path: Path) -> None:
+    client = create_agent_test_client(monkeypatch)
+    store = get_conversation_store()
+    design_path = tmp_path / "mcp-design.md"
+    executed: list[dict] = []
+    monkeypatch.setattr(
+        "app.persistence.conversation_store.classify_turn",
+        lambda **_kwargs: TurnClassification(
+            turn_type="coding",
+            scene="project",
+            access="write",
+            deliver=True,
+            task_plan={"final_deliverable": "design document file"},
+            confidence=0.95,
+            source="test",
+        ),
+    )
+    chat = ScriptedChat([
+        tool_response(
+            tool_call(
+                "delegate_to_codex",
+                {"instruction": "Research the MCP integration only.", "repo_id": "jarvis"},
+                call_id="call_codex_research",
+            )
+        ),
+        tool_response(
+            tool_call(
+                "delegate_to_codex",
+                {"instruction": "Create the MCP design document file.", "repo_id": "jarvis"},
+                call_id="call_codex_write",
+            )
+        ),
+        final_response("设计文档已生成。"),
+    ])
+    chat.install(monkeypatch)
+
+    def _fake_execute_tool(tool, tool_args, *, timeout_seconds=30):
+        executed.append(dict(tool_args))
+        if len(executed) == 1:
+            return ToolExecutionResult(ok=True, exit_code=0, stdout="调研完成，但没有写文件。", summary="research")
+        design_path.write_text("# MCP design\n", encoding="utf-8")
+        return ToolExecutionResult(
+            ok=True,
+            exit_code=0,
+            stdout=f"Created {design_path}",
+            summary="created design",
+            artifacts=[str(design_path)],
+        )
+
+    monkeypatch.setattr(react_graph, "execute_tool", _fake_execute_tool)
+    created = create_dm_turn(client, "在jarvis项目中看看怎么能加个mcp server的加载，给个设计文档给我")
+
+    run = client.post(f"/turns/{created['turn_id']}/run")
+
+    assert run.status_code == 200
+    assert run.json()["reply"] == "设计文档已生成。"
+    assert len(executed) == 2
+    assert len(chat.calls) == 3
+    tool_calls = store.list_tool_calls_by_turn(created["turn_id"])
+    assert [record.provider_tool_call_id for record in tool_calls] == ["call_codex_research", "call_codex_write"]
 
 
 def test_codex_summary_step_injects_fact_only_guardrails(monkeypatch) -> None:

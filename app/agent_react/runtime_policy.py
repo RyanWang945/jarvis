@@ -25,6 +25,11 @@ _CHAT_TOOLS = (
     "business_knowledge_search",
     "ask_user",
 )
+_LOW_RISK_RETRIEVAL_TOOLS = (
+    "obsidian_wiki_query",
+    "business_knowledge_search",
+    "tavily_search",
+)
 _PROJECT_READ_TOOLS = ("read_file", "search_files", "delegate_to_codex")
 _BASE_DISCOVERY_TOOLS = ("tool_search",)
 _WORKFLOW_GUIDANCE_TOOLS = ("load_skill_guidance",)
@@ -118,13 +123,14 @@ def _resolve_scene_policy(
         )
 
     allowed_tools: list[str] = [*_BASE_DISCOVERY_TOOLS, *_WORKFLOW_GUIDANCE_TOOLS]
+    allowed_tools.extend(_LOW_RISK_RETRIEVAL_TOOLS)
     context_sections: list[str] = ["session_state"]
     mode = scene
 
     if scene == "chat":
         allowed_tools.extend(_CHAT_TOOLS)
     elif scene == "research":
-        allowed_tools.extend((*_CHAT_TOOLS, *_WEB_TOOLS))
+        allowed_tools.extend(_CHAT_TOOLS)
         context_sections.append("research_protocol")
         if legacy_capabilities & (_LEGACY_WORKSPACE_LABELS | {"code.inspect", "code.edit", "code.test"}):
             allowed_tools.extend(_WORKSPACE_CODE_TOOLS)
@@ -136,14 +142,13 @@ def _resolve_scene_policy(
     elif scene == "project":
         if access == "read":
             allowed_tools.extend(("ask_user", *_PROJECT_READ_TOOLS))
-            context_sections.extend(("workspace_file_protocol", "workspace_protocol"))
+            context_sections.extend(("workspace_file_protocol", "workspace_protocol", "workspace_read_only_protocol"))
         else:
             allowed_tools.extend(("ask_user", *_WORKSPACE_CODE_TOOLS))
             context_sections.append("workspace_protocol")
         mode = "coding"
 
-    if "web.search" in legacy_capabilities and scene != "research":
-        allowed_tools.extend(_WEB_TOOLS)
+    if scene != "research":
         context_sections.append("web_search_protocol")
     if "kb.write" in legacy_capabilities:
         allowed_tools.extend(_KB_WRITE_TOOLS)
@@ -224,6 +229,8 @@ def _max_steps_for_scene(scene: Scene, access: AccessLevel, legacy_capabilities:
 def _search_budget_for_scene(scene: Scene, legacy_capabilities: set[str]) -> int:
     if scene == "research" or "web.search" in legacy_capabilities:
         return 10
+    if scene in {"chat", "project"}:
+        return 3
     return 0
 
 
@@ -327,6 +334,7 @@ def render_runtime_policy_for_model(policy: RuntimePolicy) -> str:
                 "Artifact delivery protocol:",
                 "- Use deliver_file when the final deliverable is an existing local file or prior artifact that should be sent to the remote conversation.",
                 "- Use read_file/search_files only to verify or locate the target file when needed; they do not send attachments.",
+                "- If the final deliverable must be created by repository work, delegate one complete Codex task that researches and writes the target file path instead of stopping after analysis.",
                 "- For binary files such as images, PDFs, archives, and spreadsheets, deliver the file instead of trying to embed file bytes in text.",
                 "- If the requested file is missing or ambiguous, ask one concise clarification question or explain the missing target.",
             ]
@@ -340,6 +348,7 @@ def render_runtime_policy_for_model(policy: RuntimePolicy) -> str:
                 "- Do not use delegate_to_codex for listing files, checking file existence, reading a known file, or bounded text search; use read_file/search_files for those.",
                 "- Trust Codex to handle routine repository work inside the registered workspace.",
                 "- Preserve the user's full repository outcome when delegating. If the user asks to update/edit/create, delegate an execution task, not a read-only preview.",
+                "- If the requested repository outcome is a report, design document, or other file, include both investigation and file creation in the Codex task contract.",
                 "- If the user asks to commit, set allow_commit=true. If the user asks to push, set allow_commit=true and allow_push=true.",
                 "- Delegate compact outcome-oriented tasks to Codex; do not prescribe shell commands, "
                 "recovery steps, or old stderr unless the user explicitly asks.",
@@ -348,6 +357,17 @@ def render_runtime_policy_for_model(policy: RuntimePolicy) -> str:
                 "- Let Codex request approval for elevated actions; do not pre-split ordinary repo work into micro approvals.",
                 "- Prefer delegate_to_codex with repo_id; do not guess unregistered workdirs.",
                 "- Surface only material approval requests to the user, then report changed files and verification.",
+            ]
+        )
+    if "workspace_read_only_protocol" in policy.context_sections:
+        lines.extend(
+            [
+                "",
+                "Workspace read-only ceiling:",
+                "- This turn is limited to repository reading, analysis, review, and design output unless the latest user message explicitly asks to modify repository files.",
+                "- For architecture analysis, design documents, code review, test-gap analysis, or cross-file reasoning, prefer delegate_to_codex with a read-only task contract over many small read_file/search_files calls.",
+                "- In read-only turns, do not instruct Codex to edit, create, delete, commit, or push files. Ask for an inline report or design unless write access is explicitly required by the user.",
+                "- If the user's requested final deliverable is a new or updated workspace file, preserve that need in the final response and state that a write-capable turn is required.",
             ]
         )
     if "summary_protocol" in policy.context_sections:
