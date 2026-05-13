@@ -35,16 +35,18 @@ def test_non_command_fallback_does_not_preserve_research_by_keyword() -> None:
     assert classification.source == "fallback"
 
 
-def test_non_command_fallback_does_not_preserve_coding_by_keyword() -> None:
+def test_project_commit_push_fallback_uses_active_repo() -> None:
     classification = classify_turn(
         content="把文件提交commit然后推送吧",
         session_state=ConversationSessionState(session_mode="coding", active_repo_id="nltk"),
     )
 
-    assert classification.turn_type == "chat"
-    assert classification.session_mode_update is None
-    assert classification.active_repo_id_update is None
-    assert classification.target_resources == ()
+    assert classification.turn_type == "coding"
+    assert classification.scene == "project"
+    assert classification.access == "push"
+    assert classification.session_mode_update == "coding"
+    assert classification.active_repo_id_update == "nltk"
+    assert classification.target_resources[0].id == "nltk"
     assert classification.source == "fallback"
     assert classification.routing_basis == "fallback"
 
@@ -176,6 +178,39 @@ def test_llm_classifier_accepts_missing_confidence_without_local_enrichment(monk
     get_settings.cache_clear()
 
 
+def test_llm_classifier_accepts_scene_access_deliver_without_capabilities(monkeypatch) -> None:
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setenv("JARVIS_DEEPSEEK_API_KEY", "test-key")
+    get_settings.cache_clear()
+
+    def _fake_chat(self, messages, response_format=None, tools=None, tool_choice=None):
+        system_prompt = messages[0].content
+        assert "Allowed scene values" in system_prompt
+        assert "Allowed access values" in system_prompt
+        return {
+            "content": (
+                '{"scene":"project","access":"read","deliver":true,'
+                '"target_resources":[{"type":"repository","id":"jarvis"}],'
+                '"routing_basis":"explicit","confidence":0.9,"reason":"send project diagrams"}'
+            )
+        }
+
+    monkeypatch.setattr(ChatClient, "chat", _fake_chat)
+
+    classification = classify_turn(
+        content="jarvis项目里还有几个架构图，都发给我吧",
+        session_state=ConversationSessionState(),
+    )
+
+    assert classification.turn_type == "coding"
+    assert classification.scene == "project"
+    assert classification.access == "read"
+    assert classification.deliver is True
+    assert classification.requested_capabilities == ("workspace.inspect", "artifact.deliver")
+    assert classification.target_resources[0].id == "jarvis"
+    get_settings.cache_clear()
+
+
 def test_llm_classifier_accepts_reminder_capability(monkeypatch) -> None:
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
     monkeypatch.setenv("JARVIS_DEEPSEEK_API_KEY", "test-key")
@@ -183,7 +218,7 @@ def test_llm_classifier_accepts_reminder_capability(monkeypatch) -> None:
 
     def _fake_chat(self, messages, response_format=None, tools=None, tool_choice=None):
         system_prompt = messages[0].content
-        assert "reminder.manage" in system_prompt
+        assert "Use scene=reminder" in system_prompt
         return {
             "content": (
                 '{"turn_type":"command","session_mode_update":null,'
@@ -213,8 +248,8 @@ def test_llm_classifier_accepts_workspace_file_capabilities(monkeypatch) -> None
 
     def _fake_chat(self, messages, response_format=None, tools=None, tool_choice=None):
         system_prompt = messages[0].content
-        assert "workspace.read_file" in system_prompt
-        assert "workspace.search_files" in system_prompt
+        assert "Use scene=project for local repository/project work" in system_prompt
+        assert "file lookup" in system_prompt
         return {
             "content": (
                 '{"turn_type":"coding","session_mode_update":"coding",'
@@ -286,8 +321,8 @@ def test_llm_classifier_accepts_artifact_delivery_capability(monkeypatch) -> Non
 
     def _fake_chat(self, messages, response_format=None, tools=None, tool_choice=None):
         system_prompt = messages[0].content
-        assert "artifact.deliver" in system_prompt
-        assert "Do not use workspace.read_file as the final capability for binary file delivery" in system_prompt
+        assert "deliver is a boolean" in system_prompt
+        assert "file/image/document back to the user" in system_prompt
         return {
             "content": (
                 '{"turn_type":"coding","session_mode_update":"coding",'

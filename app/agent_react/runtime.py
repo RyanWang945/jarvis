@@ -238,14 +238,20 @@ class TurnRuntime:
         runtime_policy = resolve_runtime_policy(
             session_mode=session_state.session_mode,
             turn_type=getattr(turn, "turn_type", "chat"),
-            requested_capabilities=_requested_capabilities_from_turn(turn),
+            legacy_capabilities=_legacy_capabilities_from_turn(turn),
+            scene=_classification_field_from_turn(turn, "scene"),
+            access=_classification_field_from_turn(turn, "access"),
+            deliver=_classification_bool_from_turn(turn, "deliver"),
         )
         logger.info(
-            "runtime policy resolved turn_id=%s mode=%s allowed_tools=%s requested_capabilities=%s",
+            "runtime policy resolved turn_id=%s mode=%s allowed_tools=%s scene=%s access=%s deliver=%s legacy_capabilities=%s",
             turn_id,
             runtime_policy.mode,
             list(runtime_policy.allowed_tools),
-            _requested_capabilities_from_turn(turn),
+            _classification_field_from_turn(turn, "scene"),
+            _classification_field_from_turn(turn, "access"),
+            _classification_bool_from_turn(turn, "deliver"),
+            _legacy_capabilities_from_turn(turn),
         )
         conversation_tool_intents = (
             tool_intents_from_metadata(conversation.metadata if conversation is not None else None)
@@ -753,7 +759,7 @@ class AgentRuntime:
         )
 
 
-def _requested_capabilities_from_turn(turn: TurnRecord) -> tuple[str, ...]:
+def _legacy_capabilities_from_turn(turn: TurnRecord) -> tuple[str, ...]:
     metadata = getattr(turn, "metadata", {}) or {}
     classification = metadata.get("classification")
     if not isinstance(classification, dict):
@@ -766,6 +772,23 @@ def _requested_capabilities_from_turn(turn: TurnRecord) -> tuple[str, ...]:
         if isinstance(item, str) and item not in capabilities:
             capabilities.append(item)
     return tuple(capabilities)
+
+
+def _classification_field_from_turn(turn: TurnRecord, field: str) -> str | None:
+    metadata = getattr(turn, "metadata", {}) or {}
+    classification = metadata.get("classification")
+    if not isinstance(classification, dict):
+        return None
+    value = classification.get(field)
+    return value if isinstance(value, str) else None
+
+
+def _classification_bool_from_turn(turn: TurnRecord, field: str) -> bool | None:
+    metadata = getattr(turn, "metadata", {}) or {}
+    classification = metadata.get("classification")
+    if not isinstance(classification, dict) or field not in classification:
+        return None
+    return bool(classification.get(field))
 
 
 def _task_plan_from_turn(turn: TurnRecord) -> dict[str, Any]:

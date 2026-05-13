@@ -812,8 +812,8 @@ def test_tool_search_grant_expands_allowed_tools_with_audit_log(monkeypatch) -> 
     run = client.post(f"/turns/{created['turn_id']}/run")
 
     assert run.status_code == 200
-    assert any("tool_search grant evaluation" in message and "x_search" in message for message in log_messages)
-    assert any("runtime allowed_tools expanded" in message and "x_search" in message for message in log_messages)
+    assert any("tool_search grant evaluation" in message and "tavily_search" in message for message in log_messages)
+    assert any("runtime allowed_tools expanded" in message and "tavily_search" in message for message in log_messages)
 
 
 def test_tool_search_grant_uses_original_request_for_continuation_message(monkeypatch) -> None:
@@ -833,15 +833,15 @@ def test_tool_search_grant_uses_original_request_for_continuation_message(monkey
                 tool_call(
                     "tool_search",
                     {
-                        "query": "delegate_to_codex inspect file",
-                        "original_user_request": "查看 app/channels/feishu_renderer.py 文件内容",
+                        "query": "deliver file to user",
+                        "original_user_request": "把 jarvis-architecture.png 发给我",
                     },
                     call_id="call_tool_search",
                 )
             )
         if tool_messages[-1].tool_call_id == "call_tool_search":
-            assert "delegate_to_codex" in tool_names
-            return final_response("delegate now available")
+            assert "deliver_file" in tool_names
+            return final_response("delivery now available")
         return final_response("done")
 
     chat = ScriptedChat([_chat, _chat])
@@ -851,8 +851,8 @@ def test_tool_search_grant_uses_original_request_for_continuation_message(monkey
     run = client.post(f"/turns/{created['turn_id']}/run")
 
     assert run.status_code == 200
-    assert "delegate_to_codex" not in seen_tool_sets[0]
-    assert "delegate_to_codex" in seen_tool_sets[1]
+    assert "deliver_file" not in seen_tool_sets[0]
+    assert "deliver_file" in seen_tool_sets[1]
 
 
 def test_load_skill_guidance_injects_turn_scoped_reminder(monkeypatch) -> None:
@@ -912,7 +912,7 @@ def test_load_skill_guidance_injects_turn_scoped_reminder(monkeypatch) -> None:
     assert run.json()["reply"] == "skill guidance loaded"
 
 
-def test_conversation_tool_intents_append_across_turns(monkeypatch) -> None:
+def test_project_scene_tool_intents_stay_turn_scoped(monkeypatch) -> None:
     client = create_agent_test_client(monkeypatch)
     store = get_conversation_store()
     chat_id = "chat-tool-intent-append"
@@ -935,11 +935,11 @@ def test_conversation_tool_intents_append_across_turns(monkeypatch) -> None:
     assert run.status_code == 200
     conversation = store.get_conversation(created["conversation_id"])
     assert conversation is not None
-    assert "delegate_to_codex" in conversation.metadata.get("active_tool_intents", [])
+    assert "delegate_to_codex" not in conversation.metadata.get("active_tool_intents", [])
 
     continued = create_dm_turn(client, "ok", chat_id=chat_id)
     run = client.post(f"/turns/{continued['turn_id']}/run")
 
     assert run.status_code == 200
     assert "delegate_to_codex" in seen_tool_sets[0]
-    assert "delegate_to_codex" in seen_tool_sets[1]
+    assert "delegate_to_codex" not in seen_tool_sets[1]

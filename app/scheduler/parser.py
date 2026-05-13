@@ -40,6 +40,10 @@ def parse_one_shot_time(
 
     base = now.astimezone(tz) if now is not None else datetime.now(tz)
 
+    iso = _parse_iso_datetime(text, tz)
+    if iso is not None:
+        return _parsed(iso, timezone=timezone, confidence=0.99, reason="iso datetime")
+
     relative = _parse_relative(text, base)
     if relative is not None:
         return _parsed(relative, timezone=timezone, confidence=0.98, reason="relative time")
@@ -49,6 +53,21 @@ def parse_one_shot_time(
         return _parsed(absolute, timezone=timezone, confidence=0.95, reason="clock time")
 
     return ParsedSchedule(ok=False, timezone=timezone, confidence=0.0, reason="unsupported time expression")
+
+
+def _parse_iso_datetime(text: str, tz) -> datetime | None:
+    candidate = text.strip()
+    if not candidate:
+        return None
+    if candidate.endswith("Z"):
+        candidate = candidate[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=tz)
+    return parsed.astimezone(tz)
 
 
 def _parse_relative(text: str, base: datetime) -> datetime | None:

@@ -5,8 +5,9 @@ from app.agent_react.runtime import _runtime_policy_with_intent_budget
 def test_research_policy_exposes_research_tools_and_budget() -> None:
     policy = resolve_runtime_policy(
         session_mode="research",
-        turn_type="research",
-        requested_capabilities=("research.deep", "web.search"),
+        turn_type="chat",
+        scene="research",
+        access="read",
     )
 
     assert policy.mode == "research"
@@ -27,6 +28,8 @@ def test_chat_policy_does_not_expose_coder_tools() -> None:
     assert "obsidian_wiki_apply" not in policy.allowed_tools
     assert "obsidian_wiki_query" in policy.allowed_tools
     assert "business_knowledge_search" in policy.allowed_tools
+    assert "read_file" not in policy.allowed_tools
+    assert "search_files" not in policy.allowed_tools
     assert "ask_user" in policy.allowed_tools
     assert "tool_search" in policy.allowed_tools
     assert "load_skill_guidance" in policy.allowed_tools
@@ -35,11 +38,31 @@ def test_chat_policy_does_not_expose_coder_tools() -> None:
     assert "shell_run_command" not in policy.allowed_tools
 
 
-def test_reminder_tool_requires_explicit_capability() -> None:
+def test_project_read_scene_exposes_file_and_codex_read_tools() -> None:
     policy = resolve_runtime_policy(
         session_mode="chat",
         turn_type="chat",
-        requested_capabilities=("reminder.manage",),
+        scene="project",
+        access="read",
+        deliver=True,
+    )
+
+    assert policy.mode == "coding"
+    assert "read_file" in policy.allowed_tools
+    assert "search_files" in policy.allowed_tools
+    assert "delegate_to_codex" in policy.allowed_tools
+    assert "deliver_file" in policy.allowed_tools
+    assert "workspace_file_protocol" in policy.context_sections
+    assert "workspace_protocol" in policy.context_sections
+    assert "artifact_delivery_protocol" in policy.context_sections
+
+
+def test_reminder_scene_exposes_reminder_tool() -> None:
+    policy = resolve_runtime_policy(
+        session_mode="chat",
+        turn_type="chat",
+        scene="reminder",
+        access="none",
     )
 
     assert "tool_search" in policy.allowed_tools
@@ -50,7 +73,7 @@ def test_reminder_capability_overrides_command_no_tools_policy() -> None:
     policy = resolve_runtime_policy(
         session_mode="chat",
         turn_type="command",
-        requested_capabilities=("reminder.manage",),
+        legacy_capabilities=("reminder.manage",),
     )
 
     assert policy.mode == "chat"
@@ -62,7 +85,7 @@ def test_artifact_delivery_capability_overrides_command_no_tools_policy() -> Non
     policy = resolve_runtime_policy(
         session_mode="chat",
         turn_type="command",
-        requested_capabilities=("artifact.deliver",),
+        legacy_capabilities=("artifact.deliver",),
     )
 
     assert policy.mode == "chat"
@@ -87,11 +110,12 @@ def test_command_policy_keeps_tool_search_as_internal_fallback() -> None:
 def test_image_generation_policy_can_delegate_to_codex_with_guidance() -> None:
     policy = resolve_runtime_policy(
         session_mode="chat",
-        turn_type="image_generation",
-        requested_capabilities=("image.generate",),
+        turn_type="chat",
+        scene="project",
+        access="write",
     )
 
-    assert policy.mode == "image_generation"
+    assert policy.mode == "coding"
     assert "tool_search" in policy.allowed_tools
     assert "load_skill_guidance" in policy.allowed_tools
     assert "delegate_to_codex" in policy.allowed_tools
@@ -107,8 +131,9 @@ def test_image_generation_policy_can_delegate_to_codex_with_guidance() -> None:
 def test_coding_policy_exposes_coder_tools() -> None:
     policy = resolve_runtime_policy(
         session_mode="chat",
-        turn_type="coding",
-        requested_capabilities=("workspace.inspect",),
+        turn_type="chat",
+        scene="project",
+        access="read",
     )
 
     assert policy.mode == "coding"
@@ -126,17 +151,18 @@ def test_coding_policy_exposes_coder_tools() -> None:
 def test_workspace_read_file_policy_exposes_file_tools_without_codex() -> None:
     policy = resolve_runtime_policy(
         session_mode="chat",
-        turn_type="coding",
-        requested_capabilities=("workspace.read_file",),
+        turn_type="chat",
+        scene="project",
+        access="read",
     )
 
     assert policy.mode == "coding"
     assert "read_file" in policy.allowed_tools
     assert "search_files" in policy.allowed_tools
-    assert "delegate_to_codex" not in policy.allowed_tools
+    assert "delegate_to_codex" in policy.allowed_tools
     assert "shell_inspect" not in policy.allowed_tools
     assert "workspace_file_protocol" in policy.context_sections
-    assert "workspace_protocol" not in policy.context_sections
+    assert "workspace_protocol" in policy.context_sections
 
     rendered = render_runtime_policy_for_model(policy)
     assert "Workspace file protocol:" in rendered
@@ -146,13 +172,15 @@ def test_workspace_read_file_policy_exposes_file_tools_without_codex() -> None:
 def test_artifact_delivery_policy_exposes_deliver_file_without_codex() -> None:
     policy = resolve_runtime_policy(
         session_mode="chat",
-        turn_type="coding",
-        requested_capabilities=("workspace.search_files", "artifact.deliver"),
+        turn_type="chat",
+        scene="project",
+        access="read",
+        deliver=True,
     )
 
     assert "deliver_file" in policy.allowed_tools
     assert "search_files" in policy.allowed_tools
-    assert "delegate_to_codex" not in policy.allowed_tools
+    assert "delegate_to_codex" in policy.allowed_tools
     assert "artifact_delivery_protocol" in policy.context_sections
 
     rendered = render_runtime_policy_for_model(policy)
@@ -164,8 +192,9 @@ def test_artifact_delivery_policy_exposes_deliver_file_without_codex() -> None:
 def test_artifact_revision_policy_can_delegate_to_codex() -> None:
     policy = resolve_runtime_policy(
         session_mode="chat",
-        turn_type="coding",
-        requested_capabilities=("artifact.revise",),
+        turn_type="chat",
+        scene="project",
+        access="write",
     )
 
     assert "delegate_to_codex" in policy.allowed_tools
@@ -175,8 +204,9 @@ def test_artifact_revision_policy_can_delegate_to_codex() -> None:
 def test_workspace_file_and_inspect_policy_can_expose_both_paths() -> None:
     policy = resolve_runtime_policy(
         session_mode="chat",
-        turn_type="coding",
-        requested_capabilities=("workspace.search_files", "workspace.inspect"),
+        turn_type="chat",
+        scene="project",
+        access="read",
     )
 
     assert "read_file" in policy.allowed_tools
@@ -189,8 +219,10 @@ def test_workspace_file_and_inspect_policy_can_expose_both_paths() -> None:
 def test_coding_policy_exposes_search_when_web_capability_requested() -> None:
     policy = resolve_runtime_policy(
         session_mode="chat",
-        turn_type="coding",
-        requested_capabilities=("workspace.inspect", "web.search"),
+        turn_type="chat",
+        scene="project",
+        access="read",
+        legacy_capabilities=("web.search",),
     )
 
     assert policy.mode == "coding"
@@ -203,7 +235,8 @@ def test_web_policy_prompts_simple_lookup_to_stay_concise() -> None:
     policy = resolve_runtime_policy(
         session_mode="chat",
         turn_type="chat",
-        requested_capabilities=("web.search",),
+        scene="research",
+        access="read",
     )
 
     rendered = render_runtime_policy_for_model(policy)
@@ -230,8 +263,10 @@ def test_tavily_conversation_intent_gets_fresh_turn_budget() -> None:
 def test_research_policy_allows_workspace_and_web_capabilities_together() -> None:
     policy = resolve_runtime_policy(
         session_mode="chat",
-        turn_type="research",
-        requested_capabilities=("workspace.inspect", "web.search", "research.deep"),
+        turn_type="chat",
+        scene="research",
+        access="read",
+        legacy_capabilities=("workspace.inspect",),
     )
 
     assert policy.mode == "research"
@@ -246,7 +281,7 @@ def test_legacy_code_capabilities_map_to_workspace_tools() -> None:
     policy = resolve_runtime_policy(
         session_mode="chat",
         turn_type="research",
-        requested_capabilities=("code.inspect", "web.search"),
+        legacy_capabilities=("code.inspect", "web.search"),
     )
 
     assert "delegate_to_codex" in policy.allowed_tools

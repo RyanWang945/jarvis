@@ -42,7 +42,11 @@ def run_scheduled_task(request: ToolExecutionRequest) -> ToolExecutionResult:
             return conversation_id
         title = str(request.args.get("title") or "提醒").strip()
         prompt = str(request.args.get("prompt") or title or "提醒").strip()
-        time_text = str(request.args.get("time_text") or "").strip()
+        time_text = _first_non_empty(
+            request.args.get("time_text"),
+            request.args.get("source_time_text"),
+            request.args.get("run_at"),
+        )
         platform = str(request.args.get("platform") or "feishu").strip()
         external_chat_id = str(request.args.get("external_chat_id") or "").strip()
         if not time_text:
@@ -88,3 +92,11 @@ def _optional_int(value: object) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _first_non_empty(*values: object) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""

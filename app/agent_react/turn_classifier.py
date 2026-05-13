@@ -18,33 +18,15 @@ logger = logging.getLogger(__name__)
 
 TurnType: TypeAlias = Literal["chat", "research", "coding", "summary", "command", "image_generation"]
 RoutingBasis: TypeAlias = Literal["explicit", "contextual", "inferred", "fallback"]
-Capability: TypeAlias = Literal[
-    "response.text",
-    "web.search",
-    "kb.search",
-    "kb.read",
-    "kb.write",
-    "workspace.inspect",
-    "workspace.read_file",
-    "workspace.search_files",
-    "workspace.edit",
-    "workspace.test",
-    "workspace.report",
-    "code.inspect",
-    "code.edit",
-    "code.test",
-    "research.deep",
-    "artifact.deliver",
-    "artifact.generate",
-    "artifact.revise",
-    "image.generate",
-    "reminder.manage",
-]
+Scene: TypeAlias = Literal["chat", "project", "research", "reminder", "control"]
+AccessLevel: TypeAlias = Literal["none", "read", "write", "commit", "push"]
 TargetResourceType: TypeAlias = Literal["repository", "knowledge_base", "conversation", "external_service"]
 
 _TURN_TYPES = {"chat", "research", "coding", "summary", "command", "image_generation"}
+_SCENES = {"chat", "project", "research", "reminder", "control"}
+_ACCESS_LEVELS = {"none", "read", "write", "commit", "push"}
 _SESSION_MODES = {"chat", "research", "coding"}
-_CAPABILITIES = {
+_LEGACY_CAPABILITY_LABELS = {
     "response.text",
     "web.search",
     "kb.search",
@@ -78,28 +60,80 @@ class TargetResource:
     name: str | None = None
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class TurnClassification:
     turn_type: TurnType
+    scene: Scene = "chat"
+    access: AccessLevel = "none"
+    deliver: bool = False
     session_mode_update: SessionMode | None = None
     active_repo_id_update: str | None = None
-    requested_capabilities: tuple[Capability, ...] = ()
     target_resources: tuple[TargetResource, ...] = ()
     task_plan: dict[str, Any] = field(default_factory=dict)
     routing_basis: RoutingBasis = "fallback"
     confidence: float = 1.0
     reason: str = ""
     source: str = "fallback"
+    _legacy_capabilities: tuple[str, ...] = field(default=(), repr=False, compare=False)
+
+    def __init__(
+        self,
+        turn_type: TurnType,
+        scene: Scene = "chat",
+        access: AccessLevel = "none",
+        deliver: bool = False,
+        session_mode_update: SessionMode | None = None,
+        active_repo_id_update: str | None = None,
+        requested_capabilities: tuple[str, ...] = (),
+        target_resources: tuple[TargetResource, ...] = (),
+        task_plan: dict[str, Any] | None = None,
+        routing_basis: RoutingBasis = "fallback",
+        confidence: float = 1.0,
+        reason: str = "",
+        source: str = "fallback",
+        _legacy_capabilities: tuple[str, ...] | None = None,
+    ) -> None:
+        raw_legacy_capabilities = _legacy_capabilities if _legacy_capabilities is not None else requested_capabilities
+        legacy_capabilities = tuple(dict.fromkeys(str(item) for item in raw_legacy_capabilities if isinstance(item, str)))
+        resolved_scene = scene
+        if resolved_scene == "chat" and (turn_type != "chat" or legacy_capabilities):
+            resolved_scene = _scene_from_legacy(turn_type, legacy_capabilities)
+        resolved_access = access
+        if resolved_access == "none":
+            resolved_access = _access_from_legacy(turn_type, legacy_capabilities)
+        resolved_deliver = deliver or _deliver_from_legacy(legacy_capabilities)
+
+        object.__setattr__(self, "turn_type", turn_type)
+        object.__setattr__(self, "scene", resolved_scene)
+        object.__setattr__(self, "access", resolved_access)
+        object.__setattr__(self, "deliver", resolved_deliver)
+        object.__setattr__(self, "session_mode_update", session_mode_update)
+        object.__setattr__(self, "active_repo_id_update", active_repo_id_update)
+        object.__setattr__(self, "target_resources", target_resources)
+        object.__setattr__(self, "task_plan", task_plan or {})
+        object.__setattr__(self, "routing_basis", routing_basis)
+        object.__setattr__(self, "confidence", confidence)
+        object.__setattr__(self, "reason", reason)
+        object.__setattr__(self, "source", source)
+        object.__setattr__(self, "_legacy_capabilities", legacy_capabilities)
+
+    @property
+    def requested_capabilities(self) -> tuple[str, ...]:
+        if self._legacy_capabilities:
+            return self._legacy_capabilities
+        return _legacy_capabilities_from_scene(self.scene, self.access, self.deliver)
 
 
 def classification_to_metadata(classification: TurnClassification) -> dict[str, Any]:
     return {
         "source": classification.source,
+        "scene": classification.scene,
+        "access": classification.access,
+        "deliver": classification.deliver,
         "confidence": classification.confidence,
         "reason": classification.reason,
         "session_mode_update": classification.session_mode_update,
         "active_repo_id_update": classification.active_repo_id_update,
-        "requested_capabilities": list(classification.requested_capabilities),
         "target_resources": [asdict(resource) for resource in classification.target_resources],
         "task_plan": dict(classification.task_plan),
         "routing_basis": classification.routing_basis,
@@ -125,7 +159,9 @@ def classify_turn(
     if llm is not None:
         return _with_target_resource(llm, active_repo_id)
 
-    return _with_target_resource(_fallback_classification(text, current, active_repo_id=active_repo_id), active_repo_id)
+    fallback_repo_id = active_repo_id or current.active_repo_id
+    fallback = _fallback_classification(text, current, active_repo_id=fallback_repo_id)
+    return _with_target_resource(fallback, active_repo_id or fallback_repo_id)
 
 
 def should_apply_session_mode_update(classification: TurnClassification) -> bool:
@@ -148,6 +184,8 @@ def _hard_rule_classification(text: str) -> TurnClassification | None:
     if command in {"/status", "/cancel", "/clear", "/repos", "/model"}:
         return TurnClassification(
             turn_type="command",
+            scene="control",
+            access="none",
             confidence=1.0,
             reason=command,
             source="hard_rule",
@@ -156,6 +194,8 @@ def _hard_rule_classification(text: str) -> TurnClassification | None:
     if command == "/research":
         return TurnClassification(
             turn_type="research",
+            scene="research",
+            access="read",
             session_mode_update="research",
             requested_capabilities=("research.deep", "web.search", "kb.search"),
             confidence=1.0,
@@ -166,6 +206,8 @@ def _hard_rule_classification(text: str) -> TurnClassification | None:
     if command == "/chat":
         return TurnClassification(
             turn_type="chat",
+            scene="chat",
+            access="none",
             session_mode_update="chat",
             confidence=1.0,
             reason="/chat command",
@@ -175,8 +217,9 @@ def _hard_rule_classification(text: str) -> TurnClassification | None:
     if command == "/coding":
         return TurnClassification(
             turn_type="coding",
+            scene="project",
+            access="read",
             session_mode_update="coding",
-            requested_capabilities=("workspace.inspect",),
             confidence=1.0,
             reason="/coding command",
             source="hard_rule",
@@ -204,32 +247,25 @@ def _llm_classification(
             role="system",
             content=(
                 "Classify the next Jarvis turn. Return compact JSON only. "
-                "Do not answer the user. Allowed turn_type values: chat, research, coding, "
-                "summary, command, image_generation. Use command only for explicit Jarvis "
+                "Do not answer the user. Prefer the simple routing fields scene, access, and deliver. "
+                "Allowed scene values: chat, project, research, reminder, control. "
+                "Allowed access values: none, read, write, commit, push. "
+                "deliver is a boolean for sending an existing or generated file/image/document back to the user. "
+                "Use scene=control only for explicit Jarvis "
                 "runtime control slash commands such as /status, /clear, /cancel, /repos, "
-                "or /model. Do not use command for ordinary user tasks such as reminders, "
+                "or /model. Do not use control for ordinary user tasks such as reminders, "
                 "file delivery, web search, repository work, or knowledge-base operations; "
-                "use chat/research/coding/image_generation plus requested_capabilities instead. "
+                "use chat, project, research, or reminder instead. "
+                "Use scene=project for local repository/project work: file lookup, file reading, project status, "
+                "git status, architecture analysis, code review, edits, tests, commits, pushes, and generated project artifacts. "
+                "Use access=read for project lookup, file reading, status checks, review, and architecture understanding. "
+                "Use access=write for modifying or generating files, access=commit for commit requests, and access=push for push requests. "
+                "Use scene=research for deep/current/external research. Use scene=reminder for reminders and scheduled tasks. "
+                "Use scene=chat for ordinary conversation that does not need local project, research, reminder, or control behavior. "
+                "For compatibility also return turn_type when obvious, but keep routing based on scene/access/deliver. "
+                "Allowed turn_type values: chat, research, coding, summary, command, image_generation. "
                 "Allowed session_mode_update values: "
-                "chat, research, coding, or null. Return requested_capabilities as atomic labels "
-                "from: response.text, web.search, kb.search, kb.write, workspace.read_file, workspace.search_files, "
-                "workspace.inspect, workspace.edit, workspace.test, workspace.report, research.deep, "
-                "artifact.deliver, artifact.generate, artifact.revise, image.generate, reminder.manage. "
-                "Use reminder.manage for explicit reminder, timed notification, wake-up, "
-                "reminder list, or reminder cancellation requests. "
-                "Use workspace.read_file only when the user needs text content, excerpts, or metadata from a known local workspace file. "
-                "Use workspace.search_files for lightweight workspace path lookup, file existence checks, "
-                "or bounded text search. "
-                "Use workspace.inspect for local repository understanding that needs multi-file reasoning, "
-                "project/repository status, git status, code review, architecture analysis, runtime design, "
-                "or prior local work products. "
-                "Use workspace.report when the user asks for a local project report/review. "
-                "Use artifact.deliver when the final user-visible output is an existing local file, image, document, "
-                "or prior artifact delivered to the remote conversation. Do not use workspace.read_file as the "
-                "final capability for binary file delivery. "
-                "Use artifact.generate when the user asks to create a new user-visible file or artifact. "
-                "Use artifact.revise when the user asks to modify a prior artifact and return the updated artifact. "
-                "Use response.text when the final output is only a text answer and no special delivery is needed. "
+                "chat, research, coding, or null. "
                 "Return target_resources only for clearly "
                 "referenced repositories, knowledge bases, conversations, or external services. "
                 "Prefer chat unless the user asks for "
@@ -277,17 +313,33 @@ def _llm_classification(
 
 
 def _classification_from_payload(payload: dict[str, Any], *, text: str = "") -> TurnClassification | None:
+    raw_scene = payload.get("scene")
+    scene = raw_scene if raw_scene in _SCENES else None
     raw_turn_type = payload.get("turn_type")
-    if raw_turn_type not in _TURN_TYPES:
+    if raw_turn_type not in _TURN_TYPES and scene is None:
         return None
 
     confidence = _coerce_payload_confidence(payload)
-    turn_type: TurnType = raw_turn_type  # type: ignore[assignment]
-    if turn_type == "command" and not text.lstrip().startswith("/"):
+    legacy_capabilities = _coerce_legacy_capabilities(payload.get("requested_capabilities"))
+    access = _coerce_access(payload.get("access"))
+    deliver = bool(payload.get("deliver"))
+    if scene is None:
+        scene = _scene_from_legacy(raw_turn_type, legacy_capabilities)  # type: ignore[arg-type]
+    if access is None:
+        access = _access_from_legacy(raw_turn_type, legacy_capabilities)
+    if not deliver:
+        deliver = _deliver_from_legacy(legacy_capabilities)
+
+    turn_type = _turn_type_from_scene(scene, raw_turn_type)
+    if (turn_type == "command" or scene == "control") and not text.lstrip().startswith("/"):
         turn_type = "chat"
+        scene = "chat"
+        access = "none"
     if confidence < _CONFIDENCE_THRESHOLD:
         return TurnClassification(
             turn_type="chat",
+            scene="chat",
+            access="none",
             session_mode_update=None,
             confidence=confidence,
             reason="low classifier confidence",
@@ -300,15 +352,17 @@ def _classification_from_payload(payload: dict[str, Any], *, text: str = "") -> 
     if raw_session_update in _SESSION_MODES:
         session_update = raw_session_update  # type: ignore[assignment]
 
-    requested_capabilities = _coerce_capabilities(payload.get("requested_capabilities"))
     target_resources = _coerce_target_resources(payload.get("target_resources"))
     task_plan = _coerce_task_plan(payload.get("task_plan"))
     routing_basis = _coerce_routing_basis(payload.get("routing_basis"), default="inferred")
 
     return TurnClassification(
         turn_type=turn_type,
+        scene=scene,
+        access=access,
+        deliver=deliver,
         session_mode_update=session_update,
-        requested_capabilities=requested_capabilities,
+        requested_capabilities=legacy_capabilities,
         target_resources=target_resources,
         task_plan=task_plan,
         routing_basis=routing_basis,
@@ -327,6 +381,8 @@ def _fallback_classification(
     if text.startswith("/"):
         return TurnClassification(
             turn_type="command",
+            scene="control",
+            access="none",
             routing_basis="fallback",
             confidence=0.7,
             reason="slash command fallback",
@@ -335,15 +391,36 @@ def _fallback_classification(
     if active_repo_id and _looks_like_registered_repo_status_request(text):
         return TurnClassification(
             turn_type="coding",
+            scene="project",
+            access="read",
             session_mode_update="coding",
             active_repo_id_update=active_repo_id,
-            requested_capabilities=("workspace.inspect",),
             routing_basis="explicit",
             confidence=0.85,
             reason="registered repository status request",
             source="fallback",
         )
-    return TurnClassification(turn_type="chat", confidence=0.6, reason="default chat", source="fallback")
+    project_access = _fallback_project_access(text)
+    if project_access is not None:
+        return TurnClassification(
+            turn_type="coding",
+            scene="project",
+            access=project_access,
+            session_mode_update="coding",
+            active_repo_id_update=active_repo_id,
+            routing_basis="fallback",
+            confidence=0.75,
+            reason="project work fallback",
+            source="fallback",
+        )
+    return TurnClassification(
+        turn_type="chat",
+        scene="chat",
+        access="none",
+        confidence=0.6,
+        reason="default chat",
+        source="fallback",
+    )
 
 
 def _with_target_resource(classification: TurnClassification, active_repo_id: str | None) -> TurnClassification:
@@ -367,9 +444,11 @@ def _target_resources_for_repo(repo_id: str | None) -> tuple[TargetResource, ...
 
 
 def _classification_targets_workspace(classification: TurnClassification) -> bool:
+    if classification.scene == "project":
+        return True
     if classification.turn_type == "coding":
         return True
-    return any(str(capability).startswith("workspace.") for capability in classification.requested_capabilities)
+    return False
 
 
 def _detect_registered_repo_reference(text: str) -> str | None:
@@ -423,6 +502,44 @@ def _looks_like_registered_repo_status_request(text: str) -> bool:
     return any(marker in lowered for marker in markers)
 
 
+def _fallback_project_access(text: str) -> AccessLevel | None:
+    lowered = text.lower()
+    path_markers = (
+        "app/",
+        "app\\",
+        "tests/",
+        "tests\\",
+        ".py",
+        ".md",
+        ".json",
+        ".yaml",
+        ".yml",
+        "readme",
+        "dockerfile",
+    )
+    project_markers = (
+        "项目",
+        "仓库",
+        "repo",
+        "repository",
+        "code",
+        "bug",
+        "文件",
+        "file",
+    )
+    if not any(marker in lowered for marker in (*path_markers, *project_markers)):
+        return None
+    if any(marker in lowered for marker in ("push", "推送")):
+        return "push"
+    if any(marker in lowered for marker in ("commit", "提交")):
+        return "commit"
+    if any(marker in lowered for marker in ("fix", "修改", "更新", "改", "edit", "write", "generate", "生成", "创建")):
+        return "write"
+    if any(marker in lowered for marker in ("inspect", "查看", "看下", "读取", "read", "review", "分析")):
+        return "read"
+    return None
+
+
 def _coerce_confidence(value: Any) -> float:
     try:
         confidence = float(value)
@@ -441,14 +558,89 @@ def _coerce_payload_confidence(payload: dict[str, Any]) -> float:
     return 0.8
 
 
-def _coerce_capabilities(value: Any) -> tuple[Capability, ...]:
+def _coerce_legacy_capabilities(value: Any) -> tuple[str, ...]:
     if not isinstance(value, list):
         return ()
-    capabilities: list[Capability] = []
+    capabilities: list[str] = []
     for item in value:
-        if isinstance(item, str) and item in _CAPABILITIES and item not in capabilities:
-            capabilities.append(item)  # type: ignore[arg-type]
+        if isinstance(item, str) and item in _LEGACY_CAPABILITY_LABELS and item not in capabilities:
+            capabilities.append(item)
     return tuple(capabilities)
+
+
+def _coerce_access(value: Any) -> AccessLevel | None:
+    if value in _ACCESS_LEVELS:
+        return value  # type: ignore[return-value]
+    return None
+
+
+def _scene_from_legacy(turn_type: TurnType | str | None, capabilities: tuple[str, ...]) -> Scene:
+    capability_set = set(capabilities)
+    if turn_type == "command":
+        if "reminder.manage" in capability_set:
+            return "reminder"
+        return "control"
+    if "reminder.manage" in capability_set:
+        return "reminder"
+    if turn_type == "research":
+        return "research"
+    if turn_type in {"coding", "image_generation"}:
+        return "project"
+    if any(str(capability).startswith(("workspace.", "code.")) for capability in capability_set) or capability_set & {
+        "artifact.generate",
+        "artifact.revise",
+        "image.generate",
+    }:
+        return "project"
+    if "research.deep" in capability_set or "web.search" in capability_set:
+        return "research"
+    return "chat"
+
+
+def _access_from_legacy(turn_type: TurnType | str | None, capabilities: tuple[str, ...]) -> AccessLevel:
+    capability_set = set(capabilities)
+    if capability_set & {"workspace.edit", "workspace.test", "code.edit", "code.test", "artifact.generate", "artifact.revise", "image.generate"}:
+        return "write"
+    if (
+        turn_type in {"coding", "research", "image_generation"}
+        or capability_set & {"workspace.inspect", "workspace.read_file", "workspace.search_files", "workspace.report", "code.inspect"}
+    ):
+        return "read"
+    return "none"
+
+
+def _deliver_from_legacy(capabilities: tuple[str, ...]) -> bool:
+    return "artifact.deliver" in set(capabilities)
+
+
+def _legacy_capabilities_from_scene(scene: Scene, access: AccessLevel, deliver: bool) -> tuple[str, ...]:
+    capabilities: list[str] = []
+    if scene == "research":
+        capabilities.extend(["research.deep", "web.search"])
+    elif scene == "reminder":
+        capabilities.append("reminder.manage")
+    elif scene == "project":
+        if access == "read":
+            capabilities.append("workspace.inspect")
+        elif access in {"write", "commit", "push"}:
+            capabilities.append("workspace.edit")
+    if deliver:
+        capabilities.append("artifact.deliver")
+    return tuple(dict.fromkeys(capabilities))
+
+
+def _turn_type_from_scene(scene: Scene, legacy_turn_type: Any) -> TurnType:
+    if legacy_turn_type in _TURN_TYPES:
+        if legacy_turn_type == "command" and scene != "control":
+            return "chat"
+        return legacy_turn_type  # type: ignore[return-value]
+    if scene == "control":
+        return "command"
+    if scene == "research":
+        return "research"
+    if scene == "project":
+        return "coding"
+    return "chat"
 
 
 def _coerce_target_resources(value: Any) -> tuple[TargetResource, ...]:

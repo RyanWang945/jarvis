@@ -56,7 +56,7 @@ class SchedulerService:
         if not parsed.ok or parsed.next_run_at is None or parsed.schedule_expr is None:
             return CreateReminderResponse(None, f"时间不够明确：{parsed.reason or request.time_text}", False)
         if parsed.confidence < 0.8:
-            return None, "时间不够明确，请补充具体日期或时间。"
+            return CreateReminderResponse(None, "时间不够明确，请补充具体日期或时间。", False)
 
         job = self._store.create_job(
             conversation_id=request.conversation_id,
@@ -78,7 +78,7 @@ class SchedulerService:
                 "parser_confidence": parsed.confidence,
             },
         )
-        return CreateReminderResponse(_job(job), _format_created_reply(job))
+        return CreateReminderResponse(_job(job), _format_created_reply(job), True)
 
     def list_reminders(self, conversation_id: int) -> list[ReminderJob]:
         return [_job(record) for record in self._store.list_jobs(conversation_id)]

@@ -26,3 +26,13 @@ def test_parse_relative_minutes() -> None:
 
     assert parsed.ok is True
     assert parsed.next_run_at.isoformat() == "2026-05-04T00:50:00+00:00"
+
+
+def test_parse_iso_datetime_with_timezone() -> None:
+    parsed = parse_one_shot_time("2026-05-13T18:54:05+08:00", timezone="Asia/Shanghai")
+
+    assert parsed.ok is True
+    assert parsed.schedule_kind == "at"
+    assert parsed.reason == "iso datetime"
+    assert parsed.schedule_expr == "2026-05-13T18:54:05+08:00"
+    assert parsed.next_run_at.isoformat() == "2026-05-13T10:54:05+00:00"

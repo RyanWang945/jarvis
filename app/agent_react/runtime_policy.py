@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from app.agent_react.session_state import SessionMode
-from app.agent_react.turn_classifier import Capability, TurnType
+from app.agent_react.turn_classifier import AccessLevel, Scene, TurnType
 
 WritebackStrategy = Literal["basic", "research", "coding", "none"]
 
@@ -20,13 +20,12 @@ class RuntimePolicy:
     writeback_strategy: WritebackStrategy = "basic"
 
 
-_BASE_READ_TOOLS = (
+_CHAT_TOOLS = (
     "obsidian_wiki_query",
     "business_knowledge_search",
-    "read_file",
-    "search_files",
     "ask_user",
 )
+_PROJECT_READ_TOOLS = ("read_file", "search_files", "delegate_to_codex")
 _BASE_DISCOVERY_TOOLS = ("tool_search",)
 _WORKFLOW_GUIDANCE_TOOLS = ("load_skill_guidance",)
 _ACTION_TOOLS = ("scheduled_task",)
@@ -36,27 +35,26 @@ _KB_WRITE_TOOLS = (
     "obsidian_wiki_apply",
 )
 _ARTIFACT_DELIVERY_TOOLS = ("deliver_file",)
-_ARTIFACT_DELIVERY_CAPABILITIES = {
+_LEGACY_ARTIFACT_DELIVERY_LABELS = {
     "artifact.deliver",
 }
-_ARTIFACT_GENERATION_CAPABILITIES = {
+_LEGACY_ARTIFACT_GENERATION_LABELS = {
     "artifact.generate",
     "artifact.revise",
 }
 _WORKSPACE_FILE_TOOLS = ("read_file", "search_files")
-_WORKSPACE_FILE_CAPABILITIES = {
+_LEGACY_WORKSPACE_FILE_LABELS = {
     "workspace.read_file",
     "workspace.search_files",
 }
 _WORKSPACE_CODE_TOOLS = ("delegate_to_codex",)
-_WORKSPACE_CODE_CAPABILITIES = {
+_LEGACY_WORKSPACE_CODE_LABELS = {
     "workspace.inspect",
     "workspace.edit",
     "workspace.test",
     "workspace.report",
 }
-_WORKSPACE_CAPABILITIES = _WORKSPACE_FILE_CAPABILITIES | _WORKSPACE_CODE_CAPABILITIES
-_ARTIFACT_CAPABILITIES = _ARTIFACT_DELIVERY_CAPABILITIES | _ARTIFACT_GENERATION_CAPABILITIES
+_LEGACY_WORKSPACE_LABELS = _LEGACY_WORKSPACE_FILE_LABELS | _LEGACY_WORKSPACE_CODE_LABELS
 _CODE_CAPABILITY_ALIASES = {
     "code.inspect": "workspace.inspect",
     "code.edit": "workspace.edit",
@@ -69,17 +67,47 @@ def resolve_runtime_policy(
     *,
     session_mode: SessionMode,
     turn_type: TurnType | str,
-    requested_capabilities: tuple[Capability | str, ...] = (),
+    legacy_capabilities: tuple[str, ...] = (),
+    requested_capabilities: tuple[str, ...] | None = None,
+    scene: Scene | str | None = None,
+    access: AccessLevel | str | None = None,
+    deliver: bool | None = None,
 ) -> RuntimePolicy:
-    capabilities = _normalize_capabilities(requested_capabilities)
-    mode = _mode_for_turn(turn_type)
+    raw_legacy_capabilities = legacy_capabilities
+    if requested_capabilities is not None:
+        raw_legacy_capabilities = (*raw_legacy_capabilities, *requested_capabilities)
+    legacy_capability_set = _normalize_legacy_capabilities(raw_legacy_capabilities)
+    if scene is None:
+        scene = _scene_from_legacy(turn_type, legacy_capability_set)
+    else:
+        scene = _normalize_scene(scene)
+    if scene is None:
+        scene = "chat"
+    if access is None:
+        access = _access_from_legacy(turn_type, legacy_capability_set)
+    else:
+        access = _normalize_access(access)
+    if deliver is None:
+        deliver = bool(legacy_capability_set & _LEGACY_ARTIFACT_DELIVERY_LABELS)
 
-    if mode == "command" and "reminder.manage" in capabilities:
-        mode = "chat"
-    if mode == "command" and "artifact.deliver" in capabilities:
-        mode = "chat"
+    return _resolve_scene_policy(
+        session_mode=session_mode,
+        scene=scene,
+        access=access,
+        deliver=deliver,
+        legacy_capabilities=legacy_capability_set,
+    )
 
-    if mode == "command":
+
+def _resolve_scene_policy(
+    *,
+    session_mode: SessionMode,
+    scene: Scene,
+    access: AccessLevel,
+    deliver: bool,
+    legacy_capabilities: set[str],
+) -> RuntimePolicy:
+    if scene == "control":
         return RuntimePolicy(
             mode="command",
             allowed_tools=_BASE_DISCOVERY_TOOLS,
@@ -88,55 +116,118 @@ def resolve_runtime_policy(
             search_budget=0,
             writeback_strategy="none",
         )
-    if mode == "image_generation":
-        return RuntimePolicy(
-            mode="image_generation",
-            allowed_tools=(*_BASE_DISCOVERY_TOOLS, *_WORKFLOW_GUIDANCE_TOOLS, *_WORKSPACE_CODE_TOOLS),
-            context_sections=("session_state", "workspace_protocol"),
-            max_steps=4,
-            search_budget=0,
-            writeback_strategy="basic",
-        )
 
-    allowed_tools: list[str] = [*_BASE_READ_TOOLS, *_BASE_DISCOVERY_TOOLS, *_WORKFLOW_GUIDANCE_TOOLS]
+    allowed_tools: list[str] = [*_BASE_DISCOVERY_TOOLS, *_WORKFLOW_GUIDANCE_TOOLS]
     context_sections: list[str] = ["session_state"]
+    mode = scene
 
-    if "reminder.manage" in capabilities:
-        allowed_tools.extend(_ACTION_TOOLS)
-    if "web.search" in capabilities:
+    if scene == "chat":
+        allowed_tools.extend(_CHAT_TOOLS)
+    elif scene == "research":
+        allowed_tools.extend((*_CHAT_TOOLS, *_WEB_TOOLS))
+        context_sections.append("research_protocol")
+        if legacy_capabilities & (_LEGACY_WORKSPACE_LABELS | {"code.inspect", "code.edit", "code.test"}):
+            allowed_tools.extend(_WORKSPACE_CODE_TOOLS)
+            context_sections.append("workspace_protocol")
+        mode = "research"
+    elif scene == "reminder":
+        allowed_tools.extend(("ask_user", *_ACTION_TOOLS))
+        mode = "chat"
+    elif scene == "project":
+        if access == "read":
+            allowed_tools.extend(("ask_user", *_PROJECT_READ_TOOLS))
+            context_sections.extend(("workspace_file_protocol", "workspace_protocol"))
+        else:
+            allowed_tools.extend(("ask_user", *_WORKSPACE_CODE_TOOLS))
+            context_sections.append("workspace_protocol")
+        mode = "coding"
+
+    if "web.search" in legacy_capabilities and scene != "research":
         allowed_tools.extend(_WEB_TOOLS)
-    if "kb.write" in capabilities:
+        context_sections.append("web_search_protocol")
+    if "kb.write" in legacy_capabilities:
         allowed_tools.extend(_KB_WRITE_TOOLS)
-    if capabilities & _ARTIFACT_DELIVERY_CAPABILITIES:
+    if deliver:
         allowed_tools.extend(_ARTIFACT_DELIVERY_TOOLS)
         context_sections.append("artifact_delivery_protocol")
-    if capabilities & _WORKSPACE_FILE_CAPABILITIES:
-        allowed_tools.extend(_WORKSPACE_FILE_TOOLS)
-        context_sections.append("workspace_file_protocol")
-    if capabilities & (_WORKSPACE_CODE_CAPABILITIES | _ARTIFACT_GENERATION_CAPABILITIES):
-        allowed_tools.extend(_WORKSPACE_CODE_TOOLS)
-        context_sections.append("workspace_protocol")
-
-    if mode == "research" or "research.deep" in capabilities:
-        context_sections.append("research_protocol")
-    elif mode == "summary":
-        context_sections.append("summary_protocol")
-    elif session_mode == "research":
-        context_sections.append("research_background")
-    elif session_mode == "coding" and not capabilities & (_WORKSPACE_CAPABILITIES | _ARTIFACT_CAPABILITIES):
-        context_sections.append("coding_background")
+        if scene == "chat":
+            allowed_tools.extend(_WORKSPACE_FILE_TOOLS)
+            context_sections.append("workspace_file_protocol")
 
     return RuntimePolicy(
         mode=mode,
         allowed_tools=tuple(dict.fromkeys(allowed_tools)),
         context_sections=tuple(dict.fromkeys(context_sections)),
-        max_steps=_max_steps(mode, capabilities),
-        search_budget=_search_budget(mode, capabilities),
+        max_steps=_max_steps_for_scene(scene, access, legacy_capabilities),
+        search_budget=_search_budget_for_scene(scene, legacy_capabilities),
         writeback_strategy=_writeback_strategy(mode),
     )
 
 
-def _normalize_capabilities(capabilities: tuple[Capability | str, ...]) -> set[str]:
+def _normalize_scene(scene: Scene | str | None) -> Scene | None:
+    if scene in {"chat", "project", "research", "reminder", "control"}:
+        return scene  # type: ignore[return-value]
+    return None
+
+
+def _normalize_access(access: AccessLevel | str | None) -> AccessLevel:
+    if access in {"none", "read", "write", "commit", "push"}:
+        return access  # type: ignore[return-value]
+    return "none"
+
+
+def _scene_from_legacy(turn_type: TurnType | str, capabilities: set[str]) -> Scene | None:
+    if turn_type == "command":
+        if "reminder.manage" in capabilities:
+            return "reminder"
+        if "artifact.deliver" in capabilities:
+            return "chat"
+        return "control"
+    if "reminder.manage" in capabilities:
+        return "reminder"
+    if turn_type == "research":
+        return "research"
+    if turn_type in {"coding", "image_generation"}:
+        return "project"
+    if (
+        capabilities & (_LEGACY_WORKSPACE_LABELS | _LEGACY_ARTIFACT_GENERATION_LABELS)
+        or {"code.inspect", "code.edit", "code.test"} & capabilities
+    ):
+        return "project"
+    if "research.deep" in capabilities or "web.search" in capabilities:
+        return "research"
+    if "artifact.deliver" in capabilities:
+        return "chat"
+    return "chat"
+
+
+def _access_from_legacy(turn_type: TurnType | str, capabilities: set[str]) -> AccessLevel:
+    if capabilities & {"workspace.edit", "workspace.test", "code.edit", "code.test", "artifact.generate", "artifact.revise", "image.generate"}:
+        return "write"
+    if turn_type in {"coding", "research", "image_generation"} or capabilities & (
+        _LEGACY_WORKSPACE_LABELS | {"code.inspect"}
+    ):
+        return "read"
+    return "none"
+
+
+def _max_steps_for_scene(scene: Scene, access: AccessLevel, legacy_capabilities: set[str]) -> int:
+    if scene == "research":
+        return 10
+    if scene == "project":
+        return 8
+    if access in {"write", "commit", "push"}:
+        return 8
+    return 6
+
+
+def _search_budget_for_scene(scene: Scene, legacy_capabilities: set[str]) -> int:
+    if scene == "research" or "web.search" in legacy_capabilities:
+        return 10
+    return 0
+
+
+def _normalize_legacy_capabilities(capabilities: tuple[str, ...]) -> set[str]:
     normalized: set[str] = set()
     for capability in capabilities:
         value = str(capability)
@@ -145,28 +236,6 @@ def _normalize_capabilities(capabilities: tuple[Capability | str, ...]) -> set[s
         if alias is not None:
             normalized.add(alias)
     return normalized
-
-
-def _mode_for_turn(turn_type: TurnType | str) -> str:
-    if turn_type in {"research", "coding", "summary", "command", "image_generation"}:
-        return str(turn_type)
-    return "chat"
-
-
-def _max_steps(mode: str, capabilities: set[str]) -> int:
-    if mode == "research" or "research.deep" in capabilities:
-        return 10
-    if capabilities & _WORKSPACE_CAPABILITIES:
-        return 8
-    if mode == "summary":
-        return 4
-    return 6
-
-
-def _search_budget(mode: str, capabilities: set[str]) -> int:
-    if "web.search" not in capabilities:
-        return 0
-    return 10
 
 
 def _writeback_strategy(mode: str) -> WritebackStrategy:
