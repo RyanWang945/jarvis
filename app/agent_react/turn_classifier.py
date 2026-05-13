@@ -125,7 +125,7 @@ def classify_turn(
     if llm is not None:
         return _with_target_resource(llm, active_repo_id)
 
-    return _with_target_resource(_fallback_classification(text, current), active_repo_id)
+    return _with_target_resource(_fallback_classification(text, current, active_repo_id=active_repo_id), active_repo_id)
 
 
 def should_apply_session_mode_update(classification: TurnClassification) -> bool:
@@ -205,7 +205,12 @@ def _llm_classification(
             content=(
                 "Classify the next Jarvis turn. Return compact JSON only. "
                 "Do not answer the user. Allowed turn_type values: chat, research, coding, "
-                "summary, command, image_generation. Allowed session_mode_update values: "
+                "summary, command, image_generation. Use command only for explicit Jarvis "
+                "runtime control slash commands such as /status, /clear, /cancel, /repos, "
+                "or /model. Do not use command for ordinary user tasks such as reminders, "
+                "file delivery, web search, repository work, or knowledge-base operations; "
+                "use chat/research/coding/image_generation plus requested_capabilities instead. "
+                "Allowed session_mode_update values: "
                 "chat, research, coding, or null. Return requested_capabilities as atomic labels "
                 "from: response.text, web.search, kb.search, kb.write, workspace.read_file, workspace.search_files, "
                 "workspace.inspect, workspace.edit, workspace.test, workspace.report, research.deep, "
@@ -216,7 +221,8 @@ def _llm_classification(
                 "Use workspace.search_files for lightweight workspace path lookup, file existence checks, "
                 "or bounded text search. "
                 "Use workspace.inspect for local repository understanding that needs multi-file reasoning, "
-                "code review, architecture analysis, runtime design, or prior local work products. "
+                "project/repository status, git status, code review, architecture analysis, runtime design, "
+                "or prior local work products. "
                 "Use workspace.report when the user asks for a local project report/review. "
                 "Use artifact.deliver when the final user-visible output is an existing local file, image, document, "
                 "or prior artifact delivered to the remote conversation. Do not use workspace.read_file as the "
@@ -267,16 +273,18 @@ def _llm_classification(
         logger.exception("turn classifier llm call failed")
         return None
 
-    return _classification_from_payload(payload)
+    return _classification_from_payload(payload, text=text)
 
 
-def _classification_from_payload(payload: dict[str, Any]) -> TurnClassification | None:
+def _classification_from_payload(payload: dict[str, Any], *, text: str = "") -> TurnClassification | None:
     raw_turn_type = payload.get("turn_type")
     if raw_turn_type not in _TURN_TYPES:
         return None
 
     confidence = _coerce_payload_confidence(payload)
     turn_type: TurnType = raw_turn_type  # type: ignore[assignment]
+    if turn_type == "command" and not text.lstrip().startswith("/"):
+        turn_type = "chat"
     if confidence < _CONFIDENCE_THRESHOLD:
         return TurnClassification(
             turn_type="chat",
@@ -310,13 +318,29 @@ def _classification_from_payload(payload: dict[str, Any]) -> TurnClassification 
     )
 
 
-def _fallback_classification(text: str, session_state: ConversationSessionState) -> TurnClassification:
+def _fallback_classification(
+    text: str,
+    session_state: ConversationSessionState,
+    *,
+    active_repo_id: str | None = None,
+) -> TurnClassification:
     if text.startswith("/"):
         return TurnClassification(
             turn_type="command",
             routing_basis="fallback",
             confidence=0.7,
             reason="slash command fallback",
+            source="fallback",
+        )
+    if active_repo_id and _looks_like_registered_repo_status_request(text):
+        return TurnClassification(
+            turn_type="coding",
+            session_mode_update="coding",
+            active_repo_id_update=active_repo_id,
+            requested_capabilities=("workspace.inspect",),
+            routing_basis="explicit",
+            confidence=0.85,
+            reason="registered repository status request",
             source="fallback",
         )
     return TurnClassification(turn_type="chat", confidence=0.6, reason="default chat", source="fallback")
@@ -358,6 +382,36 @@ def _contains_identifier(text: str, identifier: str) -> bool:
     if not identifier:
         return False
     return bool(re.search(rf"(?<![a-z0-9_-]){re.escape(identifier)}(?![a-z0-9_-])", text))
+
+
+def _looks_like_registered_repo_status_request(text: str) -> bool:
+    lowered = text.lower()
+    markers = (
+        "项目状态",
+        "仓库状态",
+        "当前状态",
+        "现在状态",
+        "状态",
+        "git status",
+        "repo status",
+        "repository status",
+        "working tree",
+        "工作区",
+        "分支",
+        "branch",
+        "未提交",
+        "未暂存",
+        "未跟踪",
+        "uncommitted",
+        "untracked",
+        "dirty",
+        "ahead",
+        "behind",
+        "最近提交",
+        "latest commit",
+        "recent commit",
+    )
+    return any(marker in lowered for marker in markers)
 
 
 def _coerce_confidence(value: Any) -> float:

@@ -716,6 +716,9 @@ def _looks_like_file_delivery_request(text: str) -> bool:
         marker in text
         for marker in (
             "发给我",
+            "给我",
+            "拿给我",
+            "传给我",
             "发送",
             "重发",
             "重新发",

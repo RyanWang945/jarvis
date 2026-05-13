@@ -11,7 +11,7 @@ def run_deliver_file(request: ToolExecutionRequest) -> ToolExecutionResult:
     from app.agent_react.delivery import get_delivery_manager
 
     artifact_id = str(request.args.get("artifact_id") or "").strip()
-    raw_path = str(request.args.get("path") or "").strip()
+    raw_path = str(request.args.get("path") or request.args.get("file_path") or "").strip()
     platform = str(request.args.get("platform") or "").strip()
     external_chat_id = str(request.args.get("external_chat_id") or "").strip()
     conversation_id = _optional_int(request.args.get("conversation_id"))

@@ -18,6 +18,18 @@ def test_parse_json_content_uses_first_json_object() -> None:
     assert parsed == {"turn_type": "chat", "confidence": 0.8}
 
 
+def test_parse_json_content_accepts_wrapped_or_prefixed_json() -> None:
+    assert parse_json_content({"content": '```json\n{"turn_type":"coding"}\n```'}) == {"turn_type": "coding"}
+    assert parse_json_content(
+        {
+            "content": (
+                '[{"turn_type":"coding","requested_capabilities":["workspace.inspect"]}]\n'
+                '{"extra":"provider accidentally emitted more data"}'
+            )
+        }
+    ) == {"turn_type": "coding", "requested_capabilities": ["workspace.inspect"]}
+
+
 def test_provider_adapter_normalizes_tool_call_args_dict_and_usage_aliases() -> None:
     normalized = normalize_response(
         {

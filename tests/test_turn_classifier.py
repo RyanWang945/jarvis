@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from app.agent_react.session_state import ConversationSessionState
 from app.agent_react.turn_classifier import (
     classification_to_metadata,
@@ -56,6 +58,35 @@ def test_low_confidence_fallback_does_not_force_session_update() -> None:
     assert classification.turn_type == "chat"
     assert classification.session_mode_update is None
     assert should_apply_session_mode_update(classification) is False
+
+
+def test_registered_repo_status_fallback_uses_workspace_inspect(monkeypatch) -> None:
+    repo = Path.cwd()
+    registry = RepositoryRegistry(
+        [
+            RepositoryRef(
+                repo_id="nltk",
+                name="NLTK",
+                root_path=repo,
+                canonical_root_path=repo.resolve(),
+            )
+        ]
+    )
+    monkeypatch.setattr("app.agent_react.turn_classifier.get_repository_registry", lambda: registry)
+
+    classification = classify_turn(
+        content="看下nltk项目的状态",
+        session_state=ConversationSessionState(),
+    )
+
+    assert classification.turn_type == "coding"
+    assert classification.session_mode_update == "coding"
+    assert classification.active_repo_id_update == "nltk"
+    assert classification.requested_capabilities == ("workspace.inspect",)
+    assert classification.target_resources[0].id == "nltk"
+    assert classification.source == "fallback"
+    assert should_apply_session_mode_update(classification) is True
+    assert should_apply_repo_update(classification) is True
 
 
 def test_current_info_request_uses_llm_classification(monkeypatch) -> None:
@@ -168,7 +199,7 @@ def test_llm_classifier_accepts_reminder_capability(monkeypatch) -> None:
         session_state=ConversationSessionState(),
     )
 
-    assert classification.turn_type == "command"
+    assert classification.turn_type == "chat"
     assert classification.requested_capabilities == ("reminder.manage",)
     assert classification.routing_basis == "explicit"
     assert classification.source == "llm"
@@ -280,6 +311,33 @@ def test_llm_classifier_accepts_artifact_delivery_capability(monkeypatch) -> Non
     assert classification.requested_capabilities == ("workspace.search_files", "artifact.deliver")
     assert classification.task_plan["objective"] == "deliver_existing_file"
     assert classification.task_plan["final_deliverable"] == "image_attachment"
+    get_settings.cache_clear()
+
+
+def test_llm_classifier_coerces_non_slash_command_to_chat(monkeypatch) -> None:
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setenv("JARVIS_DEEPSEEK_API_KEY", "test-key")
+    get_settings.cache_clear()
+
+    def _fake_chat(self, messages, response_format=None, tools=None, tool_choice=None):
+        return {
+            "content": (
+                '{"turn_type":"command","session_mode_update":null,'
+                '"requested_capabilities":["artifact.deliver"],'
+                '"routing_basis":"explicit","confidence":0.9,"reason":"deliver file"}'
+            )
+        }
+
+    monkeypatch.setattr(ChatClient, "chat", _fake_chat)
+
+    classification = classify_turn(
+        content=r"jarvis项目的这个文件E:\pythonProject\jarvis\jarvis-architecture-interview-v2.png给我",
+        session_state=ConversationSessionState(),
+    )
+
+    assert classification.turn_type == "chat"
+    assert classification.requested_capabilities == ("artifact.deliver",)
+    assert classification.source == "llm"
     get_settings.cache_clear()
 
 

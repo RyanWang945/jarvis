@@ -89,3 +89,58 @@ def test_deliver_file_sends_artifact_once_with_delivery_manager(monkeypatch) -> 
         artifact_id=artifact.artifact_id,
         purposes=("explicit",),
     ) is not None
+
+
+def test_deliver_file_accepts_file_path_alias(monkeypatch) -> None:
+    store = InMemoryConversationStore()
+    artifact_dir = Path(".pytest_tmp_deliver_file_alias")
+    artifact_dir.mkdir(exist_ok=True)
+    image_path = artifact_dir / "diagram.png"
+    image_path.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+
+    class FakeHandler:
+        channel = "feishu"
+
+        def upload_attachment(self, attachment):
+            return "image_key_1"
+
+        def send_attachment(self, external_chat_id, attachment, upload_key):
+            return "om_1"
+
+        def send_failure_notice(self, external_chat_id, attachment, error_message):
+            raise AssertionError(error_message)
+
+    register_delivery_handler(FakeHandler())
+
+    def _fake_registry():
+        return SimpleNamespace(
+            list_repositories=lambda: [
+                SimpleNamespace(canonical_root_path=artifact_dir.resolve()),
+            ],
+        )
+
+    monkeypatch.setattr("app.tools.deliver_file._conversation_store", lambda: store)
+    monkeypatch.setattr("app.agent_react.artifacts.get_repository_registry", _fake_registry)
+
+    try:
+        result = run_deliver_file(
+            ToolExecutionRequest(
+                tool_name="deliver_file",
+                workdir=None,
+                args={
+                    "file_path": str(image_path),
+                    "conversation_id": 7,
+                    "turn_id": 42,
+                    "platform": "feishu",
+                    "external_chat_id": "chat_1",
+                },
+            )
+        )
+    finally:
+        try:
+            image_path.unlink()
+            artifact_dir.rmdir()
+        except OSError:
+            pass
+
+    assert result.ok

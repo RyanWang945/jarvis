@@ -76,6 +76,8 @@ def resolve_runtime_policy(
 
     if mode == "command" and "reminder.manage" in capabilities:
         mode = "chat"
+    if mode == "command" and "artifact.deliver" in capabilities:
+        mode = "chat"
 
     if mode == "command":
         return RuntimePolicy(

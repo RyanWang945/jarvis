@@ -59,6 +59,19 @@ def test_reminder_capability_overrides_command_no_tools_policy() -> None:
     assert policy.max_steps > 1
 
 
+def test_artifact_delivery_capability_overrides_command_no_tools_policy() -> None:
+    policy = resolve_runtime_policy(
+        session_mode="chat",
+        turn_type="command",
+        requested_capabilities=("artifact.deliver",),
+    )
+
+    assert policy.mode == "chat"
+    assert "deliver_file" in policy.allowed_tools
+    assert "artifact_delivery_protocol" in policy.context_sections
+    assert policy.max_steps > 1
+
+
 def test_command_policy_keeps_tool_search_as_internal_fallback() -> None:
     policy = resolve_runtime_policy(session_mode="chat", turn_type="command")
 

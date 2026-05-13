@@ -595,6 +595,10 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
                         "type": "string",
                         "description": "Workspace-local file path fallback when artifact_id is unavailable.",
                     },
+                    "file_path": {
+                        "type": "string",
+                        "description": "Deprecated alias for path.",
+                    },
                     "filename": {
                         "type": "string",
                         "description": "Optional display filename.",
@@ -603,6 +607,7 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
                 "anyOf": [
                     {"required": ["artifact_id"]},
                     {"required": ["path"]},
+                    {"required": ["file_path"]},
                 ],
             },
             handler=run_deliver_file,

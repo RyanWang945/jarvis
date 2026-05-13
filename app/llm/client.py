@@ -126,14 +126,31 @@ def parse_json_content(message: dict[str, Any]) -> dict[str, Any]:
     content = message.get("content")
     if not isinstance(content, str) or not content.strip():
         return {}
-    parsed = json.loads(_extract_first_json_object(content))
+    parsed = _extract_first_json_value(content)
     return parsed if isinstance(parsed, dict) else {}
 
 
-def _extract_first_json_object(content: str) -> str:
+def _extract_first_json_value(content: str) -> Any:
     text = content.strip()
     decoder = json.JSONDecoder()
-    parsed, end = decoder.raw_decode(text)
-    if isinstance(parsed, dict):
-        return text[:end]
-    return text
+    for index, char in enumerate(text):
+        if char not in "{[":
+            continue
+        try:
+            parsed, _end = decoder.raw_decode(text, index)
+        except json.JSONDecodeError:
+            continue
+        candidate = _first_json_object(parsed)
+        if candidate is not None:
+            return candidate
+    return {}
+
+
+def _first_json_object(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, list):
+        for item in value:
+            if isinstance(item, dict):
+                return item
+    return None
