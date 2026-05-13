@@ -383,7 +383,7 @@ def test_registered_repo_code_request_uses_llm_workspace_capabilities(monkeypatc
     assert classification.target_resources[0].id == "nltk"
     assert classification.source == "llm"
     assert should_apply_session_mode_update(classification) is True
-    assert should_apply_repo_update(classification) is False
+    assert should_apply_repo_update(classification) is True
     get_settings.cache_clear()
 
 
@@ -422,7 +422,7 @@ def test_registered_repo_design_request_uses_llm_workspace_inspect(monkeypatch, 
 
     assert classification.turn_type == "coding"
     assert classification.session_mode_update == "coding"
-    assert classification.active_repo_id_update is None
+    assert classification.active_repo_id_update == "jarvis"
     assert "workspace.inspect" in classification.requested_capabilities
     assert classification.target_resources[0].id == "jarvis"
     get_settings.cache_clear()
@@ -536,4 +536,5 @@ def test_registered_repo_review_with_latest_release_notes_uses_llm_capabilities(
     assert "workspace.inspect" in classification.requested_capabilities
     assert "web.search" in classification.requested_capabilities
     assert classification.target_resources[0].id == "nltk"
+    assert should_apply_repo_update(classification) is True
     get_settings.cache_clear()

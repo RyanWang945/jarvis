@@ -352,15 +352,24 @@ def _with_target_resource(classification: TurnClassification, active_repo_id: st
     resources = classification.target_resources
     if not any(resource.type == "repository" and resource.id == active_repo_id for resource in resources):
         resources = (*resources, TargetResource(type="repository", id=active_repo_id))
-    if resources == classification.target_resources:
+    active_repo_id_update = classification.active_repo_id_update
+    if active_repo_id_update is None and _classification_targets_workspace(classification):
+        active_repo_id_update = active_repo_id
+    if resources == classification.target_resources and active_repo_id_update == classification.active_repo_id_update:
         return classification
-    return replace(classification, target_resources=resources)
+    return replace(classification, target_resources=resources, active_repo_id_update=active_repo_id_update)
 
 
 def _target_resources_for_repo(repo_id: str | None) -> tuple[TargetResource, ...]:
     if not repo_id:
         return ()
     return (TargetResource(type="repository", id=repo_id),)
+
+
+def _classification_targets_workspace(classification: TurnClassification) -> bool:
+    if classification.turn_type == "coding":
+        return True
+    return any(str(capability).startswith("workspace.") for capability in classification.requested_capabilities)
 
 
 def _detect_registered_repo_reference(text: str) -> str | None:
