@@ -9,6 +9,7 @@ from typing import Any
 import sqlalchemy as sa
 from sqlalchemy import create_engine
 
+from app.agent_react.artifact_context import artifact_records_to_context
 from app.agent_react.session_state import (
     ConversationSessionState,
     dump_session_state,
@@ -656,6 +657,33 @@ class MySQLConversationStore:
             ).mappings().all()
             return [self._artifact_from_row(row) for row in rows]
 
+    def list_recent_artifacts_by_conversation(self, conversation_id: int, *, limit: int = 5) -> list[ArtifactRecord]:
+        safe_limit = max(1, min(int(limit or 5), 20))
+        with self._engine.begin() as conn:
+            return self._list_recent_artifacts_by_conversation(conn, conversation_id, limit=safe_limit)
+
+    def _list_recent_artifacts_by_conversation(
+        self,
+        conn: sa.Connection,
+        conversation_id: int,
+        *,
+        limit: int = 5,
+    ) -> list[ArtifactRecord]:
+        safe_limit = max(1, min(int(limit or 5), 20))
+        try:
+            rows = conn.execute(
+                sa.text(
+                    "SELECT * FROM artifacts "
+                    "WHERE conversation_id = :conversation_id AND status = 'available' "
+                    f"ORDER BY updated_at DESC, id DESC LIMIT {safe_limit}"
+                ),
+                {"conversation_id": conversation_id},
+            ).mappings().all()
+        except sa.exc.SQLAlchemyError:
+            logger.warning("recent artifact context unavailable conversation_id=%s", conversation_id, exc_info=True)
+            return []
+        return [self._artifact_from_row(row) for row in rows]
+
     def update_artifact_status(self, artifact_id: str, *, status: str, metadata_patch: dict[str, Any] | None = None) -> None:
         with self._engine.begin() as conn:
             patch = json.dumps(metadata_patch or {})
@@ -1044,6 +1072,9 @@ class MySQLConversationStore:
                 content=content,
                 session_state=load_session_state(conversation.metadata),
                 conversation_metadata=conversation.metadata,
+                recent_artifacts=artifact_records_to_context(
+                    self._list_recent_artifacts_by_conversation(conn, conversation.id)
+                ),
             )
             classification_metadata = classification_to_metadata(classification)
             logger.info(

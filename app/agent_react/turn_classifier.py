@@ -4,7 +4,7 @@ import json
 import logging
 import os
 import re
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Literal, TypeAlias
 
 from app.agent_react.session_state import ConversationSessionState, SessionMode
@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 TurnType: TypeAlias = Literal["chat", "research", "coding", "summary", "command", "image_generation"]
 RoutingBasis: TypeAlias = Literal["explicit", "contextual", "inferred", "fallback"]
 Capability: TypeAlias = Literal[
+    "response.text",
     "web.search",
     "kb.search",
     "kb.read",
@@ -33,6 +34,9 @@ Capability: TypeAlias = Literal[
     "code.edit",
     "code.test",
     "research.deep",
+    "artifact.deliver",
+    "artifact.generate",
+    "artifact.revise",
     "image.generate",
     "reminder.manage",
 ]
@@ -41,6 +45,7 @@ TargetResourceType: TypeAlias = Literal["repository", "knowledge_base", "convers
 _TURN_TYPES = {"chat", "research", "coding", "summary", "command", "image_generation"}
 _SESSION_MODES = {"chat", "research", "coding"}
 _CAPABILITIES = {
+    "response.text",
     "web.search",
     "kb.search",
     "kb.read",
@@ -55,6 +60,9 @@ _CAPABILITIES = {
     "code.edit",
     "code.test",
     "research.deep",
+    "artifact.deliver",
+    "artifact.generate",
+    "artifact.revise",
     "image.generate",
     "reminder.manage",
 }
@@ -77,6 +85,7 @@ class TurnClassification:
     active_repo_id_update: str | None = None
     requested_capabilities: tuple[Capability, ...] = ()
     target_resources: tuple[TargetResource, ...] = ()
+    task_plan: dict[str, Any] = field(default_factory=dict)
     routing_basis: RoutingBasis = "fallback"
     confidence: float = 1.0
     reason: str = ""
@@ -92,6 +101,7 @@ def classification_to_metadata(classification: TurnClassification) -> dict[str, 
         "active_repo_id_update": classification.active_repo_id_update,
         "requested_capabilities": list(classification.requested_capabilities),
         "target_resources": [asdict(resource) for resource in classification.target_resources],
+        "task_plan": dict(classification.task_plan),
         "routing_basis": classification.routing_basis,
     }
 
@@ -101,6 +111,7 @@ def classify_turn(
     content: str,
     session_state: ConversationSessionState | None,
     conversation_metadata: dict[str, Any] | None = None,
+    recent_artifacts: list[dict[str, Any]] | None = None,
 ) -> TurnClassification:
     text = (content or "").strip()
     current = session_state or ConversationSessionState()
@@ -110,7 +121,7 @@ def classify_turn(
     if hard is not None:
         return _with_target_resource(hard, active_repo_id)
 
-    llm = _llm_classification(text, current, conversation_metadata)
+    llm = _llm_classification(text, current, conversation_metadata, recent_artifacts=recent_artifacts)
     if llm is not None:
         return _with_target_resource(llm, active_repo_id)
 
@@ -178,6 +189,7 @@ def _llm_classification(
     text: str,
     session_state: ConversationSessionState,
     conversation_metadata: dict[str, Any] | None = None,
+    recent_artifacts: list[dict[str, Any]] | None = None,
 ) -> TurnClassification | None:
     settings = get_settings()
     if os.environ.get("PYTEST_CURRENT_TEST"):
@@ -194,25 +206,36 @@ def _llm_classification(
                 "Classify the next Jarvis turn. Return compact JSON only. "
                 "Do not answer the user. Allowed turn_type values: chat, research, coding, "
                 "summary, command, image_generation. Allowed session_mode_update values: "
-                "chat, research, coding, or null. Return requested_capabilities as labels "
-                "from: web.search, kb.search, kb.write, workspace.read_file, workspace.search_files, "
+                "chat, research, coding, or null. Return requested_capabilities as atomic labels "
+                "from: response.text, web.search, kb.search, kb.write, workspace.read_file, workspace.search_files, "
                 "workspace.inspect, workspace.edit, workspace.test, workspace.report, research.deep, "
-                "image.generate, reminder.manage. "
+                "artifact.deliver, artifact.generate, artifact.revise, image.generate, reminder.manage. "
                 "Use reminder.manage for explicit reminder, timed notification, wake-up, "
                 "reminder list, or reminder cancellation requests. "
-                "Use workspace.read_file for lightweight reading of a known local workspace file. "
+                "Use workspace.read_file only when the user needs text content, excerpts, or metadata from a known local workspace file. "
                 "Use workspace.search_files for lightweight workspace path lookup, file existence checks, "
                 "or bounded text search. "
                 "Use workspace.inspect for local repository understanding that needs multi-file reasoning, "
                 "code review, architecture analysis, runtime design, or prior local work products. "
                 "Use workspace.report when the user asks for a local project report/review. "
+                "Use artifact.deliver when the final user-visible output is an existing local file, image, document, "
+                "or prior artifact delivered to the remote conversation. Do not use workspace.read_file as the "
+                "final capability for binary file delivery. "
+                "Use artifact.generate when the user asks to create a new user-visible file or artifact. "
+                "Use artifact.revise when the user asks to modify a prior artifact and return the updated artifact. "
+                "Use response.text when the final output is only a text answer and no special delivery is needed. "
                 "Return target_resources only for clearly "
                 "referenced repositories, knowledge bases, conversations, or external services. "
                 "Prefer chat unless the user asks for "
                 "multi-step research, repository/code work, summarization, or image generation. "
                 "Messages that ask to switch to a repo/project, modify files, write code, fix bugs, "
                 "run tests, inspect git status, or work inside a named repository are coding turns. "
-                "Use web.search for latest/current/recent/time-sensitive facts."
+                "Use web.search for latest/current/recent/time-sensitive facts. "
+                "Also return task_plan as a compact object describing the current turn objective, "
+                "targets, output shape, target artifacts, evidence policy, expected steps, final deliverable, and execution notes. "
+                "Plan from the full conversational context and recent_artifacts semantically: resolve whether "
+                "the user is continuing, revising, delivering, or replacing a prior artifact, and include the "
+                "relevant artifact id or filename when it is part of the plan."
             ),
         ),
         LLMMessage(
@@ -226,6 +249,7 @@ def _llm_classification(
                         "session_goal": session_state.session_goal,
                         "working_summary": session_state.working_summary,
                         "last_turn_status": session_state.last_turn_status,
+                        "recent_artifacts": recent_artifacts or [],
                         "message": text,
                     },
                     ensure_ascii=False,
@@ -270,6 +294,7 @@ def _classification_from_payload(payload: dict[str, Any]) -> TurnClassification 
 
     requested_capabilities = _coerce_capabilities(payload.get("requested_capabilities"))
     target_resources = _coerce_target_resources(payload.get("target_resources"))
+    task_plan = _coerce_task_plan(payload.get("task_plan"))
     routing_basis = _coerce_routing_basis(payload.get("routing_basis"), default="inferred")
 
     return TurnClassification(
@@ -277,6 +302,7 @@ def _classification_from_payload(payload: dict[str, Any]) -> TurnClassification 
         session_mode_update=session_update,
         requested_capabilities=requested_capabilities,
         target_resources=target_resources,
+        task_plan=task_plan,
         routing_basis=routing_basis,
         confidence=confidence,
         reason=str(payload.get("reason") or "").strip()[:160],
@@ -386,6 +412,53 @@ def _coerce_routing_basis(value: Any, *, default: RoutingBasis = "fallback") -> 
     if value in {"explicit", "contextual", "inferred", "fallback"}:
         return value  # type: ignore[return-value]
     return default
+
+
+def _coerce_task_plan(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    allowed_keys = {
+        "objective",
+        "targets",
+        "target_artifacts",
+        "output",
+        "evidence_policy",
+        "expected_steps",
+        "final_deliverable",
+        "execution_notes",
+    }
+    plan: dict[str, Any] = {}
+    for key in allowed_keys:
+        if key not in value:
+            continue
+        coerced = _coerce_task_plan_value(value[key])
+        if coerced not in (None, "", [], {}):
+            plan[key] = coerced
+    return plan
+
+
+def _coerce_task_plan_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return value.strip()[:1000]
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    if isinstance(value, list):
+        result: list[Any] = []
+        for item in value[:10]:
+            coerced = _coerce_task_plan_value(item)
+            if coerced not in (None, "", [], {}):
+                result.append(coerced)
+        return result
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for key, item in list(value.items())[:20]:
+            if not isinstance(key, str):
+                continue
+            coerced = _coerce_task_plan_value(item)
+            if coerced not in (None, "", [], {}):
+                result[key[:80]] = coerced
+        return result
+    return str(value).strip()[:1000]
 
 
 def _optional_payload_str(value: Any) -> str | None:

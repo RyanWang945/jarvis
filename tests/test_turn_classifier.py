@@ -1,5 +1,10 @@
 from app.agent_react.session_state import ConversationSessionState
-from app.agent_react.turn_classifier import classify_turn, should_apply_repo_update, should_apply_session_mode_update
+from app.agent_react.turn_classifier import (
+    classification_to_metadata,
+    classify_turn,
+    should_apply_repo_update,
+    should_apply_session_mode_update,
+)
 from app.config import get_settings
 from app.llm.client import ChatClient
 from app.repositories import RepositoryRef, RepositoryRegistry
@@ -197,6 +202,84 @@ def test_llm_classifier_accepts_workspace_file_capabilities(monkeypatch) -> None
     assert classification.turn_type == "coding"
     assert classification.requested_capabilities == ("workspace.read_file", "workspace.search_files")
     assert classification.source == "llm"
+    get_settings.cache_clear()
+
+
+def test_llm_classifier_accepts_task_plan_and_recent_artifacts(monkeypatch) -> None:
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setenv("JARVIS_DEEPSEEK_API_KEY", "test-key")
+    get_settings.cache_clear()
+
+    def _fake_chat(self, messages, response_format=None, tools=None, tool_choice=None):
+        payload = messages[1].content
+        assert "recent_artifacts" in payload
+        assert "jarvis-architecture-v3.png" in payload
+        return {
+            "content": (
+                '{"turn_type":"image_generation","session_mode_update":null,'
+                '"requested_capabilities":["workspace.inspect","workspace.read_file","image.generate"],'
+                '"task_plan":{"objective":"revise_existing_artifact",'
+                '"target_artifacts":["jarvis-architecture-v3.png"],'
+                '"evidence_policy":{"workspace_inspection":"light"},'
+                '"final_deliverable":"updated_image_file"},'
+                '"routing_basis":"contextual","confidence":0.88,"reason":"revise previous image"}'
+            )
+        }
+
+    monkeypatch.setattr(ChatClient, "chat", _fake_chat)
+
+    classification = classify_turn(
+        content="这个图不对，按工具路由和 agent 引擎关系改一下",
+        session_state=ConversationSessionState(),
+        recent_artifacts=[
+            {
+                "artifact_id": "art_1",
+                "kind": "image",
+                "filename": "jarvis-architecture-v3.png",
+            }
+        ],
+    )
+
+    assert classification.turn_type == "image_generation"
+    assert classification.task_plan["objective"] == "revise_existing_artifact"
+    assert classification.task_plan["target_artifacts"] == ["jarvis-architecture-v3.png"]
+    metadata = classification_to_metadata(classification)
+    assert metadata["task_plan"]["final_deliverable"] == "updated_image_file"
+    get_settings.cache_clear()
+
+
+def test_llm_classifier_accepts_artifact_delivery_capability(monkeypatch) -> None:
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setenv("JARVIS_DEEPSEEK_API_KEY", "test-key")
+    get_settings.cache_clear()
+
+    def _fake_chat(self, messages, response_format=None, tools=None, tool_choice=None):
+        system_prompt = messages[0].content
+        assert "artifact.deliver" in system_prompt
+        assert "Do not use workspace.read_file as the final capability for binary file delivery" in system_prompt
+        return {
+            "content": (
+                '{"turn_type":"coding","session_mode_update":"coding",'
+                '"requested_capabilities":["workspace.search_files","artifact.deliver"],'
+                '"task_plan":{"objective":"deliver_existing_file",'
+                '"targets":[{"kind":"local_file","path":"E:\\\\pythonProject\\\\jarvis\\\\jarvis-architecture-v2.png","artifact_type":"image"}],'
+                '"output":{"type":"artifact","artifact_type":"image","delivery":"send_attachment"},'
+                '"final_deliverable":"image_attachment"},'
+                '"routing_basis":"explicit","confidence":0.9,"reason":"deliver local image file"}'
+            )
+        }
+
+    monkeypatch.setattr(ChatClient, "chat", _fake_chat)
+
+    classification = classify_turn(
+        content="看一下jarvis项目的E:\\pythonProject\\jarvis\\jarvis-architecture-v2.png这个文件，然后给我",
+        session_state=ConversationSessionState(),
+    )
+
+    assert classification.turn_type == "coding"
+    assert classification.requested_capabilities == ("workspace.search_files", "artifact.deliver")
+    assert classification.task_plan["objective"] == "deliver_existing_file"
+    assert classification.task_plan["final_deliverable"] == "image_attachment"
     get_settings.cache_clear()
 
 

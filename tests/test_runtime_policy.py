@@ -131,6 +131,35 @@ def test_workspace_read_file_policy_exposes_file_tools_without_codex() -> None:
     assert "do not perform code review" in rendered
 
 
+def test_artifact_delivery_policy_exposes_deliver_file_without_codex() -> None:
+    policy = resolve_runtime_policy(
+        session_mode="chat",
+        turn_type="coding",
+        requested_capabilities=("workspace.search_files", "artifact.deliver"),
+    )
+
+    assert "deliver_file" in policy.allowed_tools
+    assert "search_files" in policy.allowed_tools
+    assert "delegate_to_codex" not in policy.allowed_tools
+    assert "artifact_delivery_protocol" in policy.context_sections
+
+    rendered = render_runtime_policy_for_model(policy)
+    assert "Artifact delivery protocol:" in rendered
+    assert "read_file/search_files only to verify or locate" in rendered
+    assert "deliver the file instead of trying to embed file bytes" in rendered
+
+
+def test_artifact_revision_policy_can_delegate_to_codex() -> None:
+    policy = resolve_runtime_policy(
+        session_mode="chat",
+        turn_type="coding",
+        requested_capabilities=("artifact.revise",),
+    )
+
+    assert "delegate_to_codex" in policy.allowed_tools
+    assert "workspace_protocol" in policy.context_sections
+
+
 def test_workspace_file_and_inspect_policy_can_expose_both_paths() -> None:
     policy = resolve_runtime_policy(
         session_mode="chat",

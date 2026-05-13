@@ -64,6 +64,43 @@ def test_context_header_includes_runtime_temporal_context() -> None:
     assert "必须以 Runtime temporal context 中的当前日期" in content
 
 
+def test_context_header_includes_task_plan_and_recent_artifacts() -> None:
+    messages, _ = ContextManager().build_initial_messages(
+        [
+            SimpleNamespace(
+                id=1,
+                role="user",
+                content="这个图不对，按路由关系改一下",
+                raw_payload={},
+            )
+        ],
+        trigger_message_id=1,
+        task_plan={
+            "objective": "revise_existing_artifact",
+            "target_artifacts": ["jarvis-architecture-v3.png"],
+            "final_deliverable": "updated_image_file",
+        },
+        recent_artifacts=[
+            {
+                "artifact_id": "art_1",
+                "kind": "image",
+                "filename": "jarvis-architecture-v3.png",
+                "path": "E:\\pythonProject\\jarvis\\jarvis-architecture-v3.png",
+                "source_tool": "delegate_to_codex",
+                "turn_id": 3093,
+                "status": "available",
+            }
+        ],
+    )
+
+    content = str(messages[0].content)
+    assert "Task plan for this turn:" in content
+    assert "revise_existing_artifact" in content
+    assert "Recent artifacts:" in content
+    assert "filename=jarvis-architecture-v3.png" in content
+    assert "Use recent artifacts to resolve references" in content
+
+
 def test_coding_context_includes_active_registered_repository(monkeypatch, tmp_path) -> None:
     repo = tmp_path / "nltk"
     repo.mkdir()

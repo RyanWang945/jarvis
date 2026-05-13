@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol
 from langchain_core.messages import AIMessage, BaseMessage, SystemMessage, ToolMessage
 from typing_extensions import TypedDict
 
+from app.agent_react.artifact_context import artifact_records_to_context
 from app.agent_react.artifacts import ChannelAttachment, artifact_to_payload, resolve_channel_attachments
 from app.agent_react.context_manager import ContextManager
 from app.agent_react.loop_provider import TurnLoopProvider, resolve_turn_loop_provider
@@ -131,6 +132,8 @@ class ConversationStore(Protocol):
     ) -> Any: ...
 
     def list_tool_calls_by_turn(self, turn_id: int) -> list: ...
+
+    def list_recent_artifacts_by_conversation(self, conversation_id: int, *, limit: int = 5) -> list: ...
 
     def finalize_turn_success(
         self,
@@ -277,6 +280,8 @@ class TurnRuntime:
             current_turn_id=turn.id,
             session_state=session_state,
             runtime_policy=runtime_policy,
+            task_plan=_task_plan_from_turn(turn),
+            recent_artifacts=_recent_artifact_context_from_store(self._store, turn.conversation_id),
         )
 
         return {
@@ -761,6 +766,26 @@ def _requested_capabilities_from_turn(turn: TurnRecord) -> tuple[str, ...]:
         if isinstance(item, str) and item not in capabilities:
             capabilities.append(item)
     return tuple(capabilities)
+
+
+def _task_plan_from_turn(turn: TurnRecord) -> dict[str, Any]:
+    metadata = getattr(turn, "metadata", {}) or {}
+    classification = metadata.get("classification")
+    if not isinstance(classification, dict):
+        return {}
+    task_plan = classification.get("task_plan")
+    return dict(task_plan) if isinstance(task_plan, dict) else {}
+
+
+def _recent_artifact_context_from_store(store: ConversationStore, conversation_id: int) -> list[dict[str, Any]]:
+    list_recent = getattr(store, "list_recent_artifacts_by_conversation", None)
+    if not callable(list_recent):
+        return []
+    try:
+        return artifact_records_to_context(list_recent(conversation_id))
+    except Exception:
+        logger.warning("failed to build recent artifact context conversation_id=%s", conversation_id, exc_info=True)
+        return []
 
 
 def _should_merge_conversation_tool_intents(runtime_policy: RuntimePolicy) -> bool:

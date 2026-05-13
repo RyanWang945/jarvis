@@ -11,6 +11,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, status
 
 from app.agent_react import AgentRuntime
+from app.agent_react.artifact_context import artifact_records_to_context
 from app.agent_react.session_state import (
     ConversationSessionState,
     dump_session_state,
@@ -401,6 +402,15 @@ class InMemoryConversationStore:
                 if record.turn_id == turn_id
             ]
 
+    def list_recent_artifacts_by_conversation(self, conversation_id: int, *, limit: int = 5) -> list[_ArtifactRecord]:
+        safe_limit = max(1, min(int(limit or 5), 20))
+        with self._lock:
+            return [
+                record
+                for record in sorted(self._artifacts.values(), key=lambda item: item.updated_at, reverse=True)
+                if record.conversation_id == conversation_id and record.status == "available"
+            ][:safe_limit]
+
     def update_artifact_status(self, artifact_id: str, *, status: str, metadata_patch: dict[str, Any] | None = None) -> None:
         with self._lock:
             record = self._artifacts.get(artifact_id)
@@ -687,6 +697,9 @@ class InMemoryConversationStore:
                 content=content,
                 session_state=load_session_state(conversation.metadata),
                 conversation_metadata=conversation.metadata,
+                recent_artifacts=artifact_records_to_context(
+                    self.list_recent_artifacts_by_conversation(conversation.id)
+                ),
             )
             classification_metadata = classification_to_metadata(classification)
             logger.info(

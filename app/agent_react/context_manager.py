@@ -250,6 +250,8 @@ class ContextManager:
         session_state: ConversationSessionState | None,
         skill_names: list[str],
         runtime_policy: RuntimePolicy | None = None,
+        task_plan: dict[str, Any] | None = None,
+        recent_artifacts: list[dict[str, Any]] | None = None,
     ) -> SystemMessage:
         sections = [SYSTEM_PROMPT.strip()]
         sections.append(_render_runtime_temporal_context())
@@ -264,6 +266,14 @@ class ContextManager:
             rendered_repositories = self._render_repository_context(session_state, runtime_policy)
             if rendered_repositories is not None:
                 sections.append(rendered_repositories)
+
+        rendered_task_plan = self._render_task_plan(task_plan)
+        if rendered_task_plan is not None:
+            sections.append(rendered_task_plan)
+
+        rendered_artifacts = self._render_recent_artifacts(recent_artifacts)
+        if rendered_artifacts is not None:
+            sections.append(rendered_artifacts)
 
         return SystemMessage(content="\n\n".join(sections))
 
@@ -360,6 +370,55 @@ class ContextManager:
         )
         return "\n".join(lines)
 
+    def _render_task_plan(self, task_plan: dict[str, Any] | None) -> str | None:
+        if not isinstance(task_plan, dict) or not task_plan:
+            return None
+        rendered = json.dumps(task_plan, ensure_ascii=False, default=str, indent=2)
+        return (
+            "Task plan for this turn:\n"
+            f"{rendered}\n"
+            "Use this as the current turn objective. Treat read/search tools as evidence collection when "
+            "the plan's final_deliverable requires an answer, edit, artifact revision, or delivery."
+        )
+
+    def _render_recent_artifacts(self, recent_artifacts: list[dict[str, Any]] | None) -> str | None:
+        if not recent_artifacts:
+            return None
+        lines = ["Recent artifacts:"]
+        for artifact in recent_artifacts[:5]:
+            if not isinstance(artifact, dict):
+                continue
+            artifact_id = str(artifact.get("artifact_id") or artifact.get("id") or "").strip()
+            kind = str(artifact.get("kind") or "").strip()
+            filename = str(artifact.get("filename") or "").strip()
+            path = str(artifact.get("path") or "").strip()
+            source_tool = str(artifact.get("source_tool") or "").strip()
+            turn_id = artifact.get("turn_id")
+            status = str(artifact.get("status") or "").strip()
+            parts = []
+            if artifact_id:
+                parts.append(f"id={artifact_id}")
+            if kind:
+                parts.append(f"kind={kind}")
+            if filename:
+                parts.append(f"filename={filename}")
+            if path:
+                parts.append(f"path={path}")
+            if source_tool:
+                parts.append(f"source_tool={source_tool}")
+            if turn_id is not None:
+                parts.append(f"turn_id={turn_id}")
+            if status:
+                parts.append(f"status={status}")
+            if parts:
+                lines.append("- " + "; ".join(parts))
+        if len(lines) == 1:
+            return None
+        lines.append(
+            "Use recent artifacts to resolve references such as 这个图, 刚才那个文件, previous image, or latest file."
+        )
+        return "\n".join(lines)
+
     def ensure_system_prompt(self, messages: list[BaseMessage]) -> list[BaseMessage]:
         if not messages:
             return [SystemMessage(content=SYSTEM_PROMPT)]
@@ -401,6 +460,8 @@ class ContextManager:
         current_turn_id: int | None = None,
         session_state: ConversationSessionState | None = None,
         runtime_policy: RuntimePolicy | None = None,
+        task_plan: dict[str, Any] | None = None,
+        recent_artifacts: list[dict[str, Any]] | None = None,
     ) -> tuple[list[BaseMessage], list[str]]:
         bounded_records = select_records_for_turn(
             records,
@@ -417,6 +478,8 @@ class ContextManager:
             session_state=session_state,
             skill_names=skill_names,
             runtime_policy=runtime_policy,
+            task_plan=task_plan,
+            recent_artifacts=recent_artifacts,
         )
         return self.inject_selected_skills([header, *lc_messages], skill_names), skill_names
 

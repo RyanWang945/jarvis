@@ -35,6 +35,14 @@ _KB_WRITE_TOOLS = (
     "obsidian_wiki_draft",
     "obsidian_wiki_apply",
 )
+_ARTIFACT_DELIVERY_TOOLS = ("deliver_file",)
+_ARTIFACT_DELIVERY_CAPABILITIES = {
+    "artifact.deliver",
+}
+_ARTIFACT_GENERATION_CAPABILITIES = {
+    "artifact.generate",
+    "artifact.revise",
+}
 _WORKSPACE_FILE_TOOLS = ("read_file", "search_files")
 _WORKSPACE_FILE_CAPABILITIES = {
     "workspace.read_file",
@@ -48,10 +56,12 @@ _WORKSPACE_CODE_CAPABILITIES = {
     "workspace.report",
 }
 _WORKSPACE_CAPABILITIES = _WORKSPACE_FILE_CAPABILITIES | _WORKSPACE_CODE_CAPABILITIES
+_ARTIFACT_CAPABILITIES = _ARTIFACT_DELIVERY_CAPABILITIES | _ARTIFACT_GENERATION_CAPABILITIES
 _CODE_CAPABILITY_ALIASES = {
     "code.inspect": "workspace.inspect",
     "code.edit": "workspace.edit",
     "code.test": "workspace.test",
+    "image.generate": "artifact.generate",
 }
 
 
@@ -95,10 +105,13 @@ def resolve_runtime_policy(
         allowed_tools.extend(_WEB_TOOLS)
     if "kb.write" in capabilities:
         allowed_tools.extend(_KB_WRITE_TOOLS)
+    if capabilities & _ARTIFACT_DELIVERY_CAPABILITIES:
+        allowed_tools.extend(_ARTIFACT_DELIVERY_TOOLS)
+        context_sections.append("artifact_delivery_protocol")
     if capabilities & _WORKSPACE_FILE_CAPABILITIES:
         allowed_tools.extend(_WORKSPACE_FILE_TOOLS)
         context_sections.append("workspace_file_protocol")
-    if capabilities & _WORKSPACE_CODE_CAPABILITIES:
+    if capabilities & (_WORKSPACE_CODE_CAPABILITIES | _ARTIFACT_GENERATION_CAPABILITIES):
         allowed_tools.extend(_WORKSPACE_CODE_TOOLS)
         context_sections.append("workspace_protocol")
 
@@ -108,7 +121,7 @@ def resolve_runtime_policy(
         context_sections.append("summary_protocol")
     elif session_mode == "research":
         context_sections.append("research_background")
-    elif session_mode == "coding" and not capabilities & _WORKSPACE_CAPABILITIES:
+    elif session_mode == "coding" and not capabilities & (_WORKSPACE_CAPABILITIES | _ARTIFACT_CAPABILITIES):
         context_sections.append("coding_background")
 
     return RuntimePolicy(
@@ -227,10 +240,24 @@ def render_runtime_policy_for_model(policy: RuntimePolicy) -> str:
             [
                 "",
                 "Workspace file protocol:",
-                "- Use read_file only for bounded reading of a known workspace file path.",
+                "- Use read_file only for bounded reading of text content or metadata from a known workspace file path.",
                 "- Use search_files only for workspace path lookup, existence checks, or bounded text search.",
+                "- Do not use read_file as the final delivery mechanism for binary files, images, documents, or archives.",
+                "- If the user wants a local file or artifact sent back and deliver_file is visible, use deliver_file after any necessary existence check.",
+                "- If deliver_file is not visible but file delivery is clearly required, use tool_search to discover the delivery capability.",
                 "- These tools are read-only and do not perform code review, architecture analysis, edits, tests, or git workflows.",
                 "- Use delegate_to_codex only when the task requires repository reasoning, code review, reports, tests, edits, or git workflows.",
+            ]
+        )
+    if "artifact_delivery_protocol" in policy.context_sections:
+        lines.extend(
+            [
+                "",
+                "Artifact delivery protocol:",
+                "- Use deliver_file when the final deliverable is an existing local file or prior artifact that should be sent to the remote conversation.",
+                "- Use read_file/search_files only to verify or locate the target file when needed; they do not send attachments.",
+                "- For binary files such as images, PDFs, archives, and spreadsheets, deliver the file instead of trying to embed file bytes in text.",
+                "- If the requested file is missing or ambiguous, ask one concise clarification question or explain the missing target.",
             ]
         )
     if "workspace_protocol" in policy.context_sections or "coding_protocol" in policy.context_sections:
