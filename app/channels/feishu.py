@@ -577,6 +577,19 @@ class FeishuChannel:
             result.status,
             len(result.reply),
         )
+        if result.status == "failed":
+            error_text = result.reply.strip() or "抱歉，调用模型时出错了，请稍后再试。"
+            if thinking_message_id:
+                self._update_card_message(
+                    thinking_message_id,
+                    self._renderer.render_error_card(error_text),
+                )
+            else:
+                self._send_text_message(chat_id, error_text)
+            if drain_after:
+                self._submit_next_queued_turn(conversation_id, chat_id)
+            return
+
         approval = _extract_codex_approval_from_reply(result.reply)
         if approval is not None:
             approval_id = approval.get("approval_id", "") or f"turn_{turn_id}"

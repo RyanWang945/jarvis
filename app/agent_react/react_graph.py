@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol
 
+import httpx
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langgraph.graph import END, StateGraph
 from typing_extensions import TypedDict
@@ -27,6 +29,8 @@ from app.tools.runtime import build_llm_tools, check_tool_policy, execute_tool, 
 
 logger = logging.getLogger(__name__)
 _CONTEXT_MANAGER = ContextManager()
+_LLM_CALL_MAX_ATTEMPTS = 2
+_LLM_RETRY_DELAY_SECONDS = 1.0
 
 
 class TurnStore(Protocol):
@@ -460,18 +464,35 @@ def call_llm(state: ReActState, store: TurnStore) -> ReActState:
             bool(getattr(message, "tool_calls", None)),
         )
 
-    try:
-        response = client.chat_normalized(llm_messages, tools=tools)
-    except Exception:
-        logger.exception("llm call failed messages_count=%s", len(llm_messages))
-        return {
-            **state,
-            "turn_id": state["turn_id"],
-            "cancelled": False,
-            "status": "failed",
-            "messages": messages + [AIMessage(content="抱歉，调用模型时出错了，请稍后再试。")],
-            "step_count": state.get("step_count", 0) + 1,
-        }
+    for attempt in range(1, _LLM_CALL_MAX_ATTEMPTS + 1):
+        try:
+            response = client.chat_normalized(llm_messages, tools=tools)
+            break
+        except Exception as exc:
+            if attempt < _LLM_CALL_MAX_ATTEMPTS and _is_retryable_llm_error(exc):
+                logger.warning(
+                    "llm call failed retrying messages_count=%s attempt=%s max_attempts=%s error=%s",
+                    len(llm_messages),
+                    attempt,
+                    _LLM_CALL_MAX_ATTEMPTS,
+                    exc,
+                )
+                time.sleep(_LLM_RETRY_DELAY_SECONDS)
+                continue
+            logger.exception(
+                "llm call failed messages_count=%s attempt=%s max_attempts=%s",
+                len(llm_messages),
+                attempt,
+                _LLM_CALL_MAX_ATTEMPTS,
+            )
+            return {
+                **state,
+                "turn_id": state["turn_id"],
+                "cancelled": False,
+                "status": "failed",
+                "messages": messages + [AIMessage(content="抱歉，调用模型时出错了，请稍后再试。")],
+                "step_count": state.get("step_count", 0) + 1,
+            }
 
     response_usage = _usage_from_normalized(response)
     token_usage = _merge_token_usage(state.get("token_usage"), response_usage)
@@ -513,6 +534,15 @@ def call_llm(state: ReActState, store: TurnStore) -> ReActState:
         "token_usage": token_usage,
         "model": model_name,
     }
+
+
+def _is_retryable_llm_error(exc: Exception) -> bool:
+    if isinstance(exc, httpx.HTTPStatusError):
+        status_code = exc.response.status_code
+        return status_code == 429 or 500 <= status_code < 600
+    return isinstance(exc, (httpx.TimeoutException, httpx.TransportError))
+
+
 def _execute_single_tool(
     tool_name: str,
     tool_args: dict[str, Any],

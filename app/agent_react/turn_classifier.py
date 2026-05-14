@@ -149,19 +149,33 @@ def classify_turn(
 ) -> TurnClassification:
     text = (content or "").strip()
     current = session_state or ConversationSessionState()
+    logger.info(
+        "turn classifier start content_length=%s session_mode=%s active_repo_id=%s metadata_keys=%s recent_artifact_count=%s",
+        len(text),
+        current.session_mode,
+        current.active_repo_id,
+        sorted((conversation_metadata or {}).keys()),
+        len(recent_artifacts or []),
+    )
     active_repo_id = _detect_registered_repo_reference(text)
 
     hard = _hard_rule_classification(text)
     if hard is not None:
-        return _with_target_resource(hard, active_repo_id)
+        classification = _with_target_resource(hard, active_repo_id)
+        _log_classification_result("hard_rule", classification, detected_repo_id=active_repo_id)
+        return classification
 
     llm = _llm_classification(text, current, conversation_metadata, recent_artifacts=recent_artifacts)
     if llm is not None:
-        return _with_target_resource(llm, active_repo_id)
+        classification = _with_target_resource(llm, active_repo_id)
+        _log_classification_result("llm", classification, detected_repo_id=active_repo_id)
+        return classification
 
     fallback_repo_id = active_repo_id or current.active_repo_id
     fallback = _fallback_classification(text, current, active_repo_id=fallback_repo_id)
-    return _with_target_resource(fallback, active_repo_id or fallback_repo_id)
+    classification = _with_target_resource(fallback, active_repo_id or fallback_repo_id)
+    _log_classification_result("fallback", classification, detected_repo_id=active_repo_id)
+    return classification
 
 
 def should_apply_session_mode_update(classification: TurnClassification) -> bool:
@@ -236,10 +250,16 @@ def _llm_classification(
 ) -> TurnClassification | None:
     settings = get_settings()
     if os.environ.get("PYTEST_CURRENT_TEST"):
+        logger.info("turn classifier llm skipped reason=pytest")
         return None
 
     resolved_llm = ModelRouter(settings).resolve(LLMNode.INTENT_CLASSIFIER, conversation_metadata)
     if not resolved_llm.profile.api_key:
+        logger.info(
+            "turn classifier llm skipped reason=missing_api_key profile=%s provider=%s",
+            resolved_llm.profile.id,
+            resolved_llm.profile.provider,
+        )
         return None
     client = resolved_llm.client
     messages = [
@@ -302,6 +322,12 @@ def _llm_classification(
 
     try:
         response_format = {"type": "json_object"} if resolved_llm.profile.supports_json_object else None
+        logger.info(
+            "turn classifier llm request profile=%s provider=%s response_format=%s",
+            resolved_llm.profile.id,
+            resolved_llm.profile.provider,
+            "json_object" if response_format else "default",
+        )
         response = client.chat_normalized(messages, response_format=response_format)
         payload = parse_json_content({"content": response.content})
         logger.info("turn classifier llm payload=%s", json.dumps(payload, ensure_ascii=False))
@@ -309,7 +335,32 @@ def _llm_classification(
         logger.exception("turn classifier llm call failed")
         return None
 
-    return _classification_from_payload(payload, text=text)
+    classification = _classification_from_payload(payload, text=text)
+    if classification is None:
+        logger.info("turn classifier llm payload rejected payload_keys=%s", sorted(payload.keys()))
+    return classification
+
+
+def _log_classification_result(
+    path: str,
+    classification: TurnClassification,
+    *,
+    detected_repo_id: str | None,
+) -> None:
+    logger.info(
+        "turn classifier result path=%s source=%s turn_type=%s scene=%s access=%s deliver=%s "
+        "confidence=%.2f routing_basis=%s detected_repo_id=%s classification=%s",
+        path,
+        classification.source,
+        classification.turn_type,
+        classification.scene,
+        classification.access,
+        classification.deliver,
+        classification.confidence,
+        classification.routing_basis,
+        detected_repo_id,
+        json.dumps(classification_to_metadata(classification), ensure_ascii=False),
+    )
 
 
 def _classification_from_payload(payload: dict[str, Any], *, text: str = "") -> TurnClassification | None:

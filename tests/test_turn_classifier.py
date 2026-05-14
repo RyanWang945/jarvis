@@ -24,6 +24,34 @@ def test_hard_rule_research_command_updates_session_mode() -> None:
     assert should_apply_session_mode_update(classification) is True
 
 
+def test_turn_classifier_logs_decision_path(monkeypatch) -> None:
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "tests/test_turn_classifier.py::test_turn_classifier_logs_decision_path")
+    log_messages: list[str] = []
+
+    import app.agent_react.turn_classifier as turn_classifier_module
+
+    original_info = turn_classifier_module.logger.info
+
+    def _capture_info(message, *args, **kwargs):
+        log_messages.append(message % args if args else str(message))
+        return original_info(message, *args, **kwargs)
+
+    monkeypatch.setattr(turn_classifier_module.logger, "info", _capture_info)
+
+    classification = classify_turn(
+        content="hello",
+        session_state=ConversationSessionState(session_mode="chat"),
+    )
+
+    assert classification.source == "fallback"
+    assert any("turn classifier start" in message for message in log_messages)
+    assert any("turn classifier llm skipped reason=pytest" in message for message in log_messages)
+    result_log = next(message for message in log_messages if "turn classifier result" in message)
+    assert "path=fallback" in result_log
+    assert "turn_type=chat" in result_log
+    assert '"source": "fallback"' in result_log
+
+
 def test_non_command_fallback_does_not_preserve_research_by_keyword() -> None:
     classification = classify_turn(
         content="继续",

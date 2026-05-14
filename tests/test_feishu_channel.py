@@ -251,6 +251,40 @@ def test_feishu_channel_updates_thinking_card(monkeypatch) -> None:
     assert updated == [("om_thinking", "interactive")]
 
 
+def test_feishu_channel_updates_error_card_for_failed_turn_result(monkeypatch) -> None:
+    channel = FeishuChannel(app_id="app", app_secret="secret")
+    updated: list[tuple[str, str, str]] = []
+    drained: list[tuple[int, str]] = []
+
+    class FakeRuntime:
+        def run_turn(self, turn_id: int) -> TurnResult:
+            return TurnResult(
+                turn_id=turn_id,
+                conversation_id=7,
+                status="failed",
+                message=ChannelMessage(content="", content_type="markdown"),
+            )
+
+    def fake_update(message_id: str, delivery) -> None:
+        card = json.loads(delivery.content)
+        content = "\n".join(element["text"]["content"] for element in card["elements"] if "text" in element)
+        updated.append((message_id, delivery.msg_type, content))
+
+    monkeypatch.setattr("app.channels.feishu.get_agent_runtime", lambda: FakeRuntime())
+    monkeypatch.setattr(channel, "_send_thinking_card", lambda chat_id, text: "om_thinking")
+    monkeypatch.setattr(channel, "_update_card_message", fake_update)
+    monkeypatch.setattr(channel, "_submit_next_queued_turn", lambda conversation_id, chat_id: drained.append((conversation_id, chat_id)))
+
+    channel._handle_agent_run("ou_1", "chat_1", "dm", "触发超时", 7, 42)
+
+    assert len(updated) == 1
+    assert updated[0][0] == "om_thinking"
+    assert updated[0][1] == "interactive"
+    assert "**❌ Request Failed**" in updated[0][2]
+    assert "调用模型时出错" in updated[0][2]
+    assert drained == [(7, "chat_1")]
+
+
 def test_feishu_channel_sends_image_attachments_once(monkeypatch) -> None:
     channel = FeishuChannel(app_id="app", app_secret="secret")
     image_dir = Path(".pytest_tmp_feishu_attachments")

@@ -4,6 +4,8 @@ from pathlib import Path
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from types import SimpleNamespace
 
+import httpx
+
 from app.agent_react import react_graph
 from app.agent_react.artifacts import resolve_channel_attachments
 from app.agent_react.runtime import TurnRuntime
@@ -109,6 +111,28 @@ def test_turn_reply_appends_model_and_token_usage_when_provider_reports_usage(mo
     assert "**本轮调用信息**" not in reply
     assert "- 模型：`deepseek-test`" in reply
     assert "- Token：输入 `10` / 输出 `3` / 合计 `13`" in reply
+
+
+def test_llm_timeout_is_retried_once(monkeypatch) -> None:
+    client = create_agent_test_client(monkeypatch)
+    monkeypatch.setattr(react_graph.time, "sleep", lambda _seconds: None)
+
+    def _timeout(_messages, _tools):
+        raise httpx.ReadTimeout("timed out")
+
+    chat = ScriptedChat([
+        _timeout,
+        final_response("recovered after retry"),
+    ])
+    chat.install(monkeypatch)
+    created = create_dm_turn(client, "Retry transient LLM timeout.")
+
+    run = client.post(f"/turns/{created['turn_id']}/run")
+
+    assert run.status_code == 200
+    assert run.json()["status"] == "completed"
+    assert run.json()["reply"] == "recovered after retry"
+    assert len(chat.calls) == 2
 
 
 def test_turn_reply_replaces_model_generated_usage_footer(monkeypatch) -> None:
