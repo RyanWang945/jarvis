@@ -278,6 +278,7 @@ def test_llm_classifier_accepts_workspace_file_capabilities(monkeypatch) -> None
         system_prompt = messages[0].content
         assert "Use scene=project for local repository/project work" in system_prompt
         assert "file lookup" in system_prompt
+        assert "external/current research with how to use, integrate, adapt, or evaluate" in system_prompt
         return {
             "content": (
                 '{"turn_type":"coding","session_mode_update":"coding",'

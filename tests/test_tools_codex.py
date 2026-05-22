@@ -34,8 +34,11 @@ def test_codex_tool_is_injected_and_claude_tool_is_hidden() -> None:
     assert "mode" not in codex_tool.args_schema["properties"]
     assert "outcome-oriented task" in codex_tool.description
     assert "Do not turn the task into a step-by-step shell script" in codex_tool.description
+    assert "open-ended repository investigation" in codex_tool.description
+    assert "locate a specific artifact for delivery" in codex_tool.description
     instruction_description = codex_tool.args_schema["properties"]["instruction"]["description"]
     assert "avoid enumerating shell commands or recovery steps" in instruction_description
+    assert "locating a specific deliverable artifact" in instruction_description
     assert get_tool_definition("delegate_to_claude_code").exposed_to_llm is False
 
 

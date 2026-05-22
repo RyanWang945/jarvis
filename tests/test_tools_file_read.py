@@ -22,6 +22,16 @@ def test_read_file_returns_bounded_workspace_file_content() -> None:
     assert "from __future__ import annotations" in payload["content"]
 
 
+def test_file_tools_descriptions_preserve_specific_artifact_lookup_boundary() -> None:
+    read_description = get_tool_definition("read_file").description
+    search_description = get_tool_definition("search_files").description
+
+    assert "specific file or artifact" in read_description
+    assert "specific known or guessable file/path/artifact" in search_description
+    assert "repository-level judgment" in read_description
+    assert "repository-level judgment" in search_description
+
+
 def test_read_file_rejects_path_outside_workspace() -> None:
     result, payload = _run_tool("read_file", path=r"C:\Users\Administrator")
 

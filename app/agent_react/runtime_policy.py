@@ -320,11 +320,12 @@ def render_runtime_policy_for_model(policy: RuntimePolicy) -> str:
                 "Workspace file protocol:",
                 "- Use read_file only for bounded reading of text content or metadata from a known workspace file path.",
                 "- Use search_files only for workspace path lookup, existence checks, or bounded text search.",
+                "- Use read_file/search_files when the user's final goal is to locate, verify, read, or deliver a specific known or guessable file/path/artifact.",
                 "- Do not use read_file as the final delivery mechanism for binary files, images, documents, or archives.",
                 "- If the user wants a local file or artifact sent back and deliver_file is visible, use deliver_file after any necessary existence check.",
                 "- If deliver_file is not visible but file delivery is clearly required, use tool_search to discover the delivery capability.",
-                "- These tools are read-only and do not perform code review, architecture analysis, edits, tests, or git workflows.",
-                "- Use delegate_to_codex only when the task requires repository reasoning, code review, reports, tests, edits, or git workflows.",
+                "- These tools are read-only and do not perform repository-level judgment such as architecture analysis, integration planning, code review, design recommendations, execution-chain analysis, edits, tests, or git workflows.",
+                "- Use delegate_to_codex when the task requires repository reasoning, code review, reports, tests, edits, git workflows, or an explanation of how something should fit into the project.",
             ]
         )
     if "artifact_delivery_protocol" in policy.context_sections:
@@ -344,8 +345,9 @@ def render_runtime_policy_for_model(policy: RuntimePolicy) -> str:
             [
                 "",
                 "Workspace protocol:",
+                "- Prefer delegate_to_codex as the first tool for open-ended repository investigation, architecture understanding, integration planning, code review, design recommendations, execution-chain analysis, or multi-file reasoning.",
                 "- Use delegate_to_codex for multi-file repository reasoning, code review, reports, tests, edits, artifact generation, and git workflows.",
-                "- Do not use delegate_to_codex for listing files, checking file existence, reading a known file, or bounded text search; use read_file/search_files for those.",
+                "- Do not use delegate_to_codex for listing files, checking file existence, reading a known file, locating a specific artifact for delivery, or bounded text search; use read_file/search_files for those.",
                 "- Trust Codex to handle routine repository work inside the registered workspace.",
                 "- Preserve the user's full repository outcome when delegating. If the user asks to update/edit/create, delegate an execution task, not a read-only preview.",
                 "- If the requested repository outcome is a report, design document, or other file, include both investigation and file creation in the Codex task contract.",

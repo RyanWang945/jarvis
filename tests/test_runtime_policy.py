@@ -170,7 +170,9 @@ def test_workspace_read_file_policy_exposes_file_tools_without_codex() -> None:
 
     rendered = render_runtime_policy_for_model(policy)
     assert "Workspace file protocol:" in rendered
-    assert "do not perform code review" in rendered
+    assert "locate, verify, read, or deliver a specific known or guessable file/path/artifact" in rendered
+    assert "repository-level judgment" in rendered
+    assert "explanation of how something should fit into the project" in rendered
 
 
 def test_artifact_delivery_policy_exposes_deliver_file_without_codex() -> None:
@@ -191,6 +193,7 @@ def test_artifact_delivery_policy_exposes_deliver_file_without_codex() -> None:
     assert "Artifact delivery protocol:" in rendered
     assert "read_file/search_files only to verify or locate" in rendered
     assert "deliver the file instead of trying to embed file bytes" in rendered
+    assert "locating a specific artifact for delivery" in rendered
 
 
 def test_artifact_revision_policy_can_delegate_to_codex() -> None:

@@ -49,8 +49,11 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
             description=(
                 "Read a known local workspace file by path for lightweight inspection. "
                 "Use this for file content snippets, logs, configuration files, and existence checks when a specific path is known. "
+                "Use it when the user's final goal is to inspect, verify, or deliver a specific file or artifact. "
                 "This tool is read-only and returns bounded text content plus file metadata. "
-                "Do not use it for code review, architecture analysis, edits, tests, or multi-file reasoning; use delegate_to_codex for those."
+                "Do not use it as the primary strategy when the user needs repository-level judgment such as "
+                "architecture analysis, integration planning, code review, design recommendations, execution-chain analysis, "
+                "or multi-file reasoning; use delegate_to_codex for those."
             ),
             args_schema={
                 "type": "object",
@@ -80,8 +83,11 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
             description=(
                 "Search local workspace files without invoking shell commands. "
                 "Use mode=path to find files by path/name or check exact path existence; use mode=content for bounded text search. "
+                "Use this when the user's final goal is to locate, verify, read, or deliver a specific known or guessable file/path/artifact. "
                 "This tool is read-only and returns matching paths plus small metadata or previews. "
-                "Do not use it for code review, architecture analysis, edits, tests, or multi-file reasoning; use delegate_to_codex for those."
+                "Do not use it as the primary strategy when the user needs repository-level judgment such as "
+                "architecture analysis, integration planning, code review, design recommendations, execution-chain analysis, "
+                "or multi-file reasoning; use delegate_to_codex for those."
             ),
             args_schema={
                 "type": "object",
@@ -203,7 +209,9 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
                 "Use this for multi-file repository reasoning, architecture review, code review, reports, tests, "
                 "code edits, refactors, bug fixes, git workflows, and repo-local visual artifacts "
                 "such as architecture diagrams or generated PNG/WebP/SVG files inside a registered repository. "
-                "Do not use this to list files, check whether a file exists, read a known file, or run bounded text search; "
+                "Prefer this as the first tool for open-ended repository investigation, integration planning, design recommendations, "
+                "execution-chain analysis, or understanding how an external technology should fit into a local project. "
+                "Do not use this to list files, check whether a file exists, read a known file, locate a specific artifact for delivery, or run bounded text search; "
                 "use read_file or search_files for those lightweight workspace file tasks. "
                 "For image generation requests, instruct Codex to preserve the requested output format and "
                 "copy any final raster image from Codex's generated-images area into the repository workspace "
@@ -230,7 +238,7 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
                             "enumerating shell commands or recovery steps, and avoid routine pre-confirmation prompts. "
                             "Do not downgrade explicit edit/commit/push requests into read-only inspection. "
                             "Do not silently change raster image-generation requests into SVG-only artifacts. "
-                            "For lightweight file existence, path lookup, known-file reading, or bounded text search, "
+                            "For lightweight file existence, path lookup, known-file reading, locating a specific deliverable artifact, or bounded text search, "
                             "do not use Codex; use read_file or search_files."
                         ),
                     },
