@@ -1,0 +1,19 @@
+{
+  "id": "fast_intent:v1",
+  "scenario": "fast_intent",
+  "version": "v1",
+  "description": "Low-latency reply-or-route decision for simple Jarvis vNext turns.",
+  "model_profile": "deepseek-v4-flash",
+  "response_format": "text",
+  "variables": ["input_json"],
+  "messages": [
+    {
+      "role": "system",
+      "template": "system.md"
+    },
+    {
+      "role": "user",
+      "template": "user.md"
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "id": "heavy_plan:v2",
+  "scenario": "heavy_plan",
+  "version": "v2",
+  "description": "Compile one user turn into a lightweight Jarvis execution plan.",
+  "response_format": "json_object",
+  "variables": ["input_json"],
+  "messages": [
+    {
+      "role": "system",
+      "template": "system.md"
+    },
+    {
+      "role": "user",
+      "template": "user.md"
+    }
+  ]
+}

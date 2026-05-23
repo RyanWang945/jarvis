@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ExecutionPlan",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["user_objective", "nodes"],
+  "properties": {
+    "user_objective": {
+      "type": "string"
+    },
+    "nodes": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["id", "runtime", "objective", "input_refs", "expected_output"],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "runtime": {
+            "type": "string",
+            "enum": ["llm", "react", "codex", "tool", "deepresearch"]
+          },
+          "objective": {
+            "type": "string"
+          },
+          "input_refs": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^(artifact|node):[A-Za-z0-9_.:-]+$"
+            }
+          },
+          "expected_output": {
+            "type": "string"
+          },
+          "tool_name": {
+            "type": ["string", "null"]
+          }
+        }
+      }
+    }
+  }
+}

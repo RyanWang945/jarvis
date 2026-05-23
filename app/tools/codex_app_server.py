@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import os
 import queue
@@ -11,6 +13,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
+
+from app.tools.common import ToolArtifact
 
 
 APPROVAL_REQUEST_METHODS = {
@@ -28,6 +32,7 @@ class CodexAppServerRunResult:
     exit_code: int | None = None
     final_text: str = ""
     approval_requests: list[dict[str, Any]] = field(default_factory=list)
+    tool_artifacts: list[ToolArtifact] = field(default_factory=list)
     error: str = ""
 
 
@@ -39,6 +44,7 @@ class CodexApprovalContinuationResult:
     exit_code: int | None = None
     final_text: str = ""
     approval_requests: list[dict[str, Any]] = field(default_factory=list)
+    tool_artifacts: list[ToolArtifact] = field(default_factory=list)
     error: str = ""
 
 
@@ -71,6 +77,8 @@ class CodexAppServerSession:
         self._pending_server_request_id: int | str | None = None
         self._pending_approval_payload: dict[str, Any] | None = None
         self._closed = False
+        self._tool_artifacts: list[ToolArtifact] = []
+        self._artifact_ids: set[str] = set()
 
     @property
     def run_dir(self) -> Path:
@@ -134,6 +142,7 @@ class CodexAppServerSession:
                     exit_code=run_result.exit_code,
                     final_text=run_result.final_text,
                     approval_requests=run_result.approval_requests,
+                    tool_artifacts=run_result.tool_artifacts,
                 )
             return CodexApprovalContinuationResult(
                 status=run_result.status if run_result.status in {"completed", "failed", "timeout"} else "failed",
@@ -141,6 +150,7 @@ class CodexAppServerSession:
                 raw_stderr=run_result.raw_stderr,
                 exit_code=run_result.exit_code,
                 final_text=run_result.final_text,
+                tool_artifacts=run_result.tool_artifacts,
                 error=run_result.error,
             )
 
@@ -278,6 +288,7 @@ class CodexAppServerSession:
             text = _final_text_from_app_server_event(event)
             if text:
                 final_text = text
+            self._collect_tool_artifact(event)
             if method in APPROVAL_REQUEST_METHODS:
                 approval = self._build_approval_payload(event)
                 if self._matches_trusted_command_prefix(approval) or (
@@ -296,6 +307,7 @@ class CodexAppServerSession:
                     exit_code=None,
                     final_text=final_text,
                     approval_requests=[approval],
+                    tool_artifacts=list(self._tool_artifacts),
                 )
             if method == "turn/completed":
                 completion_status = _turn_completion_status(event)
@@ -308,6 +320,7 @@ class CodexAppServerSession:
                         raw_stderr=self.raw_stderr(),
                         exit_code=None,
                         final_text=final_text or last_agent_text,
+                        tool_artifacts=list(self._tool_artifacts),
                         error=error,
                     )
                 self.close()
@@ -317,6 +330,7 @@ class CodexAppServerSession:
                     raw_stderr=self.raw_stderr(),
                     exit_code=0,
                     final_text=final_text,
+                    tool_artifacts=list(self._tool_artifacts),
                 )
 
         self.close()
@@ -326,6 +340,7 @@ class CodexAppServerSession:
             raw_stderr=self.raw_stderr(),
             exit_code=None,
             final_text=final_text,
+            tool_artifacts=list(self._tool_artifacts),
             error="Codex app-server timed out.",
         )
 
@@ -338,8 +353,16 @@ class CodexAppServerSession:
             raw_stderr=self.raw_stderr(),
             exit_code=exit_code,
             final_text=final_text,
+            tool_artifacts=list(self._tool_artifacts),
             error=error,
         )
+
+    def _collect_tool_artifact(self, event: dict[str, Any]) -> None:
+        artifact = _image_generation_artifact(event, run_dir=self._run_dir)
+        if artifact is None or artifact.artifact_id in self._artifact_ids:
+            return
+        self._artifact_ids.add(artifact.artifact_id)
+        self._tool_artifacts.append(artifact)
 
     def _build_approval_payload(self, event: dict[str, Any]) -> dict[str, Any]:
         params = event.get("params") if isinstance(event.get("params"), dict) else {}
@@ -539,6 +562,62 @@ def _turn_completion_error(event: dict[str, Any]) -> str:
     if isinstance(error, str):
         return error.strip()
     return ""
+
+
+def _image_generation_artifact(event: dict[str, Any], *, run_dir: Path) -> ToolArtifact | None:
+    if str(event.get("method") or "") != "item/completed":
+        return None
+    params = event.get("params")
+    if not isinstance(params, dict):
+        return None
+    item = params.get("item")
+    if not isinstance(item, dict) or item.get("type") != "imageGeneration":
+        return None
+    raw_result = str(item.get("result") or "").strip()
+    if not raw_result:
+        return None
+    image_bytes = _decode_image_result(raw_result)
+    if not image_bytes:
+        return None
+
+    item_id = str(item.get("id") or uuid4().hex).strip()
+    safe_id = _safe_artifact_filename(item_id)
+    artifacts_dir = run_dir / "artifacts"
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    path = artifacts_dir / f"{safe_id}.png"
+    path.write_bytes(image_bytes)
+    stat = path.stat()
+    return ToolArtifact(
+        artifact_id=f"codex_image:{safe_id}",
+        kind="image",
+        path=str(path),
+        mime_type="image/png",
+        filename=path.name,
+        size_bytes=stat.st_size,
+        metadata={
+            "codex_item_id": item_id,
+            "codex_item_type": "imageGeneration",
+            "revised_prompt": str(item.get("revisedPrompt") or ""),
+            "source_event": "item/completed",
+        },
+    )
+
+
+def _decode_image_result(value: str) -> bytes:
+    text = value.strip()
+    if "," in text and text.lower().startswith("data:"):
+        text = text.split(",", 1)[1]
+    try:
+        decoded = base64.b64decode(text, validate=True)
+    except (binascii.Error, ValueError):
+        return b""
+    if not decoded.startswith(b"\x89PNG\r\n\x1a\n"):
+        return b""
+    return decoded
+
+
+def _safe_artifact_filename(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._") or uuid4().hex
 
 
 def _approval_decision(approval: dict[str, Any], *, approved: bool) -> str | dict[str, Any]:

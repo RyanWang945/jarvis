@@ -22,6 +22,9 @@ from app.tools.common import ToolExecutionRequest
 from app.tools.runtime import build_llm_tools, check_tool_policy, get_tool_definition
 
 
+_TINY_PNG_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAFgwJ/lwot8gAAAABJRU5ErkJggg=="
+
+
 def test_codex_tool_is_injected_and_claude_tool_is_hidden() -> None:
     injected_names = {tool["function"]["name"] for tool in build_llm_tools()}
     codex_tool = get_tool_definition("delegate_to_codex")
@@ -439,6 +442,48 @@ def test_codex_app_server_streams_events_and_stderr_to_run_files() -> None:
             "first stderr line",
             "second stderr line",
         ]
+    finally:
+        shutil.rmtree(tmp_root, ignore_errors=True)
+
+
+def test_codex_app_server_extracts_image_generation_artifacts() -> None:
+    tmp_root = _sandbox_tmp("codex-image-artifact")
+    session = CodexAppServerSession(provider_command=["codex"], workdir=tmp_root, run_dir=tmp_root)
+    image_event = {
+        "method": "item/completed",
+        "params": {
+            "item": {
+                "type": "imageGeneration",
+                "id": "ig_test_image",
+                "status": "generating",
+                "revisedPrompt": "A tiny test image.",
+                "result": _TINY_PNG_BASE64,
+            }
+        },
+    }
+    done = {
+        "method": "turn/completed",
+        "params": {
+            "turn": {
+                "status": "completed",
+            }
+        },
+    }
+    session._stdout_queue.put(json.dumps(image_event) + "\n")
+    session._stdout_queue.put(json.dumps(done) + "\n")
+
+    try:
+        result = session._drain_until_waiting_or_done(timeout_seconds=1)
+
+        assert result.status == "completed"
+        assert len(result.tool_artifacts) == 1
+        artifact = result.tool_artifacts[0]
+        assert artifact.kind == "image"
+        assert artifact.mime_type == "image/png"
+        assert artifact.filename == "ig_test_image.png"
+        assert artifact.metadata["codex_item_id"] == "ig_test_image"
+        assert artifact.metadata["revised_prompt"] == "A tiny test image."
+        assert Path(artifact.path or "").read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)
 

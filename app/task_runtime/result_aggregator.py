@@ -1,0 +1,314 @@
+from __future__ import annotations
+
+import json
+import logging
+import time
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+
+from app.llm.client import parse_json_content
+from app.llm.model_profiles import LLMNode
+from app.llm.model_router import ModelRouter
+from app.prompting import PromptRegistry
+from app.task_runtime.node_result import ExecutionReport, NodeResult
+from app.task_runtime.planner import ExecutionPlan
+
+logger = logging.getLogger(__name__)
+
+AggregationStatus = Literal["completed", "needs_replan", "needs_user_input", "failed"]
+DEFAULT_AGGREGATOR_PROMPT_VERSION = "v1"
+
+
+class AggregationResult(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    status: AggregationStatus
+    reply: str
+    artifact_refs: list[str] = Field(default_factory=list)
+    replan_instructions: list[str] = Field(default_factory=list)
+    missing_info_question: str | None = None
+    data: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("reply")
+    @classmethod
+    def _reply_not_empty(cls, value: str) -> str:
+        text = str(value).strip()
+        if not text:
+            raise ValueError("reply must not be empty")
+        return text
+
+    @field_validator("artifact_refs", "replan_instructions")
+    @classmethod
+    def _dedupe_text_list(cls, value: list[str]) -> list[str]:
+        result: list[str] = []
+        for item in value:
+            text = str(item).strip()
+            if text and text not in result:
+                result.append(text)
+        return result
+
+
+class ResultAggregator:
+    """Fixed system step that turns node results into the turn outcome."""
+
+    def __init__(
+        self,
+        *,
+        prompt_registry: PromptRegistry | None = None,
+        prompt_version: str | None = None,
+        model_resolver=None,
+    ) -> None:
+        self._prompt_registry = prompt_registry or PromptRegistry()
+        self._prompt_version = prompt_version or DEFAULT_AGGREGATOR_PROMPT_VERSION
+        self._model_resolver = model_resolver or (lambda metadata: ModelRouter().resolve(LLMNode.SUMMARY, metadata))
+
+    def prompt_metadata(self) -> dict[str, Any]:
+        return self._prompt_registry.load("result_aggregator", self._prompt_version).metadata()
+
+    def aggregate(
+        self,
+        *,
+        plan: ExecutionPlan,
+        report: ExecutionReport,
+        current_user_input: str | None = None,
+        route: str | None = None,
+        fast_intent: dict[str, Any] | None = None,
+        artifacts: list[dict[str, Any]] | None = None,
+        runtime_hints: dict[str, Any] | None = None,
+        instructions: list[str] | None = None,
+        conversation_metadata: dict[str, Any] | None = None,
+    ) -> AggregationResult:
+        started = time.perf_counter()
+        fallback = _fallback_aggregation(plan=plan, report=report)
+        local_result = _local_aggregation_result(plan=plan, report=report, fallback=fallback)
+        if local_result is not None:
+            logger.info(
+                "result aggregator llm skipped reason=local_finalization mode=%s report_status=%s result_status=%s elapsed_ms=%s",
+                plan.finalization_hint.mode,
+                report.status,
+                local_result.status,
+                int((time.perf_counter() - started) * 1000),
+            )
+            return local_result
+        try:
+            resolved = self._model_resolver(conversation_metadata)
+        except Exception:
+            logger.exception("result aggregator model resolution failed")
+            return fallback
+        if not resolved.profile.api_key:
+            logger.info("result aggregator llm skipped reason=missing_api_key profile=%s", getattr(resolved.profile, "id", None))
+            return fallback
+
+        prompt = self._prompt_registry.load("result_aggregator", self._prompt_version)
+        response_format = prompt.response_format if resolved.profile.supports_json_object else None
+        payload = _aggregation_input(
+            plan=plan,
+            report=report,
+            current_user_input=current_user_input,
+            route=route,
+            fast_intent=fast_intent,
+            artifacts=artifacts or [],
+            runtime_hints=runtime_hints or {},
+            instructions=instructions or [],
+        )
+        try:
+            logger.info(
+                "result aggregator llm request report_status=%s node_count=%s finalization=%s response_format=%s",
+                report.status,
+                len(report.node_results),
+                plan.finalization_hint.mode,
+                response_format,
+            )
+            response = resolved.client.chat_normalized(
+                prompt.render({"input_json": json.dumps(payload, ensure_ascii=False)}),
+                response_format=response_format,
+            )
+            parsed = parse_json_content({"content": response.content})
+            result = _aggregation_from_payload(parsed, fallback=fallback, report=report)
+            logger.info(
+                "result aggregator llm completed status=%s reply_len=%s artifact_refs=%s elapsed_ms=%s",
+                result.status,
+                len(result.reply),
+                result.artifact_refs,
+                int((time.perf_counter() - started) * 1000),
+            )
+            return result
+        except Exception:
+            logger.exception("result aggregator llm failed")
+            return fallback
+
+
+def _aggregation_input(
+    *,
+    plan: ExecutionPlan,
+    report: ExecutionReport,
+    current_user_input: str | None,
+    route: str | None,
+    fast_intent: dict[str, Any] | None,
+    artifacts: list[dict[str, Any]],
+    runtime_hints: dict[str, Any],
+    instructions: list[str],
+) -> dict[str, Any]:
+    return {
+        "current_user_input": current_user_input or plan.user_objective,
+        "route": route,
+        "fast_intent": fast_intent,
+        "finalization_hint": plan.finalization_hint.model_dump(mode="json"),
+        "user_objective": plan.user_objective,
+        "plan": plan.model_dump(mode="json"),
+        "execution_report": report.model_dump(mode="json", exclude_none=True),
+        "artifacts": artifacts,
+        "runtime_hints": runtime_hints,
+        "instructions": instructions,
+    }
+
+
+def _local_aggregation_result(
+    *,
+    plan: ExecutionPlan,
+    report: ExecutionReport,
+    fallback: AggregationResult,
+) -> AggregationResult | None:
+    hint = plan.finalization_hint
+    if report.status == "blocked":
+        return fallback
+    if hint.mode == "deterministic":
+        return fallback
+    if report.status != "completed":
+        return None
+    if hint.mode != "pass_through":
+        return None
+    if not hint.user_facing:
+        return None
+    if len(report.node_results) != 1:
+        return None
+
+    result = report.node_results[0]
+    if result.status != "completed":
+        return None
+    reply = result.summary.strip()
+    if not reply:
+        return None
+    return AggregationResult(
+        status="completed",
+        reply=reply,
+        artifact_refs=_artifact_refs(report.node_results),
+        data={
+            "finalization": "pass_through",
+            "fallback": False,
+        },
+    )
+
+
+def _aggregation_from_payload(
+    payload: dict[str, Any],
+    *,
+    fallback: AggregationResult,
+    report: ExecutionReport,
+) -> AggregationResult:
+    if not isinstance(payload, dict):
+        return fallback
+    normalized = dict(payload)
+    status = normalized.get("status")
+    if status not in {"completed", "needs_replan", "needs_user_input", "failed"}:
+        normalized["status"] = fallback.status
+    normalized.setdefault("reply", fallback.reply)
+    normalized.setdefault("artifact_refs", _artifact_refs(report.node_results))
+    normalized.setdefault("replan_instructions", [])
+    normalized.setdefault("data", {})
+    try:
+        return AggregationResult.model_validate(normalized)
+    except ValidationError as exc:
+        logger.warning(
+            "result aggregator returned invalid payload; using fallback errors=%s payload=%s",
+            exc.errors(),
+            _preview_json(normalized),
+        )
+        return fallback
+
+
+def _fallback_aggregation(*, plan: ExecutionPlan, report: ExecutionReport) -> AggregationResult:
+    refs = _artifact_refs(report.node_results)
+    if report.status == "completed":
+        return AggregationResult(
+            status="completed",
+            reply=_completed_reply(plan, report),
+            artifact_refs=refs,
+            data={"fallback": True},
+        )
+    blocked = [result for result in report.node_results if result.status == "blocked"]
+    if blocked and not any(result.status == "failed" for result in report.node_results):
+        question = _blocked_question(blocked)
+        return AggregationResult(
+            status="needs_user_input",
+            reply=question,
+            missing_info_question=question,
+            artifact_refs=refs,
+            data={"fallback": True},
+        )
+    failed = [result for result in report.node_results if result.status == "failed"]
+    return AggregationResult(
+        status="failed",
+        reply=_failure_reply(failed or report.node_results),
+        artifact_refs=refs,
+        replan_instructions=_replan_instructions(report.node_results),
+        data={"fallback": True},
+    )
+
+
+def _completed_reply(plan: ExecutionPlan, report: ExecutionReport) -> str:
+    summaries = [result.summary.strip() for result in report.node_results if result.summary.strip()]
+    if not summaries:
+        return f"已完成：{plan.user_objective}"
+    if len(summaries) == 1:
+        return summaries[0]
+    lines = ["已完成，结果如下："]
+    lines.extend(f"- {summary}" for summary in summaries)
+    return "\n".join(lines)
+
+
+def _blocked_question(blocked: list[NodeResult]) -> str:
+    first = blocked[0]
+    message = first.summary or (first.error.message if first.error else "")
+    if first.error and first.error.code == "missing_active_repo":
+        return "需要先指定要操作的仓库。"
+    if first.error and first.error.code == "missing_api_key":
+        return "当前运行所需的 LLM API key 未配置，无法继续执行。"
+    return message or "当前任务缺少必要输入，需要补充信息后继续。"
+
+
+def _failure_reply(results: list[NodeResult]) -> str:
+    first = results[0]
+    message = first.summary or (first.error.message if first.error else "")
+    return message or "任务执行失败。"
+
+
+def _replan_instructions(results: list[NodeResult]) -> list[str]:
+    instructions: list[str] = []
+    for result in results:
+        if result.status == "failed":
+            instructions.append(f"Replan around failed node {result.node_id}: {result.summary}")
+        elif result.status == "blocked":
+            instructions.append(f"Resolve blocked node {result.node_id}: {result.summary}")
+    return instructions
+
+
+def _artifact_refs(results: list[NodeResult]) -> list[str]:
+    refs: list[str] = []
+    for result in results:
+        for artifact in result.artifacts:
+            ref = f"artifact:{artifact.ref}"
+            if ref not in refs:
+                refs.append(ref)
+    return refs
+
+
+def _preview_json(value: Any, *, limit: int = 2000) -> str:
+    try:
+        text = json.dumps(value, ensure_ascii=False, default=str)
+    except Exception:
+        text = str(value)
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "...[truncated]"

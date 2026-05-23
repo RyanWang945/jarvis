@@ -1,0 +1,598 @@
+# Jarvis vNext: TaskDAG Runtime 重构设计
+
+## 1. 核心方向
+
+Jarvis vNext 不再以全局 ReActLoop 作为一轮请求的总控，而是把用户请求规划成 `TaskDAG`，由 DAGRuntime 调度节点执行。
+
+```text
+User Turn
+  -> FastIntentNode + Planner 并行启动
+  -> PlanCoordinator
+  -> TaskDAG
+  -> DAGRuntime
+  -> NodeRuntime
+  -> Executor
+  -> Blackboard
+  -> Aggregator
+  -> Final Reply
+```
+
+核心决策：
+
+```text
+1. TaskDAG 替代 TurnClassifier + RuntimePolicy。
+2. Executor 替代全局 ReActLoop。
+3. Codex 退出工具层，成为 CodexExecutor。
+4. Blackboard 成为运行时状态源。
+5. PermissionGuard + approval/resume 成为硬边界。
+```
+
+## 2. FastIntent + Planner 并行
+
+Planner 是完整 DAG 规划节点，但不是所有请求都必须等待它。
+
+vNext 在收到用户请求后并行启动两个节点：
+
+```text
+User Turn
+  -> FastIntentNode
+  -> Planner
+```
+
+`FastIntentNode` 只做低延迟路由判断：
+
+```python
+class FastIntentDecision(BaseModel):
+    route: Literal[
+        "direct_llm",
+        "direct_tool",
+        "direct_react",
+        "direct_codex",
+        "needs_plan",
+    ]
+    confidence: float
+    execution_type: Literal["llm", "tool", "react", "codex"] | None = None
+    tool_name: str | None = None
+    target_resources: list[TargetResource] = []
+    reason: str = ""
+```
+
+FastIntent 不做：
+
+```text
+- 不生成完整 TaskDAG
+- 不输出 allowed_tools
+- 不授权高风险动作
+- 不替代 PermissionGuard
+- 不做多节点依赖规划
+```
+
+FastIntent 的模型固定为 `deepseek-v4-flash`，不跟随会话 active model，也不接受用户侧 runtime model override。它是低延迟路由节点，完整 Planner 可以继续使用 Planner 节点自己的模型配置。
+
+FastIntent 不允许在服务端硬编码业务语义规则，例如用关键词判断“多目标”“提醒”“代码任务”。服务端只做 schema 归一化、工具名别名归一和置信度门槛；是否需要完整 Planner 由 `deepseek-v4-flash` 的 FastIntent 输出决定。
+
+PlanCoordinator 根据 FastIntent 结果决策：
+
+```text
+if FastIntent route is direct and confidence >= threshold:
+    ignore/cancel Planner result
+    build SingleNodeDAG
+else:
+    wait Planner TaskDAG
+```
+
+这样简单任务不需要支付完整 Planner 时延，复杂任务由于 Planner 已经并行启动，也不会额外增加一次串行分类延迟。
+
+直接路由仍然构造成单节点 DAG，而不是绕过 DAGRuntime：
+
+```text
+direct_llm   -> TaskDAG(nodes=[TaskNode(execution_type="llm")])
+direct_tool  -> TaskDAG(nodes=[TaskNode(execution_type="tool", tool_name=...)])
+direct_react -> TaskDAG(nodes=[TaskNode(execution_type="react")])
+direct_codex -> TaskDAG(nodes=[TaskNode(execution_type="codex")])
+```
+
+这保证 Blackboard、PermissionGuard、approval/resume 和 Aggregator 仍然只有一套运行时模型。
+
+## 3. Planner
+
+Planner 负责把用户输入和会话上下文编译成 `TaskDAG`。
+
+Planner 只做语义规划：
+
+```text
+- 理解用户目标
+- 拆分任务节点
+- 生成节点依赖
+- 为每个节点选择 execution_type
+- 标注目标资源和期望输出
+- 生成聚合策略
+```
+
+Planner 不做：
+
+```text
+- 不输出 capability registry
+- 不输出 allowed_tools
+- 不授权高风险动作
+- 不执行工具
+- 不决定 approval 是否通过
+```
+
+`execution_type` 是 Planner 输出中最重要的执行选择：
+
+```python
+ExecutionType = Literal[
+    "llm",
+    "tool",
+    "react",
+    "codex",
+    "deepresearch",
+]
+```
+
+选择原则：
+
+```text
+llm          普通回答、解释、改写、无需工具的总结
+tool         单次确定性工具动作，例如创建提醒、交付已有文件
+react        需要多步观察和工具组合的节点，例如搜索后综合判断
+codex        本地仓库阅读、修改、测试、提交、push、代码 review
+deepresearch 深度外部研究，通常耗时更长，V1 可先保留类型不实现
+```
+
+## 4. Prompt 管理
+
+Jarvis vNext 的 prompt 是项目级运行资产，不再散落在节点代码中。所有面向 LLM 的行为提示词都应逐步收敛到根目录 `prompt/`，包括 Planner、FastIntent、旧 TurnClassifier、React Agent、上下文摘要、工具选择说明和工具 description。
+
+V1 先接入 `fast_intent` 与 `heavy_plan`：
+
+```text
+prompt/
+  scenarios/
+    fast_intent/
+      schema.json
+      versions/v1/manifest.json
+      versions/v1/system.md
+      versions/v1/user.md
+    heavy_plan/
+      schema.json
+      versions/v1/manifest.json
+      versions/v1/system.md
+      versions/v1/user.md
+```
+
+运行时代码只允许做确定性工作：
+
+```text
+- 加载 scenario + version
+- 渲染模板变量
+- 校验 manifest / schema
+- 记录 prompt id 与 sha256 fingerprint
+- 做 JSON schema 归一化、enum alias 归一、置信度门槛
+```
+
+业务语义规则必须写在 prompt 文件中，不再写成服务端关键词判断。`FastIntentNode` 和 `TurnPlanner` 通过 `PromptRegistry` 加载模板，测试和 eval 可以显式指定 prompt version。`scripts/run_task_planner_eval.py` 支持 planner / fast_intent prompt version 矩阵，并可用 `--parallel` 并发验证不同组合。
+
+默认版本由环境变量覆盖：
+
+```text
+JARVIS_PROMPT_FAST_INTENT_VERSION=v1
+JARVIS_PROMPT_HEAVY_PLAN_VERSION=v1
+```
+
+## 5. TaskDAG
+
+`TaskDAG` 是 Jarvis 的统一执行 IR。
+
+```python
+class TaskDAG(BaseModel):
+    dag_id: str
+    user_objective: str
+    success_criteria: list[str]
+    nodes: list[TaskNode]
+    aggregation: AggregationSpec
+```
+
+简单请求也是单节点 DAG：
+
+```text
+TaskDAG(nodes=[main])
+```
+
+复杂请求是多节点 DAG：
+
+```text
+TaskDAG(nodes=[research, code_edit, artifact_delivery, reminder])
+```
+
+## 6. TaskNode
+
+节点代表一个可独立调度的子任务。
+
+```python
+class TaskNode(BaseModel):
+    id: str
+    objective: str
+    execution_type: Literal["llm", "tool", "react", "codex", "deepresearch"]
+
+    tool_name: str | None = None
+    target_resources: list[TargetResource] = []
+    input: dict = {}
+    expected_output: OutputSpec
+    depends_on: list[str] = []
+    failure_policy: Literal["stop", "continue", "ask_user"] = "stop"
+```
+
+约束：
+
+```text
+- execution_type=tool 时必须有 tool_name。
+- execution_type!=tool 时不得依赖 tool_name 来表达核心执行器。
+- codex 节点通过 CodexExecutor 执行，不再调用 delegate_to_codex tool。
+- react 节点可以使用工具，但工具面由 ReactExecutor 内部策略和 PermissionGuard 共同约束。
+- deepresearch V1 可以只进入验证失败或 not_implemented，避免提前做重型闭环。
+```
+
+## 7. DAGRuntime
+
+DAGRuntime 是主循环，只负责调度，不关心工具细节。
+
+```python
+while not dag_done:
+    runnable_nodes = get_runnable_nodes(dag, blackboard)
+
+    for node in runnable_nodes:
+        result = node_runtime.run(node, blackboard)
+        blackboard.save(result)
+
+        if result.status == "waiting_approval":
+            pause_dag(result.resume_token)
+            return
+
+        if result.status == "needs_user":
+            pause_dag(result.resume_token)
+            return
+
+        if result.status == "failed" and node.failure_policy == "stop":
+            stop_dag()
+            return
+```
+
+DAGRuntime 的职责：
+
+```text
+- 找出可执行节点
+- 顺序执行 V1 节点
+- 保存节点结果
+- 根据 failure_policy 决定继续、停止或等待用户
+- 在 approval/resume 场景下暂停和恢复 DAG
+```
+
+DAGRuntime 不做：
+
+```text
+- 不解析工具权限
+- 不改写节点输入
+- 不直接调用业务工具
+- 不替 Executor 做恢复逻辑
+```
+
+## 8. NodeRuntime
+
+NodeRuntime 执行单个 TaskNode。
+
+```text
+NodeRuntime.run(node):
+  1. 从 Blackboard 读取依赖节点结果
+  2. 构造 NodeContext
+  3. 根据 node.execution_type 选择 Executor
+  4. 调用 Executor.run(node, context)
+  5. 标准化 NodeResult
+```
+
+NodeRuntime 不再引入 capability resolver。Planner 已经选择 `execution_type`，NodeRuntime 只做确定性分派。
+
+## 9. Executor
+
+Executor 是节点真正的执行者。
+
+V1 执行器：
+
+```text
+LLMExecutor      无工具普通回答
+ToolExecutor     单次确定工具调用
+ReactExecutor    节点内部多步工具观察
+CodexExecutor    本地仓库任务
+```
+
+V1 保留但可不实现：
+
+```text
+DeepResearchExecutor
+```
+
+### 7.1 LLMExecutor
+
+适合：
+
+```text
+普通解释
+无工具总结
+文本改写
+短推理
+```
+
+### 7.2 ToolExecutor
+
+适合单次确定动作：
+
+```text
+scheduled_task
+deliver_file
+简单文件定位后的交付
+```
+
+执行前仍必须经过 PermissionGuard。
+
+### 7.3 ReactExecutor
+
+ReactExecutor 是旧 ReActLoop 的新位置：它只处理某个节点内部的动态工具调用。
+
+适合：
+
+```text
+多步搜索
+知识库查询后继续判断
+搜索 + 综合回答
+需要观察结果再决定下一步的节点
+```
+
+不适合：
+
+```text
+代码仓库任务
+commit/push
+单次确定工具调用
+普通聊天
+```
+
+### 7.4 CodexExecutor
+
+Codex 不再作为普通 LLM tool 暴露。
+
+```text
+TaskNode(execution_type="codex")
+  -> NodeRuntime
+  -> CodexExecutor
+```
+
+适合：
+
+```text
+代码阅读
+代码修改
+架构 review
+测试执行
+diff 分析
+repo 报告
+commit / push
+```
+
+CodexExecutor 内部可以复用现有 `app.tools.codex` 的调用实现，但对外语义上它是 executor，不是 tool。
+
+## 10. PermissionGuard
+
+PermissionGuard 是所有高风险动作执行前的强制边界。
+
+位置：
+
+```text
+Executor 产生具体 action/tool_args
+  -> PermissionGuard.check(...)
+  -> allow / ask / deny
+  -> ToolRuntime 或 Executor 内部动作真正执行
+```
+
+它不在 Planner 阶段，也不在 DAGRuntime 调度阶段。
+
+判断维度：
+
+```text
+- node.execution_type
+- tool_name / action
+- target resource
+- tool_args / executor action args
+- 用户原始意图
+- 当前会话授权
+- pending approval resume token
+```
+
+返回：
+
+```python
+class PermissionDecision(BaseModel):
+    status: Literal["allow", "ask", "deny"]
+    reason: str
+    action: str
+    resource: str | None = None
+    resume_token: str | None = None
+```
+
+示例规则：
+
+```text
+普通 LLM 回复                         allow
+web search                            allow
+deliver existing artifact              allow
+scheduled_task create/cancel           用户明确要求时 allow，否则 ask
+repo inspect                           allow
+repo edit                              ask
+repo commit                            ask
+repo push                              ask
+obsidian_wiki_apply                    ask
+delete file / destructive shell action deny 或 ask
+```
+
+Planner 不能授权，Executor 不能绕过 PermissionGuard。
+
+## 11. Approval / Resume
+
+approval/resume 是 V1 硬边界，不推迟到 V2。
+
+当 PermissionGuard 返回 `ask`：
+
+```text
+1. Executor 返回 NodeResult(status="waiting_approval")
+2. NodeResult 携带 pending_decision 和 resume_token
+3. DAGRuntime 保存结果并暂停 DAG
+4. 用户批准后，DAGRuntime 用 resume_token 恢复同一个 node
+5. Executor 从暂停点继续，不重新跑整轮 DAG
+```
+
+节点结果：
+
+```python
+class NodeResult(BaseModel):
+    node_id: str
+    status: Literal[
+        "success",
+        "failed",
+        "skipped",
+        "needs_user",
+        "waiting_approval",
+    ]
+    summary: str
+    output: dict = {}
+    artifacts: list[ArtifactRef] = []
+    error: str | None = None
+    pending_decision: PermissionDecision | None = None
+    resume_token: str | None = None
+```
+
+## 12. Blackboard
+
+Blackboard 是 DAG/node 的运行状态源。
+
+V1 最小持久化即可：
+
+```text
+dag_run_id
+node_id
+status
+summary
+output_json
+artifact_refs
+error
+pending_approval
+resume_token
+```
+
+V1 不一次性做完整工作流平台：
+
+```text
+- tool audit 先复用现有记录
+- artifacts 先复用现有 artifact 模型
+- messages 继续作为对话记录
+- Blackboard 只保存节点状态和节点输出
+```
+
+后续再扩展：
+
+```text
+node_run_id
+node_tool_calls
+checkpoint payload
+parallel execution metadata
+retry history
+```
+
+## 13. Aggregator
+
+Aggregator 只汇总，不重新执行。
+
+职责：
+
+```text
+- 读取 Blackboard 中的 NodeResult
+- 按用户原始目标组织结果
+- 说明成功、失败、跳过、等待审批的节点
+- 附带产物和链接
+- 输出最终用户回复
+```
+
+Aggregator 不做：
+
+```text
+- 不调用工具
+- 不重新搜索
+- 不编造未出现在 NodeResult 中的事实
+- 不绕过 waiting_approval
+```
+
+## 14. V1 范围
+
+V1 做：
+
+```text
+- FastIntentNode + Planner 并行启动
+- PlanCoordinator 决定 direct 单节点 DAG 或完整 Planner DAG
+- Planner 输出 TaskDAG
+- TaskNode 使用 execution_type
+- PlanValidator 做结构校验
+- DAGRuntime 顺序执行
+- NodeRuntime 确定性分派 Executor
+- LLMExecutor / ToolExecutor / ReactExecutor / CodexExecutor
+- PermissionGuard 覆盖高风险动作
+- approval/resume 基础闭环
+- Blackboard 最小持久化
+- Aggregator 简单汇总
+```
+
+V1 不做：
+
+```text
+- capability registry
+- allowed_tools resolver
+- DAG 并发
+- 自动 verifier
+- 自动 repair
+- 多轮复杂 checkpoint
+- worker mailbox
+- agent 间通信
+```
+
+## 15. 后续演进
+
+V2：
+
+```text
+ResultVerifier
+RepairPlanner
+复杂 checkpoint
+更细粒度 approval scope
+Feishu 结构化展示
+```
+
+V3：
+
+```text
+DAG 并发调度
+失败节点重试
+动态 replan
+节点级 metrics
+```
+
+V4：
+
+```text
+DeepResearchRuntime
+ArtifactRuntime
+MemoryRuntime
+多 worker 观测系统
+Langfuse / Prometheus 指标接入
+```
+
+## 16. 一句话总结
+
+Jarvis vNext 以 TaskDAG 为核心运行时：FastIntent 和 Planner 并行启动，简单任务由 FastIntent 快速生成单节点 DAG，复杂任务等待 Planner 生成带 `execution_type` 的 DAG；DAGRuntime 循环调度可执行节点，NodeRuntime 按 `execution_type` 选择 Executor，所有高风险动作在执行前经过 PermissionGuard，节点结果写入 Blackboard，最终由 Aggregator 汇总。

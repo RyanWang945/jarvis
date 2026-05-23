@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 from shutil import which
 from uuid import uuid4
@@ -18,7 +19,7 @@ from app.tools.coder_common import (
     prepare_workspace,
 )
 from app.tools.codex_app_server import CodexAppServerRunResult, run_codex_app_server_turn
-from app.tools.common import ToolExecutionRequest, ToolExecutionResult
+from app.tools.common import ToolArtifact, ToolExecutionRequest, ToolExecutionResult
 
 
 logger = logging.getLogger(__name__)
@@ -140,6 +141,7 @@ def run_codex_coder_tool(request: ToolExecutionRequest) -> ToolExecutionResult:
             stdout=_compose_user_stdout(summary),
             stderr=raw_stderr,
             artifacts=artifacts,
+            tool_artifacts=_codex_tool_artifacts(app_server_result, run_id=run_id),
             summary=summary,
         )
 
@@ -216,8 +218,24 @@ def run_codex_coder_tool(request: ToolExecutionRequest) -> ToolExecutionResult:
         stdout=stdout,
         stderr=raw_stderr,
         artifacts=artifacts,
+        tool_artifacts=_codex_tool_artifacts(app_server_result, run_id=run_id),
         summary=summary,
     )
+
+
+def _codex_tool_artifacts(result: CodexAppServerRunResult, *, run_id: str) -> list[ToolArtifact]:
+    artifacts: list[ToolArtifact] = []
+    for artifact in result.tool_artifacts:
+        metadata = dict(artifact.metadata)
+        metadata.setdefault("codex_run_id", run_id)
+        artifacts.append(
+            replace(
+                artifact,
+                source_tool=artifact.source_tool or "delegate_to_codex",
+                metadata=metadata,
+            )
+        )
+    return artifacts
 
 
 def _apply_read_only_permission_check(

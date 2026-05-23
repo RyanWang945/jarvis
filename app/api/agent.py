@@ -5,7 +5,7 @@ import logging
 from dataclasses import replace
 from datetime import UTC, datetime
 from functools import lru_cache
-from threading import Lock
+from threading import RLock
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, status
@@ -71,7 +71,7 @@ class InMemoryConversationStore:
     """
 
     def __init__(self) -> None:
-        self._lock = Lock()
+        self._lock = RLock()
         self._next_user_id = 1
         self._next_conversation_id = 1
         self._next_message_id = 1
@@ -1303,6 +1303,11 @@ def get_conversation_store() -> MySQLConversationStore:
 
 
 def get_agent_runtime() -> AgentRuntime:
+    provider = (get_settings().agent_runtime_provider or "react").strip().lower()
+    if provider in {"task", "plan_execute", "planner"}:
+        from app.task_runtime import TaskAgentRuntime
+
+        return TaskAgentRuntime(get_conversation_store())  # type: ignore[return-value]
     return AgentRuntime(get_conversation_store())
 
 
