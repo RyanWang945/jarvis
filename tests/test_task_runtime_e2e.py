@@ -7,6 +7,7 @@ from app.api.agent import InMemoryConversationStore
 from app.config import get_settings
 from app.gateway.events import InboundEvent
 from app.gateway.service import GatewayService
+from app.progress import ProgressEvent
 from app.task_runtime import TaskAgentRuntime
 from app.task_runtime.fast_intent import FastIntentDecision
 from app.task_runtime.node_executor import NodeExecutor
@@ -97,6 +98,17 @@ class ArtifactRuntime:
         )
 
 
+class RecordingProgress:
+    def __init__(self) -> None:
+        self.events: list[ProgressEvent] = []
+
+    def emit(self, event_type: str, **payload):
+        self.events.append(ProgressEvent(event_type=event_type, **payload))
+
+    def close(self):
+        pass
+
+
 def test_feishu_gateway_can_run_task_runtime_e2e_without_network() -> None:
     store = InMemoryConversationStore()
     gateway = GatewayService(conversation_store=store)
@@ -138,6 +150,49 @@ def test_feishu_gateway_can_run_task_runtime_e2e_without_network() -> None:
     assert messages[-1].raw_payload["plan"]["nodes"][0]["id"] == "answer"
     assert messages[-1].raw_payload["execution_report"]["status"] == "completed"
     assert messages[-1].raw_payload["aggregation"]["status"] == "completed"
+
+
+def test_task_runtime_emits_progress_events() -> None:
+    store = InMemoryConversationStore()
+    gateway = GatewayService(conversation_store=store)
+    plan = ExecutionPlan(
+        user_objective="hello from feishu",
+        nodes=[PlanNode(id="answer", runtime="llm", objective="Answer simply")],
+    )
+    progress = RecordingProgress()
+    runtime = TaskAgentRuntime(
+        store,
+        planning_router=StaticPlanningRouter(plan),
+        node_executor=NodeExecutor(runtimes={"llm": EchoRuntime()}),
+        result_aggregator=ResultAggregator(model_resolver=lambda metadata: _missing_key_model()),
+    )
+    gateway_result = gateway.handle_inbound_event(
+        InboundEvent(
+            platform="feishu",
+            external_chat_id="chat-task-runtime-progress",
+            external_message_id="msg-task-runtime-progress-1",
+            chat_type="dm",
+            sender_id="ou_1",
+            sender_name="Ryan",
+            text="hello from feishu",
+        )
+    )
+
+    runtime.run_turn(gateway_result.turn_id, progress=progress)  # type: ignore[arg-type]
+
+    event_types = [event.event_type for event in progress.events]
+    assert event_types == [
+        "turn_started",
+        "planning_started",
+        "plan_created",
+        "node_started",
+        "node_completed",
+        "aggregation_started",
+        "aggregation_completed",
+        "turn_completed",
+    ]
+    assert progress.events[2].data["node_count"] == 1
+    assert progress.events[3].node_id == "answer"
 
 
 def test_task_runtime_fast_reply_bypasses_node_executor_and_aggregator() -> None:

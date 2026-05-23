@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import http
+import inspect
 import json
 import logging
 import os
@@ -40,9 +41,11 @@ from lark_oapi.ws.model import Response
 from app.agent_react import ChannelAttachment, ChannelMessage, TurnResult
 from app.agent_react.delivery import DeliveryManager, register_delivery_handler
 from app.api.agent import get_agent_runtime, get_conversation_store
+from app.channels.feishu_progress import FeishuProgressSink
 from app.channels.feishu_renderer import FeishuDelivery, FeishuRenderer
 from app.config import get_settings
 from app.gateway import InboundEvent, get_gateway_service
+from app.progress import NoopProgressReporter, ProgressReporter
 from app.persistence.models import DeliveryRecord
 from app.tools.codex_app_server import approval_command_prefix, respond_to_codex_approval
 
@@ -534,6 +537,7 @@ class FeishuChannel:
         turn_id: int | None,
     ) -> None:
         thinking_message_id: str | None = None
+        progress: ProgressReporter | None = None
         drain_after = True
         try:
             logger.info(
@@ -548,8 +552,12 @@ class FeishuChannel:
             if turn_id is None:
                 raise ValueError("Feishu triggered message did not create a turn.")
             thinking_message_id = self._send_thinking_card(chat_id, text)
-            result = get_agent_runtime().run_turn(turn_id)
+            progress = self._progress_reporter_for(thinking_message_id)
+            result = _run_turn_with_optional_progress(get_agent_runtime(), turn_id, progress)
+            progress.close()
         except Exception:
+            if progress is not None:
+                progress.close()
             logger.exception("agent run failed for feishu message")
             if turn_id is not None:
                 get_conversation_store().complete_turn(
@@ -628,6 +636,19 @@ class FeishuChannel:
             self._send_channel_message(chat_id, message)
         if drain_after:
             self._submit_next_queued_turn(conversation_id, chat_id)
+
+    def _progress_reporter_for(self, thinking_message_id: str | None) -> ProgressReporter:
+        settings = get_settings()
+        if not thinking_message_id or not settings.feishu_progress_updates_enabled:
+            return NoopProgressReporter()
+        sink = FeishuProgressSink(
+            message_id=thinking_message_id,
+            renderer=self._renderer,
+            update_card=self._update_card_message,
+            min_interval_seconds=settings.feishu_progress_min_interval_seconds,
+            max_recent_events=settings.feishu_progress_max_recent_events,
+        )
+        return ProgressReporter([sink])
 
     def _submit_next_queued_turn(self, conversation_id: int, chat_id: str) -> None:
         try:
@@ -1018,6 +1039,18 @@ def build_feishu_channel() -> FeishuChannel | None:
         app_secret=settings.feishu_app_secret,
         bot_name=settings.feishu_bot_name or "Jarvis",
     )
+
+
+def _run_turn_with_optional_progress(runtime: Any, turn_id: int, progress: ProgressReporter) -> TurnResult:
+    run_turn = runtime.run_turn
+    try:
+        signature = inspect.signature(run_turn)
+    except (TypeError, ValueError):
+        return run_turn(turn_id)
+    parameters = signature.parameters
+    if "progress" in parameters or any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
+        return run_turn(turn_id, progress=progress)
+    return run_turn(turn_id)
 
 
 def _ensure_feishu_no_proxy() -> None:

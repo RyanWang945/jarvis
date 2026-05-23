@@ -11,6 +11,7 @@ from app.channels.feishu import (
     _extract_message_id,
 )
 from app.channels.feishu_renderer import FeishuRenderer
+from app.config import get_settings
 from app.tools.codex_app_server import CodexApprovalContinuationResult
 
 
@@ -283,6 +284,73 @@ def test_feishu_channel_updates_error_card_for_failed_turn_result(monkeypatch) -
     assert "**❌ Request Failed**" in updated[0][2]
     assert "调用模型时出错" in updated[0][2]
     assert drained == [(7, "chat_1")]
+
+
+def test_feishu_channel_injects_progress_when_enabled(monkeypatch) -> None:
+    monkeypatch.setenv("JARVIS_FEISHU_PROGRESS_UPDATES_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_FEISHU_PROGRESS_MIN_INTERVAL_SECONDS", "0")
+    get_settings.cache_clear()
+    channel = FeishuChannel(app_id="app", app_secret="secret")
+    updated: list[tuple[str, str, str]] = []
+
+    class FakeRuntime:
+        def run_turn(self, turn_id: int, *, progress) -> TurnResult:
+            progress.emit("planning_started", turn_id=turn_id, summary="正在生成执行计划")
+            return TurnResult(
+                turn_id=turn_id,
+                conversation_id=7,
+                status="completed",
+                message=ChannelMessage(content="# Final\n\nDone", content_type="markdown"),
+            )
+
+    def fake_update(message_id: str, delivery) -> None:
+        card = json.loads(delivery.content)
+        content = "\n".join(element["text"]["content"] for element in card["elements"] if "text" in element)
+        updated.append((message_id, delivery.msg_type, content))
+
+    monkeypatch.setattr("app.channels.feishu.get_agent_runtime", lambda: FakeRuntime())
+    monkeypatch.setattr(channel, "_send_thinking_card", lambda chat_id, text: "om_thinking")
+    monkeypatch.setattr(channel, "_update_card_message", fake_update)
+    monkeypatch.setattr(channel, "_submit_next_queued_turn", lambda conversation_id, chat_id: None)
+
+    try:
+        channel._handle_agent_run("ou_1", "chat_1", "dm", "查资料", 7, 42)
+    finally:
+        get_settings.cache_clear()
+
+    assert updated[0][0] == "om_thinking"
+    assert "Jarvis 正在处理" in updated[0][2]
+    assert "正在生成执行计划" in updated[0][2]
+    assert updated[-1][0] == "om_thinking"
+    assert "**✅ Completed**" in updated[-1][2]
+
+
+def test_feishu_channel_keeps_old_runtime_signature_with_progress_enabled(monkeypatch) -> None:
+    monkeypatch.setenv("JARVIS_FEISHU_PROGRESS_UPDATES_ENABLED", "true")
+    get_settings.cache_clear()
+    channel = FeishuChannel(app_id="app", app_secret="secret")
+    updated: list[tuple[str, str]] = []
+
+    class FakeRuntime:
+        def run_turn(self, turn_id: int) -> TurnResult:
+            return TurnResult(
+                turn_id=turn_id,
+                conversation_id=7,
+                status="completed",
+                message=ChannelMessage(content="# Final\n\nDone", content_type="markdown"),
+            )
+
+    monkeypatch.setattr("app.channels.feishu.get_agent_runtime", lambda: FakeRuntime())
+    monkeypatch.setattr(channel, "_send_thinking_card", lambda chat_id, text: "om_thinking")
+    monkeypatch.setattr(channel, "_update_card_message", lambda message_id, delivery: updated.append((message_id, delivery.msg_type)))
+    monkeypatch.setattr(channel, "_submit_next_queued_turn", lambda conversation_id, chat_id: None)
+
+    try:
+        channel._handle_agent_run("ou_1", "chat_1", "dm", "查资料", 7, 42)
+    finally:
+        get_settings.cache_clear()
+
+    assert updated[-1] == ("om_thinking", "interactive")
 
 
 def test_feishu_channel_sends_image_attachments_once(monkeypatch) -> None:

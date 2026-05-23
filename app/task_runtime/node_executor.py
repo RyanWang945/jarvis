@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.progress import ProgressReporter, ensure_progress
 from app.task_runtime.node_execute_runtime import NodeExecuteRuntime, NodeExecutionContext
 from app.task_runtime.node_result import ExecutionReport, NodeArtifact, NodeError, NodeResult, ResolvedInput
 from app.task_runtime.planner import ExecutionPlan, NodeRuntime, PlanNode
@@ -24,7 +25,9 @@ class NodeExecutor:
         previous_node_results: list[dict[str, Any] | NodeResult] | None = None,
         runtime_hints: dict[str, Any] | None = None,
         instructions: list[str] | None = None,
+        progress: ProgressReporter | None = None,
     ) -> ExecutionReport:
+        progress = ensure_progress(progress)
         artifact_index = _artifact_index(artifacts or [])
         result_index = _previous_result_index(previous_node_results or [])
         completed_order: list[str] = []
@@ -60,6 +63,20 @@ class NodeExecutor:
                     node.input_refs,
                     len(resolved_inputs),
                 )
+                progress.emit(
+                    "node_started",
+                    turn_id=_optional_int((runtime_hints or {}).get("turn_id")),
+                    conversation_id=_optional_int((runtime_hints or {}).get("conversation_id")),
+                    stage="execution",
+                    node_id=node.id,
+                    status="running",
+                    summary=f"开始执行 {node.runtime} 节点：{node.objective}",
+                    data={
+                        "runtime": node.runtime,
+                        "input_refs": list(node.input_refs),
+                        "resolved_input_count": len(resolved_inputs),
+                    },
+                )
                 if runtime is None:
                     result = _blocked_result(
                         node,
@@ -85,6 +102,20 @@ class NodeExecutor:
                     int((time.perf_counter() - node_started) * 1000),
                     _preview(result.summary),
                 )
+                progress.emit(
+                    "node_failed" if result.status != "completed" else "node_completed",
+                    turn_id=_optional_int((runtime_hints or {}).get("turn_id")),
+                    conversation_id=_optional_int((runtime_hints or {}).get("conversation_id")),
+                    stage="execution",
+                    node_id=result.node_id,
+                    status=result.status,
+                    summary=f"{node.runtime} 节点 {result.status}: {_preview(result.summary, limit=120)}",
+                    data={
+                        "runtime": result.runtime,
+                        "artifact_count": len(result.artifacts),
+                        "elapsed_ms": int((time.perf_counter() - node_started) * 1000),
+                    },
+                )
                 results.append(result)
                 result_index[f"node:{node.id}"] = result
                 completed_order.append(node.id)
@@ -102,6 +133,16 @@ class NodeExecutor:
                         missing_refs,
                         blocked_refs,
                         message,
+                    )
+                    progress.emit(
+                        "node_failed",
+                        turn_id=_optional_int((runtime_hints or {}).get("turn_id")),
+                        conversation_id=_optional_int((runtime_hints or {}).get("conversation_id")),
+                        stage="execution",
+                        node_id=node.id,
+                        status="blocked",
+                        summary=message,
+                        data={"runtime": node.runtime, "missing_refs": missing_refs, "blocked_refs": blocked_refs},
                     )
                     results.append(result)
                     result_index[f"node:{node.id}"] = result
@@ -258,6 +299,13 @@ def _optional_str(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _optional_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _preview(value: Any, *, limit: int = 240) -> str:

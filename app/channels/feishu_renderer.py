@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from typing import Any
 
 from app.agent_react import ChannelMessage
 
@@ -50,6 +51,27 @@ class FeishuRenderer:
             ],
             update_multi=True,
         )
+
+    def render_progress_card(self, snapshot: Any) -> FeishuDelivery:
+        blocks = [
+            "**🟡 Jarvis 正在处理**",
+            f"**当前阶段**: {_snapshot_value(snapshot, 'current_stage', '准备中')}",
+            f"**正在做**: {_snapshot_value(snapshot, 'current_action', '正在处理请求')}",
+        ]
+        node_total = getattr(snapshot, "node_total", None)
+        if isinstance(node_total, int) and node_total > 0:
+            node_completed = getattr(snapshot, "node_completed", 0)
+            blocks.append(f"**节点进度**: {node_completed}/{node_total}")
+
+        completed_items = list(getattr(snapshot, "completed_items", []) or [])[-4:]
+        if completed_items:
+            blocks.append("**已完成**\n" + "\n".join(f"- {item}" for item in completed_items))
+
+        recent_events = list(getattr(snapshot, "recent_events", []) or [])[-5:]
+        if recent_events:
+            blocks.append("**最近进展**\n" + "\n".join(f"- {item}" for item in recent_events))
+
+        return self._render_card_from_blocks(blocks, update_multi=True)
 
     def render_error_card(self, message: str) -> FeishuDelivery:
         return self._render_card_from_blocks(
@@ -586,3 +608,8 @@ def _truncate_card_text(text: str, limit: int) -> str:
     if len(normalized) <= limit:
         return normalized
     return normalized[: limit - 14].rstrip() + "\n...[truncated]"
+
+
+def _snapshot_value(snapshot: Any, name: str, default: str) -> str:
+    value = str(getattr(snapshot, name, "") or "").strip()
+    return _truncate_card_text(value or default, 300)

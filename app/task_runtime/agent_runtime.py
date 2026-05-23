@@ -12,6 +12,7 @@ from app.agent_react.session_state import (
     build_session_state_after_turn,
     load_session_state,
 )
+from app.progress import ProgressReporter, ensure_progress
 from app.task_runtime.node_execute_runtime import (
     CodexNodeExecuteRuntime,
     LLMNodeExecuteRuntime,
@@ -49,7 +50,8 @@ class TaskAgentRuntime:
         )
         self._result_aggregator = result_aggregator or ResultAggregator()
 
-    def run_turn(self, turn_id: int) -> TurnResult:
+    def run_turn(self, turn_id: int, progress: ProgressReporter | None = None) -> TurnResult:
+        progress = ensure_progress(progress)
         turn = self._store.get_turn(turn_id)
         if turn is None:
             raise ValueError(f"Turn not found: {turn_id}")
@@ -78,8 +80,25 @@ class TaskAgentRuntime:
             len(recent_artifacts),
             session_state.active_repo_id,
         )
+        progress.emit(
+            "turn_started",
+            turn_id=turn_id,
+            conversation_id=turn.conversation_id,
+            stage="turn",
+            status="running",
+            summary="开始处理用户请求",
+            data={"trigger_type": getattr(turn, "trigger_type", None), "recent_artifact_count": len(recent_artifacts)},
+        )
 
         try:
+            progress.emit(
+                "planning_started",
+                turn_id=turn_id,
+                conversation_id=turn.conversation_id,
+                stage="planning",
+                status="running",
+                summary="正在判断是否需要规划并生成执行计划",
+            )
             router_result = self._planning_router.plan(
                 content=user_input,
                 session_state=session_state,
@@ -100,6 +119,21 @@ class TaskAgentRuntime:
                 router_result.plan.finalization_hint.mode,
                 router_result.elapsed_ms,
                 router_result.planner_elapsed_ms,
+            )
+            progress.emit(
+                "plan_created",
+                turn_id=turn_id,
+                conversation_id=turn.conversation_id,
+                stage="planning",
+                status="completed",
+                summary=f"已生成 {len(router_result.plan.nodes)} 个执行节点",
+                data={
+                    "route": router_result.route,
+                    "fast_route": router_result.fast_intent.route,
+                    "node_count": len(router_result.plan.nodes),
+                    "runtimes": [node.runtime for node in router_result.plan.nodes],
+                    "planner_elapsed_ms": router_result.planner_elapsed_ms,
+                },
             )
             if router_result.route == "fast_reply":
                 report = _fast_reply_report(router_result.fast_intent.reply)
@@ -128,6 +162,14 @@ class TaskAgentRuntime:
                     turn_id,
                     len(aggregation.reply),
                     int((time.perf_counter() - started) * 1000),
+                )
+                progress.emit(
+                    "turn_completed",
+                    turn_id=turn_id,
+                    conversation_id=turn.conversation_id,
+                    stage="turn",
+                    status="completed",
+                    summary="已生成直接回复",
                 )
                 self._writeback_session(
                     conversation_id=turn.conversation_id,
@@ -159,6 +201,7 @@ class TaskAgentRuntime:
                 previous_node_results=[],
                 runtime_hints=runtime_hints,
                 instructions=[],
+                progress=progress,
             )
             logger.info(
                 "task runtime execution completed turn_id=%s status=%s node_count=%s completed_order=%s elapsed_ms=%s",
@@ -169,6 +212,15 @@ class TaskAgentRuntime:
                 int((time.perf_counter() - execution_started) * 1000),
             )
             aggregation_started = time.perf_counter()
+            progress.emit(
+                "aggregation_started",
+                turn_id=turn_id,
+                conversation_id=turn.conversation_id,
+                stage="aggregation",
+                status="running",
+                summary="正在汇总执行结果",
+                data={"report_status": report.status, "node_count": len(report.node_results)},
+            )
             aggregation = self._result_aggregator.aggregate(
                 plan=router_result.plan,
                 report=report,
@@ -191,6 +243,19 @@ class TaskAgentRuntime:
                 len(aggregation.reply),
                 aggregation.artifact_refs,
                 int((time.perf_counter() - aggregation_started) * 1000),
+            )
+            progress.emit(
+                "aggregation_completed",
+                turn_id=turn_id,
+                conversation_id=turn.conversation_id,
+                stage="aggregation",
+                status=aggregation.status,
+                summary="汇总完成" if aggregation.status != "failed" else "汇总失败",
+                data={
+                    "artifact_refs": aggregation.artifact_refs,
+                    "reply_len": len(aggregation.reply),
+                    "elapsed_ms": int((time.perf_counter() - aggregation_started) * 1000),
+                },
             )
             logger.info(
                 "task runtime artifacts resolved turn_id=%s artifact_count=%s attachment_count=%s rejected_count=%s",
@@ -232,6 +297,15 @@ class TaskAgentRuntime:
                 status,
                 int((time.perf_counter() - started) * 1000),
             )
+            progress.emit(
+                "turn_failed" if status == "failed" else "turn_completed",
+                turn_id=turn_id,
+                conversation_id=turn.conversation_id,
+                stage="turn",
+                status=status,
+                summary="任务执行失败" if status == "failed" else "任务已完成",
+                data={"elapsed_ms": int((time.perf_counter() - started) * 1000)},
+            )
             self._writeback_session(
                 conversation_id=turn.conversation_id,
                 turn_id=turn_id,
@@ -261,6 +335,15 @@ class TaskAgentRuntime:
                 int((time.perf_counter() - started) * 1000),
             )
             self._store.finalize_turn_failure(turn_id, error_message=str(exc))
+            progress.emit(
+                "turn_failed",
+                turn_id=turn_id,
+                conversation_id=turn.conversation_id,
+                stage="turn",
+                status="failed",
+                summary=str(exc),
+                data={"elapsed_ms": int((time.perf_counter() - started) * 1000)},
+            )
             self._writeback_session(
                 conversation_id=turn.conversation_id,
                 turn_id=turn_id,
