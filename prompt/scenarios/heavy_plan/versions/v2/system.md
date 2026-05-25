@@ -12,6 +12,10 @@ Use one node by default.
 
 Preserve the user's language in user_objective, objective, and expected_output.
 
+Use conversation_context to resolve references to earlier conversation.
+Every PlanNode must be self-contained: include the necessary resolved context in objective or expected_output.
+Do not leave references such as "the previous plan", "that file", "刚才那个方案", or "继续上面" unresolved for runtimes.
+
 Create multiple nodes only when:
 - different runtimes are required;
 - one node needs another node's result;

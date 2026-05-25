@@ -41,11 +41,11 @@ from lark_oapi.ws.model import Response
 from app.agent_react import ChannelAttachment, ChannelMessage, TurnResult
 from app.agent_react.delivery import DeliveryManager, register_delivery_handler
 from app.api.agent import get_agent_runtime, get_conversation_store
-from app.channels.feishu_progress import FeishuProgressSink
+from app.channels.feishu_progress import FeishuCardKitProgressSink, FeishuProgressSink
 from app.channels.feishu_renderer import FeishuDelivery, FeishuRenderer
 from app.config import get_settings
 from app.gateway import InboundEvent, get_gateway_service
-from app.progress import NoopProgressReporter, ProgressReporter
+from app.progress import NoopProgressReporter, ProgressEvent, ProgressReporter
 from app.persistence.models import DeliveryRecord
 from app.tools.codex_app_server import approval_command_prefix, respond_to_codex_approval
 
@@ -64,6 +64,54 @@ class _ArtifactDeliveryState:
     upload_key: str | None = None
     external_message_id: str | None = None
     error_message: str | None = None
+
+
+_PROGRESS_ACTIVATION_EVENTS = {
+    "planning_started",
+    "plan_created",
+    "node_started",
+    "node_completed",
+    "node_failed",
+    "aggregation_started",
+    "aggregation_completed",
+}
+
+
+class _LazyFeishuProgressReporter(ProgressReporter):
+    """Create the visible Feishu progress entry only after a planned path starts."""
+
+    def __init__(self, channel: "FeishuChannel", receive_id: str, prompt: str) -> None:
+        super().__init__([])
+        self._channel = channel
+        self._receive_id = receive_id
+        self._prompt = prompt
+        self._message_id: str | None = None
+        self._sink: FeishuProgressSink | None = None
+        self._closed = False
+
+    @property
+    def message_id(self) -> str | None:
+        return self._message_id
+
+    def emit(self, event_type: str, **payload: Any) -> None:
+        if self._closed:
+            return
+        if self._message_id is None:
+            if event_type not in _PROGRESS_ACTIVATION_EVENTS:
+                return
+            self._message_id = self._channel._send_progress_entry_card(self._receive_id, self._prompt)
+            if self._message_id is None:
+                return
+            self._sink = self._channel._progress_sink_for(self._message_id)
+        if self._sink is not None:
+            self._sink.on_progress(ProgressEvent(event_type=event_type, **payload))
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._sink is not None:
+            self._sink.close()
 
 
 class _JarvisFeishuWsClient(ws.Client):
@@ -140,6 +188,8 @@ class FeishuChannel:
         self._token_expires_at: float = 0.0
         self._renderer = FeishuRenderer(title=bot_name)
         self._artifact_deliveries: dict[tuple[str, str], _ArtifactDeliveryState] = {}
+        self._cardkit_progress_message_ids: set[str] = set()
+        self._progress_sinks: dict[str, FeishuProgressSink] = {}
         self.channel = "feishu"
 
     def start(self) -> None:
@@ -551,13 +601,20 @@ class FeishuChannel:
             )
             if turn_id is None:
                 raise ValueError("Feishu triggered message did not create a turn.")
-            thinking_message_id = self._send_thinking_card(chat_id, text)
-            progress = self._progress_reporter_for(thinking_message_id)
-            result = _run_turn_with_optional_progress(get_agent_runtime(), turn_id, progress)
+            runtime = get_agent_runtime()
+            if _runtime_accepts_progress(runtime):
+                progress = _LazyFeishuProgressReporter(self, chat_id, text)
+                result = _run_turn_with_optional_progress(runtime, turn_id, progress)
+                thinking_message_id = progress.message_id if isinstance(progress, _LazyFeishuProgressReporter) else None
+            else:
+                thinking_message_id = self._send_progress_entry_card(chat_id, text)
+                progress = self._progress_reporter_for(thinking_message_id)
+                result = _run_turn_with_optional_progress(runtime, turn_id, progress)
             progress.close()
         except Exception:
             if progress is not None:
                 progress.close()
+                thinking_message_id = thinking_message_id or getattr(progress, "message_id", None)
             logger.exception("agent run failed for feishu message")
             if turn_id is not None:
                 get_conversation_store().complete_turn(
@@ -638,17 +695,33 @@ class FeishuChannel:
             self._submit_next_queued_turn(conversation_id, chat_id)
 
     def _progress_reporter_for(self, thinking_message_id: str | None) -> ProgressReporter:
+        sink = self._progress_sink_for(thinking_message_id)
+        if sink is None:
+            return NoopProgressReporter()
+        return ProgressReporter([sink])
+
+    def _progress_sink_for(self, thinking_message_id: str | None) -> FeishuProgressSink | None:
         settings = get_settings()
         if not thinking_message_id or not settings.feishu_progress_updates_enabled:
-            return NoopProgressReporter()
-        sink = FeishuProgressSink(
+            return None
+        mode = _progress_mode(settings.feishu_progress_mode)
+        logger.info(
+            "feishu progress enabled mode=%s message_id=%s min_interval_seconds=%s",
+            mode,
+            thinking_message_id,
+            settings.feishu_progress_min_interval_seconds,
+        )
+        sink_class = FeishuCardKitProgressSink if mode == "cardkit" else FeishuProgressSink
+        sink = sink_class(
             message_id=thinking_message_id,
             renderer=self._renderer,
             update_card=self._update_card_message,
             min_interval_seconds=settings.feishu_progress_min_interval_seconds,
             max_recent_events=settings.feishu_progress_max_recent_events,
+            flush_on_close=False,
         )
-        return ProgressReporter([sink])
+        self._progress_sinks[thinking_message_id] = sink
+        return sink
 
     def _submit_next_queued_turn(self, conversation_id: int, chat_id: str) -> None:
         try:
@@ -732,7 +805,12 @@ class FeishuChannel:
             self._send_message_attachments(receive_id, message)
 
     def _update_channel_message(self, message_id: str, message: ChannelMessage) -> None:
-        delivery = self._renderer.render(message)
+        if message_id in self._cardkit_progress_message_ids:
+            sink = self._progress_sinks.get(message_id)
+            snapshot = sink.snapshot if sink is not None else _initial_progress_snapshot()
+            delivery = self._renderer.render_cardkit_progress_card(snapshot, output_markdown=message.content)
+        else:
+            delivery = self._renderer.render(message)
         if delivery.msg_type != "interactive":
             raise RuntimeError("Only interactive card messages can be updated.")
         self._update_card_message(message_id, delivery)
@@ -746,6 +824,19 @@ class FeishuChannel:
             logger.exception("failed to send thinking card to %s", receive_id)
             return None
         return _extract_message_id(payload)
+
+    def _send_progress_entry_card(self, receive_id: str, prompt: str) -> str | None:
+        settings = get_settings()
+        if settings.feishu_progress_updates_enabled and _progress_mode(settings.feishu_progress_mode) == "cardkit":
+            try:
+                payload = self._send_delivery(receive_id, self._renderer.render_cardkit_progress_card(_initial_progress_snapshot()))
+                message_id = _extract_message_id(payload)
+                if message_id:
+                    self._cardkit_progress_message_ids.add(message_id)
+                return message_id
+            except Exception:
+                logger.exception("failed to send cardkit progress card to %s, falling back to thinking card", receive_id)
+        return self._send_thinking_card(receive_id, prompt)
 
     def _send_text_message(self, receive_id: str, text: str) -> None:
         self._send_delivery(receive_id, self._renderer.render_text_fallback(text))
@@ -1042,15 +1133,35 @@ def build_feishu_channel() -> FeishuChannel | None:
 
 
 def _run_turn_with_optional_progress(runtime: Any, turn_id: int, progress: ProgressReporter) -> TurnResult:
+    if _runtime_accepts_progress(runtime):
+        return runtime.run_turn(turn_id, progress=progress)
+    return runtime.run_turn(turn_id)
+
+
+def _runtime_accepts_progress(runtime: Any) -> bool:
     run_turn = runtime.run_turn
     try:
         signature = inspect.signature(run_turn)
     except (TypeError, ValueError):
-        return run_turn(turn_id)
+        return False
     parameters = signature.parameters
-    if "progress" in parameters or any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
-        return run_turn(turn_id, progress=progress)
-    return run_turn(turn_id)
+    return "progress" in parameters or any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
+
+
+def _progress_mode(value: str) -> str:
+    return "cardkit" if str(value or "").strip().lower() in {"cardkit", "cardkit_v2", "json2"} else "patch"
+
+
+def _initial_progress_snapshot() -> Any:
+    return SimpleNamespace(
+        current_stage="准备中",
+        current_action="正在理解请求",
+        completed_items=[],
+        recent_events=["已收到请求"],
+        node_total=None,
+        node_completed=0,
+        status="running",
+    )
 
 
 def _ensure_feishu_no_proxy() -> None:

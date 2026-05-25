@@ -46,7 +46,7 @@ from app.persistence.models import (
     TurnRecord as _TurnRecord,
     UserRecord as _UserRecord,
 )
-from app.persistence.conversation_store import MySQLConversationStore
+from app.persistence.conversation_store import MySQLConversationStore, _task_runtime_ingest_classification, _uses_task_runtime_provider
 from app.repositories import render_repository_report
 
 logger = logging.getLogger(__name__)
@@ -693,29 +693,41 @@ class InMemoryConversationStore:
 
         turn_id: int | None = None
         if should_respond:
-            classification = classify_turn(
-                content=content,
-                session_state=load_session_state(conversation.metadata),
-                conversation_metadata=conversation.metadata,
-                recent_artifacts=artifact_records_to_context(
-                    self.list_recent_artifacts_by_conversation(conversation.id)
-                ),
-            )
-            classification_metadata = classification_to_metadata(classification)
-            logger.info(
-                "turn classified conversation_id=%s turn_type=%s classification=%s",
-                conversation.id,
-                classification.turn_type,
-                json.dumps(classification_metadata, ensure_ascii=False),
-            )
-            session_state = load_session_state(conversation.metadata)
-            if should_apply_session_mode_update(classification) and classification.session_mode_update is not None:
-                session_state = replace(session_state, session_mode=classification.session_mode_update)
-            if should_apply_repo_update(classification):
-                session_state = replace(session_state, active_repo_id=classification.active_repo_id_update)
-            if (
-                session_state != load_session_state(conversation.metadata)
-            ):
+            original_session_state = load_session_state(conversation.metadata)
+            if _uses_task_runtime_provider():
+                turn_type, classification_metadata, session_state = _task_runtime_ingest_classification(
+                    content,
+                    original_session_state,
+                )
+                logger.info(
+                    "turn lightweight-classified conversation_id=%s turn_type=%s classification=%s",
+                    conversation.id,
+                    turn_type,
+                    json.dumps(classification_metadata, ensure_ascii=False),
+                )
+            else:
+                classification = classify_turn(
+                    content=content,
+                    session_state=original_session_state,
+                    conversation_metadata=conversation.metadata,
+                    recent_artifacts=artifact_records_to_context(
+                        self.list_recent_artifacts_by_conversation(conversation.id)
+                    ),
+                )
+                classification_metadata = classification_to_metadata(classification)
+                logger.info(
+                    "turn classified conversation_id=%s turn_type=%s classification=%s",
+                    conversation.id,
+                    classification.turn_type,
+                    json.dumps(classification_metadata, ensure_ascii=False),
+                )
+                session_state = original_session_state
+                if should_apply_session_mode_update(classification) and classification.session_mode_update is not None:
+                    session_state = replace(session_state, session_mode=classification.session_mode_update)
+                if should_apply_repo_update(classification):
+                    session_state = replace(session_state, active_repo_id=classification.active_repo_id_update)
+                turn_type = classification.turn_type
+            if session_state != original_session_state:
                 conversation.metadata = {
                     **conversation.metadata,
                     **dump_session_state(session_state),
@@ -728,7 +740,7 @@ class InMemoryConversationStore:
                 trigger_message_id=message.id,
                 trigger_type=trigger_type,
                 status="queued",
-                turn_type=classification.turn_type,
+                turn_type=turn_type,
                 started_by_user_id=user_id,
                 started_at=_now(),
                 metadata={

@@ -342,6 +342,7 @@ def _llm_messages(context: NodeExecutionContext) -> list[LLMMessage]:
         "user_objective": context.user_objective,
         "node": context.node.model_dump(mode="json"),
         "resolved_inputs": [item.model_dump(mode="json", exclude_none=True) for item in context.resolved_inputs],
+        "temporal_context": _temporal_context(context.runtime_hints),
         "runtime_hints": context.runtime_hints,
         "instructions": context.instructions,
     }
@@ -351,6 +352,7 @@ def _llm_messages(context: NodeExecutionContext) -> list[LLMMessage]:
             content=(
                 "You are Jarvis LLMNodeExecuteRuntime. Execute one plan node without tools. "
                 "Do not produce a final user reply unless the node objective itself is the whole answer. "
+                "Use the temporal_context payload as the authoritative current date/time for relative-time wording. "
                 "Write summary in the user's language when the node output is user-facing. "
                 "Return JSON with summary, optional data, and optional artifacts."
             ),
@@ -364,6 +366,7 @@ def _react_messages(context: NodeExecutionContext) -> list[LLMMessage]:
         "user_objective": context.user_objective,
         "node": context.node.model_dump(mode="json"),
         "resolved_inputs": [item.model_dump(mode="json", exclude_none=True) for item in context.resolved_inputs],
+        "temporal_context": _temporal_context(context.runtime_hints),
         "runtime_hints": context.runtime_hints,
         "instructions": context.instructions,
     }
@@ -373,6 +376,8 @@ def _react_messages(context: NodeExecutionContext) -> list[LLMMessage]:
             content=(
                 "You are Jarvis ReactNodeExecuteRuntime. Execute one research/lookup node only. "
                 "Use tools when external, business, or project-memory evidence is needed. "
+                "Use the temporal_context payload as the authoritative current date/time; convert relative terms "
+                "such as today, current, latest, recent, 今天, 当前, 最新, 最近 into concrete date constraints when searching. "
                 "Do not perform code edits or repository workflows. Do not produce a final user reply. "
                 "After tool use, return JSON with summary, findings, sources, and data. "
                 "Be concise and preserve useful evidence for downstream nodes."
@@ -407,8 +412,9 @@ def _react_result_from_response(
     tool_calls: list[dict[str, Any]],
 ) -> NodeResult:
     payload = parse_json_content({"content": response.content})
-    summary = str(payload.get("summary") or payload.get("answer") or response.content or "").strip()
+    summary = _react_summary(payload, response.content)
     data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    data.update(_react_extra_data(payload))
     findings = payload.get("findings")
     sources = payload.get("sources")
     if isinstance(findings, list):
@@ -430,9 +436,99 @@ def _react_result_from_response(
     )
 
 
+def _react_summary(payload: dict[str, Any], response_content: str) -> str:
+    for key in ("summary", "answer", "result", "final_answer"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    findings = payload.get("findings")
+    if isinstance(findings, list):
+        summary = _summary_from_list(findings)
+        if summary:
+            return summary
+    data = payload.get("data")
+    if isinstance(data, dict):
+        for key in ("summary", "answer", "result", "final_answer"):
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        summary = _summary_from_mapping(data)
+        if summary:
+            return summary
+    summary = _summary_from_mapping(_react_extra_data(payload))
+    if summary:
+        return summary
+    return str(response_content or "").strip()
+
+
+def _react_extra_data(payload: dict[str, Any]) -> dict[str, Any]:
+    reserved = {
+        "summary",
+        "answer",
+        "result",
+        "final_answer",
+        "data",
+        "findings",
+        "sources",
+        "artifacts",
+    }
+    return {key: value for key, value in payload.items() if key not in reserved}
+
+
+def _summary_from_mapping(value: dict[str, Any]) -> str:
+    for key in ("findings", "candidates", "items", "results"):
+        items = value.get(key)
+        if isinstance(items, list):
+            summary = _summary_from_list(items)
+            if summary:
+                return summary
+    if not value:
+        return ""
+    return _truncate(json.dumps(value, ensure_ascii=False), limit=1200)
+
+
+def _summary_from_list(items: list[Any]) -> str:
+    lines: list[str] = []
+    for item in items[:5]:
+        if isinstance(item, str):
+            text = item.strip()
+        elif isinstance(item, dict):
+            text = _summary_from_item(item)
+        else:
+            text = str(item).strip()
+        if text:
+            lines.append(f"- {text}")
+    return "\n".join(lines)
+
+
+def _summary_from_item(item: dict[str, Any]) -> str:
+    label = _first_item_text(item, ("name", "title", "candidate"))
+    summary = _first_item_text(item, ("summary", "answer", "claim", "result"))
+    if label and summary and label != summary:
+        return f"{label}: {summary}"
+    if label or summary:
+        return label or summary or ""
+    for key in ("summary", "answer", "title", "name", "candidate", "claim", "result"):
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    compact = {key: value for key, value in item.items() if key not in {"url", "source_url"}}
+    return _truncate(json.dumps(compact or item, ensure_ascii=False), limit=400)
+
+
+def _first_item_text(item: dict[str, Any], keys: tuple[str, ...]) -> str:
+    for key in keys:
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
 def _codex_instruction(context: NodeExecutionContext) -> str:
     sections = [
         "Execute one Jarvis plan node as CodexNodeExecuteRuntime.",
+        "",
+        _temporal_context_text(context.runtime_hints),
         "",
         f"User objective: {context.user_objective}",
         f"Node id: {context.node.id}",
@@ -458,6 +554,36 @@ def _codex_instruction(context: NodeExecutionContext) -> str:
         ]
     )
     return "\n".join(sections)
+
+
+def _temporal_context(runtime_hints: dict[str, Any]) -> dict[str, str]:
+    current_date = str(runtime_hints.get("current_date") or "").strip()
+    current_time = str(runtime_hints.get("current_time") or "").strip()
+    timezone = str(runtime_hints.get("timezone") or "").strip()
+    return {
+        key: value
+        for key, value in {
+            "current_date": current_date,
+            "current_time": current_time,
+            "timezone": timezone,
+        }.items()
+        if value
+    }
+
+
+def _temporal_context_text(runtime_hints: dict[str, Any]) -> str:
+    temporal = _temporal_context(runtime_hints)
+    if not temporal:
+        return "Temporal context: unavailable; do not infer current dates from model memory."
+    lines = ["Temporal context:"]
+    if temporal.get("current_date"):
+        lines.append(f"- Current date: {temporal['current_date']}")
+    if temporal.get("current_time"):
+        lines.append(f"- Current time: {temporal['current_time']}")
+    if temporal.get("timezone"):
+        lines.append(f"- Timezone: {temporal['timezone']}")
+    lines.append("- Interpret today/current/latest/recent and 今天/当前/最新/最近 relative to this context.")
+    return "\n".join(lines)
 
 
 def _tool_args(context: NodeExecutionContext) -> dict[str, Any]:

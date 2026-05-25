@@ -73,6 +73,49 @@ class FeishuRenderer:
 
         return self._render_card_from_blocks(blocks, update_multi=True)
 
+    def render_cardkit_progress_card(self, snapshot: Any, *, output_markdown: str | None = None) -> FeishuDelivery:
+        steps = _cardkit_progress_steps(snapshot)
+        elements = [
+            {
+                "tag": "markdown",
+                "element_id": "progress_steps",
+                "content": steps or "正在理解请求",
+            },
+        ]
+        output = _cardkit_output_content(snapshot, output_markdown)
+        if output:
+            elements.extend(
+                [
+                    {"tag": "hr", "element_id": "progress_output_divider"},
+                    {
+                        "tag": "markdown",
+                        "element_id": "progress_output",
+                        "content": output,
+                    },
+                ]
+            )
+        card = {
+            "schema": "2.0",
+            "config": {
+                "update_multi": True,
+                "style": {
+                    "text_size": {
+                        "normal_v2": {"default": "normal", "pc": "normal", "mobile": "normal"},
+                    }
+                },
+            },
+            "header": {
+                "title": {"tag": "plain_text", "content": self._title},
+                "template": "blue",
+            },
+            "body": {
+                "direction": "vertical",
+                "padding": "12px 12px 12px 12px",
+                "elements": elements,
+            },
+        }
+        return FeishuDelivery(msg_type="interactive", content=json.dumps(card, ensure_ascii=False))
+
     def render_error_card(self, message: str) -> FeishuDelivery:
         return self._render_card_from_blocks(
             [
@@ -613,3 +656,60 @@ def _truncate_card_text(text: str, limit: int) -> str:
 def _snapshot_value(snapshot: Any, name: str, default: str) -> str:
     value = str(getattr(snapshot, name, "") or "").strip()
     return _truncate_card_text(value or default, 300)
+
+
+def _cardkit_progress_steps(snapshot: Any) -> str:
+    lines: list[str] = []
+    completed_items = [_truncate_card_text(item, 140) for item in list(getattr(snapshot, "completed_items", []) or [])[-6:]]
+    if "生成执行计划" in completed_items:
+        lines.append(_aligned_check_line("生成执行计划"))
+    planned_nodes = list(getattr(snapshot, "planned_nodes", []) or [])
+    completed_node_ids = set(getattr(snapshot, "completed_node_ids", []) or [])
+    for node in planned_nodes:
+        if not isinstance(node, dict):
+            continue
+        label = _cardkit_node_label(node)
+        if not label:
+            continue
+        line = f"  {label}"
+        if str(node.get("id") or "") in completed_node_ids:
+            line = _aligned_check_line(line)
+        lines.append(line)
+    for item in completed_items:
+        if item and item != "生成执行计划" and not item.startswith("完成 "):
+            lines.append(_aligned_check_line(item))
+    current = _snapshot_value(snapshot, "current_action", "")
+    status = str(getattr(snapshot, "status", "running") or "running")
+    if current and status != "completed" and not planned_nodes and current not in completed_items:
+        lines.append(_truncate_card_text(current, 140))
+    if status == "completed" and not any("任务已完成" in line for line in lines):
+        lines.append(_aligned_check_line("任务已完成"))
+    node_total = getattr(snapshot, "node_total", None)
+    node_completed = getattr(snapshot, "node_completed", 0)
+    if isinstance(node_total, int) and node_total > 0 and node_completed < node_total:
+        remaining = max(node_total - node_completed - 1, 0)
+        lines.extend(["等待后续节点"] * min(remaining, 2))
+    return "\n".join(lines[-6:])
+
+
+def _aligned_check_line(text: str) -> str:
+    return f"{text}\t✓"
+
+
+def _cardkit_node_label(node: dict[str, Any]) -> str:
+    node_id = str(node.get("id") or "").strip()
+    runtime = str(node.get("runtime") or "").strip()
+    objective = str(node.get("objective") or "").strip()
+    label = node_id or objective
+    if runtime and label:
+        label = f"{label} ({runtime})"
+    return _truncate_card_text(label, 140)
+
+
+def _cardkit_output_content(snapshot: Any, output_markdown: str | None) -> str:
+    if output_markdown is not None:
+        output = normalize_markdown(output_markdown)
+        return output or "结果已生成。"
+    if not bool(getattr(snapshot, "output_started", False)):
+        return ""
+    return "正在生成结果..."

@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from app.agent_react.session_state import ConversationSessionState
+from app.agent_react.context_manager import ConversationContext
+from app.progress import ProgressReporter
 from app.prompting import PromptRegistry
 from app.task_runtime.fast_intent import FastIntentDecision, FastIntentNode
 from app.task_runtime.planner import ExecutionPlan, FinalizationHint, PlanNode, TurnPlanner
@@ -61,9 +63,11 @@ class PlanningRouter:
         session_state: ConversationSessionState | None = None,
         conversation_metadata: dict[str, Any] | None = None,
         recent_artifacts: list[dict[str, Any]] | None = None,
+        conversation_context: ConversationContext | None = None,
         previous_node_results: list[dict[str, Any]] | None = None,
         runtime_hints: dict[str, Any] | None = None,
         instructions: list[str] | None = None,
+        progress: ProgressReporter | None = None,
     ) -> PlanningRouterResult:
         started = time.perf_counter()
         try:
@@ -72,6 +76,8 @@ class PlanningRouter:
                 session_state=session_state,
                 conversation_metadata=conversation_metadata,
                 recent_artifacts=recent_artifacts,
+                conversation_context=conversation_context,
+                runtime_hints=runtime_hints,
             )
         except Exception:
             logger.exception("fast intent failed; falling back to planner")
@@ -92,6 +98,9 @@ class PlanningRouter:
                 fast_decision,
                 self._fast_reply_confidence_threshold,
                 has_previous_node_results=bool(previous_node_results),
+                has_context_reference=bool(
+                    conversation_context is not None and conversation_context.context_reference_detected
+                ),
             ):
                 logger.info(
                     "planning router fast reply selected confidence=%.2f reply_len=%s elapsed_ms=%s",
@@ -107,12 +116,27 @@ class PlanningRouter:
                     planner_elapsed_ms=None,
                 )
 
+            if progress is not None:
+                progress.emit(
+                    "planning_started",
+                    turn_id=_optional_int((runtime_hints or {}).get("turn_id")),
+                    conversation_id=_optional_int((runtime_hints or {}).get("conversation_id")),
+                    stage="planning",
+                    status="running",
+                    summary="正在生成执行计划",
+                    data={
+                        "fast_route": fast_decision.route,
+                        "fast_confidence": fast_decision.confidence,
+                        "reason": fast_decision.reason,
+                    },
+                )
             plan, planner_elapsed_ms = _timed_planner_call(
                 self._planner,
                 content=content,
                 session_state=session_state,
                 conversation_metadata=conversation_metadata,
                 recent_artifacts=recent_artifacts,
+                conversation_context=conversation_context,
                 previous_node_results=previous_node_results,
                 runtime_hints=runtime_hints,
                 instructions=instructions,
@@ -184,8 +208,11 @@ def _can_use_fast_reply(
     threshold: float,
     *,
     has_previous_node_results: bool = False,
+    has_context_reference: bool = False,
 ) -> bool:
     if has_previous_node_results:
+        return False
+    if has_context_reference:
         return False
     if decision.route != "fast_reply":
         return False
@@ -201,6 +228,7 @@ def _timed_planner_call(
     session_state: ConversationSessionState | None,
     conversation_metadata: dict[str, Any] | None,
     recent_artifacts: list[dict[str, Any]] | None,
+    conversation_context: ConversationContext | None,
     previous_node_results: list[dict[str, Any]] | None,
     runtime_hints: dict[str, Any] | None,
     instructions: list[str] | None,
@@ -211,8 +239,16 @@ def _timed_planner_call(
         session_state=session_state,
         conversation_metadata=conversation_metadata,
         recent_artifacts=recent_artifacts,
+        conversation_context=conversation_context,
         previous_node_results=previous_node_results,
         runtime_hints=runtime_hints,
         instructions=instructions,
     )
     return plan, int((time.perf_counter() - started) * 1000)
+
+
+def _optional_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None

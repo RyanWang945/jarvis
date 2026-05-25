@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any, Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
+from app.agent_react.context_manager import ConversationContext
 from app.agent_react.session_state import ConversationSessionState
+from app.config import get_settings
 from app.llm.client import LLMMessage, parse_json_content
 from app.llm.model_profiles import LLMNode
 from app.llm.model_router import ModelRouter
@@ -78,10 +82,11 @@ class FinalizationHint(BaseModel):
 
 
 class ExecutionPlan(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore") # pydantic设置，如果有多余的字段，需要忽略。
 
     user_objective: str
     nodes: list[PlanNode]
+    # 执行完任务后，最终回复如何收口，这个是ai生成的，planner LLM 的 system prompt 里设置的
     finalization_hint: FinalizationHint = Field(default_factory=FinalizationHint)
 
     @field_validator("user_objective")
@@ -114,6 +119,7 @@ class PlanInput(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     current_user_input: str
+    conversation_context: dict[str, Any] = Field(default_factory=dict)
     artifacts: list[dict[str, Any]] = Field(default_factory=list)
     previous_node_results: list[dict[str, Any]] = Field(default_factory=list)
     runtime_hints: dict[str, Any] = Field(default_factory=dict)
@@ -145,6 +151,7 @@ class TurnPlanner:
         session_state: ConversationSessionState | None = None,
         conversation_metadata: dict[str, Any] | None = None,
         recent_artifacts: list[dict[str, Any]] | None = None,
+        conversation_context: ConversationContext | None = None,
         previous_node_results: list[dict[str, Any]] | None = None,
         runtime_hints: dict[str, Any] | None = None,
         instructions: list[str] | None = None,
@@ -152,6 +159,7 @@ class TurnPlanner:
         session = session_state or ConversationSessionState()
         plan_input = build_plan_input(
             current_user_input=content,
+            conversation_context=conversation_context,
             artifacts=recent_artifacts or [],
             previous_node_results=previous_node_results or [],
             runtime_hints=runtime_hints,
@@ -165,25 +173,46 @@ class TurnPlanner:
 
         prompt = self._prompt_registry.load("heavy_plan", self._prompt_version)
         response_format = prompt.response_format if resolved.profile.supports_json_object else None
+        messages = _planner_messages(
+            plan_input,
+            prompt_registry=self._prompt_registry,
+            prompt_version=self._prompt_version,
+        )
+        logger.info(
+            "turn planner llm request profile=%s provider=%s response_format=%s prompt_version=%s input=%s",
+            resolved.profile.id,
+            resolved.profile.provider,
+            response_format,
+            self._prompt_version,
+            _json_for_log(plan_input.model_dump(mode="json")),
+        )
         response = resolved.client.chat_normalized(
-            _planner_messages(
-                plan_input,
-                prompt_registry=self._prompt_registry,
-                prompt_version=self._prompt_version,
-            ),
+            messages,
             response_format=response_format,
         )
+        logger.info(
+            "turn planner llm raw response model=%s finish_reason=%s usage=%s content_len=%s content=%s",
+            response.model,
+            response.finish_reason,
+            _usage_for_log(response.usage),
+            len(response.content or ""),
+            response.content,
+        )
         payload = parse_json_content({"content": response.content})
-        return _plan_from_payload(
+        logger.info("turn planner llm payload=%s", _json_for_log(payload))
+        plan = _plan_from_payload(
             payload,
             fallback_objective=plan_input.current_user_input,
             known_artifact_refs=_known_artifact_refs(plan_input.artifacts),
         )
+        logger.info("turn planner plan output=%s", _json_for_log(plan.model_dump(mode="json")))
+        return plan
 
 
 def build_plan_input(
     *,
     current_user_input: str,
+    conversation_context: ConversationContext | None = None,
     artifacts: list[dict[str, Any]],
     previous_node_results: list[dict[str, Any]],
     runtime_hints: dict[str, Any] | None,
@@ -193,8 +222,19 @@ def build_plan_input(
     hints = dict(runtime_hints or {})
     if session_state is not None and "active_repo" not in hints:
         hints["active_repo"] = session_state.active_repo_id
+    hints = _ensure_temporal_hints(hints)
     return PlanInput(
         current_user_input=current_user_input,
+        conversation_context=(
+            conversation_context.planner_payload()
+            if conversation_context is not None
+            else {
+                "has_history": False,
+                "context_reference_detected": False,
+                "summary_node": None,
+                "messages": [],
+            }
+        ),
         artifacts=_normalize_artifact_context(artifacts),
         previous_node_results=[item for item in previous_node_results if isinstance(item, dict)],
         runtime_hints=hints,
@@ -266,6 +306,45 @@ def _known_artifact_refs(artifacts: list[dict[str, Any]]) -> set[str]:
     return refs
 
 
+def _ensure_temporal_hints(hints: dict[str, Any]) -> dict[str, Any]:
+    if hints.get("current_date") and hints.get("current_time") and hints.get("timezone"):
+        return hints
+    timezone_name = str(hints.get("timezone") or get_settings().default_timezone)
+    tz = _resolve_timezone(timezone_name)
+    current = datetime.now(tz)
+    enriched = dict(hints)
+    enriched.setdefault("current_date", current.date().isoformat())
+    enriched.setdefault("current_time", current.isoformat(timespec="seconds"))
+    enriched.setdefault("timezone", timezone_name)
+    return enriched
+
+
+def _resolve_timezone(timezone_name: str):
+    try:
+        return ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        if timezone_name in {"Asia/Shanghai", "Asia/Chongqing"}:
+            return timezone(timedelta(hours=8), name=timezone_name)
+        return UTC
+
+
+def _json_for_log(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, default=str)
+    except TypeError:
+        return str(value)
+
+
+def _usage_for_log(value: Any) -> dict[str, int] | None:
+    if value is None:
+        return None
+    return {
+        "prompt_tokens": int(getattr(value, "prompt_tokens", 0) or 0),
+        "completion_tokens": int(getattr(value, "completion_tokens", 0) or 0),
+        "total_tokens": int(getattr(value, "total_tokens", 0) or 0),
+    }
+
+
 def _plan_from_payload(
     payload: dict[str, Any],
     *,
@@ -307,6 +386,10 @@ def _normalize_plan_payload(
             for node in raw_nodes
             if isinstance(node, dict)
         ]
+    normalized["finalization_hint"] = _normalize_finalization_for_nodes(
+        normalized["finalization_hint"],
+        normalized.get("nodes"),
+    )
     return normalized
 
 
@@ -324,6 +407,40 @@ def _normalize_finalization_hint(value: Any) -> dict[str, Any]:
     hint["reason"] = str(hint.get("reason") or "").strip()
     hint["user_facing"] = bool(hint.get("user_facing"))
     return hint
+
+
+def _normalize_finalization_for_nodes(hint: dict[str, Any], nodes: Any) -> dict[str, Any]:
+    if hint.get("mode") != "pass_through" or not isinstance(nodes, list):
+        return hint
+    if len(nodes) == 1 and nodes[0].get("runtime") == "llm":
+        return hint
+
+    adjusted = dict(hint)
+    if len(nodes) == 1 and nodes[0].get("runtime") == "tool":
+        adjusted["mode"] = "deterministic"
+        adjusted["reason"] = _append_reason(
+            adjusted.get("reason"),
+            "pass_through is only valid for a single llm node; coerced tool node to deterministic finalization",
+        )
+    else:
+        adjusted["mode"] = "llm"
+        adjusted["reason"] = _append_reason(
+            adjusted.get("reason"),
+            "pass_through is only valid for a single llm node; coerced non-llm plan to llm aggregation",
+        )
+    logger.info(
+        "planner finalization coerced original=pass_through new=%s node_runtimes=%s",
+        adjusted["mode"],
+        [node.get("runtime") for node in nodes],
+    )
+    return adjusted
+
+
+def _append_reason(current: Any, addition: str) -> str:
+    text = str(current or "").strip()
+    if not text:
+        return addition
+    return f"{text}; {addition}"
 
 
 def _normalize_node_payload(

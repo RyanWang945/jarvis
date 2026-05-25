@@ -209,7 +209,13 @@ def test_codex_node_execute_runtime_builds_tool_request() -> None:
                     summary="Planner IR should stay lightweight.",
                 )
             ],
-            runtime_hints={"active_repo": "jarvis", "codex_read_only": True},
+            runtime_hints={
+                "active_repo": "jarvis",
+                "codex_read_only": True,
+                "current_date": "2026-05-25",
+                "current_time": "2026-05-25T10:30:00+08:00",
+                "timezone": "Asia/Shanghai",
+            },
         )
     )
 
@@ -219,6 +225,7 @@ def test_codex_node_execute_runtime_builds_tool_request() -> None:
     assert request.args["_read_only"] is True
     assert "Review planner" in request.args["instruction"]
     assert "Planner IR should stay lightweight" in request.args["instruction"]
+    assert "Current date: 2026-05-25" in request.args["instruction"]
     assert result.status == "completed"
     assert result.summary == "Codex finished."
     assert result.artifacts[0].kind == "codex_run"
@@ -260,6 +267,11 @@ def test_react_node_execute_runtime_runs_tool_loop() -> None:
         NodeExecutionContext(
             user_objective="research agent tests",
             node=PlanNode(id="research", runtime="react", objective="Research agent testing"),
+            runtime_hints={
+                "current_date": "2026-05-25",
+                "current_time": "2026-05-25T10:30:00+08:00",
+                "timezone": "Asia/Shanghai",
+            },
         )
     )
 
@@ -269,6 +281,10 @@ def test_react_node_execute_runtime_runs_tool_loop() -> None:
     assert result.data["tool_calls"][0]["tool_name"] == "business_knowledge_search"
     assert executed == [("business_knowledge_search", {"query": "agent testing"}, 60)]
     assert chat.calls[0]["tools"][0]["function"]["name"] == "business_knowledge_search"
+    assert chat.calls[0]["messages"][0].role == "system"
+    assert "最新" in chat.calls[0]["messages"][0].content
+    assert "temporal_context" in chat.calls[0]["messages"][1].content
+    assert "2026-05-25" in chat.calls[0]["messages"][1].content
     assert chat.calls[1]["messages"][-1].role == "tool"
     assert "trace evidence" in chat.calls[1]["messages"][-1].content
 
@@ -299,3 +315,32 @@ def test_react_node_execute_runtime_rejects_unallowed_tool_call() -> None:
     assert result.status == "completed"
     assert result.data["tool_calls"][0]["status"] == "rejected"
     assert "not allowed" in result.data["tool_calls"][0]["summary"]
+
+
+def test_react_node_execute_runtime_preserves_structured_payload_without_summary() -> None:
+    from app.task_runtime.node_execute_runtime import ReactNodeExecuteRuntime
+
+    chat = ScriptedNodeChat(
+        [
+            llm_response(
+                '{"candidates":[{"name":"Elden Ring","summary":"Radahn Festival lets the player summon many allied NPCs."}],"sources":["source1"]}'
+            ),
+        ]
+    )
+    runtime = ReactNodeExecuteRuntime(
+        model_resolver=lambda context: FakeResolvedModel(chat),
+        tool_runner=lambda tool, tool_args, *, timeout_seconds=60: (_ for _ in ()).throw(AssertionError("should not run")),
+        allowed_tools=("business_knowledge_search",),
+        max_steps=2,
+    )
+
+    result = runtime.run(
+        NodeExecutionContext(
+            user_objective="这个游戏可能是啥",
+            node=PlanNode(id="research", runtime="react", objective="Research candidate games"),
+        )
+    )
+
+    assert "Elden Ring" in result.summary
+    assert result.data["candidates"][0]["name"] == "Elden Ring"
+    assert result.data["sources"] == ["source1"]

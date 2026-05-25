@@ -7,7 +7,7 @@ from pydantic import ValidationError
 
 from app.agent_react.session_state import ConversationSessionState
 from app.config import get_settings
-from app.task_runtime.planner import ExecutionPlan, PlanNode, TurnPlanner, build_plan_input
+from app.task_runtime.planner import ExecutionPlan, PlanNode, TurnPlanner, _plan_from_payload, build_plan_input
 
 
 def test_plan_node_uses_input_refs_as_graph_edges() -> None:
@@ -75,6 +75,43 @@ def test_build_plan_input_normalizes_artifacts_and_hints() -> None:
     assert plan_input.artifacts[0]["ref"] == "report-1"
     assert plan_input.artifacts[0]["name"] == "rag_eval_report.md"
     assert plan_input.runtime_hints["active_repo"] == "jarvis"
+    assert plan_input.runtime_hints["current_date"]
+    assert plan_input.runtime_hints["current_time"]
+    assert plan_input.runtime_hints["timezone"] == "Asia/Shanghai"
+
+
+def test_plan_from_payload_coerces_pass_through_for_non_llm_nodes() -> None:
+    plan = _plan_from_payload(
+        {
+            "user_objective": "查最新资料",
+            "finalization_hint": {"mode": "pass_through", "user_facing": True},
+            "nodes": [
+                {
+                    "id": "research",
+                    "runtime": "react",
+                    "objective": "查最新资料",
+                    "expected_output": "用户可读的答案",
+                }
+            ],
+        },
+        fallback_objective="查最新资料",
+    )
+
+    assert plan.finalization_hint.mode == "llm"
+    assert plan.finalization_hint.user_facing is True
+
+
+def test_plan_from_payload_keeps_pass_through_for_single_llm_node() -> None:
+    plan = _plan_from_payload(
+        {
+            "user_objective": "简单回答",
+            "finalization_hint": {"mode": "pass_through", "user_facing": True},
+            "nodes": [{"id": "answer", "runtime": "llm", "objective": "简单回答"}],
+        },
+        fallback_objective="简单回答",
+    )
+
+    assert plan.finalization_hint.mode == "pass_through"
 
 
 real_llm = pytest.mark.skipif(

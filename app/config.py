@@ -71,6 +71,7 @@ class Settings(BaseSettings):
     feishu_app_secret: str | None = None
     feishu_bot_name: str = "Jarvis"
     feishu_progress_updates_enabled: bool = False
+    feishu_progress_mode: str = "patch"
     feishu_progress_min_interval_seconds: float = 2.0
     feishu_progress_max_recent_events: int = 5
     obsidian_workspace_path: Path | None = None

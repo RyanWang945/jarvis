@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import UTC, datetime, timedelta, timezone
+from dataclasses import dataclass
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -60,6 +62,79 @@ SYSTEM_PROMPT = _SYSTEM_PROMPT = """
 _MAX_SELECTED_SKILLS = 3
 _MAX_SKILL_BODY_TOKENS = 800
 _MAX_TOTAL_SKILL_TOKENS = 1800
+_MAX_HISTORY_MESSAGE_TOKENS = 180
+_MAX_FAST_HISTORY_MESSAGES = 2
+_MAX_PLANNER_HISTORY_MESSAGES = 12
+_MAX_PLANNER_HISTORY_TOKENS = 1800
+_MAX_WORKING_SUMMARY_CHARS = 2400
+_CONTEXT_REFERENCE_MARKERS = (
+    "刚才",
+    "上面",
+    "上一轮",
+    "前面",
+    "这个",
+    "那个",
+    "继续",
+    "按你说的",
+    "按刚刚",
+    "按之前",
+    "刚刚",
+    "前一个",
+    "上一版",
+    "这版",
+    "it",
+    "that",
+    "this",
+    "previous",
+    "above",
+    "continue",
+)
+
+
+@dataclass(frozen=True)
+class ConversationContextMessage:
+    role: str
+    content: str
+
+
+@dataclass(frozen=True)
+class ConversationContext:
+    summary: str | None
+    messages: tuple[ConversationContextMessage, ...]
+    context_reference_detected: bool = False
+
+    @property
+    def has_history(self) -> bool:
+        return bool(self.summary or self.messages)
+
+    def fast_payload(self) -> dict[str, Any]:
+        return {
+            "has_history": self.has_history,
+            "context_reference_detected": self.context_reference_detected,
+            "summary": self.summary,
+            "recent_messages": [
+                {"role": message.role, "content": message.content}
+                for message in self.messages[-_MAX_FAST_HISTORY_MESSAGES:]
+            ],
+        }
+
+    def planner_payload(self) -> dict[str, Any]:
+        summary_node = None
+        if self.summary:
+            summary_node = {
+                "id": "conversation_summary",
+                "kind": "compressed_history",
+                "content": self.summary,
+            }
+        return {
+            "has_history": self.has_history,
+            "context_reference_detected": self.context_reference_detected,
+            "summary_node": summary_node,
+            "messages": [
+                {"role": message.role, "content": message.content}
+                for message in self.messages
+            ],
+        }
 
 
 def _render_runtime_temporal_context(now: datetime | None = None) -> str:
@@ -173,6 +248,21 @@ def _looks_like_raw_tool_markup(content: str) -> bool:
     return normalized.startswith("<｜｜DSML｜｜tool_calls>") or normalized.startswith("<|tool_calls|>")
 
 
+def _has_context_reference(content: str) -> bool:
+    text = str(content or "").strip()
+    if not text:
+        return False
+    lower = text.lower()
+    for marker in _CONTEXT_REFERENCE_MARKERS:
+        if marker.isascii():
+            if re.search(rf"\b{re.escape(marker)}\b", lower):
+                return True
+            continue
+        if marker in text:
+            return True
+    return False
+
+
 class ContextManager:
     """Owns model-visible message preparation inside the turn runtime."""
 
@@ -277,6 +367,60 @@ class ContextManager:
 
         return SystemMessage(content="\n\n".join(sections))
 
+    def build_conversation_context(
+        self,
+        records: list,
+        trigger_message_id: int | None,
+        *,
+        turn_records: list | None = None,
+        current_turn_id: int | None = None,
+        session_state: ConversationSessionState | None = None,
+        current_user_input: str = "",
+    ) -> ConversationContext:
+        selected = select_records_for_turn(
+            records,
+            turn_records or [],
+            current_turn_id=current_turn_id,
+            trigger_message_id=trigger_message_id,
+        )
+        history_records = [
+            record
+            for record in selected
+            if getattr(record, "id", None) != trigger_message_id
+            and (current_turn_id is None or getattr(record, "turn_id", None) != current_turn_id)
+        ]
+        messages = self._records_to_conversation_context_messages(history_records)
+        messages = self._fit_context_messages(messages, max_tokens=_MAX_PLANNER_HISTORY_TOKENS)
+        summary = session_state.working_summary if session_state is not None else None
+        return ConversationContext(
+            summary=summary,
+            messages=tuple(messages[-_MAX_PLANNER_HISTORY_MESSAGES:]),
+            context_reference_detected=_has_context_reference(current_user_input),
+        )
+
+    def update_working_summary(
+        self,
+        session_state: ConversationSessionState | None,
+        *,
+        current_user_input: str,
+        assistant_reply: str | None,
+    ) -> str | None:
+        current = session_state.working_summary if session_state is not None else None
+        exchange = self._summarize_exchange(
+            current_user_input=current_user_input,
+            assistant_reply=assistant_reply,
+        )
+        if not exchange:
+            return current
+        combined = f"{current.strip()}\n{exchange}" if current else exchange
+        if len(combined) <= _MAX_WORKING_SUMMARY_CHARS:
+            return combined
+        tail = combined[-_MAX_WORKING_SUMMARY_CHARS:].lstrip()
+        first_line_break = tail.find("\n")
+        if first_line_break > 0:
+            tail = tail[first_line_break + 1 :].lstrip()
+        return "Earlier conversation was compressed. Recent working summary:\n" + tail
+
     def build_skill_reminder_message(self, skill_names: list[str]) -> HumanMessage | None:
         rendered = self._render_selected_skills(skill_names)
         if rendered is None:
@@ -374,8 +518,11 @@ class ContextManager:
         if not isinstance(task_plan, dict) or not task_plan:
             return None
         rendered = json.dumps(task_plan, ensure_ascii=False, default=str, indent=2)
+        objective = str(task_plan.get("objective") or task_plan.get("user_objective") or "").strip()
+        objective_line = f"Current turn objective: {objective}\n" if objective else ""
         return (
             "Task plan for this turn:\n"
+            f"{objective_line}"
             f"{rendered}\n"
             "Use this as the current turn objective. Treat read/search tools as evidence collection when "
             "the plan's final_deliverable requires an answer, edit, artifact revision, or delivery."
@@ -417,6 +564,52 @@ class ContextManager:
         lines.append(
             "Use recent artifacts to resolve references such as 这个图, 刚才那个文件, previous image, or latest file."
         )
+        return "\n".join(lines)
+
+    def _records_to_conversation_context_messages(self, records: list) -> list[ConversationContextMessage]:
+        messages: list[ConversationContextMessage] = []
+        for record in records:
+            role = getattr(record, "role", None)
+            if role not in {"user", "assistant"}:
+                continue
+            content = str(getattr(record, "content", "") or "").strip()
+            if not content or _looks_like_raw_tool_markup(content):
+                continue
+            if role == "assistant":
+                content = strip_token_usage_footer(content)
+            content = self._truncate_text_by_tokens(content, _MAX_HISTORY_MESSAGE_TOKENS)
+            messages.append(ConversationContextMessage(role=role, content=content))
+        return messages
+
+    def _fit_context_messages(
+        self,
+        messages: list[ConversationContextMessage],
+        *,
+        max_tokens: int,
+    ) -> list[ConversationContextMessage]:
+        kept_reversed: list[ConversationContextMessage] = []
+        used = 0
+        for message in reversed(messages):
+            tokens = self.estimate_text_tokens(message.content) + 4
+            if kept_reversed and used + tokens > max_tokens:
+                break
+            kept_reversed.append(message)
+            used += tokens
+        return list(reversed(kept_reversed))
+
+    def _summarize_exchange(
+        self,
+        *,
+        current_user_input: str,
+        assistant_reply: str | None,
+    ) -> str:
+        lines: list[str] = []
+        user = " ".join(str(current_user_input or "").split())
+        assistant = " ".join(strip_token_usage_footer(str(assistant_reply or "")).split())
+        if user:
+            lines.append(f"User: {user[:500]}")
+        if assistant:
+            lines.append(f"Assistant: {assistant[:800]}")
         return "\n".join(lines)
 
     def ensure_system_prompt(self, messages: list[BaseMessage]) -> list[BaseMessage]:

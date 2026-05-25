@@ -24,6 +24,9 @@ class StaticPlanningRouter:
 
     def plan(self, **kwargs):
         self.calls.append(kwargs)
+        progress = kwargs.get("progress")
+        if progress is not None:
+            progress.emit("planning_started", summary="正在生成执行计划")
         return PlanningRouterResult(
             route="planned",
             plan=self.plan_result,
@@ -142,6 +145,9 @@ def test_feishu_gateway_can_run_task_runtime_e2e_without_network() -> None:
     assert run_result.status == "completed"
     assert run_result.reply == "node result: hello from feishu"
     assert router.calls[0]["content"] == "hello from feishu"
+    assert router.calls[0]["runtime_hints"]["current_date"]
+    assert router.calls[0]["runtime_hints"]["current_time"]
+    assert router.calls[0]["runtime_hints"]["timezone"] == "Asia/Shanghai"
     assert llm_runtime.calls[0].user_objective == "hello from feishu"
 
     messages = store.list_messages(gateway_result.conversation_id)
@@ -219,12 +225,14 @@ def test_task_runtime_fast_reply_bypasses_node_executor_and_aggregator() -> None
             text="你觉得数学难吗",
         )
     )
-    run_result = runtime.run_turn(gateway_result.turn_id)
+    progress = RecordingProgress()
+    run_result = runtime.run_turn(gateway_result.turn_id, progress=progress)  # type: ignore[arg-type]
 
     assert run_result.status == "completed"
     assert run_result.reply == "数学有时难，但能练会。"
     assert llm_runtime.calls == []
     assert chat.calls == []
+    assert [event.event_type for event in progress.events] == ["turn_started", "turn_completed"]
 
     messages = store.list_messages(gateway_result.conversation_id)
     raw_payload = messages[-1].raw_payload
@@ -232,6 +240,59 @@ def test_task_runtime_fast_reply_bypasses_node_executor_and_aggregator() -> None
     assert raw_payload["execution_report"]["data"]["fast_path"] is True
     assert raw_payload["execution_report"]["node_results"][0]["node_id"] == "fast_reply"
     assert raw_payload["aggregation"]["data"]["finalization"] == "fast_reply"
+
+
+def test_task_runtime_injects_history_context_only_into_planning() -> None:
+    store = InMemoryConversationStore()
+    gateway = GatewayService(conversation_store=store)
+    plan = ExecutionPlan(
+        user_objective="contextual task",
+        nodes=[PlanNode(id="answer", runtime="llm", objective="Answer with resolved context")],
+    )
+    router = StaticPlanningRouter(plan)
+    llm_runtime = EchoRuntime()
+    runtime = TaskAgentRuntime(
+        store,
+        planning_router=router,
+        node_executor=NodeExecutor(runtimes={"llm": llm_runtime}),
+        result_aggregator=ResultAggregator(model_resolver=lambda metadata: _missing_key_model()),
+    )
+
+    first = gateway.handle_inbound_event(
+        InboundEvent(
+            platform="feishu",
+            external_chat_id="chat-task-runtime-history",
+            external_message_id="msg-task-runtime-history-1",
+            chat_type="dm",
+            sender_id="ou_1",
+            sender_name="Ryan",
+            text="我们决定让 ContextManager 维护历史和压缩摘要。",
+        )
+    )
+    runtime.run_turn(first.turn_id)
+
+    second = gateway.handle_inbound_event(
+        InboundEvent(
+            platform="feishu",
+            external_chat_id="chat-task-runtime-history",
+            external_message_id="msg-task-runtime-history-2",
+            chat_type="dm",
+            sender_id="ou_1",
+            sender_name="Ryan",
+            text="继续刚才那个方案。",
+        )
+    )
+    runtime.run_turn(second.turn_id)
+
+    context = router.calls[-1]["conversation_context"]
+    planner_payload = context.planner_payload()
+    fast_payload = context.fast_payload()
+    assert planner_payload["context_reference_detected"] is True
+    assert fast_payload["context_reference_detected"] is True
+    assert any("ContextManager" in item["content"] for item in planner_payload["messages"])
+    assert planner_payload["summary_node"]["kind"] == "compressed_history"
+    assert "ContextManager" in planner_payload["summary_node"]["content"]
+    assert not hasattr(llm_runtime.calls[-1], "conversation_context")
 
 
 def test_task_runtime_persists_and_returns_node_tool_artifacts() -> None:
@@ -291,6 +352,40 @@ def test_get_agent_runtime_can_switch_to_task_runtime(monkeypatch) -> None:
         get_settings.cache_clear()
 
     assert isinstance(runtime, TaskAgentRuntime)
+
+
+def test_task_runtime_ingest_skips_legacy_turn_classifier(monkeypatch) -> None:
+    import app.api.agent as agent_api
+
+    monkeypatch.setenv("JARVIS_AGENT_RUNTIME_PROVIDER", "task")
+    get_settings.cache_clear()
+    monkeypatch.setattr(
+        agent_api,
+        "classify_turn",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("legacy classifier should not run")),
+    )
+    store = InMemoryConversationStore()
+    gateway = GatewayService(conversation_store=store)
+
+    try:
+        result = gateway.handle_inbound_event(
+            InboundEvent(
+                platform="feishu",
+                external_chat_id="chat-task-runtime-no-classifier",
+                external_message_id="msg-task-runtime-no-classifier-1",
+                chat_type="dm",
+                sender_id="ou_1",
+                sender_name="Ryan",
+                text="你好",
+            )
+        )
+    finally:
+        get_settings.cache_clear()
+
+    assert result.should_run_agent is True
+    turn = store.get_turn(result.turn_id)
+    assert turn is not None
+    assert turn.metadata["classification"]["source"] == "task_runtime_ingest"
 
 
 def _missing_key_model():

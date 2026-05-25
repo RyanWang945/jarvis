@@ -3,15 +3,19 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.agent_react.artifact_context import artifact_records_to_context
 from app.agent_react.artifacts import artifact_from_payload, artifact_to_payload, resolve_channel_attachments
+from app.agent_react.context_manager import ContextManager
 from app.agent_react.runtime import ChannelMessage, ConversationStore, TurnResult
 from app.agent_react.session_state import (
     build_session_state_after_turn,
     load_session_state,
 )
+from app.config import get_settings
 from app.progress import ProgressReporter, ensure_progress
 from app.task_runtime.node_execute_runtime import (
     CodexNodeExecuteRuntime,
@@ -37,8 +41,10 @@ class TaskAgentRuntime:
         planning_router: PlanningRouter | None = None,
         node_executor: NodeExecutor | None = None,
         result_aggregator: ResultAggregator | None = None,
+        context_manager: ContextManager | None = None,
     ) -> None:
         self._store = store
+        self._context_manager = context_manager or ContextManager()
         self._planning_router = planning_router or PlanningRouter()
         self._node_executor = node_executor or NodeExecutor(
             runtimes={
@@ -63,12 +69,21 @@ class TaskAgentRuntime:
         user_input = _trigger_user_input(self._store, turn)
         session_state = load_session_state(conversation.metadata)
         recent_artifacts = _recent_artifacts(self._store, turn.conversation_id)
+        conversation_context = self._context_manager.build_conversation_context(
+            self._store.list_messages(turn.conversation_id),
+            getattr(turn, "trigger_message_id", None),
+            turn_records=self._store.list_turns(turn.conversation_id),
+            current_turn_id=turn.id,
+            session_state=session_state,
+            current_user_input=user_input,
+        )
         runtime_hints = {
             "active_repo": session_state.active_repo_id,
             "platform": conversation.platform,
             "conversation_id": turn.conversation_id,
             "turn_id": turn_id,
             "external_chat_id": conversation.external_chat_id,
+            **_runtime_temporal_hints(),
         }
         started = time.perf_counter()
         logger.info(
@@ -91,22 +106,16 @@ class TaskAgentRuntime:
         )
 
         try:
-            progress.emit(
-                "planning_started",
-                turn_id=turn_id,
-                conversation_id=turn.conversation_id,
-                stage="planning",
-                status="running",
-                summary="正在判断是否需要规划并生成执行计划",
-            )
             router_result = self._planning_router.plan(
                 content=user_input,
                 session_state=session_state,
                 conversation_metadata=conversation.metadata,
                 recent_artifacts=recent_artifacts,
+                conversation_context=conversation_context,
                 previous_node_results=[],
                 runtime_hints=runtime_hints,
                 instructions=[],
+                progress=progress,
             )
             logger.info(
                 "task runtime planning completed turn_id=%s route=%s fast_route=%s fast_confidence=%.2f node_count=%s runtimes=%s finalization=%s elapsed_ms=%s planner_elapsed_ms=%s",
@@ -119,21 +128,6 @@ class TaskAgentRuntime:
                 router_result.plan.finalization_hint.mode,
                 router_result.elapsed_ms,
                 router_result.planner_elapsed_ms,
-            )
-            progress.emit(
-                "plan_created",
-                turn_id=turn_id,
-                conversation_id=turn.conversation_id,
-                stage="planning",
-                status="completed",
-                summary=f"已生成 {len(router_result.plan.nodes)} 个执行节点",
-                data={
-                    "route": router_result.route,
-                    "fast_route": router_result.fast_intent.route,
-                    "node_count": len(router_result.plan.nodes),
-                    "runtimes": [node.runtime for node in router_result.plan.nodes],
-                    "planner_elapsed_ms": router_result.planner_elapsed_ms,
-                },
             )
             if router_result.route == "fast_reply":
                 report = _fast_reply_report(router_result.fast_intent.reply)
@@ -176,6 +170,7 @@ class TaskAgentRuntime:
                     turn_id=turn_id,
                     status="completed",
                     reply=aggregation.reply,
+                    current_user_input=user_input,
                 )
                 return TurnResult(
                     turn_id=turn_id,
@@ -194,6 +189,29 @@ class TaskAgentRuntime:
                     ),
                 )
 
+            progress.emit(
+                "plan_created",
+                turn_id=turn_id,
+                conversation_id=turn.conversation_id,
+                stage="planning",
+                status="completed",
+                summary=f"已生成 {len(router_result.plan.nodes)} 个执行节点",
+                data={
+                    "route": router_result.route,
+                    "fast_route": router_result.fast_intent.route,
+                    "node_count": len(router_result.plan.nodes),
+                    "runtimes": [node.runtime for node in router_result.plan.nodes],
+                    "nodes": [
+                        {
+                            "id": node.id,
+                            "runtime": node.runtime,
+                            "objective": node.objective,
+                        }
+                        for node in router_result.plan.nodes
+                    ],
+                    "planner_elapsed_ms": router_result.planner_elapsed_ms,
+                },
+            )
             execution_started = time.perf_counter()
             report = self._node_executor.execute(
                 router_result.plan,
@@ -311,6 +329,7 @@ class TaskAgentRuntime:
                 turn_id=turn_id,
                 status=status,
                 reply=reply if status == "completed" else None,
+                current_user_input=user_input,
             )
             return TurnResult(
                 turn_id=turn_id,
@@ -349,6 +368,7 @@ class TaskAgentRuntime:
                 turn_id=turn_id,
                 status="failed",
                 reply=None,
+                current_user_input=user_input,
             )
             return TurnResult(
                 turn_id=turn_id,
@@ -369,14 +389,24 @@ class TaskAgentRuntime:
         turn_id: int,
         status: str,
         reply: str | None,
+        current_user_input: str = "",
     ) -> None:
         try:
             conversation = self._store.get_conversation(conversation_id)
-            session_state = build_session_state_after_turn(
-                load_session_state(conversation.metadata if conversation is not None else None),
-                turn_id=turn_id,
-                status=status,
+            previous = load_session_state(conversation.metadata if conversation is not None else None)
+            summary = self._context_manager.update_working_summary(
+                previous,
+                current_user_input=current_user_input,
                 assistant_reply=reply,
+            )
+            session_state = replace(
+                build_session_state_after_turn(
+                    previous,
+                    turn_id=turn_id,
+                    status=status,
+                    assistant_reply=reply,
+                ),
+                working_summary=summary,
             )
             self._store.update_conversation_session(conversation_id, session_state)
         except Exception:
@@ -449,6 +479,26 @@ def _persist_tool_artifacts(store: ConversationStore, conversation_id: int, arti
                 conversation_id,
                 getattr(artifact, "artifact_id", ""),
             )
+
+
+def _runtime_temporal_hints(now: datetime | None = None) -> dict[str, str]:
+    timezone_name = get_settings().default_timezone
+    tz = _resolve_timezone(timezone_name)
+    current = now.astimezone(tz) if now is not None else datetime.now(tz)
+    return {
+        "current_date": current.date().isoformat(),
+        "current_time": current.isoformat(timespec="seconds"),
+        "timezone": timezone_name,
+    }
+
+
+def _resolve_timezone(timezone_name: str):
+    try:
+        return ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        if timezone_name in {"Asia/Shanghai", "Asia/Chongqing"}:
+            return timezone(timedelta(hours=8), name=timezone_name)
+        return UTC
 
 
 def _fast_reply_report(reply: str) -> ExecutionReport:

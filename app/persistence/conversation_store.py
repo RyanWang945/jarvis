@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
@@ -40,7 +41,7 @@ from app.persistence.models import (
     TurnRecord,
     UserRecord,
 )
-from app.repositories import render_repository_report
+from app.repositories import RepositoryRegistryError, get_repository_registry, render_repository_report
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +115,59 @@ def _turn_type(content: str) -> str:
     if text.strip().startswith("/"):
         return "command"
     return "chat"
+
+
+def _uses_task_runtime_provider() -> bool:
+    provider = (get_settings().agent_runtime_provider or "react").strip().lower()
+    return provider in {"task", "plan_execute", "planner"}
+
+
+def _task_runtime_ingest_classification(content: str, session_state: ConversationSessionState) -> tuple[str, dict[str, Any], ConversationSessionState]:
+    turn_type = _turn_type(content)
+    repo_id = _detect_registered_repo_reference(content)
+    updated_session = session_state
+    target_resources: list[dict[str, str]] = []
+    if repo_id:
+        target_resources.append({"type": "repository", "id": repo_id})
+        updated_session = replace(updated_session, session_mode="coding", active_repo_id=repo_id)
+    metadata = {
+        "source": "task_runtime_ingest",
+        "scene": "project" if repo_id else "chat",
+        "access": "read",
+        "deliver": False,
+        "confidence": 1.0,
+        "reason": "Legacy turn classifier skipped for task runtime; PlanningRouter owns routing.",
+        "session_mode_update": updated_session.session_mode if updated_session != session_state else None,
+        "active_repo_id_update": repo_id,
+        "target_resources": target_resources,
+        "task_plan": {},
+        "routing_basis": "task_runtime",
+    }
+    return turn_type, metadata, updated_session
+
+
+def _detect_registered_repo_reference(content: str) -> str | None:
+    text = str(content or "").lower()
+    if not text.strip():
+        return None
+    try:
+        repositories = get_repository_registry().list_repositories()
+    except (RepositoryRegistryError, OSError):
+        return None
+    for repo in repositories:
+        repo_id = repo.repo_id.lower()
+        name = repo.name.lower()
+        if _contains_token(text, repo_id) or (name and _contains_token(text, name)):
+            return repo.repo_id
+    return None
+
+
+def _contains_token(text: str, token: str) -> bool:
+    if not token:
+        return False
+    if token.isascii():
+        return re.search(rf"(?<![A-Za-z0-9_-]){re.escape(token)}(?![A-Za-z0-9_-])", text) is not None
+    return token in text
 
 
 class MySQLConversationStore:
@@ -1068,27 +1122,40 @@ class MySQLConversationStore:
 
         turn_id: int | None = None
         if should_respond:
-            classification = classify_turn(
-                content=content,
-                session_state=load_session_state(conversation.metadata),
-                conversation_metadata=conversation.metadata,
-                recent_artifacts=artifact_records_to_context(
-                    self._list_recent_artifacts_by_conversation(conn, conversation.id)
-                ),
-            )
-            classification_metadata = classification_to_metadata(classification)
-            logger.info(
-                "turn classified conversation_id=%s turn_type=%s classification=%s",
-                conversation.id,
-                classification.turn_type,
-                json.dumps(classification_metadata, ensure_ascii=False),
-            )
             original_session_state = load_session_state(conversation.metadata)
-            session_state = original_session_state
-            if should_apply_session_mode_update(classification) and classification.session_mode_update is not None:
-                session_state = replace(session_state, session_mode=classification.session_mode_update)
-            if should_apply_repo_update(classification):
-                session_state = replace(session_state, active_repo_id=classification.active_repo_id_update)
+            if _uses_task_runtime_provider():
+                turn_type, classification_metadata, session_state = _task_runtime_ingest_classification(
+                    content,
+                    original_session_state,
+                )
+                logger.info(
+                    "turn lightweight-classified conversation_id=%s turn_type=%s classification=%s",
+                    conversation.id,
+                    turn_type,
+                    json.dumps(classification_metadata, ensure_ascii=False),
+                )
+            else:
+                classification = classify_turn(
+                    content=content,
+                    session_state=original_session_state,
+                    conversation_metadata=conversation.metadata,
+                    recent_artifacts=artifact_records_to_context(
+                        self._list_recent_artifacts_by_conversation(conn, conversation.id)
+                    ),
+                )
+                classification_metadata = classification_to_metadata(classification)
+                logger.info(
+                    "turn classified conversation_id=%s turn_type=%s classification=%s",
+                    conversation.id,
+                    classification.turn_type,
+                    json.dumps(classification_metadata, ensure_ascii=False),
+                )
+                session_state = original_session_state
+                if should_apply_session_mode_update(classification) and classification.session_mode_update is not None:
+                    session_state = replace(session_state, session_mode=classification.session_mode_update)
+                if should_apply_repo_update(classification):
+                    session_state = replace(session_state, active_repo_id=classification.active_repo_id_update)
+                turn_type = classification.turn_type
             if session_state != original_session_state:
                 session_patch = dump_session_state(session_state)
                 conversation.metadata = {**conversation.metadata, **session_patch}
@@ -1110,7 +1177,7 @@ class MySQLConversationStore:
                 conversation_id=conversation.id,
                 trigger_message_id=message.id,
                 trigger_type=trigger_type,
-                turn_type=classification.turn_type,
+                turn_type=turn_type,
                 started_by_user_id=user_id,
                 mentions=mentions,
                 classification=classification_metadata,

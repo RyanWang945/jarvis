@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 
+from app.agent_react.context_manager import ConversationContext
 from app.agent_react.session_state import ConversationSessionState
 from app.task_runtime.fast_intent import FastIntentDecision
 from app.task_runtime.planning_router import PlanningRouter
@@ -31,6 +32,14 @@ class SlowPlanner:
         if self.delay_seconds:
             time.sleep(self.delay_seconds)
         return self.plan_result
+
+
+class RecordingProgress:
+    def __init__(self) -> None:
+        self.events = []
+
+    def emit(self, event_type: str, **payload):
+        self.events.append((event_type, payload))
 
 
 class FailingPlanner:
@@ -89,6 +98,29 @@ def test_planning_router_needs_plan_always_waits_for_planner() -> None:
     assert planner.calls == 1
 
 
+def test_planning_router_emits_planning_started_before_heavy_planner() -> None:
+    fast = StaticFastIntent(FastIntentDecision(route="needs_plan", confidence=0.95, reason="needs execution"))
+    progress = RecordingProgress()
+
+    class AssertingPlanner(SlowPlanner):
+        def plan(self, **kwargs):
+            assert [event[0] for event in progress.events] == ["planning_started"]
+            return super().plan(**kwargs)
+
+    router = PlanningRouter(fast_intent=fast, planner=AssertingPlanner(_planned_plan()))
+
+    result = router.plan(
+        content="查资料",
+        runtime_hints={"turn_id": 42, "conversation_id": 7},
+        progress=progress,  # type: ignore[arg-type]
+    )
+
+    assert result.route == "planned"
+    assert progress.events[0][0] == "planning_started"
+    assert progress.events[0][1]["turn_id"] == 42
+    assert progress.events[0][1]["conversation_id"] == 7
+
+
 def test_planning_router_needs_plan_waits_for_planner() -> None:
     fast = StaticFastIntent(FastIntentDecision(route="needs_plan", confidence=0.95, reason="multi goal"))
     planned = _planned_plan()
@@ -120,6 +152,33 @@ def test_planning_router_previous_node_results_force_planner() -> None:
     result = router.plan(
         content="根据刚才的调研结果评估 jarvis",
         previous_node_results=[{"node_id": "research", "status": "completed"}],
+    )
+
+    assert result.route == "planned"
+    assert result.plan is planned
+    assert planner.calls == 1
+
+
+def test_planning_router_context_reference_forces_planner() -> None:
+    fast = StaticFastIntent(
+        FastIntentDecision(
+            route="fast_reply",
+            confidence=0.95,
+            reply="可以继续。",
+            reason="simple acknowledgement",
+        )
+    )
+    planned = _planned_plan()
+    planner = SlowPlanner(planned)
+    router = PlanningRouter(fast_intent=fast, planner=planner)
+
+    result = router.plan(
+        content="继续刚才那个方案",
+        conversation_context=ConversationContext(
+            summary="User and assistant discussed the ContextManager history plan.",
+            messages=(),
+            context_reference_detected=True,
+        ),
     )
 
     assert result.route == "planned"

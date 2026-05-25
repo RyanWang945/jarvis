@@ -7,7 +7,14 @@ from pydantic import ValidationError
 
 from app.config import get_settings
 from app.llm.provider_adapters import NormalizedLLMResponse, NormalizedToolCall
-from app.task_runtime.fast_intent import FastIntentDecision, FastIntentNode, _decision_from_payload, _decision_from_response
+from app.agent_react.session_state import ConversationSessionState
+from app.task_runtime.fast_intent import (
+    FastIntentDecision,
+    FastIntentNode,
+    _decision_from_payload,
+    _decision_from_response,
+    _fast_intent_messages,
+)
 
 
 def test_fast_intent_decision_defaults_needs_plan_to_no_runtime() -> None:
@@ -122,6 +129,22 @@ def test_fast_intent_virtual_tool_maps_to_needs_plan() -> None:
     assert decision.route == "needs_plan"
     assert decision.runtime is None
     assert decision.input_refs == []
+
+
+def test_fast_intent_messages_include_temporal_context() -> None:
+    messages = _fast_intent_messages(
+        "查最近 7 天新闻",
+        session_state=ConversationSessionState(),
+        recent_artifacts=[],
+        runtime_hints={
+            "current_date": "2026-05-25",
+            "current_time": "2026-05-25T10:30:00+08:00",
+            "timezone": "Asia/Shanghai",
+        },
+    )
+
+    assert "temporal_context" in messages[1].content
+    assert "2026-05-25" in messages[1].content
 
 
 def test_fast_intent_unknown_virtual_tool_falls_back_to_needs_plan() -> None:

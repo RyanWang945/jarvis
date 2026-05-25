@@ -6,6 +6,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from app.agent_react.context_manager import ConversationContext
 from app.agent_react.session_state import ConversationSessionState
 from app.llm.client import LLMMessage, parse_json_content
 from app.llm.provider_adapters import NormalizedLLMResponse, NormalizedToolCall
@@ -76,6 +77,8 @@ class FastIntentNode:
         session_state: ConversationSessionState | None = None,
         conversation_metadata: dict[str, Any] | None = None,
         recent_artifacts: list[dict[str, Any]] | None = None,
+        conversation_context: ConversationContext | None = None,
+        runtime_hints: dict[str, Any] | None = None,
     ) -> FastIntentDecision:
         text = (content or "").strip()
         if not text:
@@ -93,6 +96,8 @@ class FastIntentNode:
                 text,
                 session_state=session,
                 recent_artifacts=recent_artifacts or [],
+                conversation_context=conversation_context,
+                runtime_hints=runtime_hints,
                 prompt_registry=self._prompt_registry,
                 prompt_version=self._prompt_version,
             ),
@@ -107,6 +112,8 @@ def _fast_intent_messages(
     *,
     session_state: ConversationSessionState,
     recent_artifacts: list[dict[str, Any]],
+    conversation_context: ConversationContext | None = None,
+    runtime_hints: dict[str, Any] | None = None,
     prompt_registry: PromptRegistry | None = None,
     prompt_version: str | None = None,
 ) -> list[LLMMessage]:
@@ -120,6 +127,17 @@ def _fast_intent_messages(
                     "active_repo_id": session_state.active_repo_id,
                     "session_goal": session_state.session_goal,
                     "working_summary": session_state.working_summary,
+                    "temporal_context": _temporal_context(runtime_hints or {}),
+                    "conversation_context": (
+                        conversation_context.fast_payload()
+                        if conversation_context is not None
+                        else {
+                            "has_history": False,
+                            "context_reference_detected": False,
+                            "summary": None,
+                            "recent_messages": [],
+                        }
+                    ),
                     "recent_artifacts": recent_artifacts,
                     "message": text,
                 },
@@ -127,6 +145,18 @@ def _fast_intent_messages(
             )
         }
     )
+
+
+def _temporal_context(runtime_hints: dict[str, Any]) -> dict[str, str]:
+    return {
+        key: value
+        for key, value in {
+            "current_date": str(runtime_hints.get("current_date") or "").strip(),
+            "current_time": str(runtime_hints.get("current_time") or "").strip(),
+            "timezone": str(runtime_hints.get("timezone") or "").strip(),
+        }.items()
+        if value
+    }
 
 
 def _fast_intent_model_metadata() -> dict[str, Any]:

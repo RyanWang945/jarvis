@@ -19,9 +19,12 @@ class ProgressSnapshot:
     current_action: str = "正在理解请求"
     completed_items: list[str] = field(default_factory=list)
     recent_events: list[str] = field(default_factory=list)
+    planned_nodes: list[dict[str, str]] = field(default_factory=list)
+    completed_node_ids: list[str] = field(default_factory=list)
     node_total: int | None = None
     node_completed: int = 0
     tool_running: str | None = None
+    output_started: bool = False
     status: str = "running"
     started_at: float = field(default_factory=time.time)
     updated_at: float = 0.0
@@ -36,6 +39,7 @@ class FeishuProgressSink:
         update_card: Callable[[str, FeishuDelivery], None],
         min_interval_seconds: float = 2.0,
         max_recent_events: int = 5,
+        flush_on_close: bool = True,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self._message_id = message_id
@@ -44,6 +48,7 @@ class FeishuProgressSink:
         self._min_interval_seconds = max(0.0, min_interval_seconds)
         self._max_recent_events = max(1, max_recent_events)
         self._clock = clock
+        self._flush_on_close = flush_on_close
         self._snapshot = ProgressSnapshot(started_at=clock())
         self._last_flush_at = 0.0
         self._last_hash = ""
@@ -79,7 +84,8 @@ class FeishuProgressSink:
         if self._closed:
             return
         try:
-            self.flush(force=True)
+            if self._flush_on_close:
+                self.flush(force=True)
         finally:
             self._closed = True
 
@@ -101,6 +107,9 @@ class FeishuProgressSink:
                 self._snapshot.node_total = node_total
             runtimes = event.data.get("runtimes")
             suffix = f"：{', '.join(runtimes)}" if isinstance(runtimes, list) and runtimes else ""
+            nodes = event.data.get("nodes")
+            if isinstance(nodes, list):
+                self._snapshot.planned_nodes = [_node_info(item) for item in nodes if isinstance(item, dict)]
             self._snapshot.current_stage = "计划已生成"
             self._snapshot.current_action = event.summary or f"已生成 {self._snapshot.node_total or 0} 个执行节点{suffix}"
             self._add_completed("生成执行计划")
@@ -120,6 +129,8 @@ class FeishuProgressSink:
                 self._snapshot.current_action = label
             else:
                 self._snapshot.node_completed += 1
+                if event.node_id and event.node_id not in self._snapshot.completed_node_ids:
+                    self._snapshot.completed_node_ids.append(event.node_id)
                 self._snapshot.current_action = label
                 self._add_completed(_node_label(event, prefix="完成"))
             self._append_recent(label)
@@ -127,6 +138,7 @@ class FeishuProgressSink:
         if event_type == "aggregation_started":
             self._snapshot.current_stage = "汇总"
             self._snapshot.current_action = event.summary or "正在汇总执行结果"
+            self._snapshot.output_started = True
             self._append_recent("开始汇总结果")
             return
         if event_type == "aggregation_completed":
@@ -139,6 +151,7 @@ class FeishuProgressSink:
             self._snapshot.status = "completed"
             self._snapshot.current_stage = "完成"
             self._snapshot.current_action = event.summary or "任务已完成，正在返回结果"
+            self._snapshot.output_started = True
             self._append_recent(self._snapshot.current_action)
             return
         if event_type == "turn_failed":
@@ -163,6 +176,23 @@ class FeishuProgressSink:
             self._snapshot.completed_items = self._snapshot.completed_items[-6:]
 
 
+class FeishuCardKitProgressSink(FeishuProgressSink):
+    def flush(self, *, force: bool = False) -> None:
+        if self._closed and not force:
+            return
+        now = self._clock()
+        if not force and self._last_flush_at and now - self._last_flush_at < self._min_interval_seconds:
+            return
+        delivery = self._renderer.render_cardkit_progress_card(self._snapshot)
+        digest = hashlib.sha1(delivery.content.encode("utf-8")).hexdigest()
+        if digest == self._last_hash:
+            return
+        self._update_card(self._message_id, delivery)
+        self._last_hash = digest
+        self._last_flush_at = now
+        self._snapshot.updated_at = now
+
+
 def _node_label(event: ProgressEvent, *, prefix: str) -> str:
     runtime = event.data.get("runtime")
     if event.node_id and runtime:
@@ -170,6 +200,14 @@ def _node_label(event: ProgressEvent, *, prefix: str) -> str:
     if event.node_id:
         return f"{prefix} {event.node_id}"
     return prefix
+
+
+def _node_info(item: dict) -> dict[str, str]:
+    node_id = str(item.get("id") or item.get("node_id") or "").strip()
+    runtime = str(item.get("runtime") or "").strip()
+    objective = str(item.get("objective") or "").strip()
+    result = {"id": node_id, "runtime": runtime, "objective": objective}
+    return {key: value for key, value in result.items() if value}
 
 
 def _clean(value: str, *, limit: int = 160) -> str:

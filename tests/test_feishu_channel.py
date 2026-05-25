@@ -3,6 +3,8 @@ import os
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from app.agent_react import ChannelAttachment, ChannelMessage, TurnResult
 from app.channels.feishu import (
     FeishuChannel,
@@ -13,6 +15,16 @@ from app.channels.feishu import (
 from app.channels.feishu_renderer import FeishuRenderer
 from app.config import get_settings
 from app.tools.codex_app_server import CodexApprovalContinuationResult
+
+
+@pytest.fixture(autouse=True)
+def reset_feishu_progress_settings(monkeypatch):
+    monkeypatch.setenv("JARVIS_FEISHU_PROGRESS_UPDATES_ENABLED", "false")
+    monkeypatch.setenv("JARVIS_FEISHU_PROGRESS_MODE", "patch")
+    monkeypatch.delenv("JARVIS_FEISHU_PROGRESS_MIN_INTERVAL_SECONDS", raising=False)
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
 
 
 def test_feishu_renderer_prefers_interactive_for_markdown() -> None:
@@ -323,6 +335,117 @@ def test_feishu_channel_injects_progress_when_enabled(monkeypatch) -> None:
     assert "正在生成执行计划" in updated[0][2]
     assert updated[-1][0] == "om_thinking"
     assert "**✅ Completed**" in updated[-1][2]
+
+
+def test_feishu_channel_does_not_send_progress_entry_for_fast_reply(monkeypatch) -> None:
+    monkeypatch.setenv("JARVIS_FEISHU_PROGRESS_UPDATES_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_FEISHU_PROGRESS_MIN_INTERVAL_SECONDS", "0")
+    get_settings.cache_clear()
+    channel = FeishuChannel(app_id="app", app_secret="secret")
+    sent: list[tuple[str, str, str]] = []
+    updated: list[tuple[str, str]] = []
+
+    class FakeRuntime:
+        def run_turn(self, turn_id: int, *, progress) -> TurnResult:
+            progress.emit("turn_started", turn_id=turn_id, summary="开始处理用户请求")
+            progress.emit("turn_completed", turn_id=turn_id, summary="已生成直接回复")
+            return TurnResult(
+                turn_id=turn_id,
+                conversation_id=7,
+                status="completed",
+                message=ChannelMessage(content="数学有时难，但能练会。", content_type="markdown"),
+            )
+
+    def fake_send(receive_id: str, delivery) -> dict:
+        sent.append((receive_id, delivery.msg_type, delivery.content))
+        return {"code": 0, "data": {"message_id": f"om_{len(sent)}"}}
+
+    monkeypatch.setattr("app.channels.feishu.get_agent_runtime", lambda: FakeRuntime())
+    monkeypatch.setattr(channel, "_send_delivery", fake_send)
+    monkeypatch.setattr(channel, "_update_card_message", lambda message_id, delivery: updated.append((message_id, delivery.msg_type)))
+    monkeypatch.setattr(channel, "_submit_next_queued_turn", lambda conversation_id, chat_id: None)
+
+    try:
+        channel._handle_agent_run("ou_1", "chat_1", "dm", "你觉得数学难吗", 7, 42)
+    finally:
+        get_settings.cache_clear()
+
+    assert len(sent) == 1
+    assert "数学有时难，但能练会。" in sent[0][2]
+    assert "Jarvis Thinking" not in sent[0][2]
+    assert updated == []
+
+
+def test_feishu_channel_uses_cardkit_progress_mode(monkeypatch) -> None:
+    monkeypatch.setenv("JARVIS_FEISHU_PROGRESS_UPDATES_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_FEISHU_PROGRESS_MODE", "cardkit")
+    monkeypatch.setenv("JARVIS_FEISHU_PROGRESS_MIN_INTERVAL_SECONDS", "0")
+    get_settings.cache_clear()
+    channel = FeishuChannel(app_id="app", app_secret="secret")
+    sent: list[tuple[str, dict]] = []
+    updated: list[tuple[str, dict]] = []
+
+    class FakeRuntime:
+        def run_turn(self, turn_id: int, *, progress) -> TurnResult:
+            progress.emit("planning_started", turn_id=turn_id, summary="正在生成执行计划")
+            return TurnResult(
+                turn_id=turn_id,
+                conversation_id=7,
+                status="completed",
+                message=ChannelMessage(content="# Final\n\nDone", content_type="markdown"),
+            )
+
+    def fake_send(receive_id: str, delivery) -> dict:
+        sent.append((receive_id, json.loads(delivery.content)))
+        return {"code": 0, "data": {"message_id": "om_cardkit"}}
+
+    def fake_update(message_id: str, delivery) -> None:
+        updated.append((message_id, json.loads(delivery.content)))
+
+    monkeypatch.setattr("app.channels.feishu.get_agent_runtime", lambda: FakeRuntime())
+    monkeypatch.setattr(channel, "_send_delivery", fake_send)
+    monkeypatch.setattr(channel, "_update_card_message", fake_update)
+    monkeypatch.setattr(channel, "_submit_next_queued_turn", lambda conversation_id, chat_id: None)
+
+    try:
+        channel._handle_agent_run("ou_1", "chat_1", "dm", "查资料", 7, 42)
+    finally:
+        get_settings.cache_clear()
+
+    assert sent[0][1]["schema"] == "2.0"
+    assert "subtitle" not in sent[0][1]["header"]
+    assert updated[0][0] == "om_cardkit"
+    assert updated[0][1]["schema"] == "2.0"
+    assert updated[-1][1]["schema"] == "2.0"
+    final_content = json.dumps(updated[-1][1], ensure_ascii=False)
+    assert "Final" in final_content
+    assert "Done" in final_content
+
+
+def test_feishu_channel_cardkit_progress_send_falls_back_to_thinking_card(monkeypatch) -> None:
+    monkeypatch.setenv("JARVIS_FEISHU_PROGRESS_UPDATES_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_FEISHU_PROGRESS_MODE", "cardkit")
+    get_settings.cache_clear()
+    channel = FeishuChannel(app_id="app", app_secret="secret")
+    sent: list[dict] = []
+
+    def fake_send(receive_id: str, delivery) -> dict:
+        payload = json.loads(delivery.content)
+        sent.append(payload)
+        if payload.get("schema") == "2.0":
+            raise RuntimeError("cardkit failed")
+        return {"code": 0, "data": {"message_id": "om_thinking"}}
+
+    monkeypatch.setattr(channel, "_send_delivery", fake_send)
+
+    try:
+        message_id = channel._send_progress_entry_card("chat_1", "查资料")
+    finally:
+        get_settings.cache_clear()
+
+    assert message_id == "om_thinking"
+    assert sent[0]["schema"] == "2.0"
+    assert sent[1]["elements"][0]["text"]["content"] == "**🟡 Jarvis Thinking**"
 
 
 def test_feishu_channel_keeps_old_runtime_signature_with_progress_enabled(monkeypatch) -> None:
