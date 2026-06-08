@@ -40,7 +40,7 @@ def _plan() -> ExecutionPlan:
         user_objective="research then review",
         nodes=[
             PlanNode(id="research", runtime="react", objective="Research"),
-            PlanNode(id="review", runtime="codex", objective="Review", input_refs=["node:research"]),
+            PlanNode(id="review", runtime="coder", objective="Review", input_refs=["node:research"]),
         ],
     )
 
@@ -53,7 +53,7 @@ def test_result_aggregator_fallback_completed_summarizes_node_results() -> None:
             NodeResult(node_id="research", runtime="react", status="completed", summary="Found SDK facts."),
             NodeResult(
                 node_id="review",
-                runtime="codex",
+                runtime="coder",
                 status="completed",
                 summary="Reviewed implementation.",
                 artifacts=[NodeArtifact(ref="R1", kind="report")],
@@ -77,7 +77,7 @@ def test_result_aggregator_uses_llm_json_result() -> None:
     report = ExecutionReport(
         status="completed",
         node_results=[
-            NodeResult(node_id="review", runtime="codex", status="completed", summary="Reviewed.", artifacts=[NodeArtifact(ref="R1")])
+            NodeResult(node_id="review", runtime="coder", status="completed", summary="Reviewed.", artifacts=[NodeArtifact(ref="R1")])
         ],
     )
 
@@ -118,7 +118,7 @@ def test_result_aggregator_blocked_missing_repo_needs_user_input() -> None:
         node_results=[
             NodeResult(
                 node_id="review",
-                runtime="codex",
+                runtime="coder",
                 status="blocked",
                 summary="Codex runtime requires runtime_hints.active_repo.",
                 error=NodeError(code="missing_active_repo", message="active_repo missing"),

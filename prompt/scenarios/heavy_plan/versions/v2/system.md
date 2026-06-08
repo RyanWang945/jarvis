@@ -26,18 +26,19 @@ Do not create an extra llm node just to draft, summarize, or format the output o
 
 Allowed runtime values:
 - llm: ordinary reasoning, explanation, rewriting, prompt review, design review, or direct response without tools
-- react: web research, current/latest information lookup, source-based investigation, or multi-step knowledge lookup
-- codex: active/local repository reading, code review, code editing, testing, commit, push, or workspace-based implementation work
+- react: web research, current/latest information lookup, source-based investigation, deep research, or multi-step knowledge lookup
+- coder: active/local repository reading, code review, code editing, testing, commit, push, or workspace-based implementation work
 - tool: one deterministic external action; tool_name is required
-- deepresearch: only when the user explicitly asks for "deepresearch", "深度研究", or "深入研究"
 
 Only use runtime values listed in runtime_hints.available_runtimes.
 
-Use codex for any task involving the active/local repository.
+Use coder for any task involving the active/local repository.
 
-Codex can inspect a repository and produce markdown reports or recommendations in the same node.
+Coder can inspect a repository and produce markdown reports or recommendations in the same node.
 
 Use react for current, latest, recent, web-based, source-based, or multi-step knowledge research.
+
+For "deepresearch", "深度研究", or "深入研究" requests, create a DAG using the existing runtimes. Use react nodes for research and add coder, llm, or tool nodes only when the request needs repository work, synthesis, or deterministic actions. Do not use a deepresearch runtime.
 
 Use tool only for deterministic actions such as scheduled_task or deliver_file.
 
@@ -55,7 +56,7 @@ Use node refs, such as node:research_tavily, only when one node depends on anoth
 
 If previous_node_results contains completed work that already satisfies part of the objective, do not re-plan that work. Reference the completed node result with node:<id> only when a new node needs it.
 
-If the remaining work is repository evaluation based on previous research, create one codex node that references the previous node result. Do not add a separate llm evaluation node.
+If the remaining work is repository evaluation based on previous research, create one coder node that references the previous node result. Do not add a separate llm evaluation node.
 
 If the current request can be completed only by acting on an available artifact, create only that action node and reference the artifact. Do not recreate the artifact.
 
@@ -67,25 +68,26 @@ Output exactly this JSON shape:
 {
   "user_objective": "string",
   "finalization_hint": {
-    "mode": "pass_through | deterministic | llm | auto",
-    "reason": "string",
     "user_facing": true
   },
   "nodes": [
     {
       "id": "string",
-      "runtime": "llm | react | codex | tool | deepresearch",
+      "runtime": "llm | react | coder | tool",
       "objective": "string",
       "input_refs": ["artifact:A1", "node:node_id"],
       "expected_output": "string",
-      "tool_name": "string, only when runtime=tool"
+      "tool_name": "string, only when runtime=tool",
+      "runtime_hints": {"access_mode": "read | write, only when runtime=coder"}
     }
   ]
 }
 
-Use finalization_hint.mode="llm" when multiple node results, react results, or codex results likely need synthesis.
-Use finalization_hint.mode="pass_through" only when a single llm node's output should be returned directly to the user.
-Use finalization_hint.mode="deterministic" for deterministic tool actions such as delivering an artifact or setting a reminder.
-Use finalization_hint.mode="auto" when unsure.
+Set finalization_hint.user_facing=true only when a single llm node's output is intended to be returned directly to the user without additional synthesis.
+For coder nodes, include runtime_hints.access_mode. Use "read" for repository inspection, review, diagnosis, or reporting without edits. Use "write" when the user explicitly asks to modify, fix, generate, run implementation changes, commit, or push.
+Do not include codex or claude_code as runtime values. Provider selection is a runtime configuration detail.
+
+Set finalization_hint.user_facing=false for tool, react, coder, multi-node, or internal/intermediate plans.
+The runtime derives the finalization mode from nodes; do not include mode or reason.
 
 Do not include markdown, comments, hidden reasoning, or extra fields.

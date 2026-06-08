@@ -18,11 +18,11 @@ from app.prompting import PromptRegistry
 
 logger = logging.getLogger(__name__)
 
-NodeRuntime = Literal["llm", "react", "codex", "tool", "deepresearch"]
+NodeRuntime = Literal["llm", "react", "coder", "codex", "tool"]
 FinalizationMode = Literal["pass_through", "deterministic", "llm", "auto"]
 DEFAULT_PLANNER_PROMPT_VERSION = "v2"
 
-_RUNTIMES = {"llm", "react", "codex", "tool", "deepresearch"}
+_RUNTIMES = {"llm", "react", "coder", "tool"}
 
 
 class PlanNode(BaseModel):
@@ -34,6 +34,12 @@ class PlanNode(BaseModel):
     input_refs: list[str] = Field(default_factory=list)
     expected_output: str = ""
     tool_name: str | None = None
+    runtime_hints: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("runtime", mode="before")
+    @classmethod
+    def _runtime_text(cls, value: Any) -> NodeRuntime:
+        return _normalize_runtime(value)
 
     @field_validator("id", "objective")
     @classmethod
@@ -57,6 +63,20 @@ class PlanNode(BaseModel):
     @classmethod
     def _expected_output_text(cls, value: str) -> str:
         return str(value or "").strip()
+
+    @field_validator("runtime_hints")
+    @classmethod
+    def _runtime_hints_mapping(cls, value: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            return {}
+        hints = dict(value)
+        access_mode = hints.get("access_mode")
+        if access_mode is not None:
+            normalized = str(access_mode).strip().lower()
+            if normalized not in {"read", "write"}:
+                raise ValueError("runtime_hints.access_mode must be read or write")
+            hints["access_mode"] = normalized
+        return hints
 
     @model_validator(mode="after")
     def _validate_runtime_contract(self) -> PlanNode:
@@ -82,11 +102,11 @@ class FinalizationHint(BaseModel):
 
 
 class ExecutionPlan(BaseModel):
-    model_config = ConfigDict(extra="ignore") # pydantic设置，如果有多余的字段，需要忽略。
+    model_config = ConfigDict(extra="ignore")  # pydantic设置，如果有多余的字段，需要忽略。
 
     user_objective: str
     nodes: list[PlanNode]
-    # 执行完任务后，最终回复如何收口，这个是ai生成的，planner LLM 的 system prompt 里设置的
+    # 执行完任务后，最终回复如何收口；mode/reason 由 runtime 根据 nodes 推导。
     finalization_hint: FinalizationHint = Field(default_factory=FinalizationHint)
 
     @field_validator("user_objective")
@@ -353,6 +373,9 @@ def _plan_from_payload(
 ) -> ExecutionPlan:
     candidate = payload.get("plan") if isinstance(payload.get("plan"), dict) else payload
     if not isinstance(candidate, dict):
+        artifact_delivery = _fallback_artifact_delivery_plan(fallback_objective, known_artifact_refs)
+        if artifact_delivery is not None:
+            return artifact_delivery
         return _fallback_single_node_plan(fallback_objective)
     normalized = _normalize_plan_payload(
         candidate,
@@ -364,6 +387,9 @@ def _plan_from_payload(
         return ExecutionPlan.model_validate(normalized)
     except ValidationError as exc:
         logger.warning("planner returned invalid ExecutionPlan; falling back error=%s payload_keys=%s", exc, sorted(normalized))
+        artifact_delivery = _fallback_artifact_delivery_plan(fallback_objective, known_artifact_refs)
+        if artifact_delivery is not None:
+            return artifact_delivery
         return _fallback_single_node_plan(fallback_objective)
 
 
@@ -373,7 +399,7 @@ def _normalize_plan_payload(
     known_artifact_refs: set[str] | None = None,
 ) -> dict[str, Any]:
     normalized = dict(payload)
-    normalized["finalization_hint"] = _normalize_finalization_hint(normalized.get("finalization_hint"))
+    raw_finalization_hint = normalized.get("finalization_hint")
     raw_nodes = normalized.get("nodes")
     if isinstance(raw_nodes, dict):
         raw_nodes = [raw_nodes]
@@ -386,61 +412,45 @@ def _normalize_plan_payload(
             for node in raw_nodes
             if isinstance(node, dict)
         ]
-    normalized["finalization_hint"] = _normalize_finalization_for_nodes(
-        normalized["finalization_hint"],
+    normalized["finalization_hint"] = _derive_finalization_hint(
         normalized.get("nodes"),
+        raw_finalization_hint,
     )
     return normalized
 
 
-def _normalize_finalization_hint(value: Any) -> dict[str, Any]:
-    if isinstance(value, dict):
-        hint = dict(value)
-    elif isinstance(value, str):
-        hint = {"mode": value}
-    else:
-        return {"mode": "auto"}
-    mode = str(hint.get("mode") or "auto").strip().lower()
-    if mode not in {"pass_through", "deterministic", "llm", "auto"}:
-        mode = "auto"
-    hint["mode"] = mode
-    hint["reason"] = str(hint.get("reason") or "").strip()
-    hint["user_facing"] = bool(hint.get("user_facing"))
-    return hint
+def _derive_finalization_hint(nodes: Any, raw_hint: Any) -> dict[str, Any]:
+    user_facing = _finalization_user_facing(raw_hint)
+    if isinstance(nodes, list) and len(nodes) == 1 and isinstance(nodes[0], dict):
+        runtime = nodes[0].get("runtime")
+        if runtime == "llm":
+            return {
+                "mode": "pass_through",
+                "reason": "single llm node can be returned directly when marked user-facing",
+                "user_facing": user_facing,
+            }
+        if runtime == "tool":
+            return {
+                "mode": "deterministic",
+                "reason": "single tool node uses deterministic finalization",
+                "user_facing": user_facing,
+            }
+    return {
+        "mode": "llm",
+        "reason": "multiple or non-llm node results require llm aggregation",
+        "user_facing": user_facing,
+    }
 
 
-def _normalize_finalization_for_nodes(hint: dict[str, Any], nodes: Any) -> dict[str, Any]:
-    if hint.get("mode") != "pass_through" or not isinstance(nodes, list):
-        return hint
-    if len(nodes) == 1 and nodes[0].get("runtime") == "llm":
-        return hint
-
-    adjusted = dict(hint)
-    if len(nodes) == 1 and nodes[0].get("runtime") == "tool":
-        adjusted["mode"] = "deterministic"
-        adjusted["reason"] = _append_reason(
-            adjusted.get("reason"),
-            "pass_through is only valid for a single llm node; coerced tool node to deterministic finalization",
-        )
-    else:
-        adjusted["mode"] = "llm"
-        adjusted["reason"] = _append_reason(
-            adjusted.get("reason"),
-            "pass_through is only valid for a single llm node; coerced non-llm plan to llm aggregation",
-        )
-    logger.info(
-        "planner finalization coerced original=pass_through new=%s node_runtimes=%s",
-        adjusted["mode"],
-        [node.get("runtime") for node in nodes],
-    )
-    return adjusted
-
-
-def _append_reason(current: Any, addition: str) -> str:
-    text = str(current or "").strip()
-    if not text:
-        return addition
-    return f"{text}; {addition}"
+def _finalization_user_facing(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    raw = value.get("user_facing")
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        return raw.strip().lower() in {"1", "true", "yes", "y"}
+    return bool(raw)
 
 
 def _normalize_node_payload(
@@ -465,11 +475,15 @@ def _normalize_node_payload(
         node["expected_output"] = str(expected_output).strip()
 
     node["input_refs"] = _normalize_input_refs(node.get("input_refs"), known_artifact_refs=known_artifact_refs)
+    if not isinstance(node.get("runtime_hints"), dict):
+        node["runtime_hints"] = {}
     return node
 
 
 def _normalize_runtime(value: Any) -> NodeRuntime:
     text = str(value or "").strip().lower()
+    if text == "codex":
+        return "coder"
     if text in _RUNTIMES:
         return text  # type: ignore[return-value]
     return text  # type: ignore[return-value]
@@ -513,6 +527,39 @@ def _fallback_single_node_plan(objective: str) -> ExecutionPlan:
             )
         ],
     )
+
+
+def _fallback_artifact_delivery_plan(objective: str, known_artifact_refs: set[str] | None) -> ExecutionPlan | None:
+    refs = sorted(ref for ref in (known_artifact_refs or set()) if ref.startswith("artifact:"))
+    if not refs or not _looks_like_artifact_delivery(objective):
+        return None
+    return ExecutionPlan(
+        user_objective=objective,
+        finalization_hint=FinalizationHint(
+            mode="deterministic",
+            reason="fallback artifact delivery node for explicit existing-artifact delivery request",
+            user_facing=False,
+        ),
+        nodes=[
+            PlanNode(
+                id="deliver_artifact",
+                runtime="tool",
+                objective="Deliver the requested existing artifact to the user.",
+                tool_name="deliver_file",
+                input_refs=[refs[0]],
+                expected_output="Artifact delivered to the user.",
+            )
+        ],
+    )
+
+
+def _looks_like_artifact_delivery(objective: str) -> bool:
+    text = str(objective or "").strip().lower()
+    if not text:
+        return False
+    delivery_terms = ("发我", "发给我", "发送", "交付", "deliver", "send")
+    artifact_terms = ("刚刚", "刚才", "那个", "报告", "文件", "产物", "artifact", "file", "report")
+    return any(term in text for term in delivery_terms) and any(term in text for term in artifact_terms)
 
 
 def _assert_acyclic(deps: dict[str, set[str]]) -> None:

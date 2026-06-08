@@ -11,10 +11,20 @@ from app.llm.client import LLMMessage, parse_json_content
 from app.llm.provider_adapters import NormalizedLLMResponse, NormalizedToolCall
 from app.llm.model_profiles import LLMNode
 from app.llm.model_router import ModelRouter
+from app.repositories import RepositoryRegistryError, get_repository_registry
+from app.task_runtime.coder_provider import (
+    ApprovalDecision,
+    CoderAction,
+    CoderPolicy,
+    CoderProvider,
+    CoderRunRequest,
+    CoderRunResult,
+    CodexCoderProvider,
+    build_coder_provider,
+)
 from app.task_runtime.node_result import NodeArtifact, NodeError, NodeResult, ResolvedInput
 from app.task_runtime.planner import PlanNode
-from app.tools.codex import run_codex_coder_tool
-from app.tools.common import ToolExecutionRequest, ToolExecutionResult
+from app.tools.common import ToolExecutionResult
 from app.tools.runtime import build_llm_tools, execute_tool, get_tool_definition
 
 logger = logging.getLogger(__name__)
@@ -234,54 +244,76 @@ class ReactNodeExecuteRuntime:
         return observation, record
 
 
-class CodexNodeExecuteRuntime:
-    """Adapter from the new node-runtime interface to the existing Codex tool."""
+class CoderNodeExecuteRuntime:
+    """Provider-backed code execution runtime for one plan node."""
 
-    def __init__(self, runner=run_codex_coder_tool) -> None:
-        self._runner = runner
+    def __init__(self, provider: CoderProvider | None = None) -> None:
+        self._provider = provider or build_coder_provider(get_settings())
 
     def run(self, context: NodeExecutionContext) -> NodeResult:
         started = time.perf_counter()
+        if context.node.runtime_hints:
+            context = NodeExecutionContext(
+                user_objective=context.user_objective,
+                node=context.node,
+                resolved_inputs=context.resolved_inputs,
+                runtime_hints={**context.runtime_hints, **context.node.runtime_hints},
+                instructions=context.instructions,
+            )
         repo_id = _active_repo(context)
         if not repo_id:
-            logger.info("codex node blocked node_id=%s reason=missing_active_repo", context.node.id)
-            return _blocked(context.node, "missing_active_repo", "Codex runtime requires runtime_hints.active_repo.")
-        request = ToolExecutionRequest(
-            tool_name="delegate_to_codex",
-            workdir=None,
-            args={
-                "instruction": _codex_instruction(context),
-                "repo_id": repo_id,
-                "allow_commit": bool(context.runtime_hints.get("allow_commit")),
-                "allow_push": bool(context.runtime_hints.get("allow_push")),
-                "_read_only": bool(context.runtime_hints.get("codex_read_only", True)),
-            },
+            logger.info("coder node blocked node_id=%s reason=missing_active_repo", context.node.id)
+            return _blocked(context.node, "missing_active_repo", "Coder runtime requires runtime_hints.active_repo.")
+        try:
+            repo = get_repository_registry().resolve_repo(repo_id)
+        except RepositoryRegistryError as exc:
+            logger.info("coder node blocked node_id=%s repo_id=%s reason=repository_error error=%s", context.node.id, repo_id, exc)
+            return _blocked(context.node, "repository_not_available", str(exc))
+        policy = _coder_policy(context)
+        if policy.allow_push and not policy.allow_commit:
+            return _failed(context.node, "invalid_coder_policy", "allow_push=true requires allow_commit=true.", retryable=False)
+        request = CoderRunRequest(
+            repo_id=repo.repo_id,
+            workdir=repo.canonical_root_path,
+            instruction=_coder_instruction(context),
+            policy=policy,
             timeout_seconds=int(getattr(get_settings(), "coder_timeout_seconds", 1800)),
+            metadata={"node_id": context.node.id},
         )
         try:
             logger.info(
-                "codex node start node_id=%s repo_id=%s allow_commit=%s allow_push=%s read_only=%s",
+                "coder node start node_id=%s repo_id=%s provider=%s access_mode=%s allow_commit=%s allow_push=%s",
                 context.node.id,
                 repo_id,
-                request.args.get("allow_commit"),
-                request.args.get("allow_push"),
-                request.args.get("_read_only"),
+                self._provider.name,
+                policy.access_mode,
+                policy.allow_commit,
+                policy.allow_push,
             )
-            result = self._runner(request)
+            result = self._provider.run(request, decide_action=_decide_coder_action(policy))
         except Exception as exc:
-            logger.exception("codex node failed node_id=%s elapsed_ms=%s", context.node.id, int((time.perf_counter() - started) * 1000))
-            return _failed(context.node, "codex_runtime_error", str(exc), retryable=True)
-        node_result = _node_result_from_tool(context.node, result)
+            logger.exception("coder node failed node_id=%s elapsed_ms=%s", context.node.id, int((time.perf_counter() - started) * 1000))
+            return _failed(context.node, "coder_runtime_error", str(exc), retryable=True)
+        node_result = _node_result_from_coder(context.node, result, provider=self._provider.name)
         logger.info(
-            "codex node finished node_id=%s status=%s exit_code=%s artifact_count=%s elapsed_ms=%s summary=%s",
+            "coder node finished node_id=%s provider=%s status=%s exit_code=%s artifact_count=%s elapsed_ms=%s summary=%s",
             context.node.id,
+            self._provider.name,
             node_result.status,
             result.exit_code,
-            len(result.artifacts) + len(result.tool_artifacts),
+            len(result.artifacts),
             int((time.perf_counter() - started) * 1000),
             _truncate(node_result.summary, limit=300),
         )
         return node_result
+
+
+class CodexNodeExecuteRuntime(CoderNodeExecuteRuntime):
+    """Compatibility wrapper for older tests/callers that still name Codex directly."""
+
+    def __init__(self, runner=None) -> None:
+        provider = CodexCoderProvider() if runner is None else CodexCoderProvider(runner=runner)
+        super().__init__(provider=provider)
 
 
 class ToolNodeExecuteRuntime:
@@ -524,9 +556,9 @@ def _first_item_text(item: dict[str, Any], keys: tuple[str, ...]) -> str:
     return ""
 
 
-def _codex_instruction(context: NodeExecutionContext) -> str:
+def _coder_instruction(context: NodeExecutionContext) -> str:
     sections = [
-        "Execute one Jarvis plan node as CodexNodeExecuteRuntime.",
+        "Execute one Jarvis plan node as CoderNodeExecuteRuntime.",
         "",
         _temporal_context_text(context.runtime_hints),
         "",
@@ -550,7 +582,7 @@ def _codex_instruction(context: NodeExecutionContext) -> str:
         [
             "",
             "Return a concise result suitable for a NodeResult summary.",
-            "Do not ask for routine confirmation. Respect permission limits and request approval through Codex only when required.",
+            "Do not ask for routine confirmation. Respect permission limits and request approval only when required.",
         ]
     )
     return "\n".join(sections)
@@ -603,7 +635,7 @@ def _node_result_from_tool(node: PlanNode, result: ToolExecutionResult) -> NodeR
     summary = _codex_node_summary(result)
     return NodeResult(
         node_id=node.id,
-        runtime="codex",
+        runtime="coder",
         status=status,
         summary=summary,
         artifacts=[_artifact_from_tool_string(item) for item in result.artifacts],
@@ -615,6 +647,55 @@ def _node_result_from_tool(node: PlanNode, result: ToolExecutionResult) -> NodeR
         },
         error=None if result.ok else NodeError(code="codex_tool_failed", message=summary, retryable=False),
     )
+
+
+def _node_result_from_coder(node: PlanNode, result: CoderRunResult, *, provider: str) -> NodeResult:
+    approval_required = bool(result.approval_requests)
+    status = "blocked" if approval_required else "completed" if result.ok else "failed"
+    summary = result.stdout or result.summary or result.stderr or f"Coder provider {provider} finished."
+    data = {
+        "provider": provider,
+        "approval_required": approval_required,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "exit_code": result.exit_code,
+    }
+    if approval_required:
+        data["approval_requests"] = [_coder_approval_dict(item) for item in result.approval_requests]
+        first = result.approval_requests[0]
+        data["approval_id"] = first.approval_id
+        data["action_kind"] = first.action_kind
+        if first.command:
+            data["command"] = first.command
+        if first.path:
+            data["path"] = first.path
+        if first.reason:
+            data["reason"] = first.reason
+    data.update(result.metadata)
+    return NodeResult(
+        node_id=node.id,
+        runtime="coder",
+        status=status,
+        summary=summary,
+        artifacts=[_artifact_from_tool_string(item) for item in result.artifacts],
+        data=data,
+        error=(
+            NodeError(code="coder_approval_required", message=summary, retryable=False)
+            if approval_required
+            else None if result.ok else NodeError(code="coder_provider_failed", message=summary, retryable=False)
+        ),
+    )
+
+
+def _coder_approval_dict(value: Any) -> dict[str, Any]:
+    return {
+        "approval_id": value.approval_id,
+        "action_kind": value.action_kind,
+        "command": value.command,
+        "path": value.path,
+        "reason": value.reason,
+        "raw_provider_payload": value.raw_provider_payload,
+    }
 
 
 def _codex_node_summary(result: ToolExecutionResult) -> str:
@@ -690,6 +771,36 @@ def _active_repo(context: NodeExecutionContext) -> str | None:
     if isinstance(value, str) and value.strip():
         return value.strip()
     return None
+
+
+def _coder_policy(context: NodeExecutionContext) -> CoderPolicy:
+    access_mode = str(context.runtime_hints.get("access_mode") or "").strip().lower()
+    if access_mode not in {"read", "write"}:
+        access_mode = "read"
+    allow_commit = bool(context.runtime_hints.get("allow_commit")) if access_mode == "write" else False
+    allow_push = bool(context.runtime_hints.get("allow_push")) if access_mode == "write" else False
+    return CoderPolicy(access_mode=access_mode, allow_commit=allow_commit, allow_push=allow_push)
+
+
+def _decide_coder_action(policy: CoderPolicy):
+    def decide(action: CoderAction) -> ApprovalDecision:
+        if action.kind in {"read_file", "search", "git_status", "git_diff", "git_log"}:
+            return ApprovalDecision("allow")
+        if action.kind == "edit_file":
+            return ApprovalDecision("allow" if policy.access_mode == "write" else "deny", reason="read mode does not allow edits")
+        if action.kind == "commit":
+            if policy.access_mode != "write" or not policy.allow_commit:
+                return ApprovalDecision("deny", reason="commit is not allowed by coder policy")
+            return ApprovalDecision("ask", reason="commit requires approval")
+        if action.kind == "push":
+            if policy.access_mode != "write" or not policy.allow_push:
+                return ApprovalDecision("deny", reason="push is not allowed by coder policy")
+            return ApprovalDecision("strong_ask", reason="push requires strong approval")
+        if action.kind in {"secret_read", "dangerous_command", "outside_workspace_write"}:
+            return ApprovalDecision("deny", reason=f"{action.kind} is denied by default")
+        return ApprovalDecision("ask", reason="unknown external action requires approval")
+
+    return decide
 
 
 def _blocked(node: PlanNode, code: str, message: str) -> NodeResult:

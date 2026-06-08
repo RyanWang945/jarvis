@@ -14,7 +14,7 @@ from app.channels.feishu import (
 )
 from app.channels.feishu_renderer import FeishuRenderer
 from app.config import get_settings
-from app.tools.codex_app_server import CodexApprovalContinuationResult
+from app.task_runtime.coder_provider import CoderApprovalContinuationResult
 
 
 @pytest.fixture(autouse=True)
@@ -774,9 +774,10 @@ def test_feishu_approval_completion_responds_to_live_codex_session(monkeypatch) 
     calls: list[tuple[str, bool]] = []
     metadata_patches: list[tuple[int, dict]] = []
 
-    def fake_respond(approval_id: str, *, approved: bool, timeout_seconds: int, trusted_command_prefixes=None):
+    def fake_resume(approval_id: str, *, approved: bool, timeout_seconds: int, provider: str = "codex", trusted_command_prefixes=None):
+        assert provider == "codex"
         calls.append((approval_id, approved))
-        return CodexApprovalContinuationResult(status="completed", final_text="Codex finished in-place.")
+        return CoderApprovalContinuationResult(status="completed", final_text="Codex finished in-place.")
 
     class FakeStore:
         def get_conversation(self, conversation_id: int):
@@ -786,7 +787,7 @@ def test_feishu_approval_completion_responds_to_live_codex_session(monkeypatch) 
             metadata_patches.append((conversation_id, patch))
 
     monkeypatch.setattr("app.channels.feishu.get_conversation_store", lambda: FakeStore())
-    monkeypatch.setattr("app.channels.feishu.respond_to_codex_approval", fake_respond)
+    monkeypatch.setattr("app.channels.feishu.resume_coder_approval", fake_resume)
     monkeypatch.setattr(
         channel,
         "_send_channel_message",
@@ -805,15 +806,16 @@ def test_feishu_approval_completion_sends_new_card_for_next_codex_approval(monke
     sent: list[tuple[str, str, str]] = []
     metadata_patches: list[tuple[int, dict]] = []
 
-    def fake_respond(approval_id: str, *, approved: bool, timeout_seconds: int, trusted_command_prefixes=None):
-        return CodexApprovalContinuationResult(
+    def fake_resume(approval_id: str, *, approved: bool, timeout_seconds: int, provider: str = "codex", trusted_command_prefixes=None):
+        assert provider == "codex"
+        return CoderApprovalContinuationResult(
             status="approval_requested",
             approval_requests=[
-                {
-                    "id": "approval_2",
-                    "command": "git commit -m test",
-                    "reason": "Create the requested commit.",
-                }
+                SimpleNamespace(
+                    approval_id="approval_2",
+                    command="git commit -m test",
+                    reason="Create the requested commit.",
+                )
             ],
         )
 
@@ -831,7 +833,7 @@ def test_feishu_approval_completion_sends_new_card_for_next_codex_approval(monke
         return {"code": 0, "data": {"message_id": "om_next_approval"}}
 
     monkeypatch.setattr("app.channels.feishu.get_conversation_store", lambda: FakeStore())
-    monkeypatch.setattr("app.channels.feishu.respond_to_codex_approval", fake_respond)
+    monkeypatch.setattr("app.channels.feishu.resume_coder_approval", fake_resume)
     monkeypatch.setattr(channel, "_send_delivery", fake_send)
 
     channel._complete_codex_approval("chat_1", 7, 42, "approval_1", True, "om_approval")
@@ -846,8 +848,9 @@ def test_feishu_approval_completion_reports_expired_codex_session(monkeypatch) -
     sent: list[tuple[str, str]] = []
     metadata_patches: list[tuple[int, dict]] = []
 
-    def fake_respond(approval_id: str, *, approved: bool, timeout_seconds: int, trusted_command_prefixes=None):
-        return CodexApprovalContinuationResult(
+    def fake_resume(approval_id: str, *, approved: bool, timeout_seconds: int, provider: str = "codex", trusted_command_prefixes=None):
+        assert provider == "codex"
+        return CoderApprovalContinuationResult(
             status="missing",
             error="Codex approval session is no longer active.",
         )
@@ -860,7 +863,7 @@ def test_feishu_approval_completion_reports_expired_codex_session(monkeypatch) -
             metadata_patches.append((conversation_id, patch))
 
     monkeypatch.setattr("app.channels.feishu.get_conversation_store", lambda: FakeStore())
-    monkeypatch.setattr("app.channels.feishu.respond_to_codex_approval", fake_respond)
+    monkeypatch.setattr("app.channels.feishu.resume_coder_approval", fake_resume)
     monkeypatch.setattr(
         channel,
         "_send_text_message",

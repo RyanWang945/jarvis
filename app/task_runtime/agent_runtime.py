@@ -18,7 +18,7 @@ from app.agent_react.session_state import (
 from app.config import get_settings
 from app.progress import ProgressReporter, ensure_progress
 from app.task_runtime.node_execute_runtime import (
-    CodexNodeExecuteRuntime,
+    CoderNodeExecuteRuntime,
     LLMNodeExecuteRuntime,
     ReactNodeExecuteRuntime,
     ToolNodeExecuteRuntime,
@@ -50,7 +50,7 @@ class TaskAgentRuntime:
             runtimes={
                 "llm": LLMNodeExecuteRuntime(),
                 "react": ReactNodeExecuteRuntime(),
-                "codex": CodexNodeExecuteRuntime(),
+                "coder": CoderNodeExecuteRuntime(),
                 "tool": ToolNodeExecuteRuntime(),
             }
         )
@@ -83,6 +83,8 @@ class TaskAgentRuntime:
             "conversation_id": turn.conversation_id,
             "turn_id": turn_id,
             "external_chat_id": conversation.external_chat_id,
+            "available_runtimes": ["llm", "react", "coder", "tool"],
+            "coder_runtime_provider": get_settings().coder_runtime_provider,
             **_runtime_temporal_hints(),
         }
         started = time.perf_counter()
@@ -456,7 +458,8 @@ def _tool_artifacts_from_report(report: ExecutionReport, *, turn_id: int) -> lis
             if not artifact.tool_call_id:
                 updates["tool_call_id"] = f"node:{result.node_id}"
             if not artifact.source_tool:
-                updates["source_tool"] = "delegate_to_codex" if result.runtime == "codex" else result.runtime
+                provider = str(result.data.get("provider") or "")
+                updates["source_tool"] = "delegate_to_codex" if result.runtime in {"coder", "codex"} and provider in {"", "codex"} else result.runtime
             if updates:
                 artifact = replace(artifact, **updates)
             if artifact.artifact_id in seen:

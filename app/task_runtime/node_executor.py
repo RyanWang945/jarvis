@@ -84,12 +84,14 @@ class NodeExecutor:
                         f"No NodeExecuteRuntime registered for runtime: {node.runtime}",
                     )
                 else:
+                    merged_runtime_hints = dict(runtime_hints or {})
+                    merged_runtime_hints.update(node.runtime_hints)
                     result = runtime.run(
                         NodeExecutionContext(
                             user_objective=plan.user_objective,
                             node=node,
                             resolved_inputs=resolved_inputs,
-                            runtime_hints=dict(runtime_hints or {}),
+                            runtime_hints=merged_runtime_hints,
                             instructions=list(instructions or []),
                         )
                     )
@@ -243,7 +245,7 @@ def _node_result_from_mapping(value: dict[str, Any]) -> NodeResult | None:
         return None
     node_id = value.get("node_id") or value.get("id")
     runtime = value.get("runtime")
-    if not isinstance(node_id, str) or not node_id.strip() or runtime not in {"llm", "react", "codex", "tool", "deepresearch"}:
+    if not isinstance(node_id, str) or not node_id.strip() or runtime not in {"llm", "react", "coder", "codex", "tool"}:
         return None
     status = value.get("status") if value.get("status") in {"completed", "failed", "blocked"} else "completed"
     return NodeResult(

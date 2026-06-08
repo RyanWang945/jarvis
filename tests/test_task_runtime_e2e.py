@@ -304,12 +304,12 @@ def test_task_runtime_persists_and_returns_node_tool_artifacts() -> None:
     artifact_id = f"task_runtime_image:{uuid4().hex}"
     plan = ExecutionPlan(
         user_objective="生成图片",
-        nodes=[PlanNode(id="generate_image", runtime="codex", objective="Generate image")],
+        nodes=[PlanNode(id="generate_image", runtime="coder", objective="Generate image")],
     )
     runtime = TaskAgentRuntime(
         store,
         planning_router=StaticPlanningRouter(plan),
-        node_executor=NodeExecutor(runtimes={"codex": ArtifactRuntime(image_path, artifact_id)}),
+        node_executor=NodeExecutor(runtimes={"coder": ArtifactRuntime(image_path, artifact_id)}),
         result_aggregator=ResultAggregator(model_resolver=lambda metadata: _missing_key_model()),
     )
 

@@ -2,7 +2,9 @@
 
 版本：v3.1 草案
 日期：2026-05-01
-状态：新架构基线，第一阶段聚焦私聊多轮和群聊多人对话
+状态：历史基线，第一阶段聚焦私聊多轮和群聊多人对话
+
+更新说明（2026-06-08）：本文中“全局 ReAct runtime”“Deep Research 作为工具或 mode”“固定 DAG 不是主执行模型”等结论已被 vNext TaskDAG 方案修正。当前方向以 `docs/design/2026-5/【2026-05-22】jarvis next 重构` 和 `docs/design/2026-5/【2026-05-16】Jarvis DeepResearch DAG Strategy V1 设计.md` 的新版内容为准：Agent Runtime 是唯一 DAG 编排器，DeepResearch 是外层 DAG strategy / expandable subgraph，ReactLoop 和 Codex 只作为叶子节点 worker。
 
 ## 1. 背景
 

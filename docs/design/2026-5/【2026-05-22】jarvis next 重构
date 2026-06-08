@@ -6,14 +6,15 @@ Jarvis vNext 不再以全局 ReActLoop 作为一轮请求的总控，而是把�
 
 ```text
 User Turn
-  -> FastIntentNode + Planner 并行启动
-  -> PlanCoordinator
+  -> FastIntentNode
+     -> fast_reply: 直接返回
+     -> needs_plan: Planner / PlanExpander
   -> TaskDAG
   -> DAGRuntime
-  -> NodeRuntime
-  -> Executor
+  -> NodeWorkerRuntime
   -> Blackboard
   -> Aggregator
+  -> EffectHandler
   -> Final Reply
 ```
 
@@ -21,39 +22,34 @@ User Turn
 
 ```text
 1. TaskDAG 替代 TurnClassifier + RuntimePolicy。
-2. Executor 替代全局 ReActLoop。
-3. Codex 退出工具层，成为 CodexExecutor。
+2. DAGRuntime 是唯一任务编排器，ReActLoop 退化为单节点 worker。
+3. Codex 退出工具层，成为代码/仓库节点 worker。
 4. Blackboard 成为运行时状态源。
 5. PermissionGuard + approval/resume 成为硬边界。
+6. DeepResearch 是 DAG strategy / expandable subgraph，不是 runtime。
+7. 不允许直接 tool runtime；确定性副作用进入 EffectHandler。
 ```
 
-## 2. FastIntent + Planner 并行
+## 2. FastIntent + Planner 路由
 
-Planner 是完整 DAG 规划节点，但不是所有请求都必须等待它。
+Planner 是完整 DAG 规划节点，但不是所有请求都必须进入 Planner。
 
-vNext 在收到用户请求后并行启动两个节点：
+vNext 在收到用户请求后先启动低延迟 FastIntent：
 
 ```text
 User Turn
   -> FastIntentNode
-  -> Planner
+     -> fast_reply: 返回 FastIntent 生成的完整回复
+     -> needs_plan: 调用 Planner 生成 TaskDAG
 ```
 
 `FastIntentNode` 只做低延迟路由判断：
 
 ```python
 class FastIntentDecision(BaseModel):
-    route: Literal[
-        "direct_llm",
-        "direct_tool",
-        "direct_react",
-        "direct_codex",
-        "needs_plan",
-    ]
+    route: Literal["fast_reply", "needs_plan"]
     confidence: float
-    execution_type: Literal["llm", "tool", "react", "codex"] | None = None
-    tool_name: str | None = None
-    target_resources: list[TargetResource] = []
+    reply: str = ""
     reason: str = ""
 ```
 
@@ -61,7 +57,9 @@ FastIntent 不做：
 
 ```text
 - 不生成完整 TaskDAG
+- 不选择节点 runtime
 - 不输出 allowed_tools
+- 不选择真实工具名
 - 不授权高风险动作
 - 不替代 PermissionGuard
 - 不做多节点依赖规划
@@ -71,28 +69,18 @@ FastIntent 的模型固定为 `deepseek-v4-flash`，不跟随会话 active model
 
 FastIntent 不允许在服务端硬编码业务语义规则，例如用关键词判断“多目标”“提醒”“代码任务”。服务端只做 schema 归一化、工具名别名归一和置信度门槛；是否需要完整 Planner 由 `deepseek-v4-flash` 的 FastIntent 输出决定。
 
-PlanCoordinator 根据 FastIntent 结果决策：
+Agent Runtime 根据 FastIntent 结果决策：
 
 ```text
-if FastIntent route is direct and confidence >= threshold:
-    ignore/cancel Planner result
-    build SingleNodeDAG
+if FastIntent route is fast_reply and confidence >= threshold:
+    finalize_turn_success(reply)
 else:
-    wait Planner TaskDAG
+    plan = Planner.plan(...)
+    expanded = PlanExpander.expand(plan)
+    DAGRuntime.run(expanded)
 ```
 
-这样简单任务不需要支付完整 Planner 时延，复杂任务由于 Planner 已经并行启动，也不会额外增加一次串行分类延迟。
-
-直接路由仍然构造成单节点 DAG，而不是绕过 DAGRuntime：
-
-```text
-direct_llm   -> TaskDAG(nodes=[TaskNode(execution_type="llm")])
-direct_tool  -> TaskDAG(nodes=[TaskNode(execution_type="tool", tool_name=...)])
-direct_react -> TaskDAG(nodes=[TaskNode(execution_type="react")])
-direct_codex -> TaskDAG(nodes=[TaskNode(execution_type="codex")])
-```
-
-这保证 Blackboard、PermissionGuard、approval/resume 和 Aggregator 仍然只有一套运行时模型。
+简单任务直接返回，不进入 DAGRuntime。所有需要工具、仓库、文件、提醒、产物、当前信息、多步骤推理或不确定上下文的请求必须走 Planner。
 
 ## 3. Planner
 
@@ -103,9 +91,11 @@ Planner 只做语义规划：
 ```text
 - 理解用户目标
 - 拆分任务节点
+- 选择 task strategy
 - 生成节点依赖
-- 为每个节点选择 execution_type
+- 为每个叶子节点选择 runtime 和 capability
 - 标注目标资源和期望输出
+- 生成 system effects
 - 生成聚合策略
 ```
 
@@ -119,27 +109,33 @@ Planner 不做：
 - 不决定 approval 是否通过
 ```
 
-`execution_type` 是 Planner 输出中最重要的执行选择：
+`strategy` 是整轮任务形态，`runtime` 是叶子节点执行器：
 
 ```python
-ExecutionType = Literal[
-    "llm",
-    "tool",
-    "react",
-    "codex",
-    "deepresearch",
+TaskStrategy = Literal[
+    "simple_plan",
+    "deep_research",
+    "code_project",
+    "mixed_complex",
 ]
+
+NodeRuntime = Literal["llm", "react", "codex"]
 ```
 
 选择原则：
 
 ```text
-llm          普通回答、解释、改写、无需工具的总结
-tool         单次确定性工具动作，例如创建提醒、交付已有文件
-react        需要多步观察和工具组合的节点，例如搜索后综合判断
-codex        本地仓库阅读、修改、测试、提交、push、代码 review
-deepresearch 深度外部研究，通常耗时更长，V1 可先保留类型不实现
+simple_plan    普通单节点或少量节点任务
+deep_research  多来源证据链研究，由 PlanExpander 展开成普通 DAG
+code_project   以本地仓库为核心的复杂代码任务
+mixed_complex  研究、代码、产物和 effect 混合任务
+
+llm    普通回答、解释、改写、无需工具的总结和合成
+react  需要多步观察和工具组合的单个研究/检索节点
+codex  本地仓库阅读、修改、测试、提交、push、代码 review
 ```
+
+确定性动作如创建提醒、交付已有文件不再是 `runtime=tool`，而是 `effects`，由 EffectHandler 在 DAG 节点完成后执行。
 
 ## 4. Prompt 管理
 
@@ -189,8 +185,10 @@ JARVIS_PROMPT_HEAVY_PLAN_VERSION=v1
 class TaskDAG(BaseModel):
     dag_id: str
     user_objective: str
+    strategy: Literal["simple_plan", "deep_research", "code_project", "mixed_complex"]
     success_criteria: list[str]
     nodes: list[TaskNode]
+    effects: list[SystemEffect] = []
     aggregation: AggregationSpec
 ```
 
@@ -203,8 +201,10 @@ TaskDAG(nodes=[main])
 复杂请求是多节点 DAG：
 
 ```text
-TaskDAG(nodes=[research, code_edit, artifact_delivery, reminder])
+TaskDAG(nodes=[research, code_edit, review], effects=[artifact_delivery, reminder])
 ```
+
+DeepResearch 请求也是普通 DAG，只是由 `strategy=deep_research` 和 PlanExpander 生成更多 evidence-oriented 节点。
 
 ## 6. TaskNode
 
@@ -214,9 +214,9 @@ TaskDAG(nodes=[research, code_edit, artifact_delivery, reminder])
 class TaskNode(BaseModel):
     id: str
     objective: str
-    execution_type: Literal["llm", "tool", "react", "codex", "deepresearch"]
+    runtime: Literal["llm", "react", "codex"]
+    capability: str
 
-    tool_name: str | None = None
     target_resources: list[TargetResource] = []
     input: dict = {}
     expected_output: OutputSpec
@@ -227,11 +227,13 @@ class TaskNode(BaseModel):
 约束：
 
 ```text
-- execution_type=tool 时必须有 tool_name。
-- execution_type!=tool 时不得依赖 tool_name 来表达核心执行器。
-- codex 节点通过 CodexExecutor 执行，不再调用 delegate_to_codex tool。
-- react 节点可以使用工具，但工具面由 ReactExecutor 内部策略和 PermissionGuard 共同约束。
-- deepresearch V1 可以只进入验证失败或 not_implemented，避免提前做重型闭环。
+- runtime 只能是 llm / react / codex。
+- 不允许 runtime=tool。
+- 不允许 runtime=deepresearch。
+- capability 描述节点能力，例如 evidence_search、evidence_synthesis、repo_review、code_edit、code_review。
+- codex 节点通过 CodexWorker 执行，不再调用 delegate_to_codex tool。
+- react 节点可以使用工具，但工具面由 ReactWorker 内部策略和 PermissionGuard 共同约束。
+- DeepResearch 通过 strategy + PlanExpander 展开成普通 llm/react/codex 节点。
 ```
 
 ## 7. DAGRuntime
@@ -275,44 +277,44 @@ DAGRuntime 不做：
 - 不解析工具权限
 - 不改写节点输入
 - 不直接调用业务工具
-- 不替 Executor 做恢复逻辑
+- 不替 Worker 或 EffectHandler 做恢复逻辑
 ```
 
-## 8. NodeRuntime
+## 8. NodeWorkerRuntime
 
-NodeRuntime 执行单个 TaskNode。
+NodeWorkerRuntime 执行单个 TaskNode。
 
 ```text
-NodeRuntime.run(node):
+NodeWorkerRuntime.run(node):
   1. 从 Blackboard 读取依赖节点结果
   2. 构造 NodeContext
-  3. 根据 node.execution_type 选择 Executor
-  4. 调用 Executor.run(node, context)
+  3. 根据 node.runtime 选择 worker
+  4. 调用 worker.run(node, context)
   5. 标准化 NodeResult
 ```
 
-NodeRuntime 不再引入 capability resolver。Planner 已经选择 `execution_type`，NodeRuntime 只做确定性分派。
+NodeWorkerRuntime 不再引入 capability resolver。Planner/PlanExpander 已经选择 `runtime` 和 `capability`，NodeWorkerRuntime 只做确定性分派。
 
-## 9. Executor
+## 9. Worker
 
-Executor 是节点真正的执行者。
+Worker 是节点真正的执行者。
 
-V1 执行器：
-
-```text
-LLMExecutor      无工具普通回答
-ToolExecutor     单次确定工具调用
-ReactExecutor    节点内部多步工具观察
-CodexExecutor    本地仓库任务
-```
-
-V1 保留但可不实现：
+V1 worker：
 
 ```text
-DeepResearchExecutor
+LLMWorker      无工具普通回答、合成、改写
+ReactWorker    节点内部 bounded ReActLoop，用于研究/检索/知识查询
+CodexWorker    本地仓库任务
 ```
 
-### 7.1 LLMExecutor
+V1 不提供：
+
+```text
+ToolWorker
+DeepResearchWorker
+```
+
+### 9.1 LLMWorker
 
 适合：
 
@@ -323,21 +325,9 @@ DeepResearchExecutor
 短推理
 ```
 
-### 7.2 ToolExecutor
+### 9.2 ReactWorker
 
-适合单次确定动作：
-
-```text
-scheduled_task
-deliver_file
-简单文件定位后的交付
-```
-
-执行前仍必须经过 PermissionGuard。
-
-### 7.3 ReactExecutor
-
-ReactExecutor 是旧 ReActLoop 的新位置：它只处理某个节点内部的动态工具调用。
+ReactWorker 是旧 ReActLoop 的新位置：它只处理某个节点内部的动态工具调用。
 
 适合：
 
@@ -355,16 +345,17 @@ ReactExecutor 是旧 ReActLoop 的新位置：它只处理某个节点内部的�
 commit/push
 单次确定工具调用
 普通聊天
+全局 deep research 编排
 ```
 
-### 7.4 CodexExecutor
+### 9.3 CodexWorker
 
 Codex 不再作为普通 LLM tool 暴露。
 
 ```text
-TaskNode(execution_type="codex")
-  -> NodeRuntime
-  -> CodexExecutor
+TaskNode(runtime="codex")
+  -> NodeWorkerRuntime
+  -> CodexWorker
 ```
 
 适合：
@@ -379,19 +370,53 @@ repo 报告
 commit / push
 ```
 
-CodexExecutor 内部可以复用现有 `app.tools.codex` 的调用实现，但对外语义上它是 executor，不是 tool。
+CodexWorker 内部可以复用现有 `app.tools.codex` 的调用实现，但对外语义上它是 worker，不是 tool。
 
-## 10. PermissionGuard
+## 10. EffectHandler
+
+EffectHandler 执行系统级确定性副作用。
+
+适合：
+
+```text
+deliver_file
+schedule_task
+notify
+persist_artifact
+```
+
+Effect 不属于 TaskNode，不参与 worker runtime 选择。它可以依赖节点结果：
+
+```python
+class SystemEffect(BaseModel):
+    type: Literal["deliver_file", "schedule_task", "notify", "persist_artifact"]
+    depends_on: list[str] = []
+    payload: dict = {}
+    failure_policy: Literal["stop", "continue", "ask_user"] = "ask_user"
+```
+
+执行位置：
+
+```text
+DAGRuntime completed / partially completed
+  -> Aggregator drafts final result context
+  -> EffectHandler executes allowed effects
+  -> Final Reply includes effect outcome
+```
+
+Effect 执行前仍必须经过 PermissionGuard。Planner 只能声明用户请求的 effect，不能授权 effect。
+
+## 11. PermissionGuard
 
 PermissionGuard 是所有高风险动作执行前的强制边界。
 
 位置：
 
 ```text
-Executor 产生具体 action/tool_args
+Worker 或 EffectHandler 产生具体 action args
   -> PermissionGuard.check(...)
   -> allow / ask / deny
-  -> ToolRuntime 或 Executor 内部动作真正执行
+  -> Worker 内部动作或 EffectHandler 动作真正执行
 ```
 
 它不在 Planner 阶段，也不在 DAGRuntime 调度阶段。
@@ -399,10 +424,10 @@ Executor 产生具体 action/tool_args
 判断维度：
 
 ```text
-- node.execution_type
-- tool_name / action
+- node.runtime / node.capability / effect.type
+- action
 - target resource
-- tool_args / executor action args
+- action args
 - 用户原始意图
 - 当前会话授权
 - pending approval resume token
@@ -434,20 +459,20 @@ obsidian_wiki_apply                    ask
 delete file / destructive shell action deny 或 ask
 ```
 
-Planner 不能授权，Executor 不能绕过 PermissionGuard。
+Planner 不能授权，Worker 和 EffectHandler 不能绕过 PermissionGuard。
 
-## 11. Approval / Resume
+## 12. Approval / Resume
 
 approval/resume 是 V1 硬边界，不推迟到 V2。
 
 当 PermissionGuard 返回 `ask`：
 
 ```text
-1. Executor 返回 NodeResult(status="waiting_approval")
+1. Worker 或 EffectHandler 返回 waiting_approval
 2. NodeResult 携带 pending_decision 和 resume_token
 3. DAGRuntime 保存结果并暂停 DAG
 4. 用户批准后，DAGRuntime 用 resume_token 恢复同一个 node
-5. Executor 从暂停点继续，不重新跑整轮 DAG
+5. Worker 或 EffectHandler 从暂停点继续，不重新跑整轮 DAG
 ```
 
 节点结果：
@@ -470,7 +495,7 @@ class NodeResult(BaseModel):
     resume_token: str | None = None
 ```
 
-## 12. Blackboard
+## 13. Blackboard
 
 Blackboard 是 DAG/node 的运行状态源。
 
@@ -479,6 +504,8 @@ V1 最小持久化即可：
 ```text
 dag_run_id
 node_id
+runtime
+capability
 status
 summary
 output_json
@@ -507,7 +534,7 @@ parallel execution metadata
 retry history
 ```
 
-## 13. Aggregator
+## 14. Aggregator
 
 Aggregator 只汇总，不重新执行。
 
@@ -530,19 +557,20 @@ Aggregator 不做：
 - 不绕过 waiting_approval
 ```
 
-## 14. V1 范围
+## 15. V1 范围
 
 V1 做：
 
 ```text
-- FastIntentNode + Planner 并行启动
-- PlanCoordinator 决定 direct 单节点 DAG 或完整 Planner DAG
-- Planner 输出 TaskDAG
-- TaskNode 使用 execution_type
+- FastIntentNode 支持 fast_reply 直接返回
+- needs_plan 路径进入 Planner / PlanExpander
+- Planner 输出带 strategy、nodes、effects 的 TaskDAG
+- TaskNode 使用 runtime + capability
 - PlanValidator 做结构校验
 - DAGRuntime 顺序执行
-- NodeRuntime 确定性分派 Executor
-- LLMExecutor / ToolExecutor / ReactExecutor / CodexExecutor
+- NodeWorkerRuntime 确定性分派 Worker
+- LLMWorker / ReactWorker / CodexWorker
+- EffectHandler 执行 deliver_file、schedule_task 等系统 effect
 - PermissionGuard 覆盖高风险动作
 - approval/resume 基础闭环
 - Blackboard 最小持久化
@@ -560,9 +588,11 @@ V1 不做：
 - 多轮复杂 checkpoint
 - worker mailbox
 - agent 间通信
+- 独立 DeepResearchRuntime
+- 直接 tool runtime
 ```
 
-## 15. 后续演进
+## 16. 后续演进
 
 V2：
 
@@ -586,13 +616,12 @@ DAG 并发调度
 V4：
 
 ```text
-DeepResearchRuntime
-ArtifactRuntime
-MemoryRuntime
+DeepResearch strategy 的并发和动态扩展
+Artifact effect / Memory effect 强化
 多 worker 观测系统
 Langfuse / Prometheus 指标接入
 ```
 
-## 16. 一句话总结
+## 17. 一句话总结
 
-Jarvis vNext 以 TaskDAG 为核心运行时：FastIntent 和 Planner 并行启动，简单任务由 FastIntent 快速生成单节点 DAG，复杂任务等待 Planner 生成带 `execution_type` 的 DAG；DAGRuntime 循环调度可执行节点，NodeRuntime 按 `execution_type` 选择 Executor，所有高风险动作在执行前经过 PermissionGuard，节点结果写入 Blackboard，最终由 Aggregator 汇总。
+Jarvis vNext 以 TaskDAG 为核心运行时：FastIntent 只负责快回答或进入规划；复杂任务由 Planner / PlanExpander 生成带 `strategy`、`runtime`、`capability` 和 `effects` 的 DAG；DAGRuntime 循环调度可执行节点，NodeWorkerRuntime 按 `runtime` 选择 Worker，DeepResearch 作为 DAG strategy 展开，确定性副作用由 EffectHandler 执行，所有高风险动作在执行前经过 PermissionGuard，节点结果写入 Blackboard，最终由 Aggregator 汇总。

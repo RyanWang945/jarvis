@@ -21,7 +21,7 @@
           },
           "runtime": {
             "type": "string",
-            "enum": ["llm", "react", "codex", "tool", "deepresearch"]
+            "enum": ["llm", "react", "coder", "tool"]
           },
           "objective": {
             "type": "string"
@@ -38,6 +38,16 @@
           },
           "tool_name": {
             "type": ["string", "null"]
+          },
+          "runtime_hints": {
+            "type": "object",
+            "additionalProperties": true,
+            "properties": {
+              "access_mode": {
+                "type": "string",
+                "enum": ["read", "write"]
+              }
+            }
           }
         }
       }

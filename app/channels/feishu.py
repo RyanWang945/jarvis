@@ -47,7 +47,8 @@ from app.config import get_settings
 from app.gateway import InboundEvent, get_gateway_service
 from app.progress import NoopProgressReporter, ProgressEvent, ProgressReporter
 from app.persistence.models import DeliveryRecord
-from app.tools.codex_app_server import approval_command_prefix, respond_to_codex_approval
+from app.task_runtime.coder_provider import resume_coder_approval
+from app.tools.codex_app_server import approval_command_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -501,10 +502,11 @@ class FeishuChannel:
     ) -> None:
         drain_after = True
         try:
-            result = respond_to_codex_approval(
+            result = resume_coder_approval(
                 approval_id,
                 approved=approved,
                 timeout_seconds=get_settings().coder_timeout_seconds,
+                provider="codex",
                 trusted_command_prefixes=_codex_approval_prefixes(conversation_id),
             )
             logger.info(
@@ -527,9 +529,9 @@ class FeishuChannel:
 
             if result.status == "approval_requested":
                 approval = result.approval_requests[0] if result.approval_requests else {}
-                next_approval_id = str(approval.get("id") or approval_id)
-                next_command = str(approval.get("command") or "")
-                next_reason = str(approval.get("reason") or "")
+                next_approval_id = _approval_value(approval, "approval_id") or _approval_value(approval, "id") or approval_id
+                next_command = _approval_value(approval, "command")
+                next_reason = _approval_value(approval, "reason")
                 logger.info(
                     "codex approval continuation requested next approval previous_approval_id=%s next_approval_id=%s command=%s reason=%s",
                     approval_id,
@@ -1257,6 +1259,12 @@ def _extract_codex_approval_from_reply(reply: str) -> dict[str, str] | None:
         "command": command,
         "reason": reason,
     }
+
+
+def _approval_value(approval: Any, key: str) -> str:
+    if isinstance(approval, dict):
+        return str(approval.get(key) or "").strip()
+    return str(getattr(approval, key, "") or "").strip()
 
 
 def _record_codex_approval(

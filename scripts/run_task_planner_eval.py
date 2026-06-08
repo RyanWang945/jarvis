@@ -20,7 +20,7 @@ DEFAULT_DATASET = Path("tests/fixtures/task_planner_eval/planner_cases.jsonl")
 DEFAULT_OUTPUT_ROOT = Path("data/eval_runs")
 DEFAULT_RUNTIME_HINTS = {
     "active_repo": "jarvis",
-    "available_runtimes": ["llm", "react", "codex", "tool", "deepresearch"],
+    "available_runtimes": ["llm", "react", "coder", "tool"],
 }
 
 

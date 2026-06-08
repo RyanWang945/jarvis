@@ -17,7 +17,7 @@ def test_plan_node_uses_input_refs_as_graph_edges() -> None:
             PlanNode(id="research", runtime="react", objective="Research agent runtime patterns"),
             PlanNode(
                 id="review",
-                runtime="codex",
+                runtime="coder",
                 objective="Review jarvis using research result",
                 input_refs=["node:research"],
             ),
@@ -30,7 +30,7 @@ def test_plan_node_uses_input_refs_as_graph_edges() -> None:
 def test_execution_plan_allows_previous_node_result_refs() -> None:
     plan = ExecutionPlan(
         user_objective="continue from previous result",
-        nodes=[PlanNode(id="review", runtime="codex", objective="Review", input_refs=["node:previous_research"])],
+        nodes=[PlanNode(id="review", runtime="coder", objective="Review", input_refs=["node:previous_research"])],
     )
 
     assert plan.nodes[0].input_refs == ["node:previous_research"]
@@ -40,7 +40,7 @@ def test_execution_plan_rejects_self_ref() -> None:
     with pytest.raises(ValidationError, match="cannot reference itself"):
         ExecutionPlan(
             user_objective="bad graph",
-            nodes=[PlanNode(id="review", runtime="codex", objective="Review", input_refs=["node:review"])],
+            nodes=[PlanNode(id="review", runtime="coder", objective="Review", input_refs=["node:review"])],
         )
 
 
@@ -62,6 +62,11 @@ def test_plan_node_requires_tool_name_only_for_tool_runtime() -> None:
         PlanNode(id="answer", runtime="llm", objective="Answer", tool_name="scheduled_task")
 
 
+def test_plan_node_rejects_deepresearch_runtime() -> None:
+    with pytest.raises(ValidationError):
+        PlanNode(id="research", runtime="deepresearch", objective="Run deep research")  # type: ignore[arg-type]
+
+
 def test_build_plan_input_normalizes_artifacts_and_hints() -> None:
     plan_input = build_plan_input(
         current_user_input="把刚刚那个报告发我",
@@ -80,11 +85,11 @@ def test_build_plan_input_normalizes_artifacts_and_hints() -> None:
     assert plan_input.runtime_hints["timezone"] == "Asia/Shanghai"
 
 
-def test_plan_from_payload_coerces_pass_through_for_non_llm_nodes() -> None:
+def test_plan_from_payload_derives_llm_finalization_for_non_llm_nodes() -> None:
     plan = _plan_from_payload(
         {
             "user_objective": "查最新资料",
-            "finalization_hint": {"mode": "pass_through", "user_facing": True},
+            "finalization_hint": {"mode": "pass_through", "reason": "ignored", "user_facing": True},
             "nodes": [
                 {
                     "id": "research",
@@ -98,6 +103,7 @@ def test_plan_from_payload_coerces_pass_through_for_non_llm_nodes() -> None:
     )
 
     assert plan.finalization_hint.mode == "llm"
+    assert plan.finalization_hint.reason == "multiple or non-llm node results require llm aggregation"
     assert plan.finalization_hint.user_facing is True
 
 
@@ -112,6 +118,71 @@ def test_plan_from_payload_keeps_pass_through_for_single_llm_node() -> None:
     )
 
     assert plan.finalization_hint.mode == "pass_through"
+
+
+def test_plan_from_payload_derives_deterministic_finalization_for_single_tool_node() -> None:
+    plan = _plan_from_payload(
+        {
+            "user_objective": "设置提醒",
+            "finalization_hint": {"mode": "llm", "reason": "ignored", "user_facing": False},
+            "nodes": [
+                {
+                    "id": "remind",
+                    "runtime": "tool",
+                    "objective": "设置提醒",
+                    "tool_name": "scheduled_task",
+                }
+            ],
+        },
+        fallback_objective="设置提醒",
+    )
+
+    assert plan.finalization_hint.mode == "deterministic"
+    assert plan.finalization_hint.reason == "single tool node uses deterministic finalization"
+    assert plan.finalization_hint.user_facing is False
+
+
+def test_plan_from_payload_normalizes_null_node_runtime_hints() -> None:
+    plan = _plan_from_payload(
+        {
+            "user_objective": "review repo and remind me",
+            "nodes": [
+                {
+                    "id": "review",
+                    "runtime": "coder",
+                    "objective": "Review jarvis",
+                    "runtime_hints": {"access_mode": "read"},
+                },
+                {
+                    "id": "remind",
+                    "runtime": "tool",
+                    "objective": "Create reminder",
+                    "tool_name": "scheduled_task",
+                    "input_refs": ["node:review"],
+                    "runtime_hints": None,
+                },
+            ],
+        },
+        fallback_objective="review repo and remind me",
+    )
+
+    assert [node.runtime for node in plan.nodes] == ["coder", "tool"]
+    assert plan.nodes[1].runtime_hints == {}
+    assert plan.nodes[1].input_refs == ["node:review"]
+
+
+def test_plan_from_payload_falls_back_to_artifact_delivery_for_empty_nodes() -> None:
+    plan = _plan_from_payload(
+        {"user_objective": "把刚刚那个报告发我", "nodes": []},
+        fallback_objective="把刚刚那个报告发我",
+        known_artifact_refs={"artifact:A1"},
+    )
+
+    assert len(plan.nodes) == 1
+    assert plan.nodes[0].runtime == "tool"
+    assert plan.nodes[0].tool_name == "deliver_file"
+    assert plan.nodes[0].input_refs == ["artifact:A1"]
+    assert plan.finalization_hint.mode == "deterministic"
 
 
 real_llm = pytest.mark.skipif(
@@ -136,7 +207,7 @@ def test_turn_planner_real_llm_creates_artifact_delivery_node() -> None:
                 "origin": "assistant_generated",
             }
         ],
-        runtime_hints={"active_repo": None, "available_runtimes": ["llm", "react", "codex", "tool", "deepresearch"]},
+        runtime_hints={"active_repo": None, "available_runtimes": ["llm", "react", "coder", "tool"]},
     )
 
     assert len(plan.nodes) == 1
@@ -160,8 +231,8 @@ def test_turn_planner_real_llm_reuses_previous_node_result_for_replan() -> None:
                 "artifacts": [],
             }
         ],
-        runtime_hints={"active_repo": "jarvis", "available_runtimes": ["llm", "react", "codex", "tool", "deepresearch"]},
+        runtime_hints={"active_repo": "jarvis", "available_runtimes": ["llm", "react", "coder", "tool"]},
     )
 
-    assert [node.runtime for node in plan.nodes] == ["codex"]
+    assert [node.runtime for node in plan.nodes] == ["coder"]
     assert "node:research_agent_sdk" in plan.nodes[0].input_refs

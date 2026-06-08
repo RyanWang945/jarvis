@@ -61,13 +61,13 @@ def llm_response(content: str = "", *, tool_calls: tuple[NormalizedToolCall, ...
 
 def test_node_executor_runs_ready_nodes_and_passes_node_result_inputs() -> None:
     react = RecordingRuntime("react", "research")
-    codex = RecordingRuntime("codex", "review")
-    executor = NodeExecutor(runtimes={"react": react, "codex": codex})
+    coder = RecordingRuntime("coder", "review")
+    executor = NodeExecutor(runtimes={"react": react, "coder": coder})
     plan = ExecutionPlan(
         user_objective="research then review",
         nodes=[
             PlanNode(id="research", runtime="react", objective="Research agent runtime"),
-            PlanNode(id="review", runtime="codex", objective="Review repo", input_refs=["node:research"]),
+            PlanNode(id="review", runtime="coder", objective="Review repo", input_refs=["node:research"]),
         ],
     )
 
@@ -75,8 +75,8 @@ def test_node_executor_runs_ready_nodes_and_passes_node_result_inputs() -> None:
 
     assert report.status == "completed"
     assert [result.node_id for result in report.node_results] == ["research", "review"]
-    assert codex.calls[0].resolved_inputs[0].ref == "node:research"
-    assert codex.calls[0].resolved_inputs[0].summary == "research:research"
+    assert coder.calls[0].resolved_inputs[0].ref == "node:research"
+    assert coder.calls[0].resolved_inputs[0].summary == "research:research"
 
 
 def test_node_executor_resolves_artifact_inputs() -> None:
@@ -113,14 +113,14 @@ def test_node_executor_resolves_artifact_inputs() -> None:
 
 
 def test_node_executor_uses_previous_node_results() -> None:
-    codex = RecordingRuntime("codex", "review")
-    executor = NodeExecutor(runtimes={"codex": codex})
+    coder = RecordingRuntime("coder", "review")
+    executor = NodeExecutor(runtimes={"coder": coder})
     plan = ExecutionPlan(
         user_objective="evaluate jarvis",
         nodes=[
             PlanNode(
                 id="evaluate",
-                runtime="codex",
+                runtime="coder",
                 objective="Evaluate jarvis",
                 input_refs=["node:research_agent_sdk"],
             )
@@ -140,14 +140,14 @@ def test_node_executor_uses_previous_node_results() -> None:
     )
 
     assert report.status == "completed"
-    assert codex.calls[0].resolved_inputs[0].summary == "SDK tracing and handoff changed."
+    assert coder.calls[0].resolved_inputs[0].summary == "SDK tracing and handoff changed."
 
 
 def test_node_executor_blocks_nodes_with_missing_inputs() -> None:
-    executor = NodeExecutor(runtimes={"codex": RecordingRuntime("codex")})
+    executor = NodeExecutor(runtimes={"coder": RecordingRuntime("coder")})
     plan = ExecutionPlan(
         user_objective="bad inputs",
-        nodes=[PlanNode(id="review", runtime="codex", objective="Review", input_refs=["node:missing"])],
+        nodes=[PlanNode(id="review", runtime="coder", objective="Review", input_refs=["node:missing"])],
     )
 
     report = executor.execute(plan)
@@ -160,13 +160,13 @@ def test_node_executor_blocks_nodes_with_missing_inputs() -> None:
 
 def test_node_executor_blocks_downstream_when_dependency_failed() -> None:
     react = RecordingRuntime("react", "research", status="failed")
-    codex = RecordingRuntime("codex", "review")
-    executor = NodeExecutor(runtimes={"react": react, "codex": codex})
+    coder = RecordingRuntime("coder", "review")
+    executor = NodeExecutor(runtimes={"react": react, "coder": coder})
     plan = ExecutionPlan(
         user_objective="research then review",
         nodes=[
             PlanNode(id="research", runtime="react", objective="Research"),
-            PlanNode(id="review", runtime="codex", objective="Review", input_refs=["node:research"]),
+            PlanNode(id="review", runtime="coder", objective="Review", input_refs=["node:research"]),
         ],
     )
 
@@ -174,7 +174,7 @@ def test_node_executor_blocks_downstream_when_dependency_failed() -> None:
 
     assert report.status == "failed"
     assert [result.status for result in report.node_results] == ["failed", "blocked"]
-    assert codex.calls == []
+    assert coder.calls == []
 
 
 def test_codex_node_execute_runtime_builds_tool_request() -> None:
@@ -196,7 +196,7 @@ def test_codex_node_execute_runtime_builds_tool_request() -> None:
             user_objective="review jarvis",
             node=PlanNode(
                 id="review",
-                runtime="codex",
+                runtime="coder",
                 objective="Review planner",
                 expected_output="Markdown review",
                 input_refs=["node:research"],
@@ -229,6 +229,8 @@ def test_codex_node_execute_runtime_builds_tool_request() -> None:
     assert result.status == "completed"
     assert result.summary == "Codex finished."
     assert result.artifacts[0].kind == "codex_run"
+    assert result.runtime == "coder"
+    assert result.data["provider"] == "codex"
 
 
 def test_react_node_execute_runtime_runs_tool_loop() -> None:

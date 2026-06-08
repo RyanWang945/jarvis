@@ -15,7 +15,7 @@ Return exactly one JSON object:
 }
 
 Rules:
-- Treat finalization_hint as an upstream suggestion, not a command. The system may skip this LLM call before you are invoked for pass-through or deterministic cases.
+- Treat finalization_hint as runtime-derived finalization context. The system may skip this LLM call before you are invoked for pass-through or deterministic cases.
 - If the user's objective is satisfied by completed node results, use status "completed".
 - If a node failed but a different plan could likely satisfy the user, use "needs_replan" and provide concrete replan_instructions.
 - If execution is blocked because the user must provide missing information, use "needs_user_input" and set missing_info_question.

@@ -48,6 +48,7 @@ class Settings(BaseSettings):
     llm_max_output_tokens: int = 2000
     llm_context_safety_buffer: int = 1000
     agent_runtime_provider: str = "react"
+    coder_runtime_provider: str = "codex"
     coder_timeout_seconds: int = 1800
     repositories_config_path: Path | None = Field(default=Path("data/repositories.json"))
     deepseek_api_key: str | None = None

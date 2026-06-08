@@ -4,6 +4,7 @@ from app.task_runtime.agent_runtime import TaskAgentRuntime
 from app.task_runtime.fast_intent import FastIntentDecision, FastIntentNode
 from app.task_runtime.node_execute_runtime import (
     CodexNodeExecuteRuntime,
+    CoderNodeExecuteRuntime,
     LLMNodeExecuteRuntime,
     NodeExecuteRuntime,
     NodeExecutionContext,
@@ -33,6 +34,7 @@ __all__ = [
     "FastIntentDecision",
     "FastIntentNode",
     "CodexNodeExecuteRuntime",
+    "CoderNodeExecuteRuntime",
     "ExecutionReport",
     "LLMNodeExecuteRuntime",
     "NodeArtifact",

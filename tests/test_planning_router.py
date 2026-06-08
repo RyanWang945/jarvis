@@ -57,7 +57,7 @@ def _planned_plan() -> ExecutionPlan:
         user_objective="planned complex task",
         nodes=[
             PlanNode(id="research", objective="research", runtime="react"),
-            PlanNode(id="review", objective="review repo", runtime="codex", input_refs=["node:research"]),
+            PlanNode(id="review", objective="review repo", runtime="coder", input_refs=["node:research"]),
         ],
     )
 
@@ -132,7 +132,7 @@ def test_planning_router_needs_plan_waits_for_planner() -> None:
     )
 
     assert result.route == "planned"
-    assert [node.runtime for node in result.plan.nodes] == ["react", "codex"]
+    assert [node.runtime for node in result.plan.nodes] == ["react", "coder"]
     assert result.plan.nodes[1].input_refs == ["node:research"]
 
 

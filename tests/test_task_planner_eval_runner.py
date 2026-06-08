@@ -52,7 +52,7 @@ class StaticRouter:
                 user_objective=content,
                 nodes=[
                     PlanNode(id="research", objective="research agent runtime", runtime="react"),
-                    PlanNode(id="review", objective="review jarvis", runtime="codex", input_refs=["node:research"]),
+                    PlanNode(id="review", objective="review jarvis", runtime="coder", input_refs=["node:research"]),
                 ],
             ),
             fast_intent=FastIntentDecision(route="needs_plan", confidence=0.95),
@@ -69,7 +69,7 @@ def test_task_planner_eval_dataset_loads_simple_and_complex_cases() -> None:
 
     assert len(cases) >= 6
     assert any(case.required_runtimes == ["llm"] for case in cases)
-    assert any("codex" in case.required_runtimes and "tool" in case.required_runtimes for case in cases)
+    assert any("coder" in case.required_runtimes and "tool" in case.required_runtimes for case in cases)
     assert any(case.required_input_refs == ["artifact:A1"] for case in cases)
 
 
@@ -78,7 +78,7 @@ def test_task_planner_eval_score_checks_latency_and_plan_accuracy() -> None:
     plan = ExecutionPlan(
         user_objective=case.message,
         nodes=[
-            PlanNode(id="review_report", objective="review jarvis and write markdown report", runtime="codex"),
+            PlanNode(id="review_report", objective="review jarvis and write markdown report", runtime="coder"),
             PlanNode(
                 id="remind",
                 objective="remind user at 23:00",
@@ -92,7 +92,7 @@ def test_task_planner_eval_score_checks_latency_and_plan_accuracy() -> None:
     result = score_case(case, plan, elapsed_ms=1000)
 
     assert result["passed"] is True
-    assert result["runtimes"] == ["codex", "tool"]
+    assert result["runtimes"] == ["coder", "tool"]
     assert result["tool_names"] == ["scheduled_task"]
 
 
