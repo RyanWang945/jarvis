@@ -5,8 +5,6 @@ from typing import Any, Callable, Literal
 
 from app.tools.ask_user import run_ask_user
 from app.tools.business_knowledge import run_business_knowledge_search
-from app.tools.coder import run_coder_tool
-from app.tools.codex import run_codex_coder_tool
 from app.tools.common import ToolExecutionRequest, ToolExecutionResult
 from app.tools.deliver_file import run_deliver_file
 from app.tools.file_read import run_read_file, run_search_files
@@ -18,10 +16,11 @@ from app.tools.obsidian_wiki import (
 )
 from app.tools.shell import run_shell_command, run_shell_inspect
 from app.tools.scheduled_task import run_scheduled_task
-from app.tools.skill_guidance import run_load_skill_guidance
+from app.tools.skill_guidance import run_load_skill, run_load_skill_guidance
 from app.tools.tavily import run_tavily_search
 from app.tools.tool_search import run_tool_search
 from app.tools.write_file import run_write_file
+from app.tools.x_search import run_x_search
 
 RiskLevel = Literal["low", "medium", "high", "critical"]
 ExecutionMode = Literal["direct", "proposal"]
@@ -53,7 +52,7 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
                 "This tool is read-only and returns bounded text content plus file metadata. "
                 "Do not use it as the primary strategy when the user needs repository-level judgment such as "
                 "architecture analysis, integration planning, code review, design recommendations, execution-chain analysis, "
-                "or multi-file reasoning; use delegate_to_codex for those."
+                "or multi-file reasoning; use a coder runtime node for those."
             ),
             args_schema={
                 "type": "object",
@@ -87,7 +86,7 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
                 "This tool is read-only and returns matching paths plus small metadata or previews. "
                 "Do not use it as the primary strategy when the user needs repository-level judgment such as "
                 "architecture analysis, integration planning, code review, design recommendations, execution-chain analysis, "
-                "or multi-file reasoning; use delegate_to_codex for those."
+                "or multi-file reasoning; use a coder runtime node for those."
             ),
             args_schema={
                 "type": "object",
@@ -137,7 +136,7 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
                 "Use this for targeted commands such as tests, lint, build, or diagnostic commands. "
                 "Do NOT use this for web searches, factual lookups, or current events. "
                 "Do not use this for multi-step repository workflows, code editing, git commit, or git push; "
-                "use delegate_to_codex for those."
+                "use a coder runtime node for those."
             ),
             args_schema={
                 "type": "object",
@@ -152,140 +151,12 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
             requires_explicit_user_command=True,
         ),
         ToolDefinition(
-            name="delegate_to_claude_code",
-            description=(
-                "High-privilege delegation tool for repository development workflows. "
-                "Use this only for substantial code tasks such as multi-file edits, refactors, "
-                "bug fixes, code review follow-up, test execution, and git workflows inside a repository. "
-                "Do not use this for simple shell commands, factual questions, or lightweight search. "
-                "Before calling it, gather enough context to issue one complete task contract."
-            ),
-            args_schema={
-                "type": "object",
-                "properties": {
-                    "instruction": {
-                        "type": "string",
-                        "description": (
-                            "Detailed development task for the coder worker, including file constraints, "
-                            "verification expectations, and whether commit or push is permitted."
-                        ),
-                    },
-                    "repo_id": {
-                        "type": "string",
-                        "description": "Registered repository id, such as jarvis. Prefer this over workdir.",
-                    },
-                    "workdir": {
-                        "type": "string",
-                        "description": "Deprecated compatibility field. Must match a registered repository root.",
-                    },
-                    "verification_cmd": {
-                        "type": "string",
-                        "description": "Optional command the coder worker should run before finishing.",
-                    },
-                    "allow_commit": {
-                        "type": "boolean",
-                        "description": "Whether the coder worker may create a git commit.",
-                        "default": False,
-                    },
-                    "allow_push": {
-                        "type": "boolean",
-                        "description": "Whether the coder worker may push to origin. Requires allow_commit=true.",
-                        "default": False,
-                    },
-                },
-                "required": ["instruction"],
-            },
-            handler=run_coder_tool,
-            risk_level="high",
-            exposed_to_llm=False,
-            execution_mode="proposal",
-            can_modify_files=True,
-            requires_workdir=True,
-        ),
-        ToolDefinition(
-            name="delegate_to_codex",
-            description=(
-                "High-privilege delegation tool backed by Codex for local repository workflows. "
-                "Use this for multi-file repository reasoning, architecture review, code review, reports, tests, "
-                "code edits, refactors, bug fixes, git workflows, and repo-local visual artifacts "
-                "such as architecture diagrams or generated PNG/WebP/SVG files inside a registered repository. "
-                "Prefer this as the first tool for open-ended repository investigation, integration planning, design recommendations, "
-                "execution-chain analysis, or understanding how an external technology should fit into a local project. "
-                "Do not use this to list files, check whether a file exists, read a known file, locate a specific artifact for delivery, or run bounded text search; "
-                "use read_file or search_files for those lightweight workspace file tasks. "
-                "For image generation requests, instruct Codex to preserve the requested output format and "
-                "copy any final raster image from Codex's generated-images area into the repository workspace "
-                "before finishing, so Jarvis can discover and deliver it as an artifact. "
-                "Do not use this for general factual questions or lightweight web search. "
-                "Pass one compact outcome-oriented task: user goal, repo_id, constraints, permissions, "
-                "and verification expectations. Codex owns planning, repository reasoning, command selection, "
-                "retry strategy, and approval requests. Do not turn the task into a step-by-step shell script "
-                "or prescribe recovery commands unless the user explicitly requested exact commands. "
-                "Preserve the user's full repository outcome: if the user asks to edit/update/create, the "
-                "instruction must remain an execution task, not a request to read files and ask what to do. "
-                "Do not ask Codex to confirm commit messages or other routine execution details unless the "
-                "user explicitly requested that confirmation."
-            ),
-            args_schema={
-                "type": "object",
-                "properties": {
-                    "instruction": {
-                        "type": "string",
-                        "description": (
-                            "Outcome-oriented task contract for Codex. Include the goal, constraints, "
-                            "expected artifact path/format when generating a visual artifact, "
-                            "verification expectations, and whether commit or push is permitted; avoid "
-                            "enumerating shell commands or recovery steps, and avoid routine pre-confirmation prompts. "
-                            "Do not downgrade explicit edit/commit/push requests into read-only inspection. "
-                            "Do not silently change raster image-generation requests into SVG-only artifacts. "
-                            "For lightweight file existence, path lookup, known-file reading, locating a specific deliverable artifact, or bounded text search, "
-                            "do not use Codex; use read_file or search_files."
-                        ),
-                    },
-                    "repo_id": {
-                        "type": "string",
-                        "description": "Registered repository id, such as jarvis. Prefer this over workdir.",
-                    },
-                    "workdir": {
-                        "type": "string",
-                        "description": "Deprecated compatibility field. Must match a registered repository root.",
-                    },
-                    "verification_cmd": {
-                        "type": "string",
-                        "description": "Optional command the coder worker should run before finishing.",
-                    },
-                    "allow_commit": {
-                        "type": "boolean",
-                        "description": (
-                            "Whether the coder worker may create a git commit. Set true when the user asks to commit, "
-                            "create a commit, save changes in git, or push."
-                        ),
-                        "default": False,
-                    },
-                    "allow_push": {
-                        "type": "boolean",
-                        "description": (
-                            "Whether the coder worker may push to origin. Set true when the user asks to push or "
-                            "publish to a remote; requires allow_commit=true."
-                        ),
-                        "default": False,
-                    },
-                },
-                "required": ["instruction"],
-            },
-            handler=run_codex_coder_tool,
-            risk_level="high",
-            execution_mode="proposal",
-            can_modify_files=True,
-            requires_workdir=True,
-        ),
-        ToolDefinition(
             name="ask_user",
             description=(
                 "Ask the user one concise clarification question when required information is missing. "
                 "Use this when Jarvis cannot safely continue without a user choice, such as an ambiguous target, "
                 "unclear time, missing recipient, missing repository, or a required preference. "
-                "Do not use ask_user for permission to perform Codex operations; Codex approvals have their own flow. "
+                "Do not use ask_user for permission to perform coder runtime operations; provider approvals have their own flow. "
                 "Ask only the minimum necessary question, then stop and wait for the user's reply."
             ),
             args_schema={
@@ -346,6 +217,30 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
                 "required": ["query"],
             },
             handler=run_tool_search,
+            risk_level="low",
+        ),
+        ToolDefinition(
+            name="load_skill",
+            description=(
+                "Load one Jarvis skill by skill_id from the skill listing. "
+                "Use this when the user's task matches an available skill. "
+                "Loading a skill only reveals turn-scoped procedural guidance; it does not execute scripts, "
+                "grant permissions, perform routing, replace the planner, or complete the task by itself."
+            ),
+            args_schema={
+                "type": "object",
+                "properties": {
+                    "skill": {
+                        "type": "string",
+                        "description": "The skill_id from the skill listing, such as weather-1.0.0 or image-artifact-planner-1.0.0.",
+                    },
+                    "args": {
+                        "description": "Optional user-provided arguments or context for the skill.",
+                    },
+                },
+                "required": ["skill"],
+            },
+            handler=run_load_skill,
             risk_level="low",
         ),
         ToolDefinition(
@@ -622,11 +517,61 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
             risk_level="medium",
         ),
         ToolDefinition(
+            name="x_search",
+            description=(
+                "Use xAI server-side X/Twitter search for direct public X/Twitter post lookup. "
+                "Use this specialized tool for direct X/Twitter search when the user asks for latest twitter posts, X/Twitter discussion, "
+                "public posts from handles, or queries like 马斯克的最新twitter. "
+                "Prefer this over tavily_search when the user's target is specifically X/Twitter content."
+            ),
+            args_schema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The X/Twitter search query.",
+                    },
+                    "handles": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional X handles to include, without @.",
+                    },
+                    "exclude_handles": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional X handles to exclude, without @.",
+                    },
+                    "date_from": {
+                        "type": "string",
+                        "description": "Optional lower date bound in YYYY-MM-DD.",
+                    },
+                    "date_to": {
+                        "type": "string",
+                        "description": "Optional upper date bound in YYYY-MM-DD.",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Desired maximum result count, 1-20.",
+                        "default": 10,
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "Optional xAI responses model override.",
+                    },
+                },
+                "required": ["query"],
+            },
+            handler=run_x_search,
+            risk_level="low",
+            execution_mode="direct",
+        ),
+        ToolDefinition(
             name="tavily_search",
             description=(
                 "Search the web using Tavily AI Search API. "
                 "Use this when the user asks about current events, facts, or anything that requires up-to-date information from the internet. "
-                "It can also find indexed X/Twitter pages or web coverage of X/Twitter activity when a general web/news search is enough. "
+                "It can also find indexed X/Twitter pages or web coverage of X/Twitter activity when a general web/news search is enough; "
+                "prefer the specialized x_search tool when the user specifically asks for direct X/Twitter posts. "
                 "Search ONCE per question. After receiving results, summarize them and reply to the user immediately. "
                 "Do NOT search the same topic multiple times."
             ),

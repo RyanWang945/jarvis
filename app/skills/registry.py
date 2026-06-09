@@ -20,14 +20,19 @@ class SkillMatch:
 class SkillRegistry:
     def __init__(self, skills: list[Skill]) -> None:
         self._skills: dict[str, Skill] = {}
+        self._aliases: dict[str, str] = {}
         for skill in skills:
-            if skill.name in self._skills:
-                raise ValueError(f"duplicate skill: {skill.name}")
-            self._skills[skill.name] = skill
+            if skill.skill_id in self._skills:
+                raise ValueError(f"duplicate skill: {skill.skill_id}")
+            self._skills[skill.skill_id] = skill
+            display_name = (skill.manifest.name or "").strip()
+            if display_name and display_name not in self._skills and display_name not in self._aliases:
+                self._aliases[display_name] = skill.skill_id
 
     def get(self, name: str) -> Skill:
+        key = self._aliases.get(name, name)
         try:
-            return self._skills[name]
+            return self._skills[key]
         except KeyError as exc:
             raise ValueError(f"unknown skill: {name}") from exc
 
@@ -43,8 +48,9 @@ class SkillRegistry:
             return []
 
         explicit = query.lstrip("/").split(maxsplit=1)[0]
-        if query.startswith("/") and explicit in self._skills:
-            skill = self._skills[explicit]
+        explicit_key = self._aliases.get(explicit, explicit)
+        if query.startswith("/") and explicit_key in self._skills:
+            skill = self._skills[explicit_key]
             return [
                 SkillMatch(
                     skill=skill,
@@ -59,8 +65,9 @@ class SkillRegistry:
         for skill in self._skills.values():
             score = 0
             reasons: list[str] = []
-            name = skill.name.lower()
-            description = (skill.description or "").lower()
+            name = skill.skill_id.lower()
+            display_name = (skill.display_name or "").lower()
+            description = (skill.effective_description or skill.description or "").lower()
             manifest_text = " ".join(
                 [
                     skill.manifest.when_to_use or "",
@@ -73,6 +80,9 @@ class SkillRegistry:
             if name in query:
                 score += 8
                 reasons.append("name matched")
+            if display_name and display_name in query:
+                score += 6
+                reasons.append("display name matched")
             if any(capability.lower() in query for capability in skill.manifest.capabilities):
                 score += 5
                 reasons.append("capability matched")
@@ -83,7 +93,7 @@ class SkillRegistry:
                 score += 3
                 reasons.append("when_to_use matched")
 
-            haystack_tokens = _tokens(" ".join([name, description, manifest_text]))
+            haystack_tokens = _tokens(" ".join([name, display_name, description, manifest_text]))
             overlap = query_tokens.intersection(haystack_tokens)
             score += len(overlap)
             if overlap:
@@ -99,7 +109,7 @@ class SkillRegistry:
                     )
                 )
 
-        scored.sort(key=lambda item: (-item.score, item.skill.name))
+        scored.sort(key=lambda item: (-item.score, item.skill.skill_id))
         return scored[:limit]
 
 

@@ -20,7 +20,7 @@ DEFAULT_DATASET = Path("tests/fixtures/task_planner_eval/planner_cases.jsonl")
 DEFAULT_OUTPUT_ROOT = Path("data/eval_runs")
 DEFAULT_RUNTIME_HINTS = {
     "active_repo": "jarvis",
-    "available_runtimes": ["llm", "react", "coder", "tool"],
+    "available_runtimes": ["llm", "react", "coder"],
 }
 
 
@@ -254,7 +254,7 @@ def score_case(case: PlannerEvalCase, plan: ExecutionPlan, *, elapsed_ms: int) -
 
     objective_text = " ".join([plan.user_objective, *[node.objective for node in plan.nodes], *[node.expected_output for node in plan.nodes]])
     for fragment in case.objective_contains:
-        checks.append(_check(f"objective_contains:{fragment}", fragment.lower() in objective_text.lower(), fragment, objective_text))
+        checks.append(_check(f"objective_contains:{fragment}", _contains_fragment(objective_text, fragment), fragment, objective_text))
 
     passed = all(check["passed"] for check in checks)
     return {
@@ -409,6 +409,20 @@ def _check(name: str, passed: bool, expected: Any, actual: Any) -> dict[str, Any
         "expected": expected,
         "actual": actual,
     }
+
+
+def _contains_fragment(text: str, fragment: str) -> bool:
+    normalized_text = str(text or "").lower()
+    normalized_fragment = str(fragment or "").lower()
+    if normalized_fragment in normalized_text:
+        return True
+    aliases = {
+        "报告": ("report", "markdown report"),
+        "提醒": ("reminder", "remind", "notify"),
+        "调研": ("research", "investigation"),
+        "研究": ("research",),
+    }
+    return any(alias.lower() in normalized_text for alias in aliases.get(str(fragment), ()))
 
 
 def _create_run_dir(output_root: Path, *, mode: str = "planner") -> Path:

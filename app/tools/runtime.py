@@ -192,7 +192,7 @@ def _check_shell_command(command: str) -> str | None:
         return "Rejected: shell_run_command only allows one command at a time."
     normalized = command.strip()
     if any(normalized.startswith(prefix) for prefix in _COMMAND_DENY_PREFIXES):
-        return "Rejected: this command is too risky for shell_run_command; use delegate_to_codex or ask explicitly."
+        return "Rejected: this command is too risky for shell_run_command; use a coder runtime node or ask explicitly."
     path_rejection = _check_workspace_path_constraints(command)
     if path_rejection is not None:
         return path_rejection

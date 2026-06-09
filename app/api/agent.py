@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import replace
 from datetime import UTC, datetime
 from functools import lru_cache
 from threading import RLock
@@ -10,19 +9,11 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, status
 
-from app.agent_react import AgentRuntime
-from app.agent_react.artifact_context import artifact_records_to_context
 from app.agent_react.session_state import (
     ConversationSessionState,
     dump_session_state,
     load_session_state,
     render_session_state,
-)
-from app.agent_react.turn_classifier import (
-    classification_to_metadata,
-    classify_turn,
-    should_apply_repo_update,
-    should_apply_session_mode_update,
 )
 from app.api.schemas import (
     ConversationCreateRequest,
@@ -46,8 +37,9 @@ from app.persistence.models import (
     TurnRecord as _TurnRecord,
     UserRecord as _UserRecord,
 )
-from app.persistence.conversation_store import MySQLConversationStore, _task_runtime_ingest_classification, _uses_task_runtime_provider
+from app.persistence.conversation_store import MySQLConversationStore, _task_runtime_ingest_classification
 from app.repositories import render_repository_report
+from app.task_runtime import TaskAgentRuntime
 
 logger = logging.getLogger(__name__)
 
@@ -694,39 +686,16 @@ class InMemoryConversationStore:
         turn_id: int | None = None
         if should_respond:
             original_session_state = load_session_state(conversation.metadata)
-            if _uses_task_runtime_provider():
-                turn_type, classification_metadata, session_state = _task_runtime_ingest_classification(
-                    content,
-                    original_session_state,
-                )
-                logger.info(
-                    "turn lightweight-classified conversation_id=%s turn_type=%s classification=%s",
-                    conversation.id,
-                    turn_type,
-                    json.dumps(classification_metadata, ensure_ascii=False),
-                )
-            else:
-                classification = classify_turn(
-                    content=content,
-                    session_state=original_session_state,
-                    conversation_metadata=conversation.metadata,
-                    recent_artifacts=artifact_records_to_context(
-                        self.list_recent_artifacts_by_conversation(conversation.id)
-                    ),
-                )
-                classification_metadata = classification_to_metadata(classification)
-                logger.info(
-                    "turn classified conversation_id=%s turn_type=%s classification=%s",
-                    conversation.id,
-                    classification.turn_type,
-                    json.dumps(classification_metadata, ensure_ascii=False),
-                )
-                session_state = original_session_state
-                if should_apply_session_mode_update(classification) and classification.session_mode_update is not None:
-                    session_state = replace(session_state, session_mode=classification.session_mode_update)
-                if should_apply_repo_update(classification):
-                    session_state = replace(session_state, active_repo_id=classification.active_repo_id_update)
-                turn_type = classification.turn_type
+            turn_type, classification_metadata, session_state = _task_runtime_ingest_classification(
+                content,
+                original_session_state,
+            )
+            logger.info(
+                "turn lightweight-classified conversation_id=%s turn_type=%s classification=%s",
+                conversation.id,
+                turn_type,
+                json.dumps(classification_metadata, ensure_ascii=False),
+            )
             if session_state != original_session_state:
                 conversation.metadata = {
                     **conversation.metadata,
@@ -1314,13 +1283,8 @@ def get_conversation_store() -> MySQLConversationStore:
     return MySQLConversationStore()
 
 
-def get_agent_runtime() -> AgentRuntime:
-    provider = (get_settings().agent_runtime_provider or "react").strip().lower()
-    if provider in {"task", "plan_execute", "planner"}:
-        from app.task_runtime import TaskAgentRuntime
-
-        return TaskAgentRuntime(get_conversation_store())  # type: ignore[return-value]
-    return AgentRuntime(get_conversation_store())
+def get_agent_runtime() -> TaskAgentRuntime:
+    return TaskAgentRuntime(get_conversation_store())
 
 
 def _conversation_response(conversation: _ConversationRecord) -> ConversationResponse:

@@ -10,18 +10,11 @@ from typing import Any
 import sqlalchemy as sa
 from sqlalchemy import create_engine
 
-from app.agent_react.artifact_context import artifact_records_to_context
 from app.agent_react.session_state import (
     ConversationSessionState,
     dump_session_state,
     load_session_state,
     render_session_state,
-)
-from app.agent_react.turn_classifier import (
-    classification_to_metadata,
-    classify_turn,
-    should_apply_repo_update,
-    should_apply_session_mode_update,
 )
 from app.api.schemas import (
     ConversationCreateRequest,
@@ -115,11 +108,6 @@ def _turn_type(content: str) -> str:
     if text.strip().startswith("/"):
         return "command"
     return "chat"
-
-
-def _uses_task_runtime_provider() -> bool:
-    provider = (get_settings().agent_runtime_provider or "react").strip().lower()
-    return provider in {"task", "plan_execute", "planner"}
 
 
 def _task_runtime_ingest_classification(content: str, session_state: ConversationSessionState) -> tuple[str, dict[str, Any], ConversationSessionState]:
@@ -1123,39 +1111,16 @@ class MySQLConversationStore:
         turn_id: int | None = None
         if should_respond:
             original_session_state = load_session_state(conversation.metadata)
-            if _uses_task_runtime_provider():
-                turn_type, classification_metadata, session_state = _task_runtime_ingest_classification(
-                    content,
-                    original_session_state,
-                )
-                logger.info(
-                    "turn lightweight-classified conversation_id=%s turn_type=%s classification=%s",
-                    conversation.id,
-                    turn_type,
-                    json.dumps(classification_metadata, ensure_ascii=False),
-                )
-            else:
-                classification = classify_turn(
-                    content=content,
-                    session_state=original_session_state,
-                    conversation_metadata=conversation.metadata,
-                    recent_artifacts=artifact_records_to_context(
-                        self._list_recent_artifacts_by_conversation(conn, conversation.id)
-                    ),
-                )
-                classification_metadata = classification_to_metadata(classification)
-                logger.info(
-                    "turn classified conversation_id=%s turn_type=%s classification=%s",
-                    conversation.id,
-                    classification.turn_type,
-                    json.dumps(classification_metadata, ensure_ascii=False),
-                )
-                session_state = original_session_state
-                if should_apply_session_mode_update(classification) and classification.session_mode_update is not None:
-                    session_state = replace(session_state, session_mode=classification.session_mode_update)
-                if should_apply_repo_update(classification):
-                    session_state = replace(session_state, active_repo_id=classification.active_repo_id_update)
-                turn_type = classification.turn_type
+            turn_type, classification_metadata, session_state = _task_runtime_ingest_classification(
+                content,
+                original_session_state,
+            )
+            logger.info(
+                "turn lightweight-classified conversation_id=%s turn_type=%s classification=%s",
+                conversation.id,
+                turn_type,
+                json.dumps(classification_metadata, ensure_ascii=False),
+            )
             if session_state != original_session_state:
                 session_patch = dump_session_state(session_state)
                 conversation.metadata = {**conversation.metadata, **session_patch}

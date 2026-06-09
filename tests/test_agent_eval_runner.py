@@ -13,6 +13,8 @@ def test_agent_eval_smoke_dataset_loads() -> None:
     ]
     assert cases[1].expected_tools == ["tavily_search"]
     assert cases[3].requires == ["coder"]
+    assert cases[3].expected_tools == []
+    assert cases[3].expected_runtimes == ["coder"]
 
 
 def test_agent_eval_score_checks_expected_and_forbidden_tools() -> None:
@@ -61,6 +63,55 @@ def test_agent_eval_score_checks_expected_and_forbidden_tools() -> None:
     assert failed["passed"] is False
     assert any(check["name"] == "expected_tool:tavily_search" for check in failed["checks"])
     assert any(check["name"] == "forbidden_tool:shell_inspect" for check in failed["checks"])
+
+
+def test_agent_eval_score_checks_expected_runtimes() -> None:
+    case = load_cases(DEFAULT_DATASET)[3]
+
+    passed = score_case(
+        case,
+        {
+            "case_id": case.id,
+            "category": case.category,
+            "description": case.description,
+            "status": "completed",
+            "reply": "Coder finished.",
+            "tool_names": [],
+            "tool_calls": [],
+            "runtime_names": ["coder"],
+            "messages": [],
+            "turns": [],
+            "turn_ids": [1],
+            "conversation_id": 1,
+            "run_responses": [],
+            "metrics": {"elapsed_ms": 10, "turn_count": 1, "tool_call_count": 0},
+            "success_criteria": case.success_criteria,
+        },
+    )
+    failed = score_case(
+        case,
+        {
+            "case_id": case.id,
+            "category": case.category,
+            "description": case.description,
+            "status": "completed",
+            "reply": "No coder used.",
+            "tool_names": [],
+            "tool_calls": [],
+            "runtime_names": ["react"],
+            "messages": [],
+            "turns": [],
+            "turn_ids": [1],
+            "conversation_id": 1,
+            "run_responses": [],
+            "metrics": {"elapsed_ms": 10, "turn_count": 1, "tool_call_count": 0},
+            "success_criteria": case.success_criteria,
+        },
+    )
+
+    assert passed["passed"] is True
+    assert failed["passed"] is False
+    assert any(check["name"] == "expected_runtime:coder" for check in failed["checks"])
 
 
 def test_agent_eval_report_lists_skipped_cases() -> None:

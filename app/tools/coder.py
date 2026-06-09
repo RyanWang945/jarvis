@@ -7,6 +7,7 @@ from pathlib import Path
 from shutil import which
 
 from app.config import get_settings
+from app.tools.coder_common import check_coder_permissions
 from app.tools.common import ToolExecutionRequest, ToolExecutionResult
 
 
@@ -29,10 +30,12 @@ def run_coder_tool(request: ToolExecutionRequest) -> ToolExecutionResult:
         return ToolExecutionResult(ok=False, exit_code=None, summary="claude CLI was not found on PATH.")
 
     preflight_notes = _prepare_workspace(workdir)
+    preflight = _collect_postflight(workdir)
+    permission_mode = str(request.args.get("_permission_mode") or "delegate").strip() or "delegate"
     command = provider_command + [
         "--print",
         "--permission-mode",
-        "bypassPermissions",
+        permission_mode,
         "--allowedTools",
         "Read,Write,Edit,MultiEdit,Bash(git:*),Bash(type:*),Bash(dir),Bash(pwd)",
     ]
@@ -65,19 +68,31 @@ def run_coder_tool(request: ToolExecutionRequest) -> ToolExecutionResult:
         )
 
     postflight = _collect_postflight(workdir)
+    permission_check = check_coder_permissions(
+        preflight,
+        postflight,
+        allow_commit=bool(request.args.get("allow_commit")),
+        allow_push=bool(request.args.get("allow_push")),
+    )
     stdout = completed.stdout
     if preflight_notes:
         stdout = f"{stdout}\n\n[JARVIS_PREFLIGHT]\n" + "\n".join(preflight_notes)
     stdout = f"{stdout}\n\n[JARVIS_POSTFLIGHT]\n{json.dumps(postflight, ensure_ascii=False, indent=2)}"
     artifacts = _postflight_artifacts(postflight)
+    for violation in permission_check["violations"]:
+        artifacts.append(f"permission_violation:{violation}")
+    ok = completed.returncode == 0 and bool(permission_check["ok"])
+    summary = f"{provider} CLI exited with code {completed.returncode}."
+    if not permission_check["ok"]:
+        summary = summary + " Permission check failed: " + "; ".join(str(v) for v in permission_check["violations"])
 
     return ToolExecutionResult(
-        ok=completed.returncode == 0,
+        ok=ok,
         exit_code=completed.returncode,
         stdout=stdout,
         stderr=completed.stderr,
         artifacts=artifacts,
-        summary=f"{provider} CLI exited with code {completed.returncode}.",
+        summary=summary,
     )
 
 
@@ -86,20 +101,27 @@ def _build_coder_instruction(instruction: str, request: ToolExecutionRequest) ->
         return ""
     allow_commit = bool(request.args.get("allow_commit"))
     allow_push = bool(request.args.get("allow_push"))
+    read_only = bool(request.args.get("_read_only"))
     rules = [
         "You are running as a Jarvis coder worker for a local repository.",
         "Operate only inside the working directory provided by the process cwd.",
-        "Prefer direct file edits over explaining what should be changed.",
         "Before committing or pushing, inspect git status and the relevant diff.",
         "Treat the provided task contract and permissions as hard constraints.",
         "Do not modify unrelated files.",
-        "End with a concise summary of files changed, commit hash if created, and push result if pushed.",
     ]
-    if allow_commit:
+    if read_only:
+        rules.append("This is a read-only task: inspect, analyze, review, and report only.")
+        rules.append("Do not edit, create, delete, rename, stage, commit, or push files.")
+        rules.append("If the requested outcome requires repository writes, describe the required changes and stop.")
+        rules.append("End with a concise inline report; do not claim that files were changed.")
+    else:
+        rules.append("Prefer direct file edits over explaining what should be changed.")
+        rules.append("End with a concise summary of files changed, commit hash if created, and push result if pushed.")
+    if allow_commit and not read_only:
         rules.append("You may create a focused git commit only if it is needed to complete the task.")
     else:
         rules.append("Do not create any git commit.")
-    if allow_push:
+    if allow_push and not read_only:
         rules.append("You may push to origin only after a successful commit if needed by the task.")
     else:
         rules.append("Do not push to origin.")
@@ -158,18 +180,29 @@ def _collect_postflight(workdir: Path) -> dict[str, object]:
     diff_stat = _run_git(workdir, "diff", "--stat")
     branch = _run_git(workdir, "branch", "--show-current")
     commit_hash = _run_git(workdir, "rev-parse", "--short", "HEAD")
+    head = _run_git(workdir, "rev-parse", "HEAD")
     commit_subject = _run_git(workdir, "log", "-1", "--pretty=%s")
     remote = _run_git(workdir, "remote", "get-url", "origin")
+    upstream = _run_git(workdir, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+    upstream_head = (
+        _run_git(workdir, "rev-parse", "@{u}")
+        if upstream["exit_code"] == 0
+        else {"exit_code": None, "stdout": "", "stderr": ""}
+    )
     status_stdout = str(status["stdout"]).strip()
     branch_name = str(branch["stdout"]).strip()
     return {
-        "git_available": status["exit_code"] is not None,
+        "git_available": status["exit_code"] == 0,
         "status_exit_code": status["exit_code"],
         "status": status_stdout,
         "branch": branch_name,
+        "head": str(head["stdout"]).strip(),
         "commit": str(commit_hash["stdout"]).strip(),
         "commit_subject": str(commit_subject["stdout"]).strip(),
         "origin": str(remote["stdout"]).strip(),
+        "upstream_name": str(upstream["stdout"]).strip(),
+        "upstream_head": str(upstream_head["stdout"]).strip(),
+        "upstream_available": upstream["exit_code"] == 0 and bool(str(upstream["stdout"]).strip()),
         "working_tree_clean": _is_working_tree_clean(status_stdout),
         "synced_with_upstream": _is_synced_with_upstream(status_stdout),
         "files_modified": _modified_files_from_status(str(porcelain_status["stdout"])),

@@ -9,6 +9,7 @@ from app.config import Settings
 from app.tools.codex import run_codex_coder_tool
 from app.tools.codex_app_server import respond_to_codex_approval
 from app.tools.common import ToolExecutionRequest
+from app.tools.coder import run_coder_tool
 
 CoderAccessMode = Literal["read", "write"]
 ApprovalLevel = Literal["allow", "ask", "strong_ask", "deny"]
@@ -131,7 +132,7 @@ class CodexCoderProvider:
         del decide_action
         tool_result = self._runner(
             ToolExecutionRequest(
-                tool_name="delegate_to_codex",
+                tool_name="codex_coder_provider",
                 workdir=None,
                 args={
                     "instruction": request.instruction,
@@ -194,11 +195,29 @@ class ClaudeCodeCoderProvider:
         *,
         decide_action: Callable[[CoderAction], ApprovalDecision],
     ) -> CoderRunResult:
-        del request, decide_action
+        del decide_action
+        tool_result = run_coder_tool(
+            ToolExecutionRequest(
+                tool_name="claude_code_coder_provider",
+                workdir=str(request.workdir),
+                args={
+                    "instruction": request.instruction,
+                    "repo_id": request.repo_id,
+                    "allow_commit": request.policy.allow_commit,
+                    "allow_push": request.policy.allow_push,
+                    "_read_only": request.policy.access_mode == "read",
+                },
+                timeout_seconds=request.timeout_seconds,
+            )
+        )
         return CoderRunResult(
-            ok=False,
-            summary="Claude Code coder provider is not implemented yet.",
-            metadata={"provider": self.name, "reason": "claude_agent_sdk_adapter_missing"},
+            ok=tool_result.ok,
+            exit_code=tool_result.exit_code,
+            summary=tool_result.summary,
+            stdout=tool_result.stdout,
+            stderr=tool_result.stderr,
+            artifacts=list(tool_result.artifacts),
+            metadata={"provider": self.name, "tool_artifacts": [artifact.__dict__ for artifact in tool_result.tool_artifacts]},
         )
 
     def resume_approval(

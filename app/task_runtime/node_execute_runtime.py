@@ -25,9 +25,17 @@ from app.task_runtime.coder_provider import (
 from app.task_runtime.node_result import NodeArtifact, NodeError, NodeResult, ResolvedInput
 from app.task_runtime.planner import PlanNode
 from app.tools.common import ToolExecutionResult
-from app.tools.runtime import build_llm_tools, execute_tool, get_tool_definition
+from app.tools.runtime import build_llm_tools, check_tool_policy, execute_tool, get_tool_definition
 
 logger = logging.getLogger(__name__)
+
+
+_REACT_CODER_ONLY_TOOLS = {
+    "delegate_to_claude_code",
+    "delegate_to_codex",
+    "shell_inspect",
+    "shell_run_command",
+}
 
 
 @dataclass(frozen=True)
@@ -93,20 +101,16 @@ class LLMNodeExecuteRuntime:
 class ReactNodeExecuteRuntime:
     """Tool-using research runtime for one plan node."""
 
-    DEFAULT_ALLOWED_TOOLS = ("tavily_search", "business_knowledge_search", "obsidian_wiki_query")
-
     def __init__(
         self,
         *,
         model_resolver=None,
         tool_runner=execute_tool,
-        allowed_tools: tuple[str, ...] | None = None,
         max_steps: int = 6,
         tool_timeout_seconds: int = 60,
     ) -> None:
         self._model_resolver = model_resolver or (lambda context: ModelRouter().resolve(LLMNode.AGENT_STEP, None))
         self._tool_runner = tool_runner
-        self._allowed_tools = tuple(allowed_tools or self.DEFAULT_ALLOWED_TOOLS)
         self._max_steps = max(2, int(max_steps))
         self._tool_timeout_seconds = max(1, int(tool_timeout_seconds))
 
@@ -117,7 +121,7 @@ class ReactNodeExecuteRuntime:
             logger.info("react node skipped node_id=%s reason=missing_api_key profile=%s", context.node.id, getattr(resolved.profile, "id", None))
             return _blocked(context.node, "missing_api_key", "React runtime LLM API key is not configured.")
         messages = _react_messages(context)
-        tools = build_llm_tools(allowed_tools=self._allowed_tools)
+        tools = build_llm_tools()
         tool_calls: list[dict[str, Any]] = []
         response: NormalizedLLMResponse | None = None
         try:
@@ -125,11 +129,11 @@ class ReactNodeExecuteRuntime:
                 force_final = step_index == self._max_steps
                 response_format = {"type": "json_object"} if force_final and resolved.profile.supports_json_object else None
                 logger.info(
-                    "react node llm step start node_id=%s step=%s force_final=%s allowed_tools=%s tool_observation_count=%s",
+                    "react node llm step start node_id=%s step=%s force_final=%s exposed_tool_count=%s tool_observation_count=%s",
                     context.node.id,
                     step_index,
                     force_final,
-                    self._allowed_tools,
+                    len(tools),
                     len(tool_calls),
                 )
                 response = resolved.client.chat_normalized(
@@ -147,7 +151,7 @@ class ReactNodeExecuteRuntime:
                     )
                     messages.append(_assistant_tool_call_message(response))
                     for tool_call in response.tool_calls:
-                        observation, record = self._run_tool_call(tool_call)
+                        observation, record = self._run_tool_call(context, tool_call)
                         tool_calls.append(record)
                         messages.append(
                             LLMMessage(
@@ -183,18 +187,24 @@ class ReactNodeExecuteRuntime:
         )
         return result
 
-    def _run_tool_call(self, tool_call: NormalizedToolCall) -> tuple[dict[str, Any], dict[str, Any]]:
+    def _run_tool_call(self, context: NodeExecutionContext, tool_call: NormalizedToolCall) -> tuple[dict[str, Any], dict[str, Any]]:
         started = time.perf_counter()
         record: dict[str, Any] = {
             "id": tool_call.id,
             "tool_name": tool_call.name,
             "args": tool_call.args,
         }
-        if tool_call.name not in self._allowed_tools:
-            message = f"tool not allowed for ReactNodeExecuteRuntime: {tool_call.name}"
-            record.update({"status": "rejected", "summary": message})
-            logger.info("react node tool rejected tool=%s tool_call_id=%s reason=%s", tool_call.name, tool_call.id, message)
-            return {"ok": False, "status": "rejected", "error": message}, record
+        boundary_rejection = _check_react_action_permission(context, tool_call.name)
+        if boundary_rejection is not None:
+            record.update({"status": "rejected", "summary": boundary_rejection})
+            logger.info(
+                "react node tool rejected tool=%s tool_call_id=%s node_id=%s reason=%s",
+                tool_call.name,
+                tool_call.id,
+                context.node.id,
+                boundary_rejection,
+            )
+            return {"ok": False, "status": "rejected", "error": boundary_rejection}, record
         try:
             tool = get_tool_definition(tool_call.name)
         except Exception as exc:
@@ -202,6 +212,11 @@ class ReactNodeExecuteRuntime:
             record.update({"status": "failed", "summary": message})
             logger.warning("react node tool definition failed tool=%s tool_call_id=%s error=%s", tool_call.name, tool_call.id, message)
             return {"ok": False, "status": "failed", "error": message}, record
+        rejection = check_tool_policy(tool, tool_call.args, [])
+        if rejection is not None:
+            record.update({"status": "rejected", "summary": rejection})
+            logger.info("react node tool rejected tool=%s tool_call_id=%s reason=%s", tool_call.name, tool_call.id, rejection)
+            return {"ok": False, "status": "rejected", "error": rejection}, record
         try:
             logger.info("react node tool start tool=%s tool_call_id=%s args=%s", tool_call.name, tool_call.id, tool_call.args)
             result = self._tool_runner(tool, tool_call.args, timeout_seconds=self._tool_timeout_seconds)
@@ -316,59 +331,6 @@ class CodexNodeExecuteRuntime(CoderNodeExecuteRuntime):
         super().__init__(provider=provider)
 
 
-class ToolNodeExecuteRuntime:
-    """Adapter for low-level single-tool plan nodes."""
-
-    def __init__(self, *, tool_runner=execute_tool, timeout_seconds: int = 60) -> None:
-        self._tool_runner = tool_runner
-        self._timeout_seconds = max(1, int(timeout_seconds))
-
-    def run(self, context: NodeExecutionContext) -> NodeResult:
-        started = time.perf_counter()
-        tool_name = context.node.tool_name
-        if not tool_name:
-            logger.info("tool node blocked node_id=%s reason=missing_tool_name", context.node.id)
-            return _blocked(context.node, "missing_tool_name", "Tool runtime requires node.tool_name.")
-        try:
-            tool = get_tool_definition(tool_name)
-        except Exception as exc:
-            logger.warning("tool node unknown tool node_id=%s tool=%s error=%s", context.node.id, tool_name, exc)
-            return _failed(context.node, "unknown_tool", str(exc), retryable=False)
-        args = _tool_args(context)
-        try:
-            logger.info("tool node start node_id=%s tool=%s args=%s", context.node.id, tool_name, args)
-            result = self._tool_runner(tool, args, timeout_seconds=self._timeout_seconds)
-        except Exception as exc:
-            logger.exception("tool node failed node_id=%s tool=%s elapsed_ms=%s", context.node.id, tool_name, int((time.perf_counter() - started) * 1000))
-            return _failed(context.node, "tool_runtime_error", str(exc), retryable=True)
-        logger.info(
-            "tool node finished node_id=%s tool=%s ok=%s exit_code=%s artifact_count=%s elapsed_ms=%s summary=%s",
-            context.node.id,
-            tool_name,
-            result.ok,
-            result.exit_code,
-            len(result.artifacts) + len(result.tool_artifacts),
-            int((time.perf_counter() - started) * 1000),
-            _truncate(result.summary, limit=300),
-        )
-        return NodeResult(
-            node_id=context.node.id,
-            runtime="tool",
-            status="completed" if result.ok else "failed",
-            summary=result.summary or result.stdout or result.stderr or f"Tool {tool_name} finished.",
-            artifacts=[_artifact_from_tool_string(item) for item in result.artifacts],
-            data={
-                "tool_name": tool_name,
-                "args": args,
-                "stdout": result.stdout,
-                "stderr": result.stderr,
-                "exit_code": result.exit_code,
-                "tool_artifacts": [_tool_artifact_dict(item) for item in result.tool_artifacts],
-            },
-            error=None if result.ok else NodeError(code="tool_failed", message=result.summary or result.stderr, retryable=False),
-        )
-
-
 def _llm_messages(context: NodeExecutionContext) -> list[LLMMessage]:
     payload = {
         "user_objective": context.user_objective,
@@ -406,11 +368,14 @@ def _react_messages(context: NodeExecutionContext) -> list[LLMMessage]:
         LLMMessage(
             role="system",
             content=(
-                "You are Jarvis ReactNodeExecuteRuntime. Execute one research/lookup node only. "
-                "Use tools when external, business, or project-memory evidence is needed. "
+                "You are Jarvis ReactNodeExecuteRuntime. Execute one non-repository plan node. "
+                "Use tools when external, business, project-memory, reminder, or artifact-delivery action is needed. "
                 "Use the temporal_context payload as the authoritative current date/time; convert relative terms "
                 "such as today, current, latest, recent, 今天, 当前, 最新, 最近 into concrete date constraints when searching. "
-                "Do not perform code edits or repository workflows. Do not produce a final user reply. "
+                "Do not perform code edits, shell commands, repository workflows, or code-agent delegation; "
+                "code and shell work belongs to coder runtime nodes. "
+                "You may use lightweight file and artifact tools for explicit non-code document, report, artifact, or delivery work. "
+                "Do not produce a final user reply. "
                 "After tool use, return JSON with summary, findings, sources, and data. "
                 "Be concise and preserve useful evidence for downstream nodes."
             ),
@@ -444,7 +409,7 @@ def _react_result_from_response(
     tool_calls: list[dict[str, Any]],
 ) -> NodeResult:
     payload = parse_json_content({"content": response.content})
-    summary = _react_summary(payload, response.content)
+    summary = _react_summary(payload, response.content) or _react_summary_from_tool_calls(tool_calls)
     data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
     data.update(_react_extra_data(payload))
     findings = payload.get("findings")
@@ -465,6 +430,16 @@ def _react_result_from_response(
         summary=summary or "React runtime completed.",
         data=data,
         artifacts=_artifacts_from_payload(payload),
+    )
+
+
+def _check_react_action_permission(context: NodeExecutionContext, tool_name: str) -> str | None:
+    if tool_name not in _REACT_CODER_ONLY_TOOLS:
+        return None
+    node_id = context.node.id
+    return (
+        f"Rejected: React runtime node {node_id} cannot execute coder-only actions. "
+        "Use a coder node for shell commands, repository workflows, and code-agent delegation."
     )
 
 
@@ -490,7 +465,24 @@ def _react_summary(payload: dict[str, Any], response_content: str) -> str:
     summary = _summary_from_mapping(_react_extra_data(payload))
     if summary:
         return summary
-    return str(response_content or "").strip()
+    text = str(response_content or "").strip()
+    if text in {"{}", "[]", "null"}:
+        return ""
+    return text
+
+
+def _react_summary_from_tool_calls(tool_calls: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    for record in tool_calls:
+        if record.get("status") != "completed":
+            continue
+        tool_name = str(record.get("tool_name") or "tool").strip()
+        summary = str(record.get("summary") or "").strip()
+        if summary:
+            lines.append(f"- {tool_name}: {_truncate(summary, limit=500)}")
+        if len(lines) >= 5:
+            break
+    return "\n".join(lines)
 
 
 def _react_extra_data(payload: dict[str, Any]) -> dict[str, Any]:
@@ -616,37 +608,6 @@ def _temporal_context_text(runtime_hints: dict[str, Any]) -> str:
         lines.append(f"- Timezone: {temporal['timezone']}")
     lines.append("- Interpret today/current/latest/recent and 今天/当前/最新/最近 relative to this context.")
     return "\n".join(lines)
-
-
-def _tool_args(context: NodeExecutionContext) -> dict[str, Any]:
-    args = {
-        "user_objective": context.user_objective,
-        "node_objective": context.node.objective,
-        "expected_output": context.node.expected_output,
-        "resolved_inputs": [item.model_dump(mode="json", exclude_none=True) for item in context.resolved_inputs],
-    }
-    if context.runtime_hints:
-        args.update({key: value for key, value in context.runtime_hints.items() if key not in args})
-    return args
-
-
-def _node_result_from_tool(node: PlanNode, result: ToolExecutionResult) -> NodeResult:
-    status = "completed" if result.ok else "failed"
-    summary = _codex_node_summary(result)
-    return NodeResult(
-        node_id=node.id,
-        runtime="coder",
-        status=status,
-        summary=summary,
-        artifacts=[_artifact_from_tool_string(item) for item in result.artifacts],
-        data={
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "exit_code": result.exit_code,
-            "tool_artifacts": [artifact.__dict__ for artifact in result.tool_artifacts],
-        },
-        error=None if result.ok else NodeError(code="codex_tool_failed", message=summary, retryable=False),
-    )
 
 
 def _node_result_from_coder(node: PlanNode, result: CoderRunResult, *, provider: str) -> NodeResult:

@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
@@ -7,6 +8,8 @@ from langchain_core.messages import HumanMessage
 from app.agent_react.context_manager import ContextManager
 from app.skills.loader import SkillPackageLoader
 from app.skills.registry import SkillRegistry
+from app.tools.common import ToolExecutionRequest
+from app.tools.skill_guidance import run_load_skill
 
 
 def test_skill_body_strips_frontmatter_and_manifest_supports_guide_fields(tmp_path: Path) -> None:
@@ -29,6 +32,9 @@ def test_skill_body_strips_frontmatter_and_manifest_supports_guide_fields(tmp_pa
 
     package = SkillPackageLoader([]).load_package(skill_dir)
 
+    assert package.skill.skill_id == "social-search-guide"
+    assert package.skill.display_name == "social-search-guide"
+    assert package.skill.effective_description == "Social search guidance."
     assert package.manifest.when_to_use == "User asks about tweets."
     assert package.manifest.tools == ["x_search"]
     assert package.manifest.tags == ["social"]
@@ -80,7 +86,7 @@ def test_skill_registry_select_matches_returns_reason_and_confidence() -> None:
     matches = registry.select_matches("please run the release workflow")
 
     assert len(matches) == 1
-    assert matches[0].skill.name == "release-checklist"
+    assert matches[0].skill.skill_id == "release-checklist"
     assert matches[0].confidence in {"high", "medium"}
     assert matches[0].reason
 
@@ -107,12 +113,13 @@ def test_weather_skill_is_selected_for_chinese_weather_requests(monkeypatch) -> 
         current_turn_id=None,
     )
 
-    assert matches[0].skill.name == "weather"
-    assert skill_names == ["weather"]
+    assert matches[0].skill.skill_id == "weather-1.0.0"
+    assert skill_names == []
     reminder_content = str(messages[1].content)
-    assert "[Skill: weather]" in reminder_content
-    assert "If `tavily_search` is available" in reminder_content
-    assert "Do not use shell tools for web searches" in reminder_content
+    assert "The following skills are available for use with the load_skill tool:" in reminder_content
+    assert "- weather-1.0.0:" in reminder_content
+    assert "[Skill: weather-1.0.0]" not in reminder_content
+    assert "If `tavily_search` is available" not in reminder_content
 
 
 def test_image_artifact_planner_skill_is_selected_for_svg_requests(monkeypatch) -> None:
@@ -136,16 +143,14 @@ def test_image_artifact_planner_skill_is_selected_for_svg_requests(monkeypatch) 
         current_turn_id=None,
     )
 
-    assert skill_names == ["image-artifact-planner"]
+    assert skill_names == []
     assert isinstance(messages[1], HumanMessage)
     reminder_content = str(messages[1].content)
     assert reminder_content.startswith("<system-reminder>")
     assert reminder_content.endswith("</system-reminder>")
-    assert "[Skill: image-artifact-planner]" in reminder_content
-    assert "Preserve the user's requested format." in reminder_content
-    assert "not an SVG" in reminder_content
-    assert "Jarvis Runtime owns artifact discovery" in reminder_content
-    assert "[Skill: image-artifact-planner]" not in str(messages[0].content)
+    assert "- image-artifact-planner-1.0.0:" in reminder_content
+    assert "[Skill: image-artifact-planner-1.0.0]" not in reminder_content
+    assert "Preserve the user's requested format." not in reminder_content
 
 
 def test_image_artifact_planner_skill_guides_raster_image_generation(monkeypatch) -> None:
@@ -169,8 +174,35 @@ def test_image_artifact_planner_skill_guides_raster_image_generation(monkeypatch
         current_turn_id=None,
     )
 
-    assert skill_names == ["image-artifact-planner"]
+    assert skill_names == []
     reminder_content = str(messages[1].content)
-    assert "use its image generation capability" in reminder_content
-    assert "copy the final selected image into the Jarvis workspace" in reminder_content
+    assert "- image-artifact-planner-1.0.0:" in reminder_content
+    assert "use its image generation capability" not in reminder_content
     assert "Do not silently change raster image-generation requests into SVG" not in reminder_content
+
+
+def test_load_skill_loads_exact_skill_id_and_injects_body(monkeypatch, tmp_path: Path) -> None:
+    skill_dir = tmp_path / "external-review"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: Fancy Display Name\n"
+        "description: Review external skills.\n"
+        "---\n\n"
+        "Follow the external skill review checklist.\n",
+        encoding="utf-8",
+    )
+    package = SkillPackageLoader([]).load_package(skill_dir)
+    registry = SkillRegistry([package.skill])
+    monkeypatch.setattr("app.tools.skill_guidance.get_skill_registry", lambda: registry)
+    monkeypatch.setattr("app.agent_react.context_manager.get_skill_registry", lambda: registry)
+
+    result = run_load_skill(ToolExecutionRequest(tool_name="load_skill", workdir=None, args={"skill": "external-review"}))
+    payload = json.loads(result.stdout)
+    rendered = ContextManager().build_skill_reminder_message([payload["skills"][0]["name"]])
+
+    assert payload["status"] == "loaded"
+    assert payload["skills"][0]["name"] == "external-review"
+    assert rendered is not None
+    assert "[Skill: external-review]" in str(rendered.content)
+    assert "Follow the external skill review checklist." in str(rendered.content)

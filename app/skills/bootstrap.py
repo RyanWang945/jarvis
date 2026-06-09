@@ -27,20 +27,20 @@ def bootstrap_registries(*, external_paths: list[Path] | None = None, force: boo
 
     settings = get_settings()
     skills = _load_builtin_skills()
-    skill_names = {skill.name for skill in skills}
+    skill_names = {skill.skill_id for skill in skills}
 
     loader = SkillPackageLoader.from_default_paths(data_dir=settings.data_dir, extra_paths=external_paths)
     for package in loader.load():
-        duplicate_skill = package.skill.name in skill_names
+        duplicate_skill = package.skill.skill_id in skill_names
         if duplicate_skill:
             logger.warning(
                 "skipping skill package with duplicate registrations path=%s skill=%s",
                 package.path,
-                package.skill.name,
+                package.skill.skill_id,
             )
             continue
         skills.append(package.skill)
-        skill_names.add(package.skill.name)
+        skill_names.add(package.skill.skill_id)
 
     _registries = Registries(
         skill_registry=SkillRegistry(skills),

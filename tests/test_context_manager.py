@@ -3,7 +3,6 @@ from types import SimpleNamespace
 from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 
 from app.agent_react.context_manager import ContextManager
-from app.agent_react.runtime_policy import RuntimePolicy
 from app.agent_react.session_state import ConversationSessionState
 from app.repositories import RepositoryRef, RepositoryRegistry
 
@@ -127,18 +126,13 @@ def test_coding_context_includes_active_registered_repository(monkeypatch, tmp_p
         ],
         trigger_message_id=1,
         session_state=ConversationSessionState(session_mode="coding", active_repo_id="nltk"),
-        runtime_policy=RuntimePolicy(
-            mode="coding",
-            allowed_tools=("delegate_to_codex",),
-            context_sections=("coding_protocol", "session_state"),
-        ),
     )
 
     content = str(messages[0].content)
     assert "Repository context:" in content
     assert "Active repository: nltk" in content
     assert "- nltk (active):" in content
-    assert "Prefer delegate_to_codex with repo_id" in content
+    assert "coder runtime node" in content
 
 
 def test_workspace_context_includes_active_registered_repository(monkeypatch, tmp_path) -> None:
@@ -167,15 +161,9 @@ def test_workspace_context_includes_active_registered_repository(monkeypatch, tm
         ],
         trigger_message_id=1,
         session_state=ConversationSessionState(session_mode="research", active_repo_id="jarvis"),
-        runtime_policy=RuntimePolicy(
-            mode="research",
-            allowed_tools=("delegate_to_codex", "tavily_search"),
-            context_sections=("workspace_protocol", "research_protocol", "session_state"),
-        ),
     )
 
     content = str(messages[0].content)
-    assert "Workspace protocol:" in content
     assert "Repository context:" in content
     assert "Active repository: jarvis" in content
     assert "- jarvis (active):" in content

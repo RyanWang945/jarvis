@@ -21,7 +21,7 @@
           },
           "runtime": {
             "type": "string",
-            "enum": ["llm", "react", "coder", "tool"]
+            "enum": ["llm", "react", "coder"]
           },
           "objective": {
             "type": "string"
@@ -35,9 +35,6 @@
           },
           "expected_output": {
             "type": "string"
-          },
-          "tool_name": {
-            "type": ["string", "null"]
           },
           "runtime_hints": {
             "type": "object",

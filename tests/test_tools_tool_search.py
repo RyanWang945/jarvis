@@ -1,6 +1,5 @@
 import json
 
-from app.agent_react.react_graph import _tools_granted_by_tool_search
 from app.tools.common import ToolExecutionRequest
 from app.tools.runtime import get_tool_definition
 
@@ -50,28 +49,3 @@ def test_tool_search_finds_deliver_file_for_explicit_file_delivery() -> None:
 
     assert payload["status"] == "found"
     assert any(candidate["tool_name"] == "deliver_file" for candidate in payload["candidates"])
-
-
-def test_tool_search_grants_deliver_file_for_geiwo_file_request() -> None:
-    output = json.dumps(
-        {
-            "status": "found",
-            "candidates": [
-                {
-                    "tool_name": "deliver_file",
-                    "fit": "high",
-                    "risk_level": "medium",
-                    "reason": "Deliver an explicitly named workspace file.",
-                }
-            ],
-        },
-        ensure_ascii=False,
-    )
-
-    grants = _tools_granted_by_tool_search(
-        output,
-        [],
-        original_user_request=r"jarvis项目的这个文件E:\pythonProject\jarvis\jarvis-architecture-interview-v2.png给我",
-    )
-
-    assert grants == ["deliver_file"]

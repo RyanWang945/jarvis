@@ -68,7 +68,7 @@ def run_codex_coder_tool(request: ToolExecutionRequest) -> ToolExecutionResult:
         separators=(",", ":"),
     )
     logger.info(
-        "delegate_to_codex starting run_id=%s repo_id=%s workdir=%s permissions=%s timeout_seconds=%s",
+        "codex coder provider starting run_id=%s repo_id=%s workdir=%s permissions=%s timeout_seconds=%s",
         run_id,
         repo.repo_id,
         str(workdir),
@@ -76,7 +76,7 @@ def run_codex_coder_tool(request: ToolExecutionRequest) -> ToolExecutionResult:
         settings.coder_timeout_seconds,
     )
     logger.info(
-        "delegate_to_codex log paths run_id=%s run_dir=%s events_path=%s audit_path=%s stderr_path=%s approval_requests_path=%s",
+        "codex coder provider log paths run_id=%s run_dir=%s events_path=%s audit_path=%s stderr_path=%s approval_requests_path=%s",
         run_id,
         str(run_dir),
         str(run_dir / "codex-events.jsonl"),
@@ -231,7 +231,7 @@ def _codex_tool_artifacts(result: CodexAppServerRunResult, *, run_id: str) -> li
         artifacts.append(
             replace(
                 artifact,
-                source_tool=artifact.source_tool or "delegate_to_codex",
+                source_tool=artifact.source_tool or "coder",
                 metadata=metadata,
             )
         )

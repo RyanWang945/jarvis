@@ -35,9 +35,8 @@ class StaticRouter:
                     nodes=[
                         PlanNode(
                             id="deliver_report",
-                            runtime="tool",
+                            runtime="react",
                             objective="Deliver report",
-                            tool_name="deliver_file",
                             input_refs=["artifact:A1"],
                         )
                     ],
@@ -69,7 +68,7 @@ def test_task_planner_eval_dataset_loads_simple_and_complex_cases() -> None:
 
     assert len(cases) >= 6
     assert any(case.required_runtimes == ["llm"] for case in cases)
-    assert any("coder" in case.required_runtimes and "tool" in case.required_runtimes for case in cases)
+    assert any("coder" in case.required_runtimes and "react" in case.required_runtimes for case in cases)
     assert any(case.required_input_refs == ["artifact:A1"] for case in cases)
 
 
@@ -82,8 +81,7 @@ def test_task_planner_eval_score_checks_latency_and_plan_accuracy() -> None:
             PlanNode(
                 id="remind",
                 objective="remind user at 23:00",
-                runtime="tool",
-                tool_name="scheduled_task",
+                runtime="react",
                 input_refs=["node:review_report"],
             ),
         ],
@@ -92,8 +90,8 @@ def test_task_planner_eval_score_checks_latency_and_plan_accuracy() -> None:
     result = score_case(case, plan, elapsed_ms=1000)
 
     assert result["passed"] is True
-    assert result["runtimes"] == ["coder", "tool"]
-    assert result["tool_names"] == ["scheduled_task"]
+    assert result["runtimes"] == ["coder", "react"]
+    assert result["tool_names"] == []
 
 
 def test_task_planner_eval_score_fails_slow_or_inaccurate_plan() -> None:
@@ -105,8 +103,7 @@ def test_task_planner_eval_score_fails_slow_or_inaccurate_plan() -> None:
     assert result["passed"] is False
     failed_names = {check["name"] for check in result["checks"] if not check["passed"]}
     assert "latency" in failed_names
-    assert "required_runtime:tool" in failed_names
-    assert "required_tool_name:deliver_file" in failed_names
+    assert "required_runtime:react" in failed_names
     assert "required_input_ref:artifact:A1" in failed_names
 
 

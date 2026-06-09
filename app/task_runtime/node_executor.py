@@ -245,7 +245,7 @@ def _node_result_from_mapping(value: dict[str, Any]) -> NodeResult | None:
         return None
     node_id = value.get("node_id") or value.get("id")
     runtime = value.get("runtime")
-    if not isinstance(node_id, str) or not node_id.strip() or runtime not in {"llm", "react", "coder", "codex", "tool"}:
+    if not isinstance(node_id, str) or not node_id.strip() or runtime not in {"llm", "react", "coder", "codex"}:
         return None
     status = value.get("status") if value.get("status") in {"completed", "failed", "blocked"} else "completed"
     return NodeResult(

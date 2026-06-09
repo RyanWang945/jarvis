@@ -55,11 +55,11 @@ def test_execution_plan_rejects_cycles() -> None:
         )
 
 
-def test_plan_node_requires_tool_name_only_for_tool_runtime() -> None:
-    with pytest.raises(ValidationError, match="tool nodes require tool_name"):
-        PlanNode(id="remind", runtime="tool", objective="Create reminder")
-    with pytest.raises(ValidationError, match="tool_name is only valid"):
-        PlanNode(id="answer", runtime="llm", objective="Answer", tool_name="scheduled_task")
+def test_plan_node_normalizes_legacy_tool_runtime_to_react() -> None:
+    node = PlanNode(id="remind", runtime="tool", objective="Create reminder", tool_name="scheduled_task")  # type: ignore[arg-type]
+
+    assert node.runtime == "react"
+    assert node.tool_name is None
 
 
 def test_plan_node_rejects_deepresearch_runtime() -> None:
@@ -72,7 +72,7 @@ def test_build_plan_input_normalizes_artifacts_and_hints() -> None:
         current_user_input="把刚刚那个报告发我",
         artifacts=[{"id": "report-1", "filename": "rag_eval_report.md", "summary": "RAG report"}],
         previous_node_results=[],
-        runtime_hints={"available_runtimes": ["llm", "tool"]},
+        runtime_hints={"available_runtimes": ["llm", "react"]},
         session_state=ConversationSessionState(active_repo_id="jarvis"),
     )
 
@@ -120,7 +120,7 @@ def test_plan_from_payload_keeps_pass_through_for_single_llm_node() -> None:
     assert plan.finalization_hint.mode == "pass_through"
 
 
-def test_plan_from_payload_derives_deterministic_finalization_for_single_tool_node() -> None:
+def test_plan_from_payload_normalizes_legacy_tool_node_to_react() -> None:
     plan = _plan_from_payload(
         {
             "user_objective": "设置提醒",
@@ -137,8 +137,9 @@ def test_plan_from_payload_derives_deterministic_finalization_for_single_tool_no
         fallback_objective="设置提醒",
     )
 
-    assert plan.finalization_hint.mode == "deterministic"
-    assert plan.finalization_hint.reason == "single tool node uses deterministic finalization"
+    assert plan.nodes[0].runtime == "react"
+    assert plan.nodes[0].tool_name is None
+    assert plan.finalization_hint.mode == "llm"
     assert plan.finalization_hint.user_facing is False
 
 
@@ -166,7 +167,7 @@ def test_plan_from_payload_normalizes_null_node_runtime_hints() -> None:
         fallback_objective="review repo and remind me",
     )
 
-    assert [node.runtime for node in plan.nodes] == ["coder", "tool"]
+    assert [node.runtime for node in plan.nodes] == ["coder", "react"]
     assert plan.nodes[1].runtime_hints == {}
     assert plan.nodes[1].input_refs == ["node:review"]
 
@@ -179,10 +180,24 @@ def test_plan_from_payload_falls_back_to_artifact_delivery_for_empty_nodes() -> 
     )
 
     assert len(plan.nodes) == 1
-    assert plan.nodes[0].runtime == "tool"
-    assert plan.nodes[0].tool_name == "deliver_file"
+    assert plan.nodes[0].runtime == "react"
+    assert plan.nodes[0].tool_name is None
     assert plan.nodes[0].input_refs == ["artifact:A1"]
-    assert plan.finalization_hint.mode == "deterministic"
+    assert plan.finalization_hint.mode == "llm"
+
+
+def test_plan_from_payload_falls_back_to_repo_then_reminder_dag_for_empty_nodes() -> None:
+    plan = _plan_from_payload(
+        {"user_objective": "先 review jarvis 的 agent runtime 重构风险，生成一份 markdown 报告，最后今晚 11 点提醒我看报告。", "nodes": []},
+        fallback_objective="先 review jarvis 的 agent runtime 重构风险，生成一份 markdown 报告，最后今晚 11 点提醒我看报告。",
+        runtime_hints={"active_repo": "jarvis"},
+    )
+
+    assert [node.runtime for node in plan.nodes] == ["coder", "react"]
+    assert plan.nodes[0].runtime_hints["access_mode"] == "read"
+    assert plan.nodes[1].input_refs == ["node:repo_report"]
+    assert "报告" in plan.nodes[0].objective
+    assert "提醒" in plan.nodes[1].objective
 
 
 real_llm = pytest.mark.skipif(
@@ -207,12 +222,12 @@ def test_turn_planner_real_llm_creates_artifact_delivery_node() -> None:
                 "origin": "assistant_generated",
             }
         ],
-        runtime_hints={"active_repo": None, "available_runtimes": ["llm", "react", "coder", "tool"]},
+        runtime_hints={"active_repo": None, "available_runtimes": ["llm", "react", "coder"]},
     )
 
     assert len(plan.nodes) == 1
-    assert plan.nodes[0].runtime == "tool"
-    assert plan.nodes[0].tool_name == "deliver_file"
+    assert plan.nodes[0].runtime == "react"
+    assert plan.nodes[0].tool_name is None
     assert "artifact:A1" in plan.nodes[0].input_refs
 
 
@@ -231,7 +246,7 @@ def test_turn_planner_real_llm_reuses_previous_node_result_for_replan() -> None:
                 "artifacts": [],
             }
         ],
-        runtime_hints={"active_repo": "jarvis", "available_runtimes": ["llm", "react", "coder", "tool"]},
+        runtime_hints={"active_repo": "jarvis", "available_runtimes": ["llm", "react", "coder"]},
     )
 
     assert [node.runtime for node in plan.nodes] == ["coder"]

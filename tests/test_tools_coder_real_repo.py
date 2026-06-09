@@ -73,7 +73,7 @@ def test_real_repo_bootstrap_and_extend_greeter() -> None:
 
 def _run_real_coder(instruction: str, *, verification_cmd: str | None = None):
     request = ToolExecutionRequest(
-        tool_name="delegate_to_codex",
+        tool_name="codex_coder_provider",
         workdir=str(REAL_REPO),
         args={
             "instruction": instruction,

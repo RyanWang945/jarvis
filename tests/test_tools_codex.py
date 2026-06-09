@@ -4,9 +4,8 @@ import subprocess
 from pathlib import Path
 from uuid import uuid4
 
-from langchain_core.messages import HumanMessage
+import pytest
 
-from app.agent_react.runtime_policy import resolve_runtime_policy
 from app.repositories import RepositoryRef, RepositoryRegistry
 from app.tools.codex import run_codex_coder_tool
 from app.tools.codex_app_server import (
@@ -19,55 +18,21 @@ from app.tools.codex_app_server import (
 )
 from app.tools.coder_common import build_coder_instruction, check_coder_permissions
 from app.tools.common import ToolExecutionRequest
-from app.tools.runtime import build_llm_tools, check_tool_policy, get_tool_definition
+from app.tools.runtime import build_llm_tools, get_tool_definition
 
 
 _TINY_PNG_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAFgwJ/lwot8gAAAABJRU5ErkJggg=="
 
 
-def test_codex_tool_is_injected_and_claude_tool_is_hidden() -> None:
+def test_code_worker_tools_are_not_registered_llm_tools() -> None:
     injected_names = {tool["function"]["name"] for tool in build_llm_tools()}
-    codex_tool = get_tool_definition("delegate_to_codex")
 
-    assert "delegate_to_codex" in injected_names
+    assert "delegate_to_codex" not in injected_names
     assert "delegate_to_claude_code" not in injected_names
-    assert codex_tool.exposed_to_llm is True
-    assert codex_tool.args_schema["required"] == ["instruction"]
-    assert "repo_id" in codex_tool.args_schema["properties"]
-    assert "mode" not in codex_tool.args_schema["properties"]
-    assert "outcome-oriented task" in codex_tool.description
-    assert "Do not turn the task into a step-by-step shell script" in codex_tool.description
-    assert "open-ended repository investigation" in codex_tool.description
-    assert "locate a specific artifact for delivery" in codex_tool.description
-    instruction_description = codex_tool.args_schema["properties"]["instruction"]["description"]
-    assert "avoid enumerating shell commands or recovery steps" in instruction_description
-    assert "locating a specific deliverable artifact" in instruction_description
-    assert get_tool_definition("delegate_to_claude_code").exposed_to_llm is False
-
-
-def test_coding_policy_allows_codex_but_not_claude() -> None:
-    policy = resolve_runtime_policy(
-        session_mode="chat",
-        turn_type="coding",
-        requested_capabilities=("workspace.inspect",),
-    )
-
-    assert "delegate_to_codex" in policy.allowed_tools
-    assert "delegate_to_claude_code" not in policy.allowed_tools
-    assert "shell_inspect" not in policy.allowed_tools
-    assert "shell_run_command" not in policy.allowed_tools
-
-
-def test_codex_policy_allows_repository_analysis_without_edit_intent() -> None:
-    tool = get_tool_definition("delegate_to_codex")
-
-    rejection = check_tool_policy(
-        tool,
-        {"instruction": "Review Jarvis architecture against Hermes.", "repo_id": "jarvis"},
-        [HumanMessage(content="Compare Jarvis design with Hermes.")],
-    )
-
-    assert rejection is None
+    with pytest.raises(ValueError, match="unknown tool: delegate_to_codex"):
+        get_tool_definition("delegate_to_codex")
+    with pytest.raises(ValueError, match="unknown tool: delegate_to_claude_code"):
+        get_tool_definition("delegate_to_claude_code")
 
 
 def test_codex_coder_runs_with_clean_stdout_and_jsonl_artifact(monkeypatch, tmp_path: Path) -> None:
@@ -96,7 +61,7 @@ def test_codex_coder_runs_with_clean_stdout_and_jsonl_artifact(monkeypatch, tmp_
 
     result = run_codex_coder_tool(
         ToolExecutionRequest(
-            tool_name="delegate_to_codex",
+            tool_name="codex_coder_provider",
             workdir=str(repo),
             args={
                 "instruction": "Update README.md and run tests.",
@@ -176,7 +141,7 @@ def test_codex_logs_startup_context_and_log_paths(monkeypatch, tmp_path: Path) -
 
     result = run_codex_coder_tool(
         ToolExecutionRequest(
-            tool_name="delegate_to_codex",
+            tool_name="codex_coder_provider",
             workdir=None,
             args={
                 "instruction": "Inspect repo.",
@@ -189,13 +154,13 @@ def test_codex_logs_startup_context_and_log_paths(monkeypatch, tmp_path: Path) -
     )
 
     assert result.exit_code == 0
-    startup = next(message for message in log_messages if "delegate_to_codex starting" in message)
+    startup = next(message for message in log_messages if "codex coder provider starting" in message)
     assert "repo_id=jarvis" in startup
     assert "permissions=" in startup
     assert '"allow_commit":true' in startup
     assert '"allow_push":false' in startup
     assert "timeout_seconds=" in startup
-    paths = next(message for message in log_messages if "delegate_to_codex log paths" in message)
+    paths = next(message for message in log_messages if "codex coder provider log paths" in message)
     assert "codex-events.jsonl" in paths
     assert "jarvis-audit.log" in paths
     assert "codex-stderr.log" in paths
@@ -242,7 +207,7 @@ def test_codex_surfaces_approval_requests(monkeypatch, tmp_path: Path) -> None:
 
     result = run_codex_coder_tool(
         ToolExecutionRequest(
-            tool_name="delegate_to_codex",
+            tool_name="codex_coder_provider",
             workdir=str(repo),
             args={"instruction": "Add HTTP support.", "repo_id": "jarvis"},
             timeout_seconds=30,
@@ -282,7 +247,7 @@ def test_codex_failed_app_server_prefers_final_text_over_stderr(monkeypatch, tmp
 
     result = run_codex_coder_tool(
         ToolExecutionRequest(
-            tool_name="delegate_to_codex",
+            tool_name="codex_coder_provider",
             workdir=str(repo),
             args={"instruction": "Do the repo task.", "repo_id": "jarvis"},
             timeout_seconds=30,
@@ -344,7 +309,7 @@ def test_codex_failed_app_server_uses_last_event_text_when_no_final(monkeypatch)
     try:
         result = run_codex_coder_tool(
             ToolExecutionRequest(
-                tool_name="delegate_to_codex",
+                tool_name="codex_coder_provider",
                 workdir=str(repo),
                 args={"instruction": "Generate diagram.", "repo_id": "jarvis"},
                 timeout_seconds=30,
@@ -555,7 +520,7 @@ def test_codex_ignores_jarvis_run_artifacts_inside_repo(monkeypatch, tmp_path: P
 
     result = run_codex_coder_tool(
         ToolExecutionRequest(
-            tool_name="delegate_to_codex",
+            tool_name="codex_coder_provider",
             workdir=str(repo),
             args={"instruction": "Review the repository.", "repo_id": "jarvis"},
             timeout_seconds=30,
@@ -584,7 +549,7 @@ def test_codex_allows_worktree_changes_without_commit(monkeypatch, tmp_path: Pat
 
     result = run_codex_coder_tool(
         ToolExecutionRequest(
-            tool_name="delegate_to_codex",
+            tool_name="codex_coder_provider",
             workdir=str(repo),
             args={"instruction": "Update README.md.", "repo_id": "jarvis"},
             timeout_seconds=30,
@@ -614,7 +579,7 @@ def test_codex_artifacts_include_only_current_run_dirty_files(monkeypatch, tmp_p
 
     result = run_codex_coder_tool(
         ToolExecutionRequest(
-            tool_name="delegate_to_codex",
+            tool_name="codex_coder_provider",
             workdir=str(repo),
             args={"instruction": "Create current-run.txt.", "repo_id": "jarvis"},
             timeout_seconds=30,
@@ -646,7 +611,7 @@ def test_codex_coder_fails_when_commit_created_without_permission(monkeypatch, t
 
     result = run_codex_coder_tool(
         ToolExecutionRequest(
-            tool_name="delegate_to_codex",
+            tool_name="codex_coder_provider",
             workdir=str(repo),
             args={
                 "instruction": "Create a change, but do not commit.",
@@ -693,7 +658,7 @@ def test_codex_coder_parses_nested_agent_message_event(monkeypatch, tmp_path: Pa
 
     result = run_codex_coder_tool(
         ToolExecutionRequest(
-            tool_name="delegate_to_codex",
+            tool_name="codex_coder_provider",
             workdir=str(repo),
             args={"instruction": "Review this repo.", "repo_id": "jarvis"},
             timeout_seconds=30,
@@ -734,7 +699,7 @@ def test_codex_coder_reports_missing_cli(monkeypatch, tmp_path: Path) -> None:
 
     result = run_codex_coder_tool(
         ToolExecutionRequest(
-            tool_name="delegate_to_codex",
+            tool_name="codex_coder_provider",
             workdir=None,
             args={"instruction": "Update README.md.", "repo_id": "jarvis"},
         )
@@ -751,7 +716,7 @@ def test_codex_coder_rejects_unregistered_workdir(monkeypatch, tmp_path: Path) -
 
     result = run_codex_coder_tool(
         ToolExecutionRequest(
-            tool_name="delegate_to_codex",
+            tool_name="codex_coder_provider",
             workdir=str(unknown),
             args={"instruction": "Update README.md.", "workdir": str(unknown)},
         )
@@ -768,7 +733,7 @@ def test_codex_coder_rejects_repo_id_workdir_mismatch(monkeypatch, tmp_path: Pat
 
     result = run_codex_coder_tool(
         ToolExecutionRequest(
-            tool_name="delegate_to_codex",
+            tool_name="codex_coder_provider",
             workdir=str(other),
             args={"instruction": "Update README.md.", "repo_id": "jarvis", "workdir": str(other)},
         )
@@ -796,7 +761,7 @@ def test_codex_coder_allows_registered_workdir_with_warning(monkeypatch, tmp_pat
 
     result = run_codex_coder_tool(
         ToolExecutionRequest(
-            tool_name="delegate_to_codex",
+            tool_name="codex_coder_provider",
             workdir=str(repo),
             args={"instruction": "Update README.md.", "workdir": str(repo)},
         )

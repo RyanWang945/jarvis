@@ -80,16 +80,15 @@ def test_node_executor_runs_ready_nodes_and_passes_node_result_inputs() -> None:
 
 
 def test_node_executor_resolves_artifact_inputs() -> None:
-    tool = RecordingRuntime("tool", "deliver")
-    executor = NodeExecutor(runtimes={"tool": tool})
+    react = RecordingRuntime("react", "deliver")
+    executor = NodeExecutor(runtimes={"react": react})
     plan = ExecutionPlan(
         user_objective="deliver report",
         nodes=[
             PlanNode(
                 id="deliver",
-                runtime="tool",
+                runtime="react",
                 objective="Deliver report",
-                tool_name="deliver_file",
                 input_refs=["artifact:A1"],
             )
         ],
@@ -108,8 +107,8 @@ def test_node_executor_resolves_artifact_inputs() -> None:
     )
 
     assert report.status == "completed"
-    assert tool.calls[0].resolved_inputs[0].kind == "artifact"
-    assert tool.calls[0].resolved_inputs[0].artifacts[0].name == "rag_eval_report.md"
+    assert react.calls[0].resolved_inputs[0].kind == "artifact"
+    assert react.calls[0].resolved_inputs[0].artifacts[0].name == "rag_eval_report.md"
 
 
 def test_node_executor_uses_previous_node_results() -> None:
@@ -220,7 +219,7 @@ def test_codex_node_execute_runtime_builds_tool_request() -> None:
     )
 
     request = captured["request"]
-    assert request.tool_name == "delegate_to_codex"
+    assert request.tool_name == "codex_coder_provider"
     assert request.args["repo_id"] == "jarvis"
     assert request.args["_read_only"] is True
     assert "Review planner" in request.args["instruction"]
@@ -261,7 +260,6 @@ def test_react_node_execute_runtime_runs_tool_loop() -> None:
     runtime = ReactNodeExecuteRuntime(
         model_resolver=lambda context: FakeResolvedModel(chat),
         tool_runner=_tool_runner,
-        allowed_tools=("business_knowledge_search",),
         max_steps=4,
     )
 
@@ -282,7 +280,9 @@ def test_react_node_execute_runtime_runs_tool_loop() -> None:
     assert result.data["findings"] == ["trace matters"]
     assert result.data["tool_calls"][0]["tool_name"] == "business_knowledge_search"
     assert executed == [("business_knowledge_search", {"query": "agent testing"}, 60)]
-    assert chat.calls[0]["tools"][0]["function"]["name"] == "business_knowledge_search"
+    tool_names = {tool["function"]["name"] for tool in chat.calls[0]["tools"]}
+    assert "business_knowledge_search" in tool_names
+    assert "deliver_file" in tool_names
     assert chat.calls[0]["messages"][0].role == "system"
     assert "最新" in chat.calls[0]["messages"][0].content
     assert "temporal_context" in chat.calls[0]["messages"][1].content
@@ -291,19 +291,50 @@ def test_react_node_execute_runtime_runs_tool_loop() -> None:
     assert "trace evidence" in chat.calls[1]["messages"][-1].content
 
 
-def test_react_node_execute_runtime_rejects_unallowed_tool_call() -> None:
+def test_react_node_execute_runtime_exposes_all_llm_tools() -> None:
+    from app.task_runtime.node_execute_runtime import ReactNodeExecuteRuntime
+
+    chat = ScriptedNodeChat([llm_response('{"summary":"done"}')])
+    runtime = ReactNodeExecuteRuntime(
+        model_resolver=lambda context: FakeResolvedModel(chat),
+        tool_runner=lambda tool, tool_args, *, timeout_seconds=60: (_ for _ in ()).throw(AssertionError("should not run")),
+        max_steps=2,
+    )
+
+    result = runtime.run(
+        NodeExecutionContext(
+            user_objective="把刚刚那个报告发我",
+            node=PlanNode(id="deliver", runtime="react", objective="Deliver report"),
+        )
+    )
+
+    tool_names = {tool["function"]["name"] for tool in chat.calls[0]["tools"]}
+    assert result.status == "completed"
+    assert {"read_file", "shell_run_command", "scheduled_task", "deliver_file", "tavily_search"} <= tool_names
+    assert "delegate_to_codex" not in tool_names
+
+
+def test_react_node_execute_runtime_rejects_coder_only_tool_calls_before_runner() -> None:
     from app.task_runtime.node_execute_runtime import ReactNodeExecuteRuntime
 
     chat = ScriptedNodeChat(
         [
-            llm_response(tool_calls=(NormalizedToolCall(id="call_1", name="tavily_search", args={"query": "x"}),)),
+            llm_response(
+                tool_calls=(
+                    NormalizedToolCall(id="call_1", name="shell_inspect", args={"command": "git status"}),
+                    NormalizedToolCall(
+                        id="call_2",
+                        name="delegate_to_codex",
+                        args={"repo_id": "jarvis", "instruction": "Review the repo"},
+                    ),
+                )
+            ),
             llm_response('{"summary":"used available evidence","findings":[],"sources":[]}'),
         ]
     )
     runtime = ReactNodeExecuteRuntime(
         model_resolver=lambda context: FakeResolvedModel(chat),
         tool_runner=lambda tool, tool_args, *, timeout_seconds=60: (_ for _ in ()).throw(AssertionError("should not run")),
-        allowed_tools=("business_knowledge_search",),
         max_steps=4,
     )
 
@@ -316,7 +347,90 @@ def test_react_node_execute_runtime_rejects_unallowed_tool_call() -> None:
 
     assert result.status == "completed"
     assert result.data["tool_calls"][0]["status"] == "rejected"
-    assert "not allowed" in result.data["tool_calls"][0]["summary"]
+    assert result.data["tool_calls"][1]["status"] == "rejected"
+    assert "cannot execute coder-only actions" in result.data["tool_calls"][0]["summary"]
+
+
+def test_react_node_execute_runtime_allows_lightweight_file_tools() -> None:
+    from app.task_runtime.node_execute_runtime import ReactNodeExecuteRuntime
+
+    chat = ScriptedNodeChat(
+        [
+            llm_response(
+                tool_calls=(NormalizedToolCall(id="call_1", name="read_file", args={"path": "docs/example.md"}),)
+            ),
+            llm_response('{"summary":"document inspected","findings":[],"sources":[]}'),
+        ]
+    )
+    executed = []
+
+    def _tool_runner(tool, tool_args, *, timeout_seconds=60):
+        executed.append((tool.name, tool_args))
+        return ToolExecutionResult(ok=True, exit_code=0, stdout="# Example", summary="Read file: docs/example.md")
+
+    runtime = ReactNodeExecuteRuntime(
+        model_resolver=lambda context: FakeResolvedModel(chat),
+        tool_runner=_tool_runner,
+        max_steps=4,
+    )
+
+    result = runtime.run(
+        NodeExecutionContext(
+            user_objective="快速看下这个文档",
+            node=PlanNode(id="inspect_doc", runtime="react", objective="Inspect a non-code document"),
+        )
+    )
+
+    assert result.status == "completed"
+    assert result.data["tool_calls"][0]["status"] == "completed"
+    assert executed == [("read_file", {"path": "docs/example.md"})]
+
+
+def test_react_node_execute_runtime_falls_back_to_tool_summary() -> None:
+    from app.task_runtime.node_execute_runtime import ReactNodeExecuteRuntime
+
+    chat = ScriptedNodeChat(
+        [
+            llm_response(
+                tool_calls=(
+                    NormalizedToolCall(
+                        id="call_1",
+                        name="tavily_search",
+                        args={"query": "agent swarm latest", "max_results": 3},
+                    ),
+                )
+            ),
+            llm_response("{}"),
+        ]
+    )
+    executed = []
+
+    def _tool_runner(tool, tool_args, *, timeout_seconds=60):
+        executed.append(tool.name)
+        return ToolExecutionResult(
+            ok=True,
+            exit_code=0,
+            stdout="{}",
+            summary="Tavily search returned 3 results. Source URLs: https://example.com/swarm",
+        )
+
+    runtime = ReactNodeExecuteRuntime(
+        model_resolver=lambda context: FakeResolvedModel(chat),
+        tool_runner=_tool_runner,
+        max_steps=4,
+    )
+
+    result = runtime.run(
+        NodeExecutionContext(
+            user_objective="research",
+            node=PlanNode(id="research", runtime="react", objective="Research"),
+        )
+    )
+
+    assert result.status == "completed"
+    assert "tavily_search" in result.summary
+    assert "Source URLs" in result.summary
+    assert executed == ["tavily_search"]
 
 
 def test_react_node_execute_runtime_preserves_structured_payload_without_summary() -> None:
@@ -332,7 +446,6 @@ def test_react_node_execute_runtime_preserves_structured_payload_without_summary
     runtime = ReactNodeExecuteRuntime(
         model_resolver=lambda context: FakeResolvedModel(chat),
         tool_runner=lambda tool, tool_args, *, timeout_seconds=60: (_ for _ in ()).throw(AssertionError("should not run")),
-        allowed_tools=("business_knowledge_search",),
         max_steps=2,
     )
 

@@ -18,11 +18,11 @@ from app.prompting import PromptRegistry
 
 logger = logging.getLogger(__name__)
 
-NodeRuntime = Literal["llm", "react", "coder", "codex", "tool"]
+NodeRuntime = Literal["llm", "react", "coder", "codex"]
 FinalizationMode = Literal["pass_through", "deterministic", "llm", "auto"]
 DEFAULT_PLANNER_PROMPT_VERSION = "v2"
 
-_RUNTIMES = {"llm", "react", "coder", "tool"}
+_RUNTIMES = {"llm", "react", "coder"}
 
 
 class PlanNode(BaseModel):
@@ -79,12 +79,8 @@ class PlanNode(BaseModel):
         return hints
 
     @model_validator(mode="after")
-    def _validate_runtime_contract(self) -> PlanNode:
-        if self.runtime == "tool":
-            if not self.tool_name:
-                raise ValueError("tool nodes require tool_name")
-        elif self.tool_name:
-            raise ValueError("tool_name is only valid when runtime is tool")
+    def _drop_legacy_tool_name(self) -> PlanNode:
+        self.tool_name = None
         return self
 
 
@@ -189,7 +185,12 @@ class TurnPlanner:
         resolved = ModelRouter().resolve(LLMNode.PLANNER, conversation_metadata)
         if not resolved.profile.api_key:
             logger.info("turn planner llm skipped reason=missing_api_key profile=%s", resolved.profile.id)
-            return _fallback_single_node_plan(plan_input.current_user_input)
+            return _fallback_plan_for_objective(
+                plan_input.current_user_input,
+                runtime_hints=plan_input.runtime_hints,
+                known_artifact_refs=_known_artifact_refs(plan_input.artifacts),
+                previous_node_results=plan_input.previous_node_results,
+            ) or _fallback_single_node_plan(plan_input.current_user_input)
 
         prompt = self._prompt_registry.load("heavy_plan", self._prompt_version)
         response_format = prompt.response_format if resolved.profile.supports_json_object else None
@@ -224,6 +225,8 @@ class TurnPlanner:
             payload,
             fallback_objective=plan_input.current_user_input,
             known_artifact_refs=_known_artifact_refs(plan_input.artifacts),
+            runtime_hints=plan_input.runtime_hints,
+            previous_node_results=plan_input.previous_node_results,
         )
         logger.info("turn planner plan output=%s", _json_for_log(plan.model_dump(mode="json")))
         return plan
@@ -370,12 +373,22 @@ def _plan_from_payload(
     *,
     fallback_objective: str,
     known_artifact_refs: set[str] | None = None,
+    runtime_hints: dict[str, Any] | None = None,
+    previous_node_results: list[dict[str, Any]] | None = None,
 ) -> ExecutionPlan:
     candidate = payload.get("plan") if isinstance(payload.get("plan"), dict) else payload
     if not isinstance(candidate, dict):
         artifact_delivery = _fallback_artifact_delivery_plan(fallback_objective, known_artifact_refs)
         if artifact_delivery is not None:
             return artifact_delivery
+        intent_fallback = _fallback_plan_for_objective(
+            fallback_objective,
+            runtime_hints=runtime_hints,
+            known_artifact_refs=known_artifact_refs,
+            previous_node_results=previous_node_results,
+        )
+        if intent_fallback is not None:
+            return intent_fallback
         return _fallback_single_node_plan(fallback_objective)
     normalized = _normalize_plan_payload(
         candidate,
@@ -390,6 +403,14 @@ def _plan_from_payload(
         artifact_delivery = _fallback_artifact_delivery_plan(fallback_objective, known_artifact_refs)
         if artifact_delivery is not None:
             return artifact_delivery
+        intent_fallback = _fallback_plan_for_objective(
+            fallback_objective,
+            runtime_hints=runtime_hints,
+            known_artifact_refs=known_artifact_refs,
+            previous_node_results=previous_node_results,
+        )
+        if intent_fallback is not None:
+            return intent_fallback
         return _fallback_single_node_plan(fallback_objective)
 
 
@@ -427,12 +448,6 @@ def _derive_finalization_hint(nodes: Any, raw_hint: Any) -> dict[str, Any]:
             return {
                 "mode": "pass_through",
                 "reason": "single llm node can be returned directly when marked user-facing",
-                "user_facing": user_facing,
-            }
-        if runtime == "tool":
-            return {
-                "mode": "deterministic",
-                "reason": "single tool node uses deterministic finalization",
                 "user_facing": user_facing,
             }
     return {
@@ -484,6 +499,8 @@ def _normalize_runtime(value: Any) -> NodeRuntime:
     text = str(value or "").strip().lower()
     if text == "codex":
         return "coder"
+    if text == "tool":
+        return "react"
     if text in _RUNTIMES:
         return text  # type: ignore[return-value]
     return text  # type: ignore[return-value]
@@ -514,6 +531,90 @@ def _is_valid_input_ref(value: str) -> bool:
     return prefix in {"artifact", "node"} and bool(ref.strip())
 
 
+def _fallback_plan_for_objective(
+    objective: str,
+    *,
+    runtime_hints: dict[str, Any] | None = None,
+    known_artifact_refs: set[str] | None = None,
+    previous_node_results: list[dict[str, Any]] | None = None,
+) -> ExecutionPlan | None:
+    artifact_delivery = _fallback_artifact_delivery_plan(objective, known_artifact_refs)
+    if artifact_delivery is not None:
+        return artifact_delivery
+
+    active_repo = str((runtime_hints or {}).get("active_repo") or "").strip()
+    repo_task = bool(active_repo and _looks_like_repo_task(objective, active_repo))
+    reminder_task = _looks_like_reminder_task(objective)
+    previous_refs = _previous_node_refs(previous_node_results)
+
+    if repo_task and reminder_task:
+        return ExecutionPlan(
+            user_objective=objective,
+            finalization_hint=FinalizationHint(
+                mode="llm",
+                reason="fallback DAG for repository work followed by reminder action",
+                user_facing=False,
+            ),
+            nodes=[
+                PlanNode(
+                    id="repo_report",
+                    runtime="coder",
+                    objective=f"Review the {active_repo} repository for the user request and produce the requested markdown report / 报告: {objective}",
+                    input_refs=previous_refs,
+                    expected_output="Markdown report / 报告 covering the repository findings.",
+                    runtime_hints={"access_mode": "read"},
+                ),
+                PlanNode(
+                    id="set_reminder",
+                    runtime="react",
+                    objective=f"Create the requested reminder / 提醒 after the report node completes: {objective}",
+                    input_refs=["node:repo_report"],
+                    expected_output="Reminder / 提醒 created for the requested time.",
+                ),
+            ],
+        )
+
+    if repo_task:
+        return ExecutionPlan(
+            user_objective=objective,
+            finalization_hint=FinalizationHint(
+                mode="llm",
+                reason="fallback coder node for repository-scoped request",
+                user_facing=False,
+            ),
+            nodes=[
+                PlanNode(
+                    id="repo_task",
+                    runtime="coder",
+                    objective=f"Use the {active_repo} repository to complete the user request: {objective}",
+                    input_refs=previous_refs,
+                    expected_output="Repository-grounded result for the user request.",
+                    runtime_hints={"access_mode": "read"},
+                )
+            ],
+        )
+
+    if reminder_task:
+        return ExecutionPlan(
+            user_objective=objective,
+            finalization_hint=FinalizationHint(
+                mode="llm",
+                reason="fallback react node for reminder action",
+                user_facing=False,
+            ),
+            nodes=[
+                PlanNode(
+                    id="set_reminder",
+                    runtime="react",
+                    objective=f"Create the requested reminder / 提醒: {objective}",
+                    expected_output="Reminder / 提醒 created.",
+                )
+            ],
+        )
+
+    return None
+
+
 def _fallback_single_node_plan(objective: str) -> ExecutionPlan:
     return ExecutionPlan(
         user_objective=objective,
@@ -536,16 +637,15 @@ def _fallback_artifact_delivery_plan(objective: str, known_artifact_refs: set[st
     return ExecutionPlan(
         user_objective=objective,
         finalization_hint=FinalizationHint(
-            mode="deterministic",
-            reason="fallback artifact delivery node for explicit existing-artifact delivery request",
+            mode="llm",
+            reason="fallback react node for explicit existing-artifact delivery request",
             user_facing=False,
         ),
         nodes=[
             PlanNode(
                 id="deliver_artifact",
-                runtime="tool",
-                objective="Deliver the requested existing artifact to the user.",
-                tool_name="deliver_file",
+                runtime="react",
+                objective="Deliver the requested existing artifact to the user by calling the deliver_file tool.",
                 input_refs=[refs[0]],
                 expected_output="Artifact delivered to the user.",
             )
@@ -560,6 +660,62 @@ def _looks_like_artifact_delivery(objective: str) -> bool:
     delivery_terms = ("发我", "发给我", "发送", "交付", "deliver", "send")
     artifact_terms = ("刚刚", "刚才", "那个", "报告", "文件", "产物", "artifact", "file", "report")
     return any(term in text for term in delivery_terms) and any(term in text for term in artifact_terms)
+
+
+def _looks_like_repo_task(objective: str, active_repo: str) -> bool:
+    text = str(objective or "").strip().lower()
+    if not text:
+        return False
+    repo_markers = (
+        active_repo.lower(),
+        "repo",
+        "repository",
+        "project",
+        "项目",
+        "仓库",
+        "代码",
+        "planner",
+        "runtime",
+        "review",
+        "重构",
+        "评估",
+        "调整",
+        "报告",
+        "markdown",
+    )
+    return any(marker and marker in text for marker in repo_markers)
+
+
+def _looks_like_reminder_task(objective: str) -> bool:
+    text = str(objective or "").strip().lower()
+    return any(
+        marker in text
+        for marker in (
+            "提醒",
+            "remind",
+            "reminder",
+            "notify",
+            "今晚",
+            "tomorrow",
+            "明天",
+            "点",
+            "分钟后",
+            "小时后",
+        )
+    )
+
+
+def _previous_node_refs(previous_node_results: list[dict[str, Any]] | None) -> list[str]:
+    refs: list[str] = []
+    for item in previous_node_results or []:
+        if not isinstance(item, dict):
+            continue
+        node_id = str(item.get("node_id") or "").strip()
+        if node_id:
+            ref = f"node:{node_id}"
+            if ref not in refs:
+                refs.append(ref)
+    return refs
 
 
 def _assert_acyclic(deps: dict[str, set[str]]) -> None:

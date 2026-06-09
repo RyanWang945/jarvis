@@ -28,6 +28,8 @@ class EvalCase:
     messages: list[dict[str, Any]]
     expected_tools: list[str]
     forbidden_tools: list[str]
+    expected_runtimes: list[str]
+    forbidden_runtimes: list[str]
     required_status: str
     max_tool_calls: dict[str, int]
     required_reply_contains: list[str]
@@ -161,6 +163,7 @@ def run_case(client: TestClient, case: EvalCase, run_dir: Path) -> dict[str, Any
         for turn_id in turn_ids
         for tool_call in store.list_tool_calls_by_turn(turn_id)
     ]
+    runtime_names = _runtime_names_from_messages(messages)
     elapsed_ms = int((time.perf_counter() - started) * 1000)
     result = score_case(
         case,
@@ -176,6 +179,7 @@ def run_case(client: TestClient, case: EvalCase, run_dir: Path) -> dict[str, Any
             "turns": turns,
             "tool_calls": tool_calls,
             "tool_names": [tool_call["tool_name"] for tool_call in tool_calls],
+            "runtime_names": runtime_names,
             "run_responses": run_responses,
             "metrics": {
                 "elapsed_ms": elapsed_ms,
@@ -194,6 +198,8 @@ def run_case(client: TestClient, case: EvalCase, run_dir: Path) -> dict[str, Any
 def score_case(case: EvalCase, trace: dict[str, Any]) -> dict[str, Any]:
     tool_names = trace["tool_names"]
     tool_counts = Counter(tool_names)
+    runtime_names = trace.get("runtime_names", [])
+    runtime_counts = Counter(runtime_names)
     checks: list[dict[str, Any]] = []
 
     checks.append({
@@ -215,6 +221,20 @@ def score_case(case: EvalCase, trace: dict[str, Any]) -> dict[str, Any]:
             "passed": tool_counts.get(tool, 0) == 0,
             "expected": 0,
             "actual": tool_counts.get(tool, 0),
+        })
+    for runtime in case.expected_runtimes:
+        checks.append({
+            "name": f"expected_runtime:{runtime}",
+            "passed": runtime in runtime_counts,
+            "expected": "used at least once",
+            "actual": runtime_counts.get(runtime, 0),
+        })
+    for runtime in case.forbidden_runtimes:
+        checks.append({
+            "name": f"forbidden_runtime:{runtime}",
+            "passed": runtime_counts.get(runtime, 0) == 0,
+            "expected": 0,
+            "actual": runtime_counts.get(runtime, 0),
         })
     for tool, maximum in case.max_tool_calls.items():
         checks.append({
@@ -288,6 +308,8 @@ def _case_from_payload(payload: dict[str, Any], *, path: Path, line_number: int)
             messages=list(payload["messages"]),
             expected_tools=list(payload.get("expected_tools", [])),
             forbidden_tools=list(payload.get("forbidden_tools", [])),
+            expected_runtimes=list(payload.get("expected_runtimes", [])),
+            forbidden_runtimes=list(payload.get("forbidden_runtimes", [])),
             required_status=str(payload.get("required_status", "completed")),
             max_tool_calls=dict(payload.get("max_tool_calls", {})),
             required_reply_contains=list(payload.get("required_reply_contains", [])),
@@ -309,6 +331,21 @@ def _record_to_dict(record: Any) -> dict[str, Any]:
     return result
 
 
+def _runtime_names_from_messages(messages: list[dict[str, Any]]) -> list[str]:
+    runtimes: list[str] = []
+    for message in messages:
+        raw_payload = message.get("raw_payload")
+        if not isinstance(raw_payload, dict):
+            continue
+        report = raw_payload.get("execution_report")
+        if not isinstance(report, dict):
+            continue
+        for node_result in report.get("node_results") or []:
+            if isinstance(node_result, dict) and node_result.get("runtime"):
+                runtimes.append(str(node_result["runtime"]))
+    return runtimes
+
+
 def _dataset_summary(cases: list[EvalCase]) -> dict[str, Any]:
     return {
         "case_count": len(cases),
@@ -321,6 +358,8 @@ def _dataset_summary(cases: list[EvalCase]) -> dict[str, Any]:
                 "requires": case.requires,
                 "expected_tools": case.expected_tools,
                 "forbidden_tools": case.forbidden_tools,
+                "expected_runtimes": case.expected_runtimes,
+                "forbidden_runtimes": case.forbidden_runtimes,
             }
             for case in cases
         ],

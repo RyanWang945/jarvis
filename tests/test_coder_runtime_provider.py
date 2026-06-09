@@ -156,6 +156,74 @@ def test_codex_provider_surfaces_approval_request_artifact(tmp_path) -> None:
     assert result.approval_requests[0].reason == "Publish the completed change."
 
 
+def test_claude_code_provider_delegates_to_claude_tool(monkeypatch, tmp_path) -> None:
+    captured = {}
+
+    def _runner(request):
+        captured["request"] = request
+        return ToolExecutionResult(
+            ok=True,
+            exit_code=0,
+            stdout="Claude Code finished.",
+            summary="claude done",
+            artifacts=["git_worktree:clean"],
+        )
+
+    monkeypatch.setattr("app.task_runtime.coder_provider.run_coder_tool", _runner)
+
+    provider = ClaudeCodeCoderProvider()
+    result = provider.run(
+        CoderRunRequest(
+            repo_id="jarvis",
+            workdir=tmp_path,
+            instruction="Review runtime.",
+            policy=CoderPolicy(access_mode="read"),
+            timeout_seconds=123,
+        ),
+        decide_action=lambda action: None,  # type: ignore[arg-type]
+    )
+
+    request = captured["request"]
+    assert request.tool_name == "claude_code_coder_provider"
+    assert request.workdir == str(tmp_path)
+    assert request.timeout_seconds == 123
+    assert request.args["repo_id"] == "jarvis"
+    assert request.args["instruction"] == "Review runtime."
+    assert request.args["_read_only"] is True
+    assert request.args["allow_commit"] is False
+    assert request.args["allow_push"] is False
+    assert result.ok is True
+    assert result.stdout == "Claude Code finished."
+    assert result.summary == "claude done"
+    assert result.artifacts == ["git_worktree:clean"]
+    assert result.metadata["provider"] == "claude_code"
+
+
+def test_claude_code_provider_passes_write_permissions(monkeypatch, tmp_path) -> None:
+    captured = {}
+
+    def _runner(request):
+        captured["request"] = request
+        return ToolExecutionResult(ok=True, exit_code=0, summary="ok")
+
+    monkeypatch.setattr("app.task_runtime.coder_provider.run_coder_tool", _runner)
+
+    ClaudeCodeCoderProvider().run(
+        CoderRunRequest(
+            repo_id="jarvis",
+            workdir=tmp_path,
+            instruction="Commit the change.",
+            policy=CoderPolicy(access_mode="write", allow_commit=True, allow_push=True),
+        ),
+        decide_action=lambda action: None,  # type: ignore[arg-type]
+    )
+
+    args = captured["request"].args
+    assert args["_read_only"] is False
+    assert args["allow_commit"] is True
+    assert args["allow_push"] is True
+
+
 def test_coder_node_runtime_blocks_when_approval_required() -> None:
     class ApprovalProvider:
         name = "fake"
@@ -222,3 +290,11 @@ def test_resume_coder_approval_rejects_unknown_provider() -> None:
 
     assert result.status == "unsupported"
     assert "Unsupported coder runtime provider" in result.error
+
+
+def test_resume_coder_approval_reports_claude_code_unsupported() -> None:
+    result = resume_coder_approval("approval_1", approved=True, timeout_seconds=30, provider="claude_code")
+
+    assert result.status == "unsupported"
+    assert "Claude Code coder provider approval resume is not implemented" in result.error
+    assert result.metadata["provider"] == "claude_code"

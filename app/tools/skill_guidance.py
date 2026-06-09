@@ -7,6 +7,47 @@ from app.skills.bootstrap import get_skill_registry
 from app.tools.common import ToolExecutionRequest, ToolExecutionResult
 
 
+def run_load_skill(request: ToolExecutionRequest) -> ToolExecutionResult:
+    raw_skill = str(request.args.get("skill") or "").strip()
+    skill_name = raw_skill.lstrip("/")
+    if not skill_name:
+        payload = {
+            "status": "invalid_request",
+            "reason": "No skill id was provided.",
+            "skills": [],
+        }
+        return _json_result(payload)
+
+    try:
+        skill = get_skill_registry().get(skill_name)
+    except ValueError:
+        payload = {
+            "status": "unknown_skill",
+            "reason": f"Unknown Jarvis skill: {raw_skill}",
+            "skills": [],
+        }
+        return _json_result(payload)
+
+    payload: dict[str, Any] = {
+        "status": "loaded",
+        "skills": [
+            {
+                "name": skill.skill_id,
+                "description": skill.effective_description or skill.description,
+                "reason": f"explicit skill load: {skill.skill_id}",
+            }
+        ],
+        "selection_instruction": (
+            "Jarvis runtime will inject the selected skill guidance as a turn-scoped "
+            "<system-reminder>. Follow it before delegating to tools."
+        ),
+    }
+    args = request.args.get("args")
+    if args is not None:
+        payload["args"] = args
+    return _json_result(payload)
+
+
 def run_load_skill_guidance(request: ToolExecutionRequest) -> ToolExecutionResult:
     query = str(request.args.get("query") or "").strip()
     intent = str(request.args.get("intent") or "").strip()
@@ -33,8 +74,8 @@ def run_load_skill_guidance(request: ToolExecutionRequest) -> ToolExecutionResul
         "status": "loaded",
         "skills": [
             {
-                "name": match.skill.name,
-                "description": match.skill.description,
+                "name": match.skill.skill_id,
+                "description": match.skill.effective_description or match.skill.description,
                 "confidence": match.confidence,
                 "score": match.score,
                 "reason": match.reason,

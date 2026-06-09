@@ -4,7 +4,6 @@ from pathlib import Path
 from uuid import uuid4
 
 from app.api.agent import InMemoryConversationStore
-from app.config import get_settings
 from app.gateway.events import InboundEvent
 from app.gateway.service import GatewayService
 from app.progress import ProgressEvent
@@ -338,49 +337,36 @@ def test_task_runtime_persists_and_returns_node_tool_artifacts() -> None:
         image_path.unlink(missing_ok=True)
 
 
-def test_get_agent_runtime_can_switch_to_task_runtime(monkeypatch) -> None:
+def test_get_agent_runtime_returns_task_runtime_by_default(monkeypatch) -> None:
     import app.api.agent as agent_api
 
     store = InMemoryConversationStore()
-    monkeypatch.setenv("JARVIS_AGENT_RUNTIME_PROVIDER", "task")
-    get_settings.cache_clear()
+    monkeypatch.setenv("JARVIS_AGENT_RUNTIME_PROVIDER", "react")
     monkeypatch.setattr(agent_api, "get_conversation_store", lambda: store)
 
-    try:
-        runtime = agent_api.get_agent_runtime()
-    finally:
-        get_settings.cache_clear()
+    runtime = agent_api.get_agent_runtime()
 
     assert isinstance(runtime, TaskAgentRuntime)
 
 
-def test_task_runtime_ingest_skips_legacy_turn_classifier(monkeypatch) -> None:
+def test_task_runtime_ingest_has_no_legacy_classifier(monkeypatch) -> None:
     import app.api.agent as agent_api
 
-    monkeypatch.setenv("JARVIS_AGENT_RUNTIME_PROVIDER", "task")
-    get_settings.cache_clear()
-    monkeypatch.setattr(
-        agent_api,
-        "classify_turn",
-        lambda **kwargs: (_ for _ in ()).throw(AssertionError("legacy classifier should not run")),
-    )
+    assert not hasattr(agent_api, "classify" + "_turn")
     store = InMemoryConversationStore()
     gateway = GatewayService(conversation_store=store)
 
-    try:
-        result = gateway.handle_inbound_event(
-            InboundEvent(
-                platform="feishu",
-                external_chat_id="chat-task-runtime-no-classifier",
-                external_message_id="msg-task-runtime-no-classifier-1",
-                chat_type="dm",
-                sender_id="ou_1",
-                sender_name="Ryan",
-                text="你好",
-            )
+    result = gateway.handle_inbound_event(
+        InboundEvent(
+            platform="feishu",
+            external_chat_id="chat-task-runtime-no-classifier",
+            external_message_id="msg-task-runtime-no-classifier-1",
+            chat_type="dm",
+            sender_id="ou_1",
+            sender_name="Ryan",
+            text="你好",
         )
-    finally:
-        get_settings.cache_clear()
+    )
 
     assert result.should_run_agent is True
     turn = store.get_turn(result.turn_id)

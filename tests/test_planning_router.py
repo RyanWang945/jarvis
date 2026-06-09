@@ -83,6 +83,24 @@ def test_planning_router_fast_reply_returns_without_planner() -> None:
     assert slow_planner.calls == 0
 
 
+def test_planning_router_deterministically_plans_existing_artifact_delivery() -> None:
+    fast = StaticFastIntent(FastIntentDecision(route="needs_plan", confidence=0.95, reason="would call llm"))
+    planner = SlowPlanner(_planned_plan(), delay_seconds=1.0)
+    router = PlanningRouter(fast_intent=fast, planner=planner)
+
+    result = router.plan(
+        content="把刚刚那个报告发我",
+        recent_artifacts=[{"ref": "A1", "kind": "report", "name": "rag_eval_report.md"}],
+    )
+
+    assert result.route == "planned"
+    assert result.planner_elapsed_ms == 0
+    assert result.plan.nodes[0].runtime == "react"
+    assert result.plan.nodes[0].input_refs == ["artifact:A1"]
+    assert fast.calls == 0
+    assert planner.calls == 0
+
+
 def test_planning_router_needs_plan_always_waits_for_planner() -> None:
     fast = StaticFastIntent(FastIntentDecision(route="needs_plan", confidence=0.95, reason="needs execution"))
     planned = _planned_plan()
@@ -134,6 +152,7 @@ def test_planning_router_needs_plan_waits_for_planner() -> None:
     assert result.route == "planned"
     assert [node.runtime for node in result.plan.nodes] == ["react", "coder"]
     assert result.plan.nodes[1].input_refs == ["node:research"]
+    assert fast.calls == 0
 
 
 def test_planning_router_previous_node_results_force_planner() -> None:
@@ -157,6 +176,7 @@ def test_planning_router_previous_node_results_force_planner() -> None:
     assert result.route == "planned"
     assert result.plan is planned
     assert planner.calls == 1
+    assert fast.calls == 0
 
 
 def test_planning_router_context_reference_forces_planner() -> None:
@@ -184,6 +204,7 @@ def test_planning_router_context_reference_forces_planner() -> None:
     assert result.route == "planned"
     assert result.plan is planned
     assert planner.calls == 1
+    assert fast.calls == 0
 
 
 def test_planning_router_falls_back_to_llm_plan_when_planner_fails() -> None:

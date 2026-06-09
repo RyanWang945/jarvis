@@ -10,18 +10,17 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from app.agent_react.artifact_context import artifact_records_to_context
 from app.agent_react.artifacts import artifact_from_payload, artifact_to_payload, resolve_channel_attachments
 from app.agent_react.context_manager import ContextManager
-from app.agent_react.runtime import ChannelMessage, ConversationStore, TurnResult
 from app.agent_react.session_state import (
     build_session_state_after_turn,
     load_session_state,
 )
 from app.config import get_settings
 from app.progress import ProgressReporter, ensure_progress
+from app.runtime_types import ChannelMessage, ConversationStore, TurnResult
 from app.task_runtime.node_execute_runtime import (
     CoderNodeExecuteRuntime,
     LLMNodeExecuteRuntime,
     ReactNodeExecuteRuntime,
-    ToolNodeExecuteRuntime,
 )
 from app.task_runtime.node_executor import NodeExecutor
 from app.task_runtime.node_result import ExecutionReport, NodeResult
@@ -51,7 +50,6 @@ class TaskAgentRuntime:
                 "llm": LLMNodeExecuteRuntime(),
                 "react": ReactNodeExecuteRuntime(),
                 "coder": CoderNodeExecuteRuntime(),
-                "tool": ToolNodeExecuteRuntime(),
             }
         )
         self._result_aggregator = result_aggregator or ResultAggregator()
@@ -83,7 +81,7 @@ class TaskAgentRuntime:
             "conversation_id": turn.conversation_id,
             "turn_id": turn_id,
             "external_chat_id": conversation.external_chat_id,
-            "available_runtimes": ["llm", "react", "coder", "tool"],
+            "available_runtimes": ["llm", "react", "coder"],
             "coder_runtime_provider": get_settings().coder_runtime_provider,
             **_runtime_temporal_hints(),
         }
@@ -459,7 +457,7 @@ def _tool_artifacts_from_report(report: ExecutionReport, *, turn_id: int) -> lis
                 updates["tool_call_id"] = f"node:{result.node_id}"
             if not artifact.source_tool:
                 provider = str(result.data.get("provider") or "")
-                updates["source_tool"] = "delegate_to_codex" if result.runtime in {"coder", "codex"} and provider in {"", "codex"} else result.runtime
+                updates["source_tool"] = "coder" if result.runtime in {"coder", "codex"} and provider in {"", "codex"} else result.runtime
             if updates:
                 artifact = replace(artifact, **updates)
             if artifact.artifact_id in seen:

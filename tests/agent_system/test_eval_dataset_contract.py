@@ -6,7 +6,6 @@ from pathlib import Path
 
 EVAL_DIR = Path(__file__).parent / "fixtures" / "eval"
 REQUIRED_FILES = {
-    "turn_classifier_real.jsonl",
     "intent_planning_real.jsonl",
     "react_tool_selection_real.jsonl",
     "agent_e2e_real.jsonl",
@@ -73,4 +72,6 @@ def test_agent_system_eval_dataset_schema_is_stable() -> None:
 
         assert isinstance(case.get("expected_tools", []), list)
         assert isinstance(case.get("forbidden_tools", []), list)
+        assert isinstance(case.get("expected_runtimes", []), list)
+        assert isinstance(case.get("forbidden_runtimes", []), list)
         assert isinstance(case.get("max_tool_calls", {}), dict)
