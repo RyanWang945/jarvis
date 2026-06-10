@@ -92,7 +92,7 @@ def test_skill_registry_select_matches_returns_reason_and_confidence() -> None:
 
 
 def test_weather_skill_is_selected_for_chinese_weather_requests(monkeypatch) -> None:
-    skill_dir = Path("data/skills/weather-1.0.0")
+    skill_dir = Path("skills/weather-1.0.0")
     package = SkillPackageLoader([]).load_package(skill_dir)
     registry = SkillRegistry([package.skill])
     monkeypatch.setattr("app.agent_react.context_manager.get_skill_registry", lambda: registry)
@@ -116,14 +116,24 @@ def test_weather_skill_is_selected_for_chinese_weather_requests(monkeypatch) -> 
     assert matches[0].skill.skill_id == "weather-1.0.0"
     assert skill_names == []
     reminder_content = str(messages[1].content)
-    assert "The following skills are available for use with the load_skill tool:" in reminder_content
+    assert "The following skills are available for use with the Skill tool:" in reminder_content
     assert "- weather-1.0.0:" in reminder_content
     assert "[Skill: weather-1.0.0]" not in reminder_content
     assert "If `tavily_search` is available" not in reminder_content
 
 
-def test_image_artifact_planner_skill_is_selected_for_svg_requests(monkeypatch) -> None:
-    skill_dir = Path("data/skills/image-artifact-planner-1.0.0")
+def test_skill_listing_shows_menu_without_body(monkeypatch, tmp_path: Path) -> None:
+    skill_dir = tmp_path / "artifact-planner"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: Artifact Planner\n"
+        "description: Plan image and SVG artifacts.\n"
+        "when_to_use: User asks to generate visual artifacts.\n"
+        "---\n\n"
+        "Preserve the user's requested format.\n",
+        encoding="utf-8",
+    )
     package = SkillPackageLoader([]).load_package(skill_dir)
     registry = SkillRegistry([package.skill])
     monkeypatch.setattr("app.agent_react.context_manager.get_skill_registry", lambda: registry)
@@ -148,37 +158,9 @@ def test_image_artifact_planner_skill_is_selected_for_svg_requests(monkeypatch) 
     reminder_content = str(messages[1].content)
     assert reminder_content.startswith("<system-reminder>")
     assert reminder_content.endswith("</system-reminder>")
-    assert "- image-artifact-planner-1.0.0:" in reminder_content
-    assert "[Skill: image-artifact-planner-1.0.0]" not in reminder_content
+    assert "- artifact-planner:" in reminder_content
+    assert "[Skill: artifact-planner]" not in reminder_content
     assert "Preserve the user's requested format." not in reminder_content
-
-
-def test_image_artifact_planner_skill_guides_raster_image_generation(monkeypatch) -> None:
-    skill_dir = Path("data/skills/image-artifact-planner-1.0.0")
-    package = SkillPackageLoader([]).load_package(skill_dir)
-    registry = SkillRegistry([package.skill])
-    monkeypatch.setattr("app.agent_react.context_manager.get_skill_registry", lambda: registry)
-
-    messages, skill_names = ContextManager().build_initial_messages(
-        [
-            SimpleNamespace(
-                id=1,
-                role="user",
-                content="用 image gen 画一张 jarvis 项目架构图",
-                raw_payload={},
-                turn_id=1,
-            )
-        ],
-        trigger_message_id=1,
-        turn_records=[],
-        current_turn_id=None,
-    )
-
-    assert skill_names == []
-    reminder_content = str(messages[1].content)
-    assert "- image-artifact-planner-1.0.0:" in reminder_content
-    assert "use its image generation capability" not in reminder_content
-    assert "Do not silently change raster image-generation requests into SVG" not in reminder_content
 
 
 def test_load_skill_loads_exact_skill_id_and_injects_body(monkeypatch, tmp_path: Path) -> None:
@@ -197,12 +179,15 @@ def test_load_skill_loads_exact_skill_id_and_injects_body(monkeypatch, tmp_path:
     monkeypatch.setattr("app.tools.skill_guidance.get_skill_registry", lambda: registry)
     monkeypatch.setattr("app.agent_react.context_manager.get_skill_registry", lambda: registry)
 
-    result = run_load_skill(ToolExecutionRequest(tool_name="load_skill", workdir=None, args={"skill": "external-review"}))
+    result = run_load_skill(ToolExecutionRequest(tool_name="Skill", workdir=None, args={"skill": "external-review"}))
     payload = json.loads(result.stdout)
     rendered = ContextManager().build_skill_reminder_message([payload["skills"][0]["name"]])
 
     assert payload["status"] == "loaded"
+    assert payload["skill"]["skill_id"] == "external-review"
     assert payload["skills"][0]["name"] == "external-review"
+    assert "Base directory for this skill:" in payload["content"]
     assert rendered is not None
+    assert not str(rendered.content).startswith("<system-reminder>")
     assert "[Skill: external-review]" in str(rendered.content)
     assert "Follow the external skill review checklist." in str(rendered.content)

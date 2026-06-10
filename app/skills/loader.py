@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -27,14 +26,10 @@ class SkillPackageLoader:
         self._search_paths = search_paths
 
     @classmethod
-    def from_default_paths(cls, *, data_dir: Path, extra_paths: list[Path] | None = None) -> "SkillPackageLoader":
+    def from_default_paths(cls, *, workspace_root: Path, extra_paths: list[Path] | None = None) -> "SkillPackageLoader":
         paths = [
-            data_dir / "skills",
-            Path.home() / ".jarvis" / "skills",
+            workspace_root / "skills",
         ]
-        env_path = os.environ.get("JARVIS_SKILL_PATH")
-        if env_path:
-            paths.extend(Path(item).expanduser() for item in env_path.split(os.pathsep) if item.strip())
         if extra_paths:
             paths.extend(extra_paths)
         return cls(paths)

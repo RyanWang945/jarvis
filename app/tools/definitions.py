@@ -220,6 +220,30 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
             risk_level="low",
         ),
         ToolDefinition(
+            name="Skill",
+            description=(
+                "Load one Jarvis skill by skill_id from the skill listing. "
+                "Use this when the user's task matches an available skill. "
+                "Loading a skill reveals turn-scoped procedural guidance for the next model step; it does not execute scripts, "
+                "grant permissions, perform routing, replace the planner, or complete the task by itself."
+            ),
+            args_schema={
+                "type": "object",
+                "properties": {
+                    "skill": {
+                        "type": "string",
+                        "description": "The skill_id from the skill listing, such as weather-1.0.0 or image-artifact-planner-1.0.0.",
+                    },
+                    "args": {
+                        "description": "Optional user-provided arguments or context for the skill.",
+                    },
+                },
+                "required": ["skill"],
+            },
+            handler=run_load_skill,
+            risk_level="low",
+        ),
+        ToolDefinition(
             name="load_skill",
             description=(
                 "Load one Jarvis skill by skill_id from the skill listing. "
@@ -242,13 +266,14 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
             },
             handler=run_load_skill,
             risk_level="low",
+            exposed_to_llm=False,
         ),
         ToolDefinition(
             name="load_skill_guidance",
             description=(
                 "Load task-specific procedural guidance from Jarvis skills. "
                 "Use this before delegating to Codex, generating artifacts, operating on external channels, "
-                "or performing a multi-step workflow when no relevant <system-reminder> skill is already present. "
+                "or performing a multi-step workflow when no relevant loaded skill guidance is already present. "
                 "This tool only loads guidance for the current turn; it does not execute the task, change files, "
                 "call Codex, upload attachments, or grant permissions."
             ),
@@ -273,6 +298,7 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
             },
             handler=run_load_skill_guidance,
             risk_level="low",
+            exposed_to_llm=False,
         ),
         ToolDefinition(
             name="obsidian_wiki_query",

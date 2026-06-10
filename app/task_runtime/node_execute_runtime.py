@@ -6,12 +6,15 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from app.agent_react.context_manager import ContextManager
 from app.config import get_settings
 from app.llm.client import LLMMessage, parse_json_content
 from app.llm.provider_adapters import NormalizedLLMResponse, NormalizedToolCall
 from app.llm.model_profiles import LLMNode
 from app.llm.model_router import ModelRouter
 from app.repositories import RepositoryRegistryError, get_repository_registry
+from app.skills.bootstrap import get_skill_registry
+from app.skills.rendering import render_loaded_skill_guidance
 from app.task_runtime.coder_provider import (
     ApprovalDecision,
     CoderAction,
@@ -36,6 +39,9 @@ _REACT_CODER_ONLY_TOOLS = {
     "shell_inspect",
     "shell_run_command",
 }
+_SKILL_TOOL_NAMES = {"Skill"}
+_MAX_REACT_SELECTED_SKILLS = 3
+_MAX_REACT_SKILL_GUIDANCE_CHARS = 12000
 
 
 @dataclass(frozen=True)
@@ -52,10 +58,20 @@ class NodeExecuteRuntime(Protocol):
 
 
 class LLMNodeExecuteRuntime:
-    """Plain LLM runtime for one node without tool execution."""
+    """Plain LLM runtime for one node, with only the Skill loader tool exposed."""
 
-    def __init__(self, *, model_resolver=None) -> None:
+    def __init__(
+        self,
+        *,
+        model_resolver=None,
+        skill_tool_runner=execute_tool,
+        max_skill_steps: int = 3,
+        skill_tool_timeout_seconds: int = 30,
+    ) -> None:
         self._model_resolver = model_resolver or (lambda context: ModelRouter().resolve(LLMNode.AGENT_STEP, None))
+        self._skill_tool_runner = skill_tool_runner
+        self._max_skill_steps = max(1, int(max_skill_steps))
+        self._skill_tool_timeout_seconds = max(1, int(skill_tool_timeout_seconds))
 
     def run(self, context: NodeExecutionContext) -> NodeResult:
         started = time.perf_counter()
@@ -64,38 +80,109 @@ class LLMNodeExecuteRuntime:
             logger.info("llm node skipped node_id=%s reason=missing_api_key profile=%s", context.node.id, getattr(resolved.profile, "id", None))
             return _blocked(context.node, "missing_api_key", "LLM runtime API key is not configured.")
         messages = _llm_messages(context)
+        tools = build_llm_tools(allowed_tools={"Skill"})
+        tool_calls: list[dict[str, Any]] = []
+        loaded_skill_names: set[str] = set()
+        response: NormalizedLLMResponse | None = None
         response_format = {"type": "json_object"} if resolved.profile.supports_json_object else None
         try:
-            logger.info(
-                "llm node request node_id=%s model_profile=%s response_format=%s resolved_input_count=%s",
-                context.node.id,
-                getattr(resolved.profile, "id", None),
-                response_format,
-                len(context.resolved_inputs),
-            )
-            response = resolved.client.chat_normalized(messages, response_format=response_format)
-            payload = parse_json_content({"content": response.content}) if response_format else {}
+            for step_index in range(1, self._max_skill_steps + 1):
+                force_final = step_index == self._max_skill_steps
+                logger.info(
+                    "llm node request node_id=%s step=%s model_profile=%s response_format=%s resolved_input_count=%s skill_tool_count=%s force_final=%s",
+                    context.node.id,
+                    step_index,
+                    getattr(resolved.profile, "id", None),
+                    response_format,
+                    len(context.resolved_inputs),
+                    len(tool_calls),
+                    force_final,
+                )
+                response = resolved.client.chat_normalized(
+                    messages,
+                    tools=None if force_final else tools,
+                    tool_choice=None if force_final else "auto",
+                    response_format=response_format,
+                )
+                if response.tool_calls:
+                    messages.append(_assistant_tool_call_message(response))
+                    for tool_call in response.tool_calls:
+                        observation, record = self._run_skill_tool_call(tool_call)
+                        tool_calls.append(record)
+                        messages.append(
+                            LLMMessage(
+                                role="tool",
+                                tool_call_id=tool_call.id,
+                                content=json.dumps(observation, ensure_ascii=False),
+                            )
+                        )
+                    skill_message = _skill_guidance_message_from_tool_records(tool_calls, loaded_skill_names)
+                    if skill_message is not None:
+                        messages.append(skill_message)
+                    continue
+
+                result = _llm_result_from_response(context, response, tool_calls)
+                logger.info(
+                    "llm node completed node_id=%s model=%s finish_reason=%s skill_tool_count=%s summary_len=%s elapsed_ms=%s",
+                    context.node.id,
+                    response.model,
+                    response.finish_reason,
+                    len(tool_calls),
+                    len(result.summary),
+                    int((time.perf_counter() - started) * 1000),
+                )
+                return result
         except Exception as exc:
             logger.exception("llm node failed node_id=%s elapsed_ms=%s", context.node.id, int((time.perf_counter() - started) * 1000))
             return _failed(context.node, "llm_runtime_error", str(exc), retryable=True)
-        summary = str(payload.get("summary") or payload.get("answer") or response.content or "").strip()
-        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-        logger.info(
-            "llm node completed node_id=%s model=%s finish_reason=%s summary_len=%s elapsed_ms=%s",
-            context.node.id,
-            response.model,
-            response.finish_reason,
-            len(summary),
-            int((time.perf_counter() - started) * 1000),
+        if response is None:
+            return _failed(context.node, "llm_runtime_no_response", "LLM runtime finished without a response.", retryable=True)
+        return _llm_result_from_response(context, response, tool_calls)
+
+    def _run_skill_tool_call(self, tool_call: NormalizedToolCall) -> tuple[dict[str, Any], dict[str, Any]]:
+        started = time.perf_counter()
+        record: dict[str, Any] = {
+            "id": tool_call.id,
+            "tool_name": tool_call.name,
+            "args": tool_call.args,
+        }
+        if tool_call.name not in _SKILL_TOOL_NAMES:
+            message = "Rejected: LLM runtime nodes can only call the Skill tool."
+            record.update({"status": "rejected", "summary": message})
+            return {"ok": False, "status": "rejected", "error": message}, record
+        try:
+            tool = get_tool_definition(tool_call.name)
+            result = self._skill_tool_runner(
+                tool,
+                tool_call.args,
+                timeout_seconds=self._skill_tool_timeout_seconds,
+            )
+        except Exception as exc:
+            message = str(exc)
+            record.update({"status": "failed", "summary": message})
+            logger.exception("llm node skill tool failed tool_call_id=%s elapsed_ms=%s", tool_call.id, int((time.perf_counter() - started) * 1000))
+            return {"ok": False, "status": "failed", "error": message}, record
+
+        status = "completed" if result.ok else "failed"
+        record.update(
+            {
+                "status": status,
+                "summary": result.summary,
+                "exit_code": result.exit_code,
+            }
         )
-        return NodeResult(
-            node_id=context.node.id,
-            runtime="llm",
-            status="completed",
-            summary=summary or "LLM runtime completed.",
-            data=data,
-            artifacts=_artifacts_from_payload(payload),
-        )
+        loaded_skill = _loaded_skill_from_tool_result(tool.name, result.stdout)
+        if loaded_skill is not None:
+            record["loaded_skill"] = loaded_skill
+        observation = {
+            "ok": result.ok,
+            "status": status,
+            "tool_name": tool.name,
+            "summary": result.summary,
+            "stdout": _truncate(_tool_observation_stdout(tool.name, result.stdout)),
+            "stderr": _truncate(result.stderr),
+        }
+        return observation, record
 
 
 class ReactNodeExecuteRuntime:
@@ -123,6 +210,7 @@ class ReactNodeExecuteRuntime:
         messages = _react_messages(context)
         tools = build_llm_tools()
         tool_calls: list[dict[str, Any]] = []
+        loaded_skill_names: set[str] = set()
         response: NormalizedLLMResponse | None = None
         try:
             for step_index in range(1, self._max_steps + 1):
@@ -160,6 +248,12 @@ class ReactNodeExecuteRuntime:
                                 content=json.dumps(observation, ensure_ascii=False),
                             )
                         )
+                    skill_message = _skill_guidance_message_from_tool_records(
+                        tool_calls,
+                        loaded_skill_names,
+                    )
+                    if skill_message is not None:
+                        messages.append(skill_message)
                     continue
                 result = _react_result_from_response(context, response, tool_calls)
                 logger.info(
@@ -207,6 +301,10 @@ class ReactNodeExecuteRuntime:
             return {"ok": False, "status": "rejected", "error": boundary_rejection}, record
         try:
             tool = get_tool_definition(tool_call.name)
+            if not tool.exposed_to_llm:
+                message = f"Rejected: hidden tool is not callable by React runtime: {tool.name}"
+                record.update({"status": "rejected", "summary": message})
+                return {"ok": False, "status": "rejected", "error": message}, record
         except Exception as exc:
             message = str(exc)
             record.update({"status": "failed", "summary": message})
@@ -246,12 +344,15 @@ class ReactNodeExecuteRuntime:
                 "tool_artifacts": [_tool_artifact_dict(item) for item in result.tool_artifacts],
             }
         )
+        loaded_skill = _loaded_skill_from_tool_result(tool.name, result.stdout)
+        if loaded_skill is not None:
+            record["loaded_skill"] = loaded_skill
         observation = {
             "ok": result.ok,
             "status": status,
             "tool_name": tool.name,
             "summary": result.summary,
-            "stdout": _truncate(result.stdout),
+            "stdout": _truncate(_tool_observation_stdout(tool.name, result.stdout)),
             "stderr": _truncate(result.stderr),
             "artifacts": list(result.artifacts),
             "tool_artifacts": [_tool_artifact_dict(item) for item in result.tool_artifacts],
@@ -340,7 +441,7 @@ def _llm_messages(context: NodeExecutionContext) -> list[LLMMessage]:
         "runtime_hints": context.runtime_hints,
         "instructions": context.instructions,
     }
-    return [
+    messages = [
         LLMMessage(
             role="system",
             content=(
@@ -353,6 +454,10 @@ def _llm_messages(context: NodeExecutionContext) -> list[LLMMessage]:
         ),
         LLMMessage(role="user", content=json.dumps(payload, ensure_ascii=False)),
     ]
+    skill_listing = _skill_listing_message()
+    if skill_listing is not None:
+        messages.append(skill_listing)
+    return messages
 
 
 def _react_messages(context: NodeExecutionContext) -> list[LLMMessage]:
@@ -364,7 +469,7 @@ def _react_messages(context: NodeExecutionContext) -> list[LLMMessage]:
         "runtime_hints": context.runtime_hints,
         "instructions": context.instructions,
     }
-    return [
+    messages = [
         LLMMessage(
             role="system",
             content=(
@@ -382,6 +487,130 @@ def _react_messages(context: NodeExecutionContext) -> list[LLMMessage]:
         ),
         LLMMessage(role="user", content=json.dumps(payload, ensure_ascii=False)),
     ]
+    skill_listing = _skill_listing_message()
+    if skill_listing is not None:
+        messages.append(skill_listing)
+    return messages
+
+
+def _skill_listing_message() -> LLMMessage | None:
+    try:
+        message = ContextManager().build_skill_listing_message()
+    except Exception:
+        logger.warning("node runtime failed to render skill listing", exc_info=True)
+        return None
+    if message is None:
+        return None
+    return LLMMessage(role="user", content=str(message.content or ""))
+
+
+def _skill_guidance_message_from_tool_records(
+    tool_calls: list[dict[str, Any]],
+    loaded_skill_names: set[str],
+) -> LLMMessage | None:
+    invocations: list[dict[str, Any]] = []
+    for record in tool_calls:
+        loaded = record.get("loaded_skill")
+        if not isinstance(loaded, dict):
+            continue
+        name = str(loaded.get("name") or "").strip()
+        if not name or name in loaded_skill_names:
+            continue
+        loaded_skill_names.add(name)
+        invocations.append(loaded)
+    return _render_skill_guidance_message(invocations)
+
+
+def _render_skill_guidance_message(invocations: list[dict[str, Any]]) -> LLMMessage | None:
+    content = _render_skill_guidance_text(invocations)
+    if content is None:
+        return None
+    return LLMMessage(role="user", content=content)
+
+
+def _render_skill_guidance_text(invocations: list[dict[str, Any]]) -> str | None:
+    if not invocations:
+        return None
+    try:
+        registry = get_skill_registry()
+    except Exception:
+        logger.warning("node runtime failed to access skill registry", exc_info=True)
+        return None
+
+    sections: list[str] = []
+    seen: set[str] = set()
+    for invocation in invocations:
+        if len(sections) >= _MAX_REACT_SELECTED_SKILLS:
+            break
+        name = str(invocation.get("name") or invocation.get("skill") or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        content = invocation.get("content")
+        if isinstance(content, str) and content.strip():
+            sections.append(f"[Skill: {name}]\n{content.strip()}")
+            continue
+        try:
+            skill = registry.get(name)
+        except ValueError:
+            continue
+        body = render_loaded_skill_guidance(skill, args=invocation.get("args")).strip()
+        if not body:
+            continue
+        sections.append(f"[Skill: {skill.skill_id}]\n{body}")
+
+    if not sections:
+        return None
+    content = (
+        "Loaded skills for this turn. Follow their procedural guidance when relevant.\n\n"
+        + "\n\n".join(sections)
+    )
+    if len(content) > _MAX_REACT_SKILL_GUIDANCE_CHARS:
+        content = content[:_MAX_REACT_SKILL_GUIDANCE_CHARS].rstrip() + "\n\n[Skill content truncated by Jarvis runtime.]"
+    return content
+
+
+def _loaded_skill_from_tool_result(tool_name: str, stdout: str) -> dict[str, Any] | None:
+    if tool_name not in _SKILL_TOOL_NAMES:
+        return None
+    try:
+        payload = json.loads(stdout or "{}")
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict) or payload.get("status") != "loaded":
+        return None
+    skill_payload = payload.get("skill")
+    name = ""
+    if isinstance(skill_payload, dict):
+        name = str(skill_payload.get("skill_id") or "").strip()
+    if not name:
+        skills = payload.get("skills")
+        if isinstance(skills, list) and skills and isinstance(skills[0], dict):
+            name = str(skills[0].get("name") or "").strip()
+    if not name:
+        return None
+    loaded: dict[str, Any] = {"name": name}
+    if "args" in payload:
+        loaded["args"] = payload.get("args")
+    content = payload.get("content")
+    if isinstance(content, str) and content.strip():
+        loaded["content"] = content
+    return loaded
+
+
+def _tool_observation_stdout(tool_name: str, stdout: str) -> str:
+    if tool_name not in _SKILL_TOOL_NAMES:
+        return stdout
+    try:
+        payload = json.loads(stdout or "{}")
+    except json.JSONDecodeError:
+        return stdout
+    if not isinstance(payload, dict):
+        return stdout
+    if "content" in payload:
+        payload = dict(payload)
+        payload["content"] = "[injected as turn-scoped skill guidance]"
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def _assistant_tool_call_message(response: NormalizedLLMResponse) -> LLMMessage:
@@ -400,6 +629,27 @@ def _assistant_tool_call_message(response: NormalizedLLMResponse) -> LLMMessage:
             for tool_call in response.tool_calls
         ],
         reasoning_content=response.reasoning_content,
+    )
+
+
+def _llm_result_from_response(
+    context: NodeExecutionContext,
+    response: NormalizedLLMResponse,
+    tool_calls: list[dict[str, Any]],
+) -> NodeResult:
+    payload = parse_json_content({"content": response.content})
+    summary = str(payload.get("summary") or payload.get("answer") or response.content or "").strip()
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    if tool_calls:
+        data = dict(data)
+        data["tool_calls"] = tool_calls
+    return NodeResult(
+        node_id=context.node.id,
+        runtime="llm",
+        status="completed",
+        summary=summary or "LLM runtime completed.",
+        data=data,
+        artifacts=_artifacts_from_payload(payload),
     )
 
 

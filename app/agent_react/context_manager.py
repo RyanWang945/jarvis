@@ -17,6 +17,7 @@ from app.config import get_settings
 from app.llm.client import LLMMessage
 from app.repositories import RepositoryRegistryError, get_repository_registry
 from app.skills.bootstrap import get_skill_registry
+from app.skills.rendering import render_loaded_skill_guidance
 from utils.token_counter import count_text_tokens
 
 SYSTEM_PROMPT = _SYSTEM_PROMPT = """
@@ -430,7 +431,7 @@ class ContextManager:
         rendered = self._render_selected_skills(skill_names)
         if rendered is None:
             return None
-        return HumanMessage(content=f"<system-reminder>\n{rendered}\n</system-reminder>")
+        return HumanMessage(content=rendered)
 
     def build_skill_listing_message(self) -> HumanMessage | None:
         rendered = self._render_skill_listing()
@@ -453,7 +454,7 @@ class ContextManager:
                 skill = registry.get(skill_name)
             except ValueError:
                 continue
-            body = self._bounded_skill_body(skill.load_body().strip())
+            body = self._bounded_skill_body(render_loaded_skill_guidance(skill).strip())
             if not body:
                 continue
             section = f"[Skill: {skill.skill_id}]\n{body}"
@@ -470,7 +471,7 @@ class ContextManager:
             return None
 
         return (
-            "Selected skills for this turn. Use them as procedural guidance when relevant.\n\n"
+            "Loaded skills for this turn. Follow their procedural guidance when relevant.\n\n"
             + "\n\n".join(sections)
         )
 
@@ -483,7 +484,7 @@ class ContextManager:
         lines = [
             "Jarvis skills are procedural guidance packages. Loading a skill only reveals its instructions; it does not execute scripts, grant permissions, perform routing, replace the planner, or perform the task by itself.",
             "",
-            "The following skills are available for use with the load_skill tool:",
+            "The following skills are available for use with the Skill tool:",
         ]
         total_tokens = self.estimate_text_tokens("\n".join(lines))
         item_count = 0

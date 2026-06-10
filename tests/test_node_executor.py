@@ -6,6 +6,8 @@ from app.task_runtime.node_result import NodeResult, ResolvedInput
 from app.task_runtime.planner import ExecutionPlan, PlanNode
 from app.tools.common import ToolExecutionResult
 from app.llm.provider_adapters import NormalizedLLMResponse, NormalizedToolCall
+from app.skills.loader import SkillPackageLoader
+from app.skills.registry import SkillRegistry
 
 
 class RecordingRuntime:
@@ -459,3 +461,110 @@ def test_react_node_execute_runtime_preserves_structured_payload_without_summary
     assert "Elden Ring" in result.summary
     assert result.data["candidates"][0]["name"] == "Elden Ring"
     assert result.data["sources"] == ["source1"]
+
+
+def test_react_node_execute_runtime_lets_model_load_skill(monkeypatch, tmp_path) -> None:
+    from app.task_runtime.node_execute_runtime import ReactNodeExecuteRuntime
+
+    registry = _install_test_skill_registry(monkeypatch, tmp_path, "react-skill")
+    chat = ScriptedNodeChat(
+        [
+            llm_response(
+                tool_calls=(
+                    NormalizedToolCall(
+                        id="call_skill_1",
+                        name="Skill",
+                        args={"skill": "react-skill", "args": "topic"},
+                    ),
+                )
+            ),
+            llm_response('{"summary":"used react skill"}'),
+        ]
+    )
+    runtime = ReactNodeExecuteRuntime(
+        model_resolver=lambda context: FakeResolvedModel(chat),
+        max_steps=3,
+    )
+
+    result = runtime.run(
+        NodeExecutionContext(
+            user_objective="use a skill",
+            node=PlanNode(id="react", runtime="react", objective="Use procedural guidance"),
+        )
+    )
+
+    assert registry.get("react-skill").skill_id == "react-skill"
+    assert result.status == "completed"
+    assert result.summary == "used react skill"
+    assert result.data["tool_calls"][0]["tool_name"] == "Skill"
+    assert result.data["tool_calls"][0]["loaded_skill"]["name"] == "react-skill"
+    assert {tool["function"]["name"] for tool in chat.calls[0]["tools"]} >= {"Skill", "tavily_search"}
+    second_call_text = "\n\n".join(str(message.content) for message in chat.calls[1]["messages"])
+    assert "[Skill: react-skill]" in second_call_text
+    assert "Skill guidance marker for react-skill." in second_call_text
+    assert "<system-reminder>\nLoaded skills for this turn." not in second_call_text
+    tool_message_text = str([message for message in chat.calls[1]["messages"] if message.role == "tool"][0].content)
+    assert "[injected as turn-scoped skill guidance]" in tool_message_text
+
+
+def test_llm_node_execute_runtime_can_load_skill_for_own_call(monkeypatch, tmp_path) -> None:
+    from app.task_runtime.node_execute_runtime import LLMNodeExecuteRuntime
+
+    _install_test_skill_registry(monkeypatch, tmp_path, "llm-skill")
+    chat = ScriptedNodeChat(
+        [
+            llm_response(
+                tool_calls=(
+                    NormalizedToolCall(
+                        id="call_skill_1",
+                        name="Skill",
+                        args={"skill": "llm-skill"},
+                    ),
+                )
+            ),
+            llm_response('{"summary":"used llm skill"}'),
+        ]
+    )
+    runtime = LLMNodeExecuteRuntime(
+        model_resolver=lambda context: FakeResolvedModel(chat),
+        max_skill_steps=3,
+    )
+
+    result = runtime.run(
+        NodeExecutionContext(
+            user_objective="answer with a skill",
+            node=PlanNode(id="answer", runtime="llm", objective="Answer with optional procedural guidance"),
+        )
+    )
+
+    assert result.status == "completed"
+    assert result.summary == "used llm skill"
+    assert result.data["tool_calls"][0]["tool_name"] == "Skill"
+    assert {tool["function"]["name"] for tool in chat.calls[0]["tools"]} == {"Skill"}
+    first_call_text = "\n\n".join(str(message.content) for message in chat.calls[0]["messages"])
+    assert "- llm-skill:" in first_call_text
+    assert "Skill guidance marker for llm-skill." not in first_call_text
+    second_call_text = "\n\n".join(str(message.content) for message in chat.calls[1]["messages"])
+    assert "[Skill: llm-skill]" in second_call_text
+    assert "Skill guidance marker for llm-skill." in second_call_text
+    assert "<system-reminder>\nLoaded skills for this turn." not in second_call_text
+
+
+def _install_test_skill_registry(monkeypatch, tmp_path, skill_id: str) -> SkillRegistry:
+    skill_dir = tmp_path / skill_id
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        f"name: {skill_id}\n"
+        f"description: Guidance for {skill_id}.\n"
+        "---\n\n"
+        f"# {skill_id}\n\n"
+        f"Skill guidance marker for {skill_id}.\n",
+        encoding="utf-8",
+    )
+    package = SkillPackageLoader([]).load_package(skill_dir)
+    registry = SkillRegistry([package.skill])
+    monkeypatch.setattr("app.agent_react.context_manager.get_skill_registry", lambda: registry)
+    monkeypatch.setattr("app.tools.skill_guidance.get_skill_registry", lambda: registry)
+    monkeypatch.setattr("app.task_runtime.node_execute_runtime.get_skill_registry", lambda: registry)
+    return registry

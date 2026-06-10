@@ -4,6 +4,7 @@ import json
 from typing import Any
 
 from app.skills.bootstrap import get_skill_registry
+from app.skills.rendering import expected_tools_for_skill, render_loaded_skill_guidance
 from app.tools.common import ToolExecutionRequest, ToolExecutionResult
 
 
@@ -28,21 +29,40 @@ def run_load_skill(request: ToolExecutionRequest) -> ToolExecutionResult:
         }
         return _json_result(payload)
 
+    if skill.manifest.disable_model_invocation:
+        payload = {
+            "status": "disabled_skill",
+            "reason": f"Jarvis skill is disabled for model invocation: {skill.skill_id}",
+            "skills": [],
+        }
+        return _json_result(payload)
+
+    args = request.args.get("args")
+    expected_tools = expected_tools_for_skill(skill)
+    content = render_loaded_skill_guidance(skill, args=args)
     payload: dict[str, Any] = {
         "status": "loaded",
+        "skill": {
+            "skill_id": skill.skill_id,
+            "display_name": skill.display_name,
+            "effective_description": skill.effective_description or skill.description,
+            "content_path": str(skill.content_path) if skill.content_path is not None else None,
+        },
+        "expected_tools": expected_tools,
         "skills": [
             {
                 "name": skill.skill_id,
                 "description": skill.effective_description or skill.description,
+                "expected_tools": expected_tools,
                 "reason": f"explicit skill load: {skill.skill_id}",
             }
         ],
         "selection_instruction": (
-            "Jarvis runtime will inject the selected skill guidance as a turn-scoped "
-            "<system-reminder>. Follow it before delegating to tools."
+            "Jarvis runtime will inject the selected skill guidance as turn-scoped loaded skill content. "
+            "Follow it before delegating to tools."
         ),
+        "content": content,
     }
-    args = request.args.get("args")
     if args is not None:
         payload["args"] = args
     return _json_result(payload)
@@ -83,8 +103,8 @@ def run_load_skill_guidance(request: ToolExecutionRequest) -> ToolExecutionResul
             for match in matches
         ],
         "selection_instruction": (
-            "Jarvis runtime will inject the selected skill guidance as a turn-scoped "
-            "<system-reminder>. Follow it before delegating to tools."
+            "Jarvis runtime will inject the selected skill guidance as turn-scoped loaded skill content. "
+            "Follow it before delegating to tools."
         ),
     }
     return _json_result(payload)

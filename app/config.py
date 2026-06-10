@@ -77,6 +77,10 @@ class Settings(BaseSettings):
     obsidian_workspace_path: Path | None = None
     obsidian_vault_path: Path | None = None
     default_timezone: str = "Asia/Shanghai"
+    mcp_enabled: bool = False
+    mcp_config_path: Path | None = None
+    mcp_servers_json: str | None = None
+    mcp_tools_cache_ttl_seconds: float = 300.0
 
     # MySQL configuration
     mysql_host: str = "127.0.0.1"
