@@ -14,6 +14,7 @@ from app.task_runtime.node_result import NodeResult
 from app.task_runtime.planner import ExecutionPlan, PlanNode
 from app.task_runtime.planning_router import PlanningRouterResult
 from app.task_runtime.result_aggregator import ResultAggregator
+from app.task_runtime.session_workspace import SessionWorkspaceManager
 
 
 class StaticPlanningRouter:
@@ -111,7 +112,7 @@ class RecordingProgress:
         pass
 
 
-def test_feishu_gateway_can_run_task_runtime_e2e_without_network() -> None:
+def test_feishu_gateway_can_run_task_runtime_e2e_without_network(tmp_path: Path) -> None:
     store = InMemoryConversationStore()
     gateway = GatewayService(conversation_store=store)
     plan = ExecutionPlan(
@@ -125,6 +126,7 @@ def test_feishu_gateway_can_run_task_runtime_e2e_without_network() -> None:
         planning_router=router,
         node_executor=NodeExecutor(runtimes={"llm": llm_runtime}),
         result_aggregator=ResultAggregator(model_resolver=lambda metadata: _missing_key_model()),
+        session_workspace_manager=SessionWorkspaceManager(workdir=tmp_path),
     )
 
     gateway_result = gateway.handle_inbound_event(
@@ -157,7 +159,7 @@ def test_feishu_gateway_can_run_task_runtime_e2e_without_network() -> None:
     assert messages[-1].raw_payload["aggregation"]["status"] == "completed"
 
 
-def test_task_runtime_emits_progress_events() -> None:
+def test_task_runtime_emits_progress_events(tmp_path: Path) -> None:
     store = InMemoryConversationStore()
     gateway = GatewayService(conversation_store=store)
     plan = ExecutionPlan(
@@ -170,6 +172,7 @@ def test_task_runtime_emits_progress_events() -> None:
         planning_router=StaticPlanningRouter(plan),
         node_executor=NodeExecutor(runtimes={"llm": EchoRuntime()}),
         result_aggregator=ResultAggregator(model_resolver=lambda metadata: _missing_key_model()),
+        session_workspace_manager=SessionWorkspaceManager(workdir=tmp_path),
     )
     gateway_result = gateway.handle_inbound_event(
         InboundEvent(
@@ -200,7 +203,7 @@ def test_task_runtime_emits_progress_events() -> None:
     assert progress.events[3].node_id == "answer"
 
 
-def test_task_runtime_fast_reply_bypasses_node_executor_and_aggregator() -> None:
+def test_task_runtime_fast_reply_bypasses_node_executor_and_aggregator(tmp_path: Path) -> None:
     store = InMemoryConversationStore()
     gateway = GatewayService(conversation_store=store)
     router = StaticFastReplyRouter("数学有时难，但能练会。")
@@ -211,6 +214,7 @@ def test_task_runtime_fast_reply_bypasses_node_executor_and_aggregator() -> None
         planning_router=router,
         node_executor=NodeExecutor(runtimes={"llm": llm_runtime}),
         result_aggregator=ResultAggregator(model_resolver=lambda metadata: _resolved_model(chat)),
+        session_workspace_manager=SessionWorkspaceManager(workdir=tmp_path),
     )
 
     gateway_result = gateway.handle_inbound_event(
@@ -241,7 +245,7 @@ def test_task_runtime_fast_reply_bypasses_node_executor_and_aggregator() -> None
     assert raw_payload["aggregation"]["data"]["finalization"] == "fast_reply"
 
 
-def test_task_runtime_injects_history_context_only_into_planning() -> None:
+def test_task_runtime_injects_history_context_only_into_planning(tmp_path: Path) -> None:
     store = InMemoryConversationStore()
     gateway = GatewayService(conversation_store=store)
     plan = ExecutionPlan(
@@ -255,6 +259,7 @@ def test_task_runtime_injects_history_context_only_into_planning() -> None:
         planning_router=router,
         node_executor=NodeExecutor(runtimes={"llm": llm_runtime}),
         result_aggregator=ResultAggregator(model_resolver=lambda metadata: _missing_key_model()),
+        session_workspace_manager=SessionWorkspaceManager(workdir=tmp_path),
     )
 
     first = gateway.handle_inbound_event(
@@ -294,7 +299,7 @@ def test_task_runtime_injects_history_context_only_into_planning() -> None:
     assert not hasattr(llm_runtime.calls[-1], "conversation_context")
 
 
-def test_task_runtime_persists_and_returns_node_tool_artifacts() -> None:
+def test_task_runtime_persists_and_returns_node_tool_artifacts(tmp_path: Path) -> None:
     store = InMemoryConversationStore()
     gateway = GatewayService(conversation_store=store)
     image_path = Path("data") / "artifact_previews" / f"task-runtime-{uuid4().hex}.png"
@@ -310,6 +315,7 @@ def test_task_runtime_persists_and_returns_node_tool_artifacts() -> None:
         planning_router=StaticPlanningRouter(plan),
         node_executor=NodeExecutor(runtimes={"coder": ArtifactRuntime(image_path, artifact_id)}),
         result_aggregator=ResultAggregator(model_resolver=lambda metadata: _missing_key_model()),
+        session_workspace_manager=SessionWorkspaceManager(workdir=tmp_path),
     )
 
     try:
@@ -333,6 +339,10 @@ def test_task_runtime_persists_and_returns_node_tool_artifacts() -> None:
         raw_payload = store.list_messages(gateway_result.conversation_id)[-1].raw_payload
         assert raw_payload["artifacts"][0]["artifact_id"] == artifact_id
         assert raw_payload["attachments"][0]["artifact_id"] == artifact_id
+        promoted_path = Path(raw_payload["artifacts"][0]["path"])
+        assert promoted_path.parent.name == "artifacts"
+        assert promoted_path.parent.parent.parent == tmp_path / "sessions"
+        assert raw_payload["attachments"][0]["path"] == str(promoted_path.resolve())
     finally:
         image_path.unlink(missing_ok=True)
 

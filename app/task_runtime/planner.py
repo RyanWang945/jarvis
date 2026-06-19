@@ -20,8 +20,6 @@ logger = logging.getLogger(__name__)
 
 NodeRuntime = Literal["llm", "react", "coder", "codex"]
 FinalizationMode = Literal["pass_through", "deterministic", "llm", "auto"]
-DEFAULT_PLANNER_PROMPT_VERSION = "v2"
-
 _RUNTIMES = {"llm", "react", "coder"}
 
 
@@ -155,7 +153,7 @@ class TurnPlanner:
 
     def __init__(self, *, prompt_registry: PromptRegistry | None = None, prompt_version: str | None = None) -> None:
         self._prompt_registry = prompt_registry or PromptRegistry()
-        self._prompt_version = prompt_version or DEFAULT_PLANNER_PROMPT_VERSION
+        self._prompt_version = prompt_version
 
     def prompt_metadata(self) -> dict[str, Any]:
         return self._prompt_registry.load("heavy_plan", self._prompt_version).metadata()
@@ -204,7 +202,7 @@ class TurnPlanner:
             resolved.profile.id,
             resolved.profile.provider,
             response_format,
-            self._prompt_version,
+            prompt.version,
             _json_for_log(plan_input.model_dump(mode="json")),
         )
         response = resolved.client.chat_normalized(
@@ -272,7 +270,7 @@ def _planner_messages(
     prompt_version: str | None = None,
 ) -> list[LLMMessage]:
     registry = prompt_registry or PromptRegistry()
-    prompt = registry.load("heavy_plan", prompt_version or DEFAULT_PLANNER_PROMPT_VERSION)
+    prompt = registry.load("heavy_plan", prompt_version)
     return prompt.render(
         {
             "input_json": json.dumps(
@@ -574,6 +572,15 @@ def _fallback_plan_for_objective(
             ],
         )
 
+    if repo_task and _looks_like_coarse_code_decomposition_task(objective):
+        areas = _code_business_areas(objective)
+        return _fallback_coarse_code_plan(
+            objective=objective,
+            active_repo=active_repo,
+            areas=areas,
+            previous_refs=previous_refs,
+        )
+
     if repo_task:
         return ExecutionPlan(
             user_objective=objective,
@@ -684,6 +691,134 @@ def _looks_like_repo_task(objective: str, active_repo: str) -> bool:
         "markdown",
     )
     return any(marker and marker in text for marker in repo_markers)
+
+
+def _looks_like_coarse_code_decomposition_task(objective: str) -> bool:
+    text = str(objective or "").strip().lower()
+    if not text:
+        return False
+    code_markers = (
+        "实现",
+        "开发",
+        "新增",
+        "修改",
+        "修复",
+        "重构",
+        "接入",
+        "改造",
+        "implement",
+        "build",
+        "fix",
+        "feature",
+    )
+    broad_markers = (
+        "跨业务",
+        "不同业务",
+        "多个业务",
+        "多业务",
+        "多模块",
+        "不同模块",
+        "合并",
+        "整合",
+        "集成",
+        "merge",
+        "integrate",
+        "integration",
+    )
+    return any(marker in text for marker in code_markers) and (
+        len(_code_business_areas(objective)) >= 2 or any(marker in text for marker in broad_markers)
+    )
+
+
+def _code_business_areas(objective: str) -> list[str]:
+    text = str(objective or "").strip().lower()
+    candidates = (
+        ("会员/积分业务", ("会员", "积分", "member", "points", "loyalty")),
+        ("订单业务", ("订单", "order")),
+        ("支付/退款业务", ("支付", "退款", "payment", "refund")),
+        ("用户/账号业务", ("用户", "账号", "登录", "权限", "user", "account", "auth")),
+        ("商品业务", ("商品", "sku", "product")),
+        ("库存业务", ("库存", "inventory")),
+        ("通知/消息业务", ("通知", "消息", "短信", "email", "notification", "message")),
+        ("报表/分析业务", ("报表", "统计", "分析", "report", "analytics")),
+        ("任务调度业务", ("调度", "定时", "job", "scheduler")),
+        ("检索/RAG业务", ("检索", "知识库", "rag", "search", "embedding")),
+        ("工具/路由业务", ("工具", "路由", "tool", "routing")),
+        ("planner/runtime业务", ("planner", "runtime", "任务分解", "计划")),
+    )
+    areas: list[str] = []
+    for label, markers in candidates:
+        if any(marker in text for marker in markers):
+            areas.append(label)
+    return areas
+
+
+def _fallback_coarse_code_plan(
+    *,
+    objective: str,
+    active_repo: str,
+    areas: list[str],
+    previous_refs: list[str],
+) -> ExecutionPlan:
+    implementation_areas = areas[:3] or ["主要代码业务"]
+    nodes: list[PlanNode] = []
+    implementation_refs: list[str] = []
+    for index, area in enumerate(implementation_areas, start=1):
+        node_id = f"implement_area_{index}"
+        implementation_refs.append(f"node:{node_id}")
+        nodes.append(
+            PlanNode(
+                id=node_id,
+                runtime="coder",
+                objective=(
+                    f"在 {active_repo} 仓库按粗粒度业务板块实现 {area} 相关代码改动，"
+                    f"保持任务边界在业务能力层，不拆成低层文件操作或单个测试步骤：{objective}"
+                ),
+                input_refs=previous_refs,
+                expected_output=f"{area} 的代码实现说明、关键改动和本节点内完成的必要自检结果。",
+                runtime_hints={"access_mode": "write"},
+            )
+        )
+
+    integration_ref = implementation_refs[-1]
+    if len(implementation_refs) > 1:
+        integration_ref = "node:integrate_business_code"
+        nodes.append(
+            PlanNode(
+                id="integrate_business_code",
+                runtime="coder",
+                objective=(
+                    f"合并 / integrate {active_repo} 仓库中不同业务实现节点的代码结果，处理跨业务接口、数据流和冲突，"
+                    f"不要拆成低层文件操作：{objective}"
+                ),
+                input_refs=implementation_refs,
+                expected_output="不同业务代码改动已完成整合，跨业务契约、冲突处理和剩余风险说明清楚。",
+                runtime_hints={"access_mode": "write"},
+            )
+        )
+
+    nodes.append(
+        PlanNode(
+            id="code_review",
+            runtime="coder",
+            objective=(
+                f"Review / 代码审查 {active_repo} 仓库的粗粒度代码改动，聚焦业务正确性、集成风险、回归风险和是否满足用户要求：{objective}"
+            ),
+            input_refs=[integration_ref],
+            expected_output="代码 review 结论、发现的问题、建议修复项和可交付状态。",
+            runtime_hints={"access_mode": "read"},
+        )
+    )
+
+    return ExecutionPlan(
+        user_objective=objective,
+        finalization_hint=FinalizationHint(
+            mode="llm",
+            reason="fallback coarse DAG for broad multi-area code work",
+            user_facing=False,
+        ),
+        nodes=nodes,
+    )
 
 
 def _looks_like_reminder_task(objective: str) -> bool:

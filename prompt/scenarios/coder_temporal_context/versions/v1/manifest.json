@@ -1,0 +1,14 @@
+{
+  "id": "coder_temporal_context:v1",
+  "scenario": "coder_temporal_context",
+  "version": "v1",
+  "description": "Temporal context block for delegated coder node instructions.",
+  "response_format": "text",
+  "variables": ["has_temporal", "current_date", "current_time", "timezone"],
+  "messages": [
+    {
+      "role": "user",
+      "template": "context.md"
+    }
+  ]
+}

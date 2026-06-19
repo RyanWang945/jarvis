@@ -17,8 +17,6 @@ from app.task_runtime.planner import ExecutionPlan
 logger = logging.getLogger(__name__)
 
 AggregationStatus = Literal["completed", "needs_replan", "needs_user_input", "failed"]
-DEFAULT_AGGREGATOR_PROMPT_VERSION = "v1"
-
 
 class AggregationResult(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -60,7 +58,7 @@ class ResultAggregator:
         model_resolver=None,
     ) -> None:
         self._prompt_registry = prompt_registry or PromptRegistry()
-        self._prompt_version = prompt_version or DEFAULT_AGGREGATOR_PROMPT_VERSION
+        self._prompt_version = prompt_version
         self._model_resolver = model_resolver or (lambda metadata: ModelRouter().resolve(LLMNode.SUMMARY, metadata))
 
     def prompt_metadata(self) -> dict[str, Any]:

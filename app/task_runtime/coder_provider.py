@@ -137,6 +137,8 @@ class CodexCoderProvider:
                 args={
                     "instruction": request.instruction,
                     "repo_id": request.repo_id,
+                    "_runtime_workdir": str(request.workdir),
+                    "_runtime_run_dir": str(request.run_dir) if request.run_dir is not None else "",
                     "allow_commit": request.policy.allow_commit,
                     "allow_push": request.policy.allow_push,
                     "_read_only": request.policy.access_mode == "read",
@@ -203,6 +205,7 @@ class ClaudeCodeCoderProvider:
                 args={
                     "instruction": request.instruction,
                     "repo_id": request.repo_id,
+                    "_runtime_run_dir": str(request.run_dir) if request.run_dir is not None else "",
                     "allow_commit": request.policy.allow_commit,
                     "allow_push": request.policy.allow_push,
                     "_read_only": request.policy.access_mode == "read",

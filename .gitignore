@@ -24,6 +24,8 @@ __MACOSX/
 .claude/
 logs/
 sandbox/
+sessions/
+projects/
 *.db
 *.db-journal
 nul

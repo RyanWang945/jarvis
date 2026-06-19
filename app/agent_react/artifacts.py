@@ -14,7 +14,6 @@ from typing import Any, Literal
 from xml.etree import ElementTree
 
 from app.config import get_settings
-from app.repositories import get_repository_registry
 from app.tools.common import ToolArtifact
 
 IMAGE_MIME_BY_SUFFIX = {
@@ -158,9 +157,16 @@ def resolve_channel_attachments(
     artifacts: list[ToolArtifact],
     *,
     turn_id: int | None = None,
+    extra_allowed_roots: list[Path] | tuple[Path, ...] | None = None,
 ) -> ArtifactResolution:
     settings = get_settings()
-    allowed_roots = _allowed_roots(settings.workspace_root, settings.data_dir)
+    workspace_root = settings.workspace_root.resolve()
+    allowed_roots = _dedupe_roots(
+        [
+            *_allowed_roots(workspace_root, settings.data_dir),
+            *_resolve_existing_roots(extra_allowed_roots or ()),
+        ]
+    )
     attachments: list[ChannelAttachment] = []
     rejected: list[ArtifactRejection] = []
     seen: set[str] = set()
@@ -175,7 +181,7 @@ def resolve_channel_attachments(
         if artifact.artifact_id in seen:
             continue
         seen.add(artifact.artifact_id)
-        attachment, reason = _resolve_one(artifact, allowed_roots)
+        attachment, reason = _resolve_one(artifact, allowed_roots, workspace_root)
         if attachment is not None:
             attachments.append(attachment)
         elif reason is not None:
@@ -183,7 +189,11 @@ def resolve_channel_attachments(
     return ArtifactResolution(tuple(attachments), tuple(rejected))
 
 
-def _resolve_one(artifact: ToolArtifact, allowed_roots: tuple[Path, ...]) -> tuple[ChannelAttachment | None, str | None]:
+def _resolve_one(
+    artifact: ToolArtifact,
+    allowed_roots: tuple[Path, ...],
+    workspace_root: Path,
+) -> tuple[ChannelAttachment | None, str | None]:
     try:
         raw_path = Path(artifact.path or "")
         resolved = raw_path.expanduser().resolve(strict=True)
@@ -192,7 +202,7 @@ def _resolve_one(artifact: ToolArtifact, allowed_roots: tuple[Path, ...]) -> tup
 
     if not resolved.is_file():
         return None, "not_a_file"
-    if not _is_within_any(resolved, allowed_roots):
+    if not _is_allowed_attachment_path(resolved, allowed_roots, workspace_root):
         return None, "path_outside_allowed_roots"
     if _is_sensitive_path(resolved):
         return None, "sensitive_path"
@@ -414,15 +424,33 @@ def _clamp_viewport(value: float) -> int:
 
 def _allowed_roots(workspace_root: Path, data_dir: Path) -> tuple[Path, ...]:
     roots: list[Path] = []
-    for repo in get_repository_registry().list_repositories():
-        roots.append(repo.canonical_root_path)
     data_root = data_dir if data_dir.is_absolute() else workspace_root / data_dir
-    for candidate in (workspace_root, data_root / "coder_runs"):
+    for candidate in (
+        data_root / "artifact_previews",
+        data_root / "coder_runs",
+        *_session_artifact_roots(workspace_root),
+    ):
         try:
             resolved = candidate.resolve(strict=True)
         except OSError:
             continue
         roots.append(resolved)
+    return _dedupe_roots(roots)
+
+
+def _resolve_existing_roots(roots: list[Path] | tuple[Path, ...]) -> tuple[Path, ...]:
+    resolved_roots: list[Path] = []
+    for root in roots:
+        try:
+            resolved = Path(root).resolve(strict=True)
+        except OSError:
+            continue
+        if resolved.is_dir():
+            resolved_roots.append(resolved)
+    return tuple(resolved_roots)
+
+
+def _dedupe_roots(roots: list[Path] | tuple[Path, ...]) -> tuple[Path, ...]:
     deduped: list[Path] = []
     seen: set[str] = set()
     for root in roots:
@@ -431,6 +459,15 @@ def _allowed_roots(workspace_root: Path, data_dir: Path) -> tuple[Path, ...]:
             seen.add(key)
             deduped.append(root)
     return tuple(deduped)
+
+
+def _session_artifact_roots(workspace_root: Path) -> tuple[Path, ...]:
+    sessions_root = workspace_root / "sessions"
+    try:
+        sessions = [item for item in sessions_root.iterdir() if item.is_dir()]
+    except OSError:
+        return ()
+    return tuple(session / "artifacts" for session in sessions)
 
 
 def _legacy_artifact_path(label: str, value: str, base_dir: Path | None) -> Path | None:
@@ -452,6 +489,29 @@ def _is_within_any(path: Path, roots: tuple[Path, ...]) -> bool:
         except ValueError:
             continue
     return False
+
+
+def _is_allowed_attachment_path(path: Path, allowed_roots: tuple[Path, ...], workspace_root: Path) -> bool:
+    sessions_root = (workspace_root / "sessions").resolve()
+    if _is_within(path, sessions_root):
+        return _is_session_artifact_path(path, sessions_root)
+    return _is_within_any(path, allowed_roots)
+
+
+def _is_session_artifact_path(path: Path, sessions_root: Path) -> bool:
+    try:
+        relative = path.relative_to(sessions_root)
+    except ValueError:
+        return False
+    return len(relative.parts) >= 3 and relative.parts[1] == "artifacts"
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
 
 
 def _is_sensitive_path(path: Path) -> bool:

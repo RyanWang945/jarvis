@@ -35,6 +35,38 @@ def test_claude_coder_uses_delegate_permission_mode_by_default(monkeypatch, tmp_
     assert captured["command"][captured["command"].index("--permission-mode") + 1] == "delegate"
 
 
+def test_claude_coder_uses_runtime_run_dir(monkeypatch, tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    provider_run = tmp_path / "sessions" / "s1" / "nodes" / "n1" / "provider_run"
+    real_run = subprocess.run
+
+    def _run(command, **kwargs):
+        if command and command[0] == "claude":
+            return subprocess.CompletedProcess(command, 0, stdout="Reviewed.\n", stderr="")
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr("app.tools.coder._resolve_cli_command", lambda: ["claude"])
+    monkeypatch.setattr("app.tools.coder.subprocess.run", _run)
+
+    result = run_coder_tool(
+        ToolExecutionRequest(
+            tool_name="claude_code_coder_provider",
+            workdir=str(repo),
+            args={
+                "instruction": "Review this repo.",
+                "repo_id": "jarvis",
+                "_runtime_run_dir": str(provider_run),
+            },
+            timeout_seconds=30,
+        )
+    )
+
+    assert result.ok is True
+    assert (provider_run / "claude-stdout.log").read_text(encoding="utf-8") == "Reviewed.\n"
+    assert "[JARVIS_POSTFLIGHT]" in (provider_run / "jarvis-audit.log").read_text(encoding="utf-8")
+    assert f"jarvis_audit:{provider_run / 'jarvis-audit.log'}" in result.artifacts
+
+
 def test_claude_coder_fails_when_commit_created_without_permission(monkeypatch, tmp_path: Path) -> None:
     repo = _init_repo(tmp_path / "repo")
     real_run = subprocess.run

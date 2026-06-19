@@ -66,10 +66,11 @@ class StaticRouter:
 def test_task_planner_eval_dataset_loads_simple_and_complex_cases() -> None:
     cases = load_cases("tests/fixtures/task_planner_eval/planner_cases.jsonl")
 
-    assert len(cases) >= 6
+    assert len(cases) >= 7
     assert any(case.required_runtimes == ["llm"] for case in cases)
     assert any("coder" in case.required_runtimes and "react" in case.required_runtimes for case in cases)
     assert any(case.required_input_refs == ["artifact:A1"] for case in cases)
+    assert any(case.required_node_objective_contains for case in cases)
 
 
 def test_task_planner_eval_score_checks_latency_and_plan_accuracy() -> None:
@@ -92,6 +93,35 @@ def test_task_planner_eval_score_checks_latency_and_plan_accuracy() -> None:
     assert result["passed"] is True
     assert result["runtimes"] == ["coder", "react"]
     assert result["tool_names"] == []
+
+
+def test_task_planner_eval_score_checks_required_node_objective_groups() -> None:
+    case = next(case for case in load_cases("tests/fixtures/task_planner_eval/planner_cases.jsonl") if case.id == "complex_code_business_roles")
+    plan = ExecutionPlan(
+        user_objective=case.message,
+        nodes=[
+            PlanNode(id="order_points", objective="订单业务实现：订单完成后累积积分", runtime="coder"),
+            PlanNode(id="payment_refund", objective="支付/退款业务实现：支付退款时撤销积分", runtime="coder"),
+            PlanNode(
+                id="integrate",
+                objective="合并不同业务代码并处理跨业务契约",
+                runtime="coder",
+                input_refs=["node:order_points", "node:payment_refund"],
+            ),
+            PlanNode(
+                id="review",
+                objective="code review 合并后的业务代码",
+                runtime="coder",
+                input_refs=["node:integrate"],
+            ),
+        ],
+    )
+
+    result = score_case(case, plan, elapsed_ms=1000)
+
+    assert result["passed"] is True
+    assert any(check["name"] == "required_node_objective_contains:订单业务+实现" for check in result["checks"])
+    assert any(check["name"] == "required_node_objective_contains:支付/退款业务+实现" for check in result["checks"])
 
 
 def test_task_planner_eval_score_fails_slow_or_inaccurate_plan() -> None:

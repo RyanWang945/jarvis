@@ -1,0 +1,15 @@
+{
+  "id": "tool_definitions:v1",
+  "scenario": "tool_definitions",
+  "version": "v1",
+  "description": "Model-facing tool descriptions and argument schema descriptions.",
+  "response_format": "text",
+  "variables": [],
+  "assets": ["catalog.json"],
+  "messages": [
+    {
+      "role": "system",
+      "template": "catalog.md"
+    }
+  ]
+}

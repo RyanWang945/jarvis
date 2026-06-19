@@ -13,6 +13,10 @@ from app.config import get_settings
 from app.llm.client import LLMMessage, LLMRole
 
 _VARIABLE_PATTERN = re.compile(r"{{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*}}")
+_SECTION_PATTERN = re.compile(
+    r"{{\s*(?P<kind>[#^])\s*(?P<key>[a-zA-Z_][a-zA-Z0-9_]*)\s*}}(?P<body>.*?){{\s*/\s*(?P=key)\s*}}",
+    re.DOTALL,
+)
 
 
 PromptResponseFormat = Literal["json_object", "text"]
@@ -35,6 +39,7 @@ class PromptManifest(BaseModel):
     model_profile: str | None = None
     response_format: PromptResponseFormat = "text"
     variables: list[str] = Field(default_factory=list)
+    assets: list[str] = Field(default_factory=list)
     messages: list[PromptMessageTemplate]
 
     @field_validator("id", "scenario", "version")
@@ -55,6 +60,16 @@ class PromptManifest(BaseModel):
                 result.append(text)
         return result
 
+    @field_validator("assets")
+    @classmethod
+    def _dedupe_assets(cls, value: list[str]) -> list[str]:
+        result: list[str] = []
+        for item in value:
+            text = str(item).strip()
+            if text and text not in result:
+                result.append(text)
+        return result
+
     @model_validator(mode="after")
     def _id_matches_scenario_version(self) -> PromptManifest:
         expected = f"{self.scenario}:{self.version}"
@@ -63,6 +78,33 @@ class PromptManifest(BaseModel):
         if not self.messages:
             raise ValueError("prompt manifest requires at least one message")
         return self
+
+
+class PromptConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    default_versions: dict[str, str] = Field(default_factory=dict)
+    profiles: dict[str, dict[str, str]] = Field(default_factory=dict)
+
+    @field_validator("default_versions", "profiles")
+    @classmethod
+    def _strip_keys_and_values(cls, value: dict[str, Any]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for raw_key, raw_value in value.items():
+            key = str(raw_key).strip()
+            if not key:
+                continue
+            if isinstance(raw_value, dict):
+                result[key] = {
+                    str(item_key).strip(): str(item_value).strip()
+                    for item_key, item_value in raw_value.items()
+                    if str(item_key).strip() and str(item_value).strip()
+                }
+                continue
+            text = str(raw_value).strip()
+            if text:
+                result[key] = text
+        return result
 
 
 class PromptBundle:
@@ -98,10 +140,15 @@ class PromptBundle:
         return None
 
     @property
+    def model_profile(self) -> str | None:
+        return self.manifest.model_profile
+
+    @property
     def fingerprint(self) -> str:
         parts = [
             _read_bytes(self.version_dir / "manifest.json"),
             *[_read_bytes(self.version_dir / message.template) for message in self.manifest.messages],
+            *[_read_bytes(self.version_dir / asset) for asset in self.manifest.assets],
         ]
         if self.schema_path is not None and self.schema_path.exists():
             parts.append(_read_bytes(self.schema_path))
@@ -123,6 +170,12 @@ class PromptBundle:
             for message in self.manifest.messages
         ]
 
+    def render_text(self, context: dict[str, Any]) -> str:
+        messages = self.render(context)
+        if len(messages) != 1:
+            raise ValueError(f"Prompt {self.id} must contain exactly one message to render as text")
+        return messages[0].content
+
     def schema(self) -> dict[str, Any]:
         if self.schema_path is None or not self.schema_path.exists():
             return {}
@@ -134,6 +187,7 @@ class PromptBundle:
             "prompt_scenario": self.scenario,
             "prompt_version": self.version,
             "prompt_sha256": self.fingerprint,
+            **({"model_profile": self.model_profile} if self.model_profile else {}),
         }
 
 
@@ -141,6 +195,7 @@ class PromptRegistry:
     def __init__(self, root: Path | None = None) -> None:
         self.root = root or get_settings().workspace_root / "prompt"
         self._cache: dict[tuple[str, str], PromptBundle] = {}
+        self._config: PromptConfig | None = None
 
     def load(self, scenario: str, version: str | None = None) -> PromptBundle:
         scenario_name = scenario.strip()
@@ -167,11 +222,55 @@ class PromptRegistry:
         return bundle
 
     def active_version(self, scenario: str) -> str:
-        env_name = "JARVIS_PROMPT_" + re.sub(r"[^A-Z0-9]+", "_", scenario.upper()).strip("_") + "_VERSION"
-        return os.environ.get(env_name, "v1").strip() or "v1"
+        scenario_name = scenario.strip()
+        env_name = "JARVIS_PROMPT_" + re.sub(r"[^A-Z0-9]+", "_", scenario_name.upper()).strip("_") + "_VERSION"
+        env_version = os.environ.get(env_name)
+        if env_version is not None and env_version.strip():
+            return env_version.strip()
+
+        mapped_versions = _parse_version_mapping(os.environ.get("JARVIS_PROMPT_VERSIONS"))
+        mapped_version = mapped_versions.get(scenario_name)
+        if mapped_version:
+            return mapped_version
+
+        profile_name = os.environ.get("JARVIS_PROMPT_PROFILE", "").strip()
+        if profile_name:
+            profile = self.config.profiles.get(profile_name, {})
+            profile_version = profile.get(scenario_name)
+            if profile_version:
+                return profile_version
+
+        default_version = self.config.default_versions.get(scenario_name)
+        if default_version:
+            return default_version
+        return "v1"
+
+    @property
+    def config(self) -> PromptConfig:
+        if self._config is not None:
+            return self._config
+        config_path = self.root / "config.json"
+        if config_path.exists():
+            self._config = PromptConfig.model_validate(json.loads(config_path.read_text(encoding="utf-8")))
+        else:
+            self._config = PromptConfig()
+        return self._config
 
 
 def _render_template(template: str, context: dict[str, Any]) -> str:
+    def replace_section(match: re.Match[str]) -> str:
+        key = match.group("key")
+        body = match.group("body")
+        enabled = _is_truthy(context.get(key))
+        if match.group("kind") == "^":
+            enabled = not enabled
+        return body if enabled else ""
+
+    previous = None
+    while previous != template:
+        previous = template
+        template = _SECTION_PATTERN.sub(replace_section, template)
+
     def replace(match: re.Match[str]) -> str:
         key = match.group(1)
         if key not in context:
@@ -186,3 +285,39 @@ def _render_template(template: str, context: dict[str, Any]) -> str:
 
 def _read_bytes(path: Path) -> bytes:
     return path.read_bytes()
+
+
+def _is_truthy(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return bool(value.strip()) and value.strip().lower() not in {"0", "false", "no", "off", "none", "null"}
+    if isinstance(value, (list, tuple, set, dict)):
+        return bool(value)
+    return bool(value)
+
+
+def _parse_version_mapping(value: str | None) -> dict[str, str]:
+    if not value or not value.strip():
+        return {}
+    text = value.strip()
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        payload = None
+    if isinstance(payload, dict):
+        return {
+            str(key).strip(): str(version).strip()
+            for key, version in payload.items()
+            if str(key).strip() and str(version).strip()
+        }
+    result: dict[str, str] = {}
+    for item in text.split(","):
+        key, separator, version = item.partition("=")
+        if not separator:
+            key, separator, version = item.partition(":")
+        if separator and key.strip() and version.strip():
+            result[key.strip()] = version.strip()
+    return result

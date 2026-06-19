@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import logging
+import re
+import shutil
 import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -26,6 +30,8 @@ from app.task_runtime.node_executor import NodeExecutor
 from app.task_runtime.node_result import ExecutionReport, NodeResult
 from app.task_runtime.planning_router import PlanningRouter
 from app.task_runtime.result_aggregator import AggregationResult, ResultAggregator
+from app.task_runtime.session_workspace import SessionWorkspaceManager, SessionWorkspaceRef
+from app.tools.common import ToolArtifact
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +47,7 @@ class TaskAgentRuntime:
         node_executor: NodeExecutor | None = None,
         result_aggregator: ResultAggregator | None = None,
         context_manager: ContextManager | None = None,
+        session_workspace_manager: SessionWorkspaceManager | None = None,
     ) -> None:
         self._store = store
         self._context_manager = context_manager or ContextManager()
@@ -53,6 +60,7 @@ class TaskAgentRuntime:
             }
         )
         self._result_aggregator = result_aggregator or ResultAggregator()
+        self._session_workspace_manager = session_workspace_manager or SessionWorkspaceManager()
 
     def run_turn(self, turn_id: int, progress: ProgressReporter | None = None) -> TurnResult:
         progress = ensure_progress(progress)
@@ -105,6 +113,7 @@ class TaskAgentRuntime:
             data={"trigger_type": getattr(turn, "trigger_type", None), "recent_artifact_count": len(recent_artifacts)},
         )
 
+        session_workspace: SessionWorkspaceRef | None = None
         try:
             router_result = self._planning_router.plan(
                 content=user_input,
@@ -212,14 +221,25 @@ class TaskAgentRuntime:
                     "planner_elapsed_ms": router_result.planner_elapsed_ms,
                 },
             )
+            session_workspace = self._session_workspace_manager.create_for_plan(
+                router_result.plan,
+                turn_id=turn_id,
+                conversation_id=turn.conversation_id,
+            )
+            self._session_workspace_manager.update_status(session_workspace, "running")
+            execution_runtime_hints = {
+                **runtime_hints,
+                **session_workspace.runtime_hints(),
+            }
             execution_started = time.perf_counter()
             report = self._node_executor.execute(
                 router_result.plan,
                 artifacts=recent_artifacts,
                 previous_node_results=[],
-                runtime_hints=runtime_hints,
+                runtime_hints=execution_runtime_hints,
                 instructions=[],
                 progress=progress,
+                session_workspace=session_workspace,
             )
             logger.info(
                 "task runtime execution completed turn_id=%s status=%s node_count=%s completed_order=%s elapsed_ms=%s",
@@ -246,13 +266,20 @@ class TaskAgentRuntime:
                 route=router_result.route,
                 fast_intent=router_result.fast_intent.model_dump(mode="json"),
                 artifacts=recent_artifacts,
-                runtime_hints=runtime_hints,
+                runtime_hints=execution_runtime_hints,
                 instructions=[],
                 conversation_metadata=conversation.metadata,
             )
-            tool_artifacts = _tool_artifacts_from_report(report, turn_id=turn_id)
+            tool_artifacts = _promote_tool_artifacts_to_session(
+                _tool_artifacts_from_report(report, turn_id=turn_id),
+                session_workspace,
+            )
             _persist_tool_artifacts(self._store, turn.conversation_id, tool_artifacts)
-            artifact_resolution = resolve_channel_attachments(tool_artifacts, turn_id=turn_id)
+            artifact_resolution = resolve_channel_attachments(
+                tool_artifacts,
+                turn_id=turn_id,
+                extra_allowed_roots=[session_workspace.artifacts_dir],
+            )
             logger.info(
                 "task runtime aggregation completed turn_id=%s status=%s finalization=%s reply_len=%s artifact_refs=%s elapsed_ms=%s",
                 turn_id,
@@ -289,6 +316,7 @@ class TaskAgentRuntime:
                 "plan": router_result.plan.model_dump(mode="json"),
                 "execution_report": report.model_dump(mode="json", exclude_none=True),
                 "aggregation": aggregation.model_dump(mode="json", exclude_none=True),
+                "session_workspace": session_workspace.metadata(),
             }
             if tool_artifacts:
                 raw_payload["artifacts"] = [artifact_to_payload(item) for item in tool_artifacts]
@@ -309,6 +337,7 @@ class TaskAgentRuntime:
                     raw_payload=raw_payload,
                 )
                 status = "completed"
+            self._session_workspace_manager.update_status(session_workspace, status)
             logger.info(
                 "task runtime turn finished turn_id=%s status=%s elapsed_ms=%s",
                 turn_id,
@@ -354,6 +383,8 @@ class TaskAgentRuntime:
                 int((time.perf_counter() - started) * 1000),
             )
             self._store.finalize_turn_failure(turn_id, error_message=str(exc))
+            if session_workspace is not None:
+                self._session_workspace_manager.update_status(session_workspace, "failed")
             progress.emit(
                 "turn_failed",
                 turn_id=turn_id,
@@ -437,8 +468,8 @@ def _recent_artifacts(store: ConversationStore, conversation_id: int) -> list[di
         return []
 
 
-def _tool_artifacts_from_report(report: ExecutionReport, *, turn_id: int) -> list[Any]:
-    artifacts: list[Any] = []
+def _tool_artifacts_from_report(report: ExecutionReport, *, turn_id: int) -> list[ToolArtifact]:
+    artifacts: list[ToolArtifact] = []
     seen: set[str] = set()
     for result in report.node_results:
         raw_items = result.data.get("tool_artifacts")
@@ -465,6 +496,76 @@ def _tool_artifacts_from_report(report: ExecutionReport, *, turn_id: int) -> lis
             seen.add(artifact.artifact_id)
             artifacts.append(artifact)
     return artifacts
+
+
+def _promote_tool_artifacts_to_session(
+    artifacts: list[ToolArtifact],
+    session_workspace: SessionWorkspaceRef,
+) -> list[ToolArtifact]:
+    return [_promote_tool_artifact_to_session(artifact, session_workspace) for artifact in artifacts]
+
+
+def _promote_tool_artifact_to_session(
+    artifact: ToolArtifact,
+    session_workspace: SessionWorkspaceRef,
+) -> ToolArtifact:
+    if artifact.kind not in {"image", "file"} or not artifact.path:
+        return artifact
+    try:
+        source = Path(artifact.path).expanduser().resolve(strict=True)
+    except OSError:
+        return artifact
+    if not source.is_file():
+        return artifact
+    artifacts_dir = session_workspace.artifacts_dir.resolve()
+    try:
+        source.relative_to(artifacts_dir)
+        return artifact
+    except ValueError:
+        pass
+
+    target = (artifacts_dir / _session_artifact_filename(artifact, source)).resolve()
+    try:
+        target.relative_to(artifacts_dir)
+    except ValueError:
+        logger.warning("session artifact promotion target escaped artifacts dir artifact_id=%s", artifact.artifact_id)
+        return artifact
+
+    try:
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+        stat = target.stat()
+    except OSError:
+        logger.warning("session artifact promotion failed artifact_id=%s source=%s", artifact.artifact_id, source, exc_info=True)
+        return artifact
+
+    metadata = dict(artifact.metadata)
+    metadata.update(
+        {
+            "session_id": session_workspace.session_id,
+            "session_artifacts_dir": str(session_workspace.artifacts_dir),
+            "source_path": str(source),
+            "promoted_to_session_artifacts": True,
+        }
+    )
+    return replace(
+        artifact,
+        path=str(target),
+        filename=target.name,
+        size_bytes=stat.st_size,
+        metadata=metadata,
+    )
+
+
+def _session_artifact_filename(artifact: ToolArtifact, source: Path) -> str:
+    raw_name = artifact.filename or source.name or "artifact"
+    raw_path = Path(raw_name)
+    suffix = raw_path.suffix or source.suffix
+    suffix = re.sub(r"[^A-Za-z0-9.]+", "", suffix)[:16]
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", raw_path.stem).strip("._-")[:80] or "artifact"
+    digest_source = f"{artifact.artifact_id}|{source}"
+    digest = hashlib.sha256(digest_source.encode("utf-8", errors="replace")).hexdigest()[:12]
+    return f"{stem}-{digest}{suffix}"
 
 
 def _persist_tool_artifacts(store: ConversationStore, conversation_id: int, artifacts: list[Any]) -> None:

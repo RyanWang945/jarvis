@@ -40,6 +40,7 @@ class PlannerEvalCase:
     required_tool_names: list[str]
     required_input_refs: list[str]
     objective_contains: list[str]
+    required_node_objective_contains: list[list[str]]
     max_latency_ms: int
     raw: dict[str, Any]
 
@@ -227,6 +228,7 @@ def dataset_summary(cases: list[PlannerEvalCase]) -> dict[str, Any]:
                 "required_runtimes": case.required_runtimes,
                 "required_tool_names": case.required_tool_names,
                 "required_input_refs": case.required_input_refs,
+                "required_node_objective_contains": case.required_node_objective_contains,
                 "max_latency_ms": case.max_latency_ms,
             }
             for case in cases
@@ -255,6 +257,26 @@ def score_case(case: PlannerEvalCase, plan: ExecutionPlan, *, elapsed_ms: int) -
     objective_text = " ".join([plan.user_objective, *[node.objective for node in plan.nodes], *[node.expected_output for node in plan.nodes]])
     for fragment in case.objective_contains:
         checks.append(_check(f"objective_contains:{fragment}", _contains_fragment(objective_text, fragment), fragment, objective_text))
+
+    node_texts = {
+        node.id: " ".join([node.objective, node.expected_output])
+        for node in plan.nodes
+    }
+    for fragments in case.required_node_objective_contains:
+        group_name = "+".join(fragments)
+        matching_node_ids = [
+            node_id
+            for node_id, node_text in node_texts.items()
+            if all(_contains_fragment(node_text, fragment) for fragment in fragments)
+        ]
+        checks.append(
+            _check(
+                f"required_node_objective_contains:{group_name}",
+                bool(matching_node_ids),
+                fragments,
+                matching_node_ids or node_texts,
+            )
+        )
 
     passed = all(check["passed"] for check in checks)
     return {
@@ -387,6 +409,7 @@ def _case_from_payload(payload: dict[str, Any], *, path: Path, line_number: int)
             required_tool_names=list(payload.get("required_tool_names", [])),
             required_input_refs=list(payload.get("required_input_refs", [])),
             objective_contains=list(payload.get("objective_contains", [])),
+            required_node_objective_contains=_normalize_fragment_groups(payload.get("required_node_objective_contains", [])),
             max_latency_ms=int(payload.get("max_latency_ms", 15000)),
             raw=payload,
         )
@@ -421,8 +444,27 @@ def _contains_fragment(text: str, fragment: str) -> bool:
         "提醒": ("reminder", "remind", "notify"),
         "调研": ("research", "investigation"),
         "研究": ("research",),
+        "实现": ("implement", "implementation", "build", "code changes"),
+        "合并": ("merge", "integrate", "integration", "整合", "集成"),
+        "订单": ("order",),
+        "支付": ("payment", "refund"),
+        "订单业务": ("订单模块", "订单能力", "order"),
+        "支付/退款业务": ("支付退款业务", "支付模块", "退款模块", "payment", "refund"),
+        "review": ("评审", "审查", "代码审查", "code review"),
     }
     return any(alias.lower() in normalized_text for alias in aliases.get(str(fragment), ()))
+
+
+def _normalize_fragment_groups(value: Any) -> list[list[str]]:
+    if not isinstance(value, list):
+        return []
+    groups: list[list[str]] = []
+    for item in value:
+        raw_group = item if isinstance(item, list) else [item]
+        group = [str(fragment).strip() for fragment in raw_group if str(fragment).strip()]
+        if group:
+            groups.append(group)
+    return groups
 
 
 def _create_run_dir(output_root: Path, *, mode: str = "planner") -> Path:

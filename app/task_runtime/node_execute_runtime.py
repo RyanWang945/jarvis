@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any, Protocol
 
 from app.agent_react.context_manager import ContextManager
@@ -12,6 +13,7 @@ from app.llm.client import LLMMessage, parse_json_content
 from app.llm.provider_adapters import NormalizedLLMResponse, NormalizedToolCall
 from app.llm.model_profiles import LLMNode
 from app.llm.model_router import ModelRouter
+from app.prompting import PromptRegistry
 from app.repositories import RepositoryRegistryError, get_repository_registry
 from app.skills.bootstrap import get_skill_registry
 from app.skills.rendering import render_loaded_skill_guidance
@@ -27,6 +29,7 @@ from app.task_runtime.coder_provider import (
 )
 from app.task_runtime.node_result import NodeArtifact, NodeError, NodeResult, ResolvedInput
 from app.task_runtime.planner import PlanNode
+from app.task_runtime.session_workspace import NodeRepoCommit, commit_node_repo, prepare_node_repo
 from app.tools.common import ToolExecutionResult
 from app.tools.runtime import build_llm_tools, check_tool_policy, execute_tool, get_tool_definition
 
@@ -385,28 +388,63 @@ class CoderNodeExecuteRuntime:
         except RepositoryRegistryError as exc:
             logger.info("coder node blocked node_id=%s repo_id=%s reason=repository_error error=%s", context.node.id, repo_id, exc)
             return _blocked(context.node, "repository_not_available", str(exc))
+        try:
+            workdir = prepare_node_repo(
+                repo_id=repo.repo_id,
+                project_path=repo.canonical_root_path,
+                runtime_hints=context.runtime_hints,
+            ) or repo.canonical_root_path
+        except (RuntimeError, ValueError, OSError) as exc:
+            logger.info("coder node blocked node_id=%s repo_id=%s reason=node_repo_prepare_failed error=%s", context.node.id, repo_id, exc)
+            return _blocked(context.node, "node_repo_prepare_failed", str(exc))
+        run_dir = _provider_run_dir(context)
         policy = _coder_policy(context)
         if policy.allow_push and not policy.allow_commit:
             return _failed(context.node, "invalid_coder_policy", "allow_push=true requires allow_commit=true.", retryable=False)
+        request_metadata = {
+            "node_id": context.node.id,
+            "project_path": str(repo.canonical_root_path),
+            "workdir": str(workdir),
+        }
+        if run_dir is not None:
+            request_metadata["run_dir"] = str(run_dir)
+        session_id = str(context.runtime_hints.get("session_id") or "").strip()
+        if session_id:
+            request_metadata["session_id"] = session_id
         request = CoderRunRequest(
             repo_id=repo.repo_id,
-            workdir=repo.canonical_root_path,
+            workdir=workdir,
             instruction=_coder_instruction(context),
             policy=policy,
             timeout_seconds=int(getattr(get_settings(), "coder_timeout_seconds", 1800)),
-            metadata={"node_id": context.node.id},
+            run_dir=run_dir,
+            metadata=request_metadata,
         )
         try:
             logger.info(
-                "coder node start node_id=%s repo_id=%s provider=%s access_mode=%s allow_commit=%s allow_push=%s",
+                "coder node start node_id=%s repo_id=%s provider=%s workdir=%s run_dir=%s access_mode=%s allow_commit=%s allow_push=%s",
                 context.node.id,
                 repo_id,
                 self._provider.name,
+                str(workdir),
+                str(run_dir) if run_dir is not None else "",
                 policy.access_mode,
                 policy.allow_commit,
                 policy.allow_push,
             )
             result = self._provider.run(request, decide_action=_decide_coder_action(policy))
+            result = replace(result, metadata={**request.metadata, **result.metadata})
+            if result.ok and policy.access_mode == "write" and _should_auto_commit_node_worktree(context, workdir):
+                try:
+                    result = _commit_coder_node_worktree(
+                        result,
+                        workdir=workdir,
+                        node_id=context.node.id,
+                        objective=context.node.objective,
+                    )
+                except (RuntimeError, OSError) as exc:
+                    logger.exception("coder node worktree commit failed node_id=%s workdir=%s", context.node.id, workdir)
+                    return _failed(context.node, "node_repo_commit_failed", str(exc), retryable=True)
         except Exception as exc:
             logger.exception("coder node failed node_id=%s elapsed_ms=%s", context.node.id, int((time.perf_counter() - started) * 1000))
             return _failed(context.node, "coder_runtime_error", str(exc), retryable=True)
@@ -441,19 +479,9 @@ def _llm_messages(context: NodeExecutionContext) -> list[LLMMessage]:
         "runtime_hints": context.runtime_hints,
         "instructions": context.instructions,
     }
-    messages = [
-        LLMMessage(
-            role="system",
-            content=(
-                "You are Jarvis LLMNodeExecuteRuntime. Execute one plan node without tools. "
-                "Do not produce a final user reply unless the node objective itself is the whole answer. "
-                "Use the temporal_context payload as the authoritative current date/time for relative-time wording. "
-                "Write summary in the user's language when the node output is user-facing. "
-                "Return JSON with summary, optional data, and optional artifacts."
-            ),
-        ),
-        LLMMessage(role="user", content=json.dumps(payload, ensure_ascii=False)),
-    ]
+    messages = PromptRegistry().load("llm_node_execute").render(
+        {"input_json": json.dumps(payload, ensure_ascii=False)}
+    )
     skill_listing = _skill_listing_message()
     if skill_listing is not None:
         messages.append(skill_listing)
@@ -469,24 +497,9 @@ def _react_messages(context: NodeExecutionContext) -> list[LLMMessage]:
         "runtime_hints": context.runtime_hints,
         "instructions": context.instructions,
     }
-    messages = [
-        LLMMessage(
-            role="system",
-            content=(
-                "You are Jarvis ReactNodeExecuteRuntime. Execute one non-repository plan node. "
-                "Use tools when external, business, project-memory, reminder, or artifact-delivery action is needed. "
-                "Use the temporal_context payload as the authoritative current date/time; convert relative terms "
-                "such as today, current, latest, recent, 今天, 当前, 最新, 最近 into concrete date constraints when searching. "
-                "Do not perform code edits, shell commands, repository workflows, or code-agent delegation; "
-                "code and shell work belongs to coder runtime nodes. "
-                "You may use lightweight file and artifact tools for explicit non-code document, report, artifact, or delivery work. "
-                "Do not produce a final user reply. "
-                "After tool use, return JSON with summary, findings, sources, and data. "
-                "Be concise and preserve useful evidence for downstream nodes."
-            ),
-        ),
-        LLMMessage(role="user", content=json.dumps(payload, ensure_ascii=False)),
-    ]
+    messages = PromptRegistry().load("react_node_execute").render(
+        {"input_json": json.dumps(payload, ensure_ascii=False)}
+    )
     skill_listing = _skill_listing_message()
     if skill_listing is not None:
         messages.append(skill_listing)
@@ -561,10 +574,7 @@ def _render_skill_guidance_text(invocations: list[dict[str, Any]]) -> str | None
 
     if not sections:
         return None
-    content = (
-        "Loaded skills for this turn. Follow their procedural guidance when relevant.\n\n"
-        + "\n\n".join(sections)
-    )
+    content = PromptRegistry().load("loaded_skill_guidance").render_text({"skill_sections": "\n\n".join(sections)})
     if len(content) > _MAX_REACT_SKILL_GUIDANCE_CHARS:
         content = content[:_MAX_REACT_SKILL_GUIDANCE_CHARS].rstrip() + "\n\n[Skill content truncated by Jarvis runtime.]"
     return content
@@ -799,35 +809,27 @@ def _first_item_text(item: dict[str, Any], keys: tuple[str, ...]) -> str:
 
 
 def _coder_instruction(context: NodeExecutionContext) -> str:
-    sections = [
-        "Execute one Jarvis plan node as CoderNodeExecuteRuntime.",
-        "",
-        _temporal_context_text(context.runtime_hints),
-        "",
-        f"User objective: {context.user_objective}",
-        f"Node id: {context.node.id}",
-        f"Node objective: {context.node.objective}",
-        f"Expected output: {context.node.expected_output or 'Repository task result.'}",
-    ]
+    resolved_inputs_lines: list[str] = []
     if context.resolved_inputs:
-        sections.extend(["", "Resolved inputs:"])
         for item in context.resolved_inputs:
-            sections.append(f"- {item.ref} ({item.kind}, status={item.source_status or 'n/a'}): {item.summary}")
+            resolved_inputs_lines.append(f"- {item.ref} ({item.kind}, status={item.source_status or 'n/a'}): {item.summary}")
             if item.data:
-                sections.append(f"  data: {json.dumps(item.data, ensure_ascii=False)[:2000]}")
+                resolved_inputs_lines.append(f"  data: {json.dumps(item.data, ensure_ascii=False)[:2000]}")
             if item.artifacts:
                 artifact_refs = ", ".join(f"artifact:{artifact.ref}" for artifact in item.artifacts)
-                sections.append(f"  artifacts: {artifact_refs}")
-    if context.instructions:
-        sections.extend(["", "Additional instructions:", *[f"- {item}" for item in context.instructions]])
-    sections.extend(
-        [
-            "",
-            "Return a concise result suitable for a NodeResult summary.",
-            "Do not ask for routine confirmation. Respect permission limits and request approval only when required.",
-        ]
+                resolved_inputs_lines.append(f"  artifacts: {artifact_refs}")
+    additional_instructions = "\n".join(f"- {item}" for item in context.instructions)
+    return PromptRegistry().load("coder_node_execute").render_text(
+        {
+            "temporal_context": _temporal_context_text(context.runtime_hints),
+            "user_objective": context.user_objective,
+            "node_id": context.node.id,
+            "node_objective": context.node.objective,
+            "expected_output": context.node.expected_output or "Repository task result.",
+            "resolved_inputs_section": "\n".join(resolved_inputs_lines),
+            "additional_instructions_section": additional_instructions,
+        }
     )
-    return "\n".join(sections)
 
 
 def _temporal_context(runtime_hints: dict[str, Any]) -> dict[str, str]:
@@ -847,17 +849,14 @@ def _temporal_context(runtime_hints: dict[str, Any]) -> dict[str, str]:
 
 def _temporal_context_text(runtime_hints: dict[str, Any]) -> str:
     temporal = _temporal_context(runtime_hints)
-    if not temporal:
-        return "Temporal context: unavailable; do not infer current dates from model memory."
-    lines = ["Temporal context:"]
-    if temporal.get("current_date"):
-        lines.append(f"- Current date: {temporal['current_date']}")
-    if temporal.get("current_time"):
-        lines.append(f"- Current time: {temporal['current_time']}")
-    if temporal.get("timezone"):
-        lines.append(f"- Timezone: {temporal['timezone']}")
-    lines.append("- Interpret today/current/latest/recent and 今天/当前/最新/最近 relative to this context.")
-    return "\n".join(lines)
+    return PromptRegistry().load("coder_temporal_context").render_text(
+        {
+            "has_temporal": bool(temporal),
+            "current_date": temporal.get("current_date", ""),
+            "current_time": temporal.get("current_time", ""),
+            "timezone": temporal.get("timezone", ""),
+        }
+    )
 
 
 def _node_result_from_coder(node: PlanNode, result: CoderRunResult, *, provider: str) -> NodeResult:
@@ -896,6 +895,55 @@ def _node_result_from_coder(node: PlanNode, result: CoderRunResult, *, provider:
             else None if result.ok else NodeError(code="coder_provider_failed", message=summary, retryable=False)
         ),
     )
+
+
+def _commit_coder_node_worktree(
+    result: CoderRunResult,
+    *,
+    workdir: Path,
+    node_id: str,
+    objective: str,
+) -> CoderRunResult:
+    node_commit = commit_node_repo(workdir, node_id=node_id, objective=objective)
+    if node_commit is None:
+        return result
+
+    metadata = dict(result.metadata)
+    metadata["node_commit"] = node_commit.metadata()
+    artifacts = _with_node_commit_artifacts(result.artifacts, node_commit)
+    stdout = result.stdout
+    if stdout:
+        stdout = stdout.rstrip() + f"\n\n[JARVIS_NODE_COMMIT]\n{node_commit.short_hash} {node_commit.subject}\n"
+    return replace(result, stdout=stdout, artifacts=artifacts, metadata=metadata)
+
+
+def _should_auto_commit_node_worktree(context: NodeExecutionContext, workdir: Path) -> bool:
+    raw_repos_dir = context.runtime_hints.get("node_repos_dir")
+    if not raw_repos_dir:
+        return False
+    try:
+        workdir.resolve().relative_to(Path(str(raw_repos_dir)).resolve())
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _with_node_commit_artifacts(artifacts: list[str], node_commit: NodeRepoCommit) -> list[str]:
+    result = list(artifacts)
+    commit_artifact = f"git_commit:{node_commit.short_hash}"
+    node_commit_artifact = f"node_git_commit:{node_commit.short_hash}"
+    if commit_artifact not in result:
+        result.append(commit_artifact)
+    if node_commit_artifact not in result:
+        result.append(node_commit_artifact)
+    if "git_worktree:clean" not in result:
+        result = [item for item in result if item != "git_worktree:dirty"]
+        result.append("git_worktree:clean")
+    for path in node_commit.files:
+        file_artifact = f"git_file:{path}"
+        if file_artifact not in result:
+            result.append(file_artifact)
+    return result
 
 
 def _coder_approval_dict(value: Any) -> dict[str, Any]:
@@ -982,6 +1030,14 @@ def _active_repo(context: NodeExecutionContext) -> str | None:
     if isinstance(value, str) and value.strip():
         return value.strip()
     return None
+
+
+def _provider_run_dir(context: NodeExecutionContext) -> Path | None:
+    value = context.runtime_hints.get("provider_run_dir")
+    if value is None:
+        return None
+    text = str(value).strip()
+    return Path(text) if text else None
 
 
 def _coder_policy(context: NodeExecutionContext) -> CoderPolicy:

@@ -1,0 +1,53 @@
+{
+  "default_versions": {
+    "agent_system": "v1",
+    "coder_temporal_context": "v1",
+    "coder_node_execute": "v1",
+    "coder_worker": "v1",
+    "fast_intent": "v1",
+    "heavy_plan": "v2",
+    "kb_eval_gold_span_refine": "v1",
+    "kb_eval_query_generation": "v1",
+    "legacy_completion_assessor": "v1",
+    "legacy_final_answer_synthesizer": "v1",
+    "legacy_planner": "v1",
+    "loaded_skill_guidance": "v1",
+    "llm_node_execute": "v1",
+    "react_node_execute": "v1",
+    "recent_artifacts_context": "v1",
+    "repository_context": "v1",
+    "result_aggregator": "v1",
+    "runtime_temporal_context": "v1",
+    "skill_listing": "v1",
+    "task_plan_context": "v1",
+    "tool_definitions": "v1"
+  },
+  "profiles": {
+    "default": {
+      "agent_system": "v1",
+      "coder_temporal_context": "v1",
+      "coder_node_execute": "v1",
+      "coder_worker": "v1",
+      "fast_intent": "v1",
+      "heavy_plan": "v2",
+      "kb_eval_gold_span_refine": "v1",
+      "kb_eval_query_generation": "v1",
+      "legacy_completion_assessor": "v1",
+      "legacy_final_answer_synthesizer": "v1",
+      "legacy_planner": "v1",
+      "loaded_skill_guidance": "v1",
+      "llm_node_execute": "v1",
+      "react_node_execute": "v1",
+      "recent_artifacts_context": "v1",
+      "repository_context": "v1",
+      "result_aggregator": "v1",
+      "runtime_temporal_context": "v1",
+      "skill_listing": "v1",
+      "task_plan_context": "v1",
+      "tool_definitions": "v1"
+    },
+    "planner_v1": {
+      "heavy_plan": "v1"
+    }
+  }
+}

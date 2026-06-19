@@ -1,0 +1,18 @@
+{
+  "id": "legacy_planner:v1",
+  "scenario": "legacy_planner",
+  "version": "v1",
+  "description": "Legacy tool-call planner prompt preserved for migration history.",
+  "response_format": "json_object",
+  "variables": ["instruction"],
+  "messages": [
+    {
+      "role": "system",
+      "template": "system.md"
+    },
+    {
+      "role": "user",
+      "template": "user.md"
+    }
+  ]
+}

@@ -18,7 +18,6 @@ from app.task_runtime.planner import FinalizationHint, NodeRuntime
 logger = logging.getLogger(__name__)
 
 FastIntentRoute = Literal["fast_reply", "needs_plan"]
-FAST_INTENT_MODEL_PROFILE = "deepseek-v4-flash"
 
 _ROUTE_RUNTIMES: dict[str, NodeRuntime | None] = {
     "fast_reply": None,
@@ -85,12 +84,12 @@ class FastIntentNode:
             raise ValueError("content must not be empty")
 
         session = session_state or ConversationSessionState()
-        resolved = ModelRouter().resolve(LLMNode.INTENT_CLASSIFIER, _fast_intent_model_metadata())
+        prompt = self._prompt_registry.load("fast_intent", self._prompt_version)
+        resolved = ModelRouter().resolve(LLMNode.INTENT_CLASSIFIER, _fast_intent_model_metadata(prompt.model_profile))
         if not resolved.profile.api_key:
             logger.info("fast intent llm skipped reason=missing_api_key profile=%s", resolved.profile.id)
             return FastIntentDecision(route="needs_plan", confidence=0.5, reason="missing LLM API key")
 
-        prompt = self._prompt_registry.load("fast_intent", self._prompt_version)
         response = resolved.client.chat_normalized(
             _fast_intent_messages(
                 text,
@@ -159,8 +158,10 @@ def _temporal_context(runtime_hints: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def _fast_intent_model_metadata() -> dict[str, Any]:
-    return {"model_overrides": {LLMNode.INTENT_CLASSIFIER.value: FAST_INTENT_MODEL_PROFILE}}
+def _fast_intent_model_metadata(model_profile: str | None) -> dict[str, Any]:
+    if not model_profile:
+        return {}
+    return {"model_overrides": {LLMNode.INTENT_CLASSIFIER.value: model_profile}}
 
 
 def _decision_from_payload(payload: dict[str, Any]) -> FastIntentDecision:

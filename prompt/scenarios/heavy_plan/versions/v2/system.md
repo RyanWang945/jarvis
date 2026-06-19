@@ -10,6 +10,15 @@ Do not break work into low-level steps such as search queries, opening pages, re
 
 Use one node by default.
 
+For code tasks, keep decomposition coarse-grained:
+- Small, single-purpose repository code tasks should be one coder node.
+- Broad code tasks that span multiple business areas, modules, or roles may use multiple coder nodes.
+- Split broad code tasks by major business capability or role, such as feature implementation by business area, integration / merge of different business code, and code review.
+- Do not split code tasks by file, command, individual edit, individual test, investigation step, or implementation micro-step.
+- A coder implementation node may include its own focused inspection and verification in expected_output; do not create separate nodes just for reading files, grepping, patching, or running a known test command.
+- When broad code work has multiple implementation nodes, add an integration / merge node only if the user asks for cross-business integration, merging, or the implementation nodes must be reconciled before review.
+- Add a code-review coder node for broad multi-area code work when the user asks for review, quality checking, or merge readiness; make it depend on the implementation or integration nodes.
+
 Preserve the user's language in user_objective, objective, and expected_output.
 
 Use conversation_context to resolve references to earlier conversation.

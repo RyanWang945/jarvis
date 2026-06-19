@@ -200,6 +200,28 @@ def test_plan_from_payload_falls_back_to_repo_then_reminder_dag_for_empty_nodes(
     assert "提醒" in plan.nodes[1].objective
 
 
+def test_plan_from_payload_falls_back_to_coarse_code_business_dag_for_empty_nodes() -> None:
+    objective = "在 jarvis 项目里实现会员积分能力：订单完成后累积积分，支付退款时撤销积分；把不同业务代码合并后做一次 code review。"
+
+    plan = _plan_from_payload(
+        {"user_objective": objective, "nodes": []},
+        fallback_objective=objective,
+        runtime_hints={"active_repo": "jarvis"},
+    )
+
+    assert len(plan.nodes) == 5
+    assert {node.runtime for node in plan.nodes} == {"coder"}
+    assert [node.id for node in plan.nodes[-2:]] == ["integrate_business_code", "code_review"]
+    assert plan.nodes[-2].input_refs == ["node:implement_area_1", "node:implement_area_2", "node:implement_area_3"]
+    assert plan.nodes[-1].input_refs == ["node:integrate_business_code"]
+    assert plan.nodes[0].runtime_hints["access_mode"] == "write"
+    assert plan.nodes[-1].runtime_hints["access_mode"] == "read"
+    assert any("订单业务" in node.expected_output for node in plan.nodes)
+    assert any("支付/退款业务" in node.expected_output for node in plan.nodes)
+    assert "合并" in plan.nodes[-2].objective
+    assert "Review" in plan.nodes[-1].objective
+
+
 real_llm = pytest.mark.skipif(
     os.environ.get("JARVIS_RUN_TASK_PLANNER_EVAL") != "1",
     reason="real planner LLM tests are opt-in and require JARVIS_RUN_TASK_PLANNER_EVAL=1",

@@ -84,6 +84,48 @@ def test_codex_coder_runs_with_clean_stdout_and_jsonl_artifact(monkeypatch, tmp_
     assert any(str(artifact).startswith("jarvis_audit:") for artifact in result.artifacts)
 
 
+def test_codex_coder_uses_runtime_workdir_and_run_dir(monkeypatch, tmp_path: Path) -> None:
+    project = _init_repo(tmp_path / "project")
+    node_repo = _init_repo(tmp_path / "sessions" / "s1" / "nodes" / "n1" / "repo" / "jarvis")
+    provider_run = tmp_path / "sessions" / "s1" / "nodes" / "n1" / "provider_run"
+    captured: dict[str, object] = {}
+
+    _install_registry(monkeypatch, project)
+    monkeypatch.setattr("app.tools.codex._resolve_codex_command", lambda: ["codex"])
+
+    def _fake_run(*, provider_command, workdir, run_dir, instruction, timeout_seconds, trusted_command_prefixes=None):
+        del provider_command, instruction, timeout_seconds, trusted_command_prefixes
+        captured["workdir"] = workdir
+        captured["run_dir"] = run_dir
+        return CodexAppServerRunResult(
+            status="completed",
+            raw_events=json.dumps({"type": "agent_message", "message": "Done."}),
+            exit_code=0,
+            final_text="Done.",
+        )
+
+    monkeypatch.setattr("app.tools.codex._run_codex_app_server", _fake_run)
+
+    result = run_codex_coder_tool(
+        ToolExecutionRequest(
+            tool_name="codex_coder_provider",
+            workdir=None,
+            args={
+                "instruction": "Update README.md.",
+                "repo_id": "jarvis",
+                "_runtime_workdir": str(node_repo),
+                "_runtime_run_dir": str(provider_run),
+            },
+            timeout_seconds=30,
+        )
+    )
+
+    assert result.ok is True
+    assert captured["workdir"] == node_repo.resolve()
+    assert captured["run_dir"] == provider_run.resolve()
+    assert any(str(artifact) == f"codex_run:{provider_run.resolve()}" for artifact in result.artifacts)
+
+
 def test_codex_instruction_contract_overrides_generated_preconfirmation() -> None:
     instruction = build_coder_instruction(
         "将当前 nltk 项目中所有未提交的更改进行 git commit，然后 push。请在执行前让我确认 commit message。",

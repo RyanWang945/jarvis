@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
 from typing import Any, Callable, Literal
 
+from app.prompting import PromptRegistry
 from app.tools.ask_user import run_ask_user
 from app.tools.business_knowledge import run_business_knowledge_search
 from app.tools.common import ToolExecutionRequest, ToolExecutionResult
@@ -41,34 +45,58 @@ class ToolDefinition:
     requires_workdir: bool = False
 
 
+def _tool_description(tool_name: str) -> str:
+    value = _tool_prompt_catalog().get(tool_name, {}).get("description")
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"Missing tool prompt description for {tool_name}")
+    return value.strip()
+
+
+def _property_description(tool_name: str, property_name: str) -> str:
+    properties = _tool_prompt_catalog().get(tool_name, {}).get("properties", {})
+    if not isinstance(properties, dict):
+        properties = {}
+    value = properties.get(property_name)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"Missing tool prompt property description for {tool_name}.{property_name}")
+    return value.strip()
+
+
+def _tool_prompt_catalog() -> dict[str, Any]:
+    bundle = PromptRegistry().load("tool_definitions")
+    return _load_tool_prompt_catalog(str(bundle.version_dir), bundle.fingerprint)
+
+
+@lru_cache(maxsize=16)
+def _load_tool_prompt_catalog(version_dir: str, fingerprint: str) -> dict[str, Any]:
+    del fingerprint
+    path = Path(version_dir) / "catalog.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("tool_definitions catalog must be a JSON object")
+    return payload
+
+
 def builtin_tool_definitions() -> list[ToolDefinition]:
     return [
         ToolDefinition(
             name="read_file",
-            description=(
-                "Read a known local workspace file by path for lightweight inspection. "
-                "Use this for file content snippets, logs, configuration files, and existence checks when a specific path is known. "
-                "Use it when the user's final goal is to inspect, verify, or deliver a specific file or artifact. "
-                "This tool is read-only and returns bounded text content plus file metadata. "
-                "Do not use it as the primary strategy when the user needs repository-level judgment such as "
-                "architecture analysis, integration planning, code review, design recommendations, execution-chain analysis, "
-                "or multi-file reasoning; use a coder runtime node for those."
-            ),
+            description=_tool_description("read_file"),
             args_schema={
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Workspace-relative file path such as app/tools/runtime.py.",
+                        "description": _property_description("read_file", "path"),
                     },
                     "start_line": {
                         "type": "integer",
-                        "description": "1-based line number to start reading from. Defaults to 1.",
+                        "description": _property_description("read_file", "start_line"),
                         "default": 1,
                     },
                     "max_lines": {
                         "type": "integer",
-                        "description": "Maximum lines to return, capped by the runtime. Defaults to 200.",
+                        "description": _property_description("read_file", "max_lines"),
                         "default": 200,
                     },
                 },
@@ -79,31 +107,23 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
         ),
         ToolDefinition(
             name="search_files",
-            description=(
-                "Search local workspace files without invoking shell commands. "
-                "Use mode=path to find files by path/name or check exact path existence; use mode=content for bounded text search. "
-                "Use this when the user's final goal is to locate, verify, read, or deliver a specific known or guessable file/path/artifact. "
-                "This tool is read-only and returns matching paths plus small metadata or previews. "
-                "Do not use it as the primary strategy when the user needs repository-level judgment such as "
-                "architecture analysis, integration planning, code review, design recommendations, execution-chain analysis, "
-                "or multi-file reasoning; use a coder runtime node for those."
-            ),
+            description=_tool_description("search_files"),
             args_schema={
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Path/name/content query to search inside the workspace.",
+                        "description": _property_description("search_files", "query"),
                     },
                     "mode": {
                         "type": "string",
                         "enum": ["path", "content"],
-                        "description": "path searches file paths and exact existence; content searches file text.",
+                        "description": _property_description("search_files", "mode"),
                         "default": "path",
                     },
                     "max_results": {
                         "type": "integer",
-                        "description": "Maximum results to return, capped by the runtime.",
+                        "description": _property_description("search_files", "max_results"),
                         "default": 20,
                     },
                 },
@@ -114,11 +134,7 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
         ),
         ToolDefinition(
             name="shell_inspect",
-            description=(
-                "Inspect the local environment and repository using read-only shell commands. "
-                "Use this for listing files, reading file content, searching text, and checking git or tool status. "
-                "Do NOT use this for web searches, factual lookups, or current events."
-            ),
+            description=_tool_description("shell_inspect"),
             args_schema={
                 "type": "object",
                 "properties": {
@@ -131,13 +147,7 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
         ),
         ToolDefinition(
             name="shell_run_command",
-            description=(
-                "Run one explicit local shell command after Jarvis safety checks. "
-                "Use this for targeted commands such as tests, lint, build, or diagnostic commands. "
-                "Do NOT use this for web searches, factual lookups, or current events. "
-                "Do not use this for multi-step repository workflows, code editing, git commit, or git push; "
-                "use a coder runtime node for those."
-            ),
+            description=_tool_description("shell_run_command"),
             args_schema={
                 "type": "object",
                 "properties": {
@@ -152,23 +162,17 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
         ),
         ToolDefinition(
             name="ask_user",
-            description=(
-                "Ask the user one concise clarification question when required information is missing. "
-                "Use this when Jarvis cannot safely continue without a user choice, such as an ambiguous target, "
-                "unclear time, missing recipient, missing repository, or a required preference. "
-                "Do not use ask_user for permission to perform coder runtime operations; provider approvals have their own flow. "
-                "Ask only the minimum necessary question, then stop and wait for the user's reply."
-            ),
+            description=_tool_description("ask_user"),
             args_schema={
                 "type": "object",
                 "properties": {
                     "question": {
                         "type": "string",
-                        "description": "The exact short question to show to the user.",
+                        "description": _property_description("ask_user", "question"),
                     },
                     "reason": {
                         "type": "string",
-                        "description": "Brief internal reason why the answer is needed.",
+                        "description": _property_description("ask_user", "reason"),
                     },
                     "expected_answer_type": {
                         "type": "string",
@@ -178,7 +182,7 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
                     "choices": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Optional concise choices when expected_answer_type is choice.",
+                        "description": _property_description("ask_user", "choices"),
                     },
                 },
                 "required": ["question"],
@@ -188,29 +192,21 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
         ),
         ToolDefinition(
             name="tool_search",
-            description=(
-                "Search Jarvis's tool catalog when the currently exposed low-risk tools cannot satisfy the user's request. "
-                "This tool only discovers candidate tools; it never executes them and never grants permission by itself. "
-                "Tool discovery is internal: never tell the user you are searching available tools or looking up related tools. "
-                "Use it before asking for a hidden capability such as reminders, web search, repository work, or wiki writes. "
-                "If the request can be answered from the current conversation without any tool, or no suitable tool exists, "
-                "return no_capable_tool rather than forcing a tool. Never use tool_search as a retry mechanism after an "
-                "unrelated tool failure unless the original user request still clearly needs another capability."
-            ),
+            description=_tool_description("tool_search"),
             args_schema={
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Capability search query, expanded from the user's request without adding new intent.",
+                        "description": _property_description("tool_search", "query"),
                     },
                     "original_user_request": {
                         "type": "string",
-                        "description": "The user's original request or the relevant quoted part of it.",
+                        "description": _property_description("tool_search", "original_user_request"),
                     },
                     "max_results": {
                         "type": "integer",
-                        "description": "Maximum candidate tools to return. Defaults to 3.",
+                        "description": _property_description("tool_search", "max_results"),
                         "default": 3,
                     },
                 },
@@ -221,21 +217,16 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
         ),
         ToolDefinition(
             name="Skill",
-            description=(
-                "Load one Jarvis skill by skill_id from the skill listing. "
-                "Use this when the user's task matches an available skill. "
-                "Loading a skill reveals turn-scoped procedural guidance for the next model step; it does not execute scripts, "
-                "grant permissions, perform routing, replace the planner, or complete the task by itself."
-            ),
+            description=_tool_description("Skill"),
             args_schema={
                 "type": "object",
                 "properties": {
                     "skill": {
                         "type": "string",
-                        "description": "The skill_id from the skill listing, such as weather-1.0.0 or image-artifact-planner-1.0.0.",
+                        "description": _property_description("Skill", "skill"),
                     },
                     "args": {
-                        "description": "Optional user-provided arguments or context for the skill.",
+                        "description": _property_description("Skill", "args"),
                     },
                 },
                 "required": ["skill"],
@@ -245,21 +236,16 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
         ),
         ToolDefinition(
             name="load_skill",
-            description=(
-                "Load one Jarvis skill by skill_id from the skill listing. "
-                "Use this when the user's task matches an available skill. "
-                "Loading a skill only reveals turn-scoped procedural guidance; it does not execute scripts, "
-                "grant permissions, perform routing, replace the planner, or complete the task by itself."
-            ),
+            description=_tool_description("load_skill"),
             args_schema={
                 "type": "object",
                 "properties": {
                     "skill": {
                         "type": "string",
-                        "description": "The skill_id from the skill listing, such as weather-1.0.0 or image-artifact-planner-1.0.0.",
+                        "description": _property_description("load_skill", "skill"),
                     },
                     "args": {
-                        "description": "Optional user-provided arguments or context for the skill.",
+                        "description": _property_description("load_skill", "args"),
                     },
                 },
                 "required": ["skill"],
@@ -270,27 +256,21 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
         ),
         ToolDefinition(
             name="load_skill_guidance",
-            description=(
-                "Load task-specific procedural guidance from Jarvis skills. "
-                "Use this before delegating to Codex, generating artifacts, operating on external channels, "
-                "or performing a multi-step workflow when no relevant loaded skill guidance is already present. "
-                "This tool only loads guidance for the current turn; it does not execute the task, change files, "
-                "call Codex, upload attachments, or grant permissions."
-            ),
+            description=_tool_description("load_skill_guidance"),
             args_schema={
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "The user task or workflow capability to match against installed Jarvis skills.",
+                        "description": _property_description("load_skill_guidance", "query"),
                     },
                     "intent": {
                         "type": "string",
-                        "description": "Optional normalized intent, such as image artifact generation or repository workflow.",
+                        "description": _property_description("load_skill_guidance", "intent"),
                     },
                     "max_results": {
                         "type": "integer",
-                        "description": "Maximum skills to load. Defaults to 3.",
+                        "description": _property_description("load_skill_guidance", "max_results"),
                         "default": 3,
                     },
                 },
@@ -302,10 +282,7 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
         ),
         ToolDefinition(
             name="obsidian_wiki_query",
-            description=(
-                "Query the obsidian_wiki long-term knowledge store. "
-                "Use this for project memory, concepts, decisions, and supporting raw evidence."
-            ),
+            description=_tool_description("obsidian_wiki_query"),
             args_schema={
                 "type": "object",
                 "properties": {
@@ -317,11 +294,11 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
                     },
                     "workspace_path": {
                         "type": "string",
-                        "description": "Obsidian wiki workspace root containing vault/ and system/. Defaults to data/obsidian_wiki.",
+                        "description": _property_description("obsidian_wiki_query", "workspace_path"),
                     },
                     "vault_path": {
                         "type": "string",
-                        "description": "Deprecated alias for workspace_path.",
+                        "description": _property_description("obsidian_wiki_query", "vault_path"),
                     },
                 },
                 "required": ["query"],
@@ -330,10 +307,7 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
         ),
         ToolDefinition(
             name="obsidian_wiki_draft",
-            description=(
-                "Create a candidate obsidian_wiki draft for stable knowledge such as design, decisions, concepts, or playbooks. "
-                "This does not write to the formal wiki page."
-            ),
+            description=_tool_description("obsidian_wiki_draft"),
             args_schema={
                 "type": "object",
                 "properties": {
@@ -350,11 +324,11 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
                     "target_hint": {"type": "string"},
                     "workspace_path": {
                         "type": "string",
-                        "description": "Obsidian wiki workspace root containing vault/ and system/. Defaults to data/obsidian_wiki.",
+                        "description": _property_description("obsidian_wiki_draft", "workspace_path"),
                     },
                     "vault_path": {
                         "type": "string",
-                        "description": "Deprecated alias for workspace_path.",
+                        "description": _property_description("obsidian_wiki_draft", "vault_path"),
                     },
                 },
                 "required": ["title", "page_type", "content"],
@@ -363,10 +337,7 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
         ),
         ToolDefinition(
             name="obsidian_wiki_apply",
-            description=(
-                "Apply a previously created obsidian_wiki draft to the formal wiki. "
-                "Use this only after user confirmation."
-            ),
+            description=_tool_description("obsidian_wiki_apply"),
             args_schema={
                 "type": "object",
                 "properties": {
@@ -374,11 +345,11 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
                     "target_page": {"type": "string"},
                     "workspace_path": {
                         "type": "string",
-                        "description": "Obsidian wiki workspace root containing vault/ and system/. Defaults to data/obsidian_wiki.",
+                        "description": _property_description("obsidian_wiki_apply", "workspace_path"),
                     },
                     "vault_path": {
                         "type": "string",
-                        "description": "Deprecated alias for workspace_path.",
+                        "description": _property_description("obsidian_wiki_apply", "vault_path"),
                     },
                 },
                 "required": ["draft_id"],
@@ -387,19 +358,17 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
         ),
         ToolDefinition(
             name="obsidian_wiki_maintain",
-            description=(
-                "Run lightweight maintenance on the obsidian_wiki vault, such as checking frontmatter, page types, source ids, and dead links."
-            ),
+            description=_tool_description("obsidian_wiki_maintain"),
             args_schema={
                 "type": "object",
                 "properties": {
                     "workspace_path": {
                         "type": "string",
-                        "description": "Obsidian wiki workspace root containing vault/ and system/. Defaults to data/obsidian_wiki.",
+                        "description": _property_description("obsidian_wiki_maintain", "workspace_path"),
                     },
                     "vault_path": {
                         "type": "string",
-                        "description": "Deprecated alias for workspace_path.",
+                        "description": _property_description("obsidian_wiki_maintain", "vault_path"),
                     },
                 },
             },
@@ -407,13 +376,7 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
         ),
         ToolDefinition(
             name="business_knowledge_search",
-            description=(
-                "Query the OpenSearch-backed business knowledge store. "
-                "Use this for business corpora such as deep research materials, imported documents, "
-                "Wikipedia-style reference corpora, and SEC filings. "
-                "Do not use this for personal memory, user notes, project decisions, or Obsidian wiki pages; "
-                "use obsidian_wiki_query for those."
-            ),
+            description=_tool_description("business_knowledge_search"),
             args_schema={
                 "type": "object",
                 "properties": {
@@ -425,28 +388,25 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
                     },
                     "language": {
                         "type": "string",
-                        "description": "Corpus language, default zh; sec_filing defaults to en.",
+                        "description": _property_description("business_knowledge_search", "language"),
                     },
                     "chunk_profile_id": {"type": "string"},
                     "top_k": {"type": "integer", "default": 5, "minimum": 1, "maximum": 20},
                     "source_type": {
                         "type": "string",
-                        "description": (
-                            "Optional business source type, for example wikipedia, "
-                            "deep_research, sec_filing, or generic."
-                        ),
+                        "description": _property_description("business_knowledge_search", "source_type"),
                     },
-                    "source_id": {"type": "string", "description": "Optional exact source id filter."},
+                    "source_id": {"type": "string", "description": _property_description("business_knowledge_search", "source_id")},
                     "source_ids": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Optional list of source ids to search within.",
+                        "description": _property_description("business_knowledge_search", "source_ids"),
                     },
-                    "ticker": {"type": "string", "description": "SEC filing ticker filter."},
-                    "company_name": {"type": "string", "description": "SEC filing company filter."},
-                    "form_type": {"type": "string", "description": "SEC filing form type such as 10-K or 10-Q."},
-                    "fiscal_year": {"type": "integer", "description": "SEC filing fiscal year filter."},
-                    "section_title": {"type": "string", "description": "SEC filing section title filter."},
+                    "ticker": {"type": "string", "description": _property_description("business_knowledge_search", "ticker")},
+                    "company_name": {"type": "string", "description": _property_description("business_knowledge_search", "company_name")},
+                    "form_type": {"type": "string", "description": _property_description("business_knowledge_search", "form_type")},
+                    "fiscal_year": {"type": "integer", "description": _property_description("business_knowledge_search", "fiscal_year")},
+                    "section_title": {"type": "string", "description": _property_description("business_knowledge_search", "section_title")},
                 },
                 "required": ["query"],
             },
@@ -454,22 +414,17 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
         ),
         ToolDefinition(
             name="write_file",
-            description=(
-                "Write a UTF-8 markdown file inside the local Jarvis workspace. "
-                "Use this when the user explicitly asks to create or overwrite a markdown file in the repository. "
-                "Always provide a workspace-relative .md path. Do not guess paths outside the project. "
-                "If the target directory does not already exist, stop and ask the user before proceeding."
-            ),
+            description=_tool_description("write_file"),
             args_schema={
                 "type": "object",
                 "properties": {
                     "relative_path": {
                         "type": "string",
-                        "description": "Workspace-relative markdown path such as docs/research/2026-05/example.md",
+                        "description": _property_description("write_file", "relative_path"),
                     },
                     "content": {
                         "type": "string",
-                        "description": "Full markdown content to write.",
+                        "description": _property_description("write_file", "content"),
                     },
                 },
                 "required": ["relative_path", "content"],
@@ -479,14 +434,7 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
         ),
         ToolDefinition(
             name="scheduled_task",
-            description=(
-                "Create, list, or remove Jarvis reminder tasks when the user asks to be reminded, "
-                "notified later, woken up, or shown/cancelled existing reminders. "
-                "Use natural-language time_text such as 今天10点 or in 20 minutes; "
-                "Jarvis parses and validates the concrete schedule. "
-                "The runtime supplies conversation_id, platform, and external_chat_id automatically; "
-                "do not ask the user for those fields."
-            ),
+            description=_tool_description("scheduled_task"),
             args_schema={
                 "type": "object",
                 "properties": {
@@ -505,32 +453,25 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
         ),
         ToolDefinition(
             name="deliver_file",
-            description=(
-                "Deliver a previously generated local artifact or an explicitly requested workspace file "
-                "to the current conversation channel. Use only when the user explicitly asks to send, "
-                "resend, upload, or deliver a file/image. Do not use this as part of ordinary image "
-                "generation; generated artifacts are delivered automatically by the runtime. Prefer "
-                "artifact_id for historical artifacts and use path only when the user explicitly names a file. "
-                "The runtime supplies conversation_id, turn_id, platform, and external_chat_id automatically."
-            ),
+            description=_tool_description("deliver_file"),
             args_schema={
                 "type": "object",
                 "properties": {
                     "artifact_id": {
                         "type": "string",
-                        "description": "Preferred artifact id to deliver or redeliver.",
+                        "description": _property_description("deliver_file", "artifact_id"),
                     },
                     "path": {
                         "type": "string",
-                        "description": "Workspace-local file path fallback when artifact_id is unavailable.",
+                        "description": _property_description("deliver_file", "path"),
                     },
                     "file_path": {
                         "type": "string",
-                        "description": "Deprecated alias for path.",
+                        "description": _property_description("deliver_file", "file_path"),
                     },
                     "filename": {
                         "type": "string",
-                        "description": "Optional display filename.",
+                        "description": _property_description("deliver_file", "filename"),
                     },
                 },
                 "anyOf": [
@@ -544,45 +485,40 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
         ),
         ToolDefinition(
             name="x_search",
-            description=(
-                "Use xAI server-side X/Twitter search for direct public X/Twitter post lookup. "
-                "Use this specialized tool for direct X/Twitter search when the user asks for latest twitter posts, X/Twitter discussion, "
-                "public posts from handles, or queries like 马斯克的最新twitter. "
-                "Prefer this over tavily_search when the user's target is specifically X/Twitter content."
-            ),
+            description=_tool_description("x_search"),
             args_schema={
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "The X/Twitter search query.",
+                        "description": _property_description("x_search", "query"),
                     },
                     "handles": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Optional X handles to include, without @.",
+                        "description": _property_description("x_search", "handles"),
                     },
                     "exclude_handles": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Optional X handles to exclude, without @.",
+                        "description": _property_description("x_search", "exclude_handles"),
                     },
                     "date_from": {
                         "type": "string",
-                        "description": "Optional lower date bound in YYYY-MM-DD.",
+                        "description": _property_description("x_search", "date_from"),
                     },
                     "date_to": {
                         "type": "string",
-                        "description": "Optional upper date bound in YYYY-MM-DD.",
+                        "description": _property_description("x_search", "date_to"),
                     },
                     "max_results": {
                         "type": "integer",
-                        "description": "Desired maximum result count, 1-20.",
+                        "description": _property_description("x_search", "max_results"),
                         "default": 10,
                     },
                     "model": {
                         "type": "string",
-                        "description": "Optional xAI responses model override.",
+                        "description": _property_description("x_search", "model"),
                     },
                 },
                 "required": ["query"],
@@ -593,47 +529,40 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
         ),
         ToolDefinition(
             name="tavily_search",
-            description=(
-                "Search the web using Tavily AI Search API. "
-                "Use this when the user asks about current events, facts, or anything that requires up-to-date information from the internet. "
-                "It can also find indexed X/Twitter pages or web coverage of X/Twitter activity when a general web/news search is enough; "
-                "prefer the specialized x_search tool when the user specifically asks for direct X/Twitter posts. "
-                "Search ONCE per question. After receiving results, summarize them and reply to the user immediately. "
-                "Do NOT search the same topic multiple times."
-            ),
+            description=_tool_description("tavily_search"),
             args_schema={
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "The search query string.",
+                        "description": _property_description("tavily_search", "query"),
                     },
                     "search_depth": {
                         "type": "string",
                         "enum": ["basic", "advanced"],
-                        "description": "'basic' for fast results (1-2s), 'advanced' for comprehensive research (5-10s).",
+                        "description": _property_description("tavily_search", "search_depth"),
                         "default": "basic",
                     },
                     "topic": {
                         "type": "string",
                         "enum": ["general", "news"],
-                        "description": "'general' for broad web search, 'news' for current events in the last 7 days.",
+                        "description": _property_description("tavily_search", "topic"),
                         "default": "general",
                     },
                     "max_results": {
                         "type": "integer",
-                        "description": "Maximum number of results to return (1-10).",
+                        "description": _property_description("tavily_search", "max_results"),
                         "default": 5,
                     },
                     "include_domains": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Optional list of domains to specifically include.",
+                        "description": _property_description("tavily_search", "include_domains"),
                     },
                     "exclude_domains": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Optional list of domains to exclude.",
+                        "description": _property_description("tavily_search", "exclude_domains"),
                     },
                 },
                 "required": ["query"],

@@ -43,7 +43,10 @@ def run_codex_coder_tool(request: ToolExecutionRequest) -> ToolExecutionResult:
     except RepositoryRegistryError as exc:
         return ToolExecutionResult(ok=False, exit_code=None, summary=str(exc))
 
-    workdir = repo.canonical_root_path
+    try:
+        workdir = _runtime_workdir(request, repo)
+    except RepositoryRegistryError as exc:
+        return ToolExecutionResult(ok=False, exit_code=None, summary=str(exc))
 
     provider_command = _resolve_codex_command()
     if provider_command is None:
@@ -51,7 +54,7 @@ def run_codex_coder_tool(request: ToolExecutionRequest) -> ToolExecutionResult:
 
     settings = get_settings()
     run_id = uuid4().hex
-    run_dir = _coder_run_dir(run_id)
+    run_dir = _runtime_run_dir(request.args, run_id)
     run_dir.mkdir(parents=True, exist_ok=True)
     allow_commit = bool(request.args.get("allow_commit"))
     allow_push = bool(request.args.get("allow_push"))
@@ -344,6 +347,23 @@ def _resolve_repository(request: ToolExecutionRequest) -> tuple[RepositoryRef, l
         return repo, warnings
 
     raise RepositoryRegistryError("Coder repo_id or registered workdir is required.")
+
+
+def _runtime_workdir(request: ToolExecutionRequest, repo: RepositoryRef) -> Path:
+    raw = str(request.args.get("_runtime_workdir") or "").strip()
+    if not raw:
+        return repo.canonical_root_path
+    path = Path(raw).resolve()
+    if not path.is_dir():
+        raise RepositoryRegistryError(f"Runtime workdir does not exist: {path}")
+    return path
+
+
+def _runtime_run_dir(args: dict[str, object], run_id: str) -> Path:
+    raw = str(args.get("_runtime_run_dir") or "").strip()
+    if raw:
+        return Path(raw).resolve()
+    return _coder_run_dir(run_id)
 
 
 def _resolve_codex_command() -> list[str] | None:

@@ -9,6 +9,12 @@ from app.progress import ProgressReporter, ensure_progress
 from app.task_runtime.node_execute_runtime import NodeExecuteRuntime, NodeExecutionContext
 from app.task_runtime.node_result import ExecutionReport, NodeArtifact, NodeError, NodeResult, ResolvedInput
 from app.task_runtime.planner import ExecutionPlan, NodeRuntime, PlanNode
+from app.task_runtime.session_workspace import (
+    SessionWorkspaceRef,
+    node_workspace_hints,
+    write_node_input_snapshot,
+    write_node_result,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +32,7 @@ class NodeExecutor:
         runtime_hints: dict[str, Any] | None = None,
         instructions: list[str] | None = None,
         progress: ProgressReporter | None = None,
+        session_workspace: SessionWorkspaceRef | None = None,
     ) -> ExecutionReport:
         progress = ensure_progress(progress)
         artifact_index = _artifact_index(artifacts or [])
@@ -77,6 +84,21 @@ class NodeExecutor:
                         "resolved_input_count": len(resolved_inputs),
                     },
                 )
+                merged_runtime_hints = dict(runtime_hints or {})
+                if session_workspace is not None:
+                    merged_runtime_hints.update(session_workspace.runtime_hints())
+                merged_runtime_hints.update(node_workspace_hints(session_workspace, node.id))
+                merged_runtime_hints.update(node.runtime_hints)
+                node_workspace = session_workspace.node(node.id) if session_workspace is not None else None
+                if node_workspace is not None:
+                    write_node_input_snapshot(
+                        node_workspace,
+                        user_objective=plan.user_objective,
+                        node=node,
+                        resolved_inputs=resolved_inputs,
+                        runtime_hints=merged_runtime_hints,
+                        instructions=list(instructions or []),
+                    )
                 if runtime is None:
                     result = _blocked_result(
                         node,
@@ -84,8 +106,6 @@ class NodeExecutor:
                         f"No NodeExecuteRuntime registered for runtime: {node.runtime}",
                     )
                 else:
-                    merged_runtime_hints = dict(runtime_hints or {})
-                    merged_runtime_hints.update(node.runtime_hints)
                     result = runtime.run(
                         NodeExecutionContext(
                             user_objective=plan.user_objective,
@@ -95,6 +115,8 @@ class NodeExecutor:
                             instructions=list(instructions or []),
                         )
                     )
+                if node_workspace is not None:
+                    write_node_result(node_workspace, result)
                 logger.info(
                     "node executor node finished node_id=%s runtime=%s status=%s artifact_count=%s elapsed_ms=%s summary_preview=%s",
                     result.node_id,
@@ -128,6 +150,23 @@ class NodeExecutor:
                     _, missing_refs, blocked_refs = _resolve_inputs(node, artifact_index, result_index)
                     message = _blocked_message(missing_refs, blocked_refs)
                     result = _blocked_result(node, "unresolved_input_refs", message)
+                    if session_workspace is not None:
+                        node_workspace = session_workspace.node(node.id)
+                        merged_runtime_hints = dict(runtime_hints or {})
+                        merged_runtime_hints.update(session_workspace.runtime_hints())
+                        merged_runtime_hints.update(node_workspace_hints(session_workspace, node.id))
+                        merged_runtime_hints.update(node.runtime_hints)
+                        write_node_input_snapshot(
+                            node_workspace,
+                            user_objective=plan.user_objective,
+                            node=node,
+                            resolved_inputs=[],
+                            runtime_hints=merged_runtime_hints,
+                            instructions=list(instructions or []),
+                            missing_refs=missing_refs,
+                            blocked_refs=blocked_refs,
+                        )
+                        write_node_result(node_workspace, result)
                     logger.warning(
                         "node executor node blocked node_id=%s runtime=%s missing_refs=%s blocked_refs=%s message=%s",
                         node.id,
