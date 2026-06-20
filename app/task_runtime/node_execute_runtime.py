@@ -718,17 +718,13 @@ def _llm_result_from_response(
     if reply:
         data = dict(data)
         data.setdefault("reply", reply)
-    if tool_calls:
-        data = dict(data)
-        data["tool_calls"] = tool_calls
-    if usage_records:
-        data = dict(data)
-        data["usage_records"] = list(usage_records)
     return NodeResult(
         node_id=context.node.id,
         runtime="llm",
         status="completed",
         summary=summary or "LLM runtime completed.",
+        tool_calls=tool_calls,
+        usage_records=usage_records,
         data=data,
         artifacts=_artifacts_from_payload(payload),
     )
@@ -768,14 +764,13 @@ def _react_result_from_response(
         data.setdefault("sources", sources)
     else:
         data.setdefault("sources", [])
-    data["tool_calls"] = tool_calls
-    if usage_records:
-        data["usage_records"] = list(usage_records)
     return NodeResult(
         node_id=context.node.id,
         runtime="react",
         status="completed",
         summary=summary or "React runtime completed.",
+        tool_calls=tool_calls,
+        usage_records=usage_records,
         data=data,
         artifacts=_artifacts_from_payload(payload),
     )

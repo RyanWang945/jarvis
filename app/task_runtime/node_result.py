@@ -63,6 +63,8 @@ class NodeResult(BaseModel):
     summary: str = ""
     artifacts: list[NodeArtifact] = Field(default_factory=list)
     approval_requests: list[dict[str, Any]] = Field(default_factory=list)
+    tool_calls: list[dict[str, Any]] = Field(default_factory=list)
+    usage_records: list[dict[str, Any]] = Field(default_factory=list)
     data: dict[str, Any] = Field(default_factory=dict)
     error: NodeError | None = None
 
@@ -80,6 +82,13 @@ class NodeResult(BaseModel):
         if not isinstance(value, list):
             return []
         return approval_request_dicts(value)
+
+    @field_validator("tool_calls", "usage_records", mode="before")
+    @classmethod
+    def _dict_list(cls, value: Any) -> list[dict[str, Any]]:
+        if not isinstance(value, list):
+            return []
+        return [dict(item) for item in value if isinstance(item, dict)]
 
 
 class ResolvedInput(BaseModel):

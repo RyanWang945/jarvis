@@ -224,7 +224,7 @@ def test_react_node_execute_runtime_runs_tool_loop() -> None:
     assert result.status == "completed"
     assert result.summary == "found evidence"
     assert result.data["findings"] == ["trace matters"]
-    assert result.data["tool_calls"][0]["tool_name"] == "business_knowledge_search"
+    assert result.tool_calls[0]["tool_name"] == "business_knowledge_search"
     assert executed == [("business_knowledge_search", {"query": "agent testing"}, 60)]
     tool_names = {tool["function"]["name"] for tool in chat.calls[0]["tools"]}
     assert "business_knowledge_search" in tool_names
@@ -292,9 +292,9 @@ def test_react_node_execute_runtime_rejects_coder_only_tool_calls_before_runner(
     )
 
     assert result.status == "completed"
-    assert result.data["tool_calls"][0]["status"] == "rejected"
-    assert result.data["tool_calls"][1]["status"] == "rejected"
-    assert "cannot execute coder-only actions" in result.data["tool_calls"][0]["summary"]
+    assert result.tool_calls[0]["status"] == "rejected"
+    assert result.tool_calls[1]["status"] == "rejected"
+    assert "cannot execute coder-only actions" in result.tool_calls[0]["summary"]
 
 
 def test_react_node_execute_runtime_allows_lightweight_file_tools() -> None:
@@ -328,7 +328,7 @@ def test_react_node_execute_runtime_allows_lightweight_file_tools() -> None:
     )
 
     assert result.status == "completed"
-    assert result.data["tool_calls"][0]["status"] == "completed"
+    assert result.tool_calls[0]["status"] == "completed"
     assert executed == [("read_file", {"path": "docs/example.md"})]
 
 
@@ -440,8 +440,8 @@ def test_react_node_execute_runtime_lets_model_load_skill(monkeypatch, tmp_path)
     assert registry.get("react-skill").skill_id == "react-skill"
     assert result.status == "completed"
     assert result.summary == "used react skill"
-    assert result.data["tool_calls"][0]["tool_name"] == "Skill"
-    assert result.data["tool_calls"][0]["loaded_skill"]["name"] == "react-skill"
+    assert result.tool_calls[0]["tool_name"] == "Skill"
+    assert result.tool_calls[0]["loaded_skill"]["name"] == "react-skill"
     assert {tool["function"]["name"] for tool in chat.calls[0]["tools"]} >= {"Skill", "tavily_search"}
     second_call_text = "\n\n".join(str(message.content) for message in chat.calls[1]["messages"])
     assert "[Skill: react-skill]" in second_call_text
@@ -483,7 +483,7 @@ def test_llm_node_execute_runtime_can_load_skill_for_own_call(monkeypatch, tmp_p
 
     assert result.status == "completed"
     assert result.summary == "used llm skill"
-    assert result.data["tool_calls"][0]["tool_name"] == "Skill"
+    assert result.tool_calls[0]["tool_name"] == "Skill"
     assert {tool["function"]["name"] for tool in chat.calls[0]["tools"]} == {"Skill"}
     first_call_text = "\n\n".join(str(message.content) for message in chat.calls[0]["messages"])
     assert "- llm-skill:" in first_call_text

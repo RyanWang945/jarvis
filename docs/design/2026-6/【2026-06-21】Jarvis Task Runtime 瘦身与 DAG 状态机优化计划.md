@@ -428,6 +428,8 @@ debug
 
 已执行迁移：`NodeResult` 已新增顶层 `approval_requests`，coder node 新写入路径不再把 approval request 列表写入 `data["approval_requests"]`。聚合层仍保留读取旧 `data["approval_requests"]` 的兼容 fallback。
 
+已执行迁移：`NodeResult` 已新增顶层 `tool_calls` 和 `usage_records`。LLM/React runtime 新写入路径使用顶层字段；artifact 发布和 usage 汇总保留旧 `data["tool_calls"]` / `data["usage_records"]` 读取兼容。coder finalizer 的 usage 仍待后续迁移。
+
 ### 3.6 `runtime_hints`
 
 需要拆成以下对象：

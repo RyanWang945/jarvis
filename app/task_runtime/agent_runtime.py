@@ -546,7 +546,7 @@ def _tool_artifact_payloads(result: NodeResult) -> list[dict[str, Any]]:
     raw_items = result.data.get("tool_artifacts")
     if isinstance(raw_items, list):
         payloads.extend(item for item in raw_items if isinstance(item, dict))
-    raw_calls = result.data.get("tool_calls")
+    raw_calls = result.tool_calls or result.data.get("tool_calls")
     if isinstance(raw_calls, list):
         for call in raw_calls:
             if not isinstance(call, dict):

@@ -80,28 +80,26 @@ class UsageRuntime:
             runtime=context.node.runtime,
             status="completed",
             summary="node result with usage",
-            data={
-                "usage_records": [
-                    {
-                        "source": "llm",
-                        "provider": "deepseek",
-                        "model": "deepseek-v4-flash",
-                        "stage": "llm_node",
-                        "prompt_tokens": 100,
-                        "completion_tokens": 25,
-                        "total_tokens": 125,
-                    },
-                    {
-                        "source": "codex_app_server",
-                        "provider": "codex",
-                        "model": "codex",
-                        "stage": "coder",
-                        "prompt_tokens": 200,
-                        "completion_tokens": 50,
-                        "total_tokens": 250,
-                    },
-                ]
-            },
+            usage_records=[
+                {
+                    "source": "llm",
+                    "provider": "deepseek",
+                    "model": "deepseek-v4-flash",
+                    "stage": "llm_node",
+                    "prompt_tokens": 100,
+                    "completion_tokens": 25,
+                    "total_tokens": 125,
+                },
+                {
+                    "source": "codex_app_server",
+                    "provider": "codex",
+                    "model": "codex",
+                    "stage": "coder",
+                    "prompt_tokens": 200,
+                    "completion_tokens": 50,
+                    "total_tokens": 250,
+                },
+            ],
         )
 
 
@@ -140,26 +138,24 @@ class NestedToolArtifactRuntime(ArtifactRuntime):
             runtime=context.node.runtime,
             status="completed",
             summary="generated image",
-            data={
-                "tool_calls": [
-                    {
-                        "id": "call_1",
-                        "tool_name": "write_image",
-                        "status": "completed",
-                        "tool_artifacts": [
-                            {
-                                "artifact_id": self.artifact_id,
-                                "kind": "image",
-                                "path": str(self.image_path),
-                                "mime_type": "image/png",
-                                "filename": self.image_path.name,
-                                "size_bytes": self.image_path.stat().st_size,
-                                "source_tool": "write_image",
-                            }
-                        ],
-                    }
-                ]
-            },
+            tool_calls=[
+                {
+                    "id": "call_1",
+                    "tool_name": "write_image",
+                    "status": "completed",
+                    "tool_artifacts": [
+                        {
+                            "artifact_id": self.artifact_id,
+                            "kind": "image",
+                            "path": str(self.image_path),
+                            "mime_type": "image/png",
+                            "filename": self.image_path.name,
+                            "size_bytes": self.image_path.stat().st_size,
+                            "source_tool": "write_image",
+                        }
+                    ],
+                }
+            ],
         )
 
 

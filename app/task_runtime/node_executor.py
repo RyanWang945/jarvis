@@ -323,6 +323,8 @@ def _node_result_from_mapping(value: dict[str, Any]) -> NodeResult | None:
         summary=str(value.get("summary") or ""),
         artifacts=[_artifact_from_mapping(item) for item in value.get("artifacts", []) if isinstance(item, dict)],
         approval_requests=value.get("approval_requests") if isinstance(value.get("approval_requests"), list) else [],
+        tool_calls=value.get("tool_calls") if isinstance(value.get("tool_calls"), list) else [],
+        usage_records=value.get("usage_records") if isinstance(value.get("usage_records"), list) else [],
         data=value.get("data") if isinstance(value.get("data"), dict) else {},
     )
 
