@@ -978,9 +978,9 @@ def _finalize_coder_node_result(
     provider: str,
 ) -> NodeResult:
     approval_required = bool(result.approval_requests)
+    approval_requests = [approval_request_to_dict(item) for item in result.approval_requests]
     approval_data: dict[str, Any] = {}
     if approval_required:
-        approval_data["approval_requests"] = [approval_request_to_dict(item) for item in result.approval_requests]
         first = result.approval_requests[0]
         approval_data["approval_id"] = first.approval_id
         approval_data["action_kind"] = first.action_kind
@@ -1004,6 +1004,7 @@ def _finalize_coder_node_result(
         metadata=result.metadata,
         approval_required=approval_required,
         approval_data=approval_data,
+        approval_requests=approval_requests,
         session_root=_optional_path(context.runtime_hints.get("session_workspace_dir")),
         node_workspace=_optional_path(context.runtime_hints.get("node_workspace_dir")),
         manifest_path=_optional_path(context.runtime_hints.get("node_manifest_path")),

@@ -136,6 +136,7 @@ class CodeNodeFinalizer:
         metadata: dict[str, Any],
         approval_required: bool = False,
         approval_data: dict[str, Any] | None = None,
+        approval_requests: list[dict[str, Any]] | None = None,
         session_root: Path | None = None,
         node_workspace: Path | None = None,
         manifest_path: Path | None = None,
@@ -227,6 +228,7 @@ class CodeNodeFinalizer:
             status=status,
             summary=summary,
             artifacts=artifacts,
+            approval_requests=approval_requests or [],
             data=data,
             error=_final_error(
                 status=status,

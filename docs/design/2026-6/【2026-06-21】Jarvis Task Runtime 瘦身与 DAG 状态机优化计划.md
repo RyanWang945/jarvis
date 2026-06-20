@@ -426,6 +426,8 @@ debug
 4. `usage_records` 不再藏在 `data`。
 5. 原始 stdout/stderr 不直接进入用户结果，只进 debug 或 provider log 文件。
 
+已执行迁移：`NodeResult` 已新增顶层 `approval_requests`，coder node 新写入路径不再把 approval request 列表写入 `data["approval_requests"]`。聚合层仍保留读取旧 `data["approval_requests"]` 的兼容 fallback。
+
 ### 3.6 `runtime_hints`
 
 需要拆成以下对象：

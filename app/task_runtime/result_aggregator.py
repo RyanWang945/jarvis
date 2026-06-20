@@ -388,6 +388,8 @@ def _blocked_question(blocked: list[NodeResult], *, approval_requested: bool = F
 def _approval_requests(results: list[NodeResult]) -> list[dict[str, Any]]:
     raw_requests: list[Any] = []
     for result in results:
+        if result.approval_requests:
+            raw_requests.extend(result.approval_requests)
         raw = result.data.get("approval_requests")
         if not isinstance(raw, list):
             continue

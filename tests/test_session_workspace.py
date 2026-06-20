@@ -297,8 +297,8 @@ def test_write_coder_node_requests_approval_before_merging_to_protected_branch(m
     assert report.status == "blocked"
     assert result.error is not None
     assert result.error.code == "coder_approval_required"
-    assert len(result.data["approval_requests"]) == 1
-    approval = result.data["approval_requests"][0]
+    assert len(result.approval_requests) == 1
+    approval = result.approval_requests[0]
     assert approval["action_kind"] == "merge_to_protected"
     assert approval["payload"]["source"] == "runtime_git"
     assert approval["payload"]["repo_workspace"]["target_branch"] == default_branch

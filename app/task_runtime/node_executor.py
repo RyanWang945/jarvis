@@ -322,6 +322,7 @@ def _node_result_from_mapping(value: dict[str, Any]) -> NodeResult | None:
         status=status,
         summary=str(value.get("summary") or ""),
         artifacts=[_artifact_from_mapping(item) for item in value.get("artifacts", []) if isinstance(item, dict)],
+        approval_requests=value.get("approval_requests") if isinstance(value.get("approval_requests"), list) else [],
         data=value.get("data") if isinstance(value.get("data"), dict) else {},
     )
 

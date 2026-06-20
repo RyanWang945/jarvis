@@ -217,7 +217,7 @@ def test_result_aggregator_preserves_blocked_approval_requests() -> None:
                 runtime="coder",
                 status="blocked",
                 summary="approval required",
-                data={"approval_requests": [approval]},
+                approval_requests=[approval],
                 error=NodeError(code="coder_approval_required", message="approval required"),
             )
         ],

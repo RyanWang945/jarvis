@@ -279,7 +279,8 @@ def test_coder_node_runtime_blocks_when_approval_required() -> None:
     assert result.data["approval_id"] == "approval_42"
     assert result.data["action_kind"] == "commit"
     assert result.data["command"] == "git commit -m change"
-    assert result.data["approval_requests"][0]["payload"] == {"id": "approval_42"}
+    assert result.approval_requests[0]["payload"] == {"id": "approval_42"}
+    assert "approval_requests" not in result.data
 
 
 def test_resume_coder_approval_delegates_to_codex(monkeypatch) -> None:

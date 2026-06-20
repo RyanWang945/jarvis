@@ -4,6 +4,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.task_runtime.approval_types import approval_request_dicts
 from app.task_runtime.planner import NodeRuntime
 
 NodeStatus = Literal["completed", "failed", "blocked"]
@@ -61,6 +62,7 @@ class NodeResult(BaseModel):
     status: NodeStatus
     summary: str = ""
     artifacts: list[NodeArtifact] = Field(default_factory=list)
+    approval_requests: list[dict[str, Any]] = Field(default_factory=list)
     data: dict[str, Any] = Field(default_factory=dict)
     error: NodeError | None = None
 
@@ -71,6 +73,13 @@ class NodeResult(BaseModel):
         if not text:
             raise ValueError("node_id must not be empty")
         return text
+
+    @field_validator("approval_requests", mode="before")
+    @classmethod
+    def _approval_requests_list(cls, value: Any) -> list[dict[str, Any]]:
+        if not isinstance(value, list):
+            return []
+        return approval_request_dicts(value)
 
 
 class ResolvedInput(BaseModel):
