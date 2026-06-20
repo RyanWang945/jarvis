@@ -3,16 +3,17 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Literal, Protocol
+from typing import Any, Literal, Protocol
 
 from app.config import Settings
+from app.runtime_usage import usage_record_from_token_usage
+from app.task_runtime.approval_types import ApprovalRequest, approval_request_from_mapping
 from app.tools.codex import run_codex_coder_tool
 from app.tools.codex_app_server import respond_to_codex_approval
 from app.tools.common import ToolExecutionRequest
 from app.tools.coder import run_coder_tool
 
 CoderAccessMode = Literal["read", "write"]
-ApprovalLevel = Literal["allow", "ask", "strong_ask", "deny"]
 
 
 @dataclass(frozen=True)
@@ -20,45 +21,6 @@ class CoderPolicy:
     access_mode: CoderAccessMode
     allow_commit: bool = False
     allow_push: bool = False
-
-
-@dataclass(frozen=True)
-class CoderAction:
-    kind: Literal[
-        "read_file",
-        "search",
-        "git_status",
-        "git_diff",
-        "git_log",
-        "edit_file",
-        "commit",
-        "push",
-        "secret_read",
-        "dangerous_command",
-        "outside_workspace_write",
-        "unknown_external_action",
-    ]
-    command: str | None = None
-    path: str | None = None
-    description: str = ""
-    raw_provider_payload: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class ApprovalDecision:
-    decision: ApprovalLevel
-    reason: str = ""
-    approval_id: str | None = None
-
-
-@dataclass(frozen=True)
-class CoderApprovalRequest:
-    approval_id: str
-    action_kind: str
-    reason: str = ""
-    command: str | None = None
-    path: str | None = None
-    raw_provider_payload: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -80,7 +42,7 @@ class CoderRunResult:
     stdout: str = ""
     stderr: str = ""
     artifacts: list[str] = field(default_factory=list)
-    approval_requests: list[CoderApprovalRequest] = field(default_factory=list)
+    approval_requests: list[ApprovalRequest] = field(default_factory=list)
     raw_events_path: Path | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -92,7 +54,7 @@ class CoderApprovalContinuationResult:
     raw_events: str = ""
     raw_stderr: str = ""
     exit_code: int | None = None
-    approval_requests: list[CoderApprovalRequest] = field(default_factory=list)
+    approval_requests: list[ApprovalRequest] = field(default_factory=list)
     error: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -100,12 +62,7 @@ class CoderApprovalContinuationResult:
 class CoderProvider(Protocol):
     name: str
 
-    def run(
-        self,
-        request: CoderRunRequest,
-        *,
-        decide_action: Callable[[CoderAction], ApprovalDecision],
-    ) -> CoderRunResult: ...
+    def run(self, request: CoderRunRequest) -> CoderRunResult: ...
 
     def resume_approval(
         self,
@@ -123,13 +80,7 @@ class CodexCoderProvider:
     def __init__(self, *, runner=run_codex_coder_tool) -> None:
         self._runner = runner
 
-    def run(
-        self,
-        request: CoderRunRequest,
-        *,
-        decide_action: Callable[[CoderAction], ApprovalDecision],
-    ) -> CoderRunResult:
-        del decide_action
+    def run(self, request: CoderRunRequest) -> CoderRunResult:
         tool_result = self._runner(
             ToolExecutionRequest(
                 tool_name="codex_coder_provider",
@@ -139,6 +90,9 @@ class CodexCoderProvider:
                     "repo_id": request.repo_id,
                     "_runtime_workdir": str(request.workdir),
                     "_runtime_run_dir": str(request.run_dir) if request.run_dir is not None else "",
+                    "source_branch": str(request.metadata.get("source_branch") or ""),
+                    "target_branch": str(request.metadata.get("target_branch") or ""),
+                    "node_branch": str(request.metadata.get("node_branch") or ""),
                     "allow_commit": request.policy.allow_commit,
                     "allow_push": request.policy.allow_push,
                     "_read_only": request.policy.access_mode == "read",
@@ -155,7 +109,10 @@ class CodexCoderProvider:
             stderr=tool_result.stderr,
             artifacts=list(tool_result.artifacts),
             approval_requests=approval_requests,
-            metadata={"tool_artifacts": [artifact.__dict__ for artifact in tool_result.tool_artifacts]},
+            metadata={
+                **dict(tool_result.metadata),
+                "tool_artifacts": [artifact.__dict__ for artifact in tool_result.tool_artifacts],
+            },
         )
 
     def resume_approval(
@@ -178,26 +135,20 @@ class CodexCoderProvider:
             raw_events=result.raw_events,
             raw_stderr=result.raw_stderr,
             exit_code=result.exit_code,
-            approval_requests=[
-                _approval_request_from_payload(item, index=index)
-                for index, item in enumerate(result.approval_requests, start=1)
-                if isinstance(item, dict)
-            ],
+            approval_requests=_approval_requests_from_payloads(result.approval_requests),
             error=result.error,
-            metadata={"provider": self.name, "tool_artifacts": [artifact.__dict__ for artifact in result.tool_artifacts]},
+            metadata={
+                "provider": self.name,
+                "tool_artifacts": [artifact.__dict__ for artifact in result.tool_artifacts],
+                **_codex_usage_metadata(result.usage),
+            },
         )
 
 
 class ClaudeCodeCoderProvider:
     name = "claude_code"
 
-    def run(
-        self,
-        request: CoderRunRequest,
-        *,
-        decide_action: Callable[[CoderAction], ApprovalDecision],
-    ) -> CoderRunResult:
-        del decide_action
+    def run(self, request: CoderRunRequest) -> CoderRunResult:
         tool_result = run_coder_tool(
             ToolExecutionRequest(
                 tool_name="claude_code_coder_provider",
@@ -206,6 +157,9 @@ class ClaudeCodeCoderProvider:
                     "instruction": request.instruction,
                     "repo_id": request.repo_id,
                     "_runtime_run_dir": str(request.run_dir) if request.run_dir is not None else "",
+                    "source_branch": str(request.metadata.get("source_branch") or ""),
+                    "target_branch": str(request.metadata.get("target_branch") or ""),
+                    "node_branch": str(request.metadata.get("node_branch") or ""),
                     "allow_commit": request.policy.allow_commit,
                     "allow_push": request.policy.allow_push,
                     "_read_only": request.policy.access_mode == "read",
@@ -275,8 +229,19 @@ def resume_coder_approval(
     )
 
 
-def _approval_requests_from_artifacts(artifacts: list[str]) -> list[CoderApprovalRequest]:
-    requests: list[CoderApprovalRequest] = []
+def _codex_usage_metadata(usage) -> dict[str, Any]:
+    record = usage_record_from_token_usage(
+        usage,
+        source="codex_app_server",
+        provider="codex",
+        model="codex",
+        stage="coder",
+    )
+    return {"usage_records": [record]} if record is not None else {}
+
+
+def _approval_requests_from_artifacts(artifacts: list[str]) -> list[ApprovalRequest]:
+    requests: list[ApprovalRequest] = []
     for artifact in artifacts:
         text = str(artifact)
         if not text.startswith("codex_approval_requests:"):
@@ -287,44 +252,14 @@ def _approval_requests_from_artifacts(artifacts: list[str]) -> list[CoderApprova
         except (OSError, json.JSONDecodeError):
             continue
         raw_requests = payload if isinstance(payload, list) else [payload]
-        for index, raw in enumerate(raw_requests, start=1):
-            if isinstance(raw, dict):
-                requests.append(_approval_request_from_payload(raw, index=index))
+        requests.extend(_approval_requests_from_payloads(raw_requests))
     return requests
 
 
-def _approval_request_from_payload(payload: dict[str, Any], *, index: int) -> CoderApprovalRequest:
-    command = _optional_text(payload.get("command"))
-    path = _optional_text(payload.get("path"))
-    return CoderApprovalRequest(
-        approval_id=_optional_text(payload.get("id") or payload.get("approval_id") or payload.get("request_id")) or f"approval_{index}",
-        action_kind=_action_kind_from_command(command),
-        command=command,
-        path=path,
-        reason=_optional_text(payload.get("reason") or payload.get("description") or payload.get("message")) or "",
-        raw_provider_payload=dict(payload),
-    )
-
-
-def _action_kind_from_command(command: str | None) -> str:
-    text = (command or "").strip().lower()
-    if not text:
-        return "unknown_external_action"
-    if text.startswith("git status"):
-        return "git_status"
-    if text.startswith("git diff"):
-        return "git_diff"
-    if text.startswith("git log"):
-        return "git_log"
-    if text.startswith("git commit"):
-        return "commit"
-    if text.startswith("git push"):
-        return "push"
-    return "unknown_external_action"
-
-
-def _optional_text(value: Any) -> str | None:
-    if value is None:
-        return None
-    text = str(value).strip()
-    return text or None
+def _approval_requests_from_payloads(values: list[Any]) -> list[ApprovalRequest]:
+    requests: list[ApprovalRequest] = []
+    for index, value in enumerate(values, start=1):
+        request = approval_request_from_mapping(value, fallback_id=f"approval_{index}")
+        if request is not None:
+            requests.append(request)
+    return requests

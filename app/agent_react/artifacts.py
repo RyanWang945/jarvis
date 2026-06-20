@@ -72,10 +72,13 @@ def artifact_from_payload(payload: dict[str, Any]) -> ToolArtifact | None:
             turn_id=_optional_int(payload.get("turn_id")),
             tool_call_id=_optional_str(payload.get("tool_call_id")),
             path=_optional_str(payload.get("path")),
+            session_relative_path=_optional_str(payload.get("session_relative_path")),
             mime_type=_optional_str(payload.get("mime_type")),
             filename=_optional_str(payload.get("filename")),
             size_bytes=_optional_int(payload.get("size_bytes")),
             source_tool=str(payload.get("source_tool") or ""),
+            node_id=_optional_str(payload.get("node_id")),
+            publish=_optional_bool(payload.get("publish"), default=True),
             metadata=payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {},
         )
     except Exception:
@@ -108,6 +111,7 @@ def legacy_artifact_to_tool_artifact(
             turn_id=turn_id,
             tool_call_id=tool_call_id,
             source_tool=source_tool,
+            publish=False,
             metadata={"legacy": raw},
         )
 
@@ -145,10 +149,12 @@ def legacy_artifact_to_tool_artifact(
         turn_id=turn_id,
         tool_call_id=tool_call_id,
         path=str(path) if path is not None else None,
+        session_relative_path=None,
         mime_type=_guess_mime(path) if path is not None else None,
         filename=path.name if path is not None else None,
         size_bytes=stat_size,
         source_tool=source_tool,
+        publish=kind in {"file", "log"},
         metadata={"legacy": raw} if label else {},
     )
 
@@ -560,3 +566,16 @@ def _optional_int(value: Any) -> int | None:
         return int(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def _optional_bool(value: Any, *, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "external", "publish"}:
+        return True
+    if text in {"0", "false", "no", "internal", "none"}:
+        return False
+    return default

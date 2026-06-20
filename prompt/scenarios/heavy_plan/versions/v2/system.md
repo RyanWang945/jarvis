@@ -82,13 +82,20 @@ Output exactly this JSON shape:
       "objective": "string",
       "input_refs": ["artifact:A1", "node:node_id"],
       "expected_output": "string",
-      "runtime_hints": {"access_mode": "read | write, only when runtime=coder"}
+      "runtime_hints": {
+        "access_mode": "read | write, only when runtime=coder",
+        "source_branch": "optional source branch such as main or master",
+        "target_branch": "optional target development branch such as feat/my-skill",
+        "worktree_mode": "node_branch_worktree, only when a coder node should use Jarvis-managed branch worktrees"
+      }
     }
   ]
 }
 
 Set finalization_hint.user_facing=true only when a single llm node's output is intended to be returned directly to the user without additional synthesis.
 For coder nodes, include runtime_hints.access_mode. Use "read" for repository inspection, review, diagnosis, or reporting without edits. Use "write" when the user explicitly asks to modify, fix, generate, run implementation changes, commit, or push.
+When a branch or source branch is obvious, include it as a runtime_hints hint, but do not add extra branch-analysis nodes. The coder runtime resolves Git context before provider execution to select the repository, source branch, target branch, and worktree mode.
+For write-mode coder nodes, Jarvis runtime creates/checks out the target branch and per-node worktree after Git context resolution; the coder worker must not do branch checkout itself.
 Do not include codex or claude_code as runtime values. Provider selection is a runtime configuration detail.
 
 Set finalization_hint.user_facing=false for react, coder, multi-node, or internal/intermediate plans.

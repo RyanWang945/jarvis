@@ -111,6 +111,74 @@ def test_result_aggregator_pass_through_skips_llm() -> None:
     assert chat.calls == []
 
 
+def test_result_aggregator_pass_through_renders_structured_llm_data() -> None:
+    chat = ScriptedSummaryChat('{"status":"completed","reply":"should not be used"}')
+    aggregator = ResultAggregator(model_resolver=lambda metadata: FakeResolvedModel(chat))
+    plan = ExecutionPlan(
+        user_objective="这个和金价有关系吗",
+        finalization_hint=FinalizationHint(mode="pass_through", user_facing=True, reason="single user-facing node"),
+        nodes=[PlanNode(id="explain_gold_relation", runtime="llm", objective="解释美伊局势与金价的关系")],
+    )
+    report = ExecutionReport(
+        status="completed",
+        node_results=[
+            NodeResult(
+                node_id="explain_gold_relation",
+                runtime="llm",
+                status="completed",
+                summary="美伊局势与金价存在密切关联，主要通过以下几条传导路径：",
+                data={
+                    "primary_factors": [
+                        {
+                            "factor": "避险需求",
+                            "explanation": "美伊冲突升级会加剧不确定性，投资者转向黄金等避险资产。",
+                        },
+                        {
+                            "factor": "石油价格传导",
+                            "explanation": "霍尔木兹海峡风险可能推升油价和通胀预期，从而提振金价。",
+                        },
+                    ],
+                    "typical_pattern": "紧张（金价上涨） -> 停火（金价回落） -> 反复拉锯（金价震荡）",
+                },
+            )
+        ],
+    )
+
+    result = aggregator.aggregate(plan=plan, report=report)
+
+    assert result.status == "completed"
+    assert "避险需求" in result.reply
+    assert "石油价格传导" in result.reply
+    assert "典型走势" in result.reply
+    assert len(result.reply) > len(report.node_results[0].summary)
+    assert chat.calls == []
+
+
+def test_result_aggregator_pass_through_prefers_explicit_reply() -> None:
+    aggregator = ResultAggregator(model_resolver=lambda metadata: _missing_key_model())
+    plan = ExecutionPlan(
+        user_objective="解释关系",
+        finalization_hint=FinalizationHint(mode="pass_through", user_facing=True),
+        nodes=[PlanNode(id="main", runtime="llm", objective="解释关系")],
+    )
+    report = ExecutionReport(
+        status="completed",
+        node_results=[
+            NodeResult(
+                node_id="main",
+                runtime="llm",
+                status="completed",
+                summary="短摘要",
+                data={"reply": "这是完整回复。", "primary_factors": [{"factor": "A", "explanation": "B"}]},
+            )
+        ],
+    )
+
+    result = aggregator.aggregate(plan=plan, report=report)
+
+    assert result.reply == "这是完整回复。"
+
+
 def test_result_aggregator_blocked_missing_repo_needs_user_input() -> None:
     aggregator = ResultAggregator(model_resolver=lambda metadata: _missing_key_model())
     report = ExecutionReport(
@@ -130,6 +198,36 @@ def test_result_aggregator_blocked_missing_repo_needs_user_input() -> None:
 
     assert result.status == "needs_user_input"
     assert result.missing_info_question == "需要先指定要操作的仓库。"
+
+
+def test_result_aggregator_preserves_blocked_approval_requests() -> None:
+    aggregator = ResultAggregator(model_resolver=lambda metadata: _missing_key_model())
+    approval = {
+        "approval_id": "runtime_git_1",
+        "action_kind": "merge_to_protected",
+        "command": "git merge --no-ff node_branch",
+        "reason": "Merge to main.",
+        "payload": {"source": "runtime_git"},
+    }
+    report = ExecutionReport(
+        status="blocked",
+        node_results=[
+            NodeResult(
+                node_id="review",
+                runtime="coder",
+                status="blocked",
+                summary="approval required",
+                data={"approval_requests": [approval]},
+                error=NodeError(code="coder_approval_required", message="approval required"),
+            )
+        ],
+    )
+
+    result = aggregator.aggregate(plan=_plan(), report=report)
+
+    assert result.status == "needs_user_input"
+    assert result.reply == "该操作需要确认后继续。"
+    assert result.data["approval_requests"] == [approval]
 
 
 def test_result_aggregator_failed_result_includes_replan_instruction() -> None:

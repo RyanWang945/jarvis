@@ -260,11 +260,40 @@ def _artifact_index(artifacts: list[dict[str, Any]]) -> dict[str, NodeArtifact]:
             continue
         node_artifact = NodeArtifact(
             ref=ref,
+            artifact_id=_optional_str(artifact.get("artifact_id") or artifact.get("id")),
             kind=str(artifact.get("kind") or artifact.get("type") or "artifact"),
             name=_optional_str(artifact.get("name") or artifact.get("filename") or artifact.get("title")),
             description=str(artifact.get("description") or artifact.get("summary") or ""),
             path=_optional_str(artifact.get("path")),
-            metadata={key: value for key, value in artifact.items() if key not in {"ref", "id", "artifact_id", "kind", "type", "name", "filename", "title", "description", "summary", "path"}},
+            session_relative_path=_optional_str(artifact.get("session_relative_path")),
+            mime_type=_optional_str(artifact.get("mime_type")),
+            filename=_optional_str(artifact.get("filename")),
+            size_bytes=_optional_int(artifact.get("size_bytes")),
+            source_tool=_optional_str(artifact.get("source_tool")) or "",
+            publish=_optional_bool(artifact.get("publish"), default=True),
+            metadata={
+                key: value
+                for key, value in artifact.items()
+                if key
+                not in {
+                    "ref",
+                    "id",
+                    "artifact_id",
+                    "kind",
+                    "type",
+                    "name",
+                    "filename",
+                    "title",
+                    "description",
+                    "summary",
+                    "path",
+                    "session_relative_path",
+                    "mime_type",
+                    "size_bytes",
+                    "source_tool",
+                    "publish",
+                }
+            },
         )
         result[f"artifact:{node_artifact.ref}"] = node_artifact
     return result
@@ -300,10 +329,17 @@ def _node_result_from_mapping(value: dict[str, Any]) -> NodeResult | None:
 def _artifact_from_mapping(value: dict[str, Any]) -> NodeArtifact:
     return NodeArtifact(
         ref=str(value.get("ref") or value.get("id") or value.get("artifact_id") or "artifact"),
+        artifact_id=_optional_str(value.get("artifact_id") or value.get("id")),
         kind=str(value.get("kind") or value.get("type") or "artifact"),
         name=_optional_str(value.get("name") or value.get("filename")),
         description=str(value.get("description") or value.get("summary") or ""),
         path=_optional_str(value.get("path")),
+        session_relative_path=_optional_str(value.get("session_relative_path")),
+        mime_type=_optional_str(value.get("mime_type")),
+        filename=_optional_str(value.get("filename")),
+        size_bytes=_optional_int(value.get("size_bytes")),
+        source_tool=_optional_str(value.get("source_tool")) or "",
+        publish=_optional_bool(value.get("publish"), default=True),
         metadata=value.get("metadata") if isinstance(value.get("metadata"), dict) else {},
     )
 
@@ -347,6 +383,19 @@ def _optional_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _optional_bool(value: Any, *, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "external", "publish"}:
+        return True
+    if text in {"0", "false", "no", "internal", "none"}:
+        return False
+    return default
 
 
 def _preview(value: Any, *, limit: int = 240) -> str:

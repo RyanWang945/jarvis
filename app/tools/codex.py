@@ -11,6 +11,7 @@ from uuid import uuid4
 
 from app.config import get_settings
 from app.repositories import RepositoryRef, RepositoryRegistryError, get_repository_registry
+from app.runtime_usage import usage_record_from_token_usage
 from app.tools.coder_common import (
     build_coder_instruction,
     check_coder_permissions,
@@ -145,6 +146,7 @@ def run_codex_coder_tool(request: ToolExecutionRequest) -> ToolExecutionResult:
             stderr=raw_stderr,
             artifacts=artifacts,
             tool_artifacts=_codex_tool_artifacts(app_server_result, run_id=run_id),
+            metadata=_codex_usage_metadata(app_server_result),
             summary=summary,
         )
 
@@ -222,8 +224,20 @@ def run_codex_coder_tool(request: ToolExecutionRequest) -> ToolExecutionResult:
         stderr=raw_stderr,
         artifacts=artifacts,
         tool_artifacts=_codex_tool_artifacts(app_server_result, run_id=run_id),
+        metadata=_codex_usage_metadata(app_server_result),
         summary=summary,
     )
+
+
+def _codex_usage_metadata(result: CodexAppServerRunResult) -> dict[str, object]:
+    record = usage_record_from_token_usage(
+        result.usage,
+        source="codex_app_server",
+        provider="codex",
+        model="codex",
+        stage="coder",
+    )
+    return {"usage_records": [record]} if record is not None else {}
 
 
 def _codex_tool_artifacts(result: CodexAppServerRunResult, *, run_id: str) -> list[ToolArtifact]:
@@ -274,6 +288,7 @@ def _run_codex_app_server(
         instruction=instruction,
         timeout_seconds=timeout_seconds,
         trusted_command_prefixes=trusted_command_prefixes,
+        allowed_write_roots=[run_dir.parent],
     )
 
 
@@ -310,7 +325,7 @@ def _run_codex_process(
     env = os.environ.copy()
     env["GIT_CONFIG_COUNT"] = "1"
     env["GIT_CONFIG_KEY_0"] = "safe.directory"
-    env["GIT_CONFIG_VALUE_0"] = str(workdir)
+    env["GIT_CONFIG_VALUE_0"] = workdir.resolve().as_posix()
     return subprocess.run(
         command,
         cwd=str(workdir),

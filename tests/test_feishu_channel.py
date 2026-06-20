@@ -9,12 +9,11 @@ from app.agent_react import ChannelAttachment, ChannelMessage, TurnResult
 from app.channels.feishu import (
     FeishuChannel,
     _ensure_feishu_no_proxy,
-    _extract_codex_approval_from_reply,
     _extract_message_id,
 )
 from app.channels.feishu_renderer import FeishuRenderer
 from app.config import get_settings
-from app.task_runtime.coder_provider import CoderApprovalContinuationResult
+from app.task_runtime.approval_types import ApprovalContinuationResult
 
 
 @pytest.fixture(autouse=True)
@@ -91,7 +90,7 @@ def test_feishu_renderer_renders_codex_approval_buttons() -> None:
     assert delivery.msg_type == "interactive"
     card = json.loads(delivery.content)
     content = "\n".join(element["text"]["content"] for element in card["elements"] if "text" in element)
-    assert "**Codex 权限审批**" in content
+    assert "**Jarvis 权限审批**" in content
     assert "```" not in content
     assert card["elements"][2]["text"]["tag"] == "plain_text"
     assert "git push origin HEAD" in card["elements"][2]["text"]["content"]
@@ -185,7 +184,7 @@ def test_feishu_renderer_repairs_quad_asterisk_labels() -> None:
     assert "**资产属性** | 避险资产" in all_content
 
 
-def test_feishu_renderer_moves_model_usage_footer_to_note() -> None:
+def test_feishu_renderer_moves_usage_footer_to_note() -> None:
     renderer = FeishuRenderer(title="Jarvis")
 
     delivery = renderer.render(
@@ -193,7 +192,6 @@ def test_feishu_renderer_moves_model_usage_footer_to_note() -> None:
             content=(
                 "这是最终回复。\n\n"
                 "---\n"
-                "- 模型：`deepseek-v4-flash`\n"
                 "- Token：输入 `4553` / 输出 `618` / 合计 `5171`"
             ),
             content_type="markdown",
@@ -213,7 +211,7 @@ def test_feishu_renderer_moves_model_usage_footer_to_note() -> None:
     assert card["elements"][-1]["elements"] == [
         {
             "tag": "plain_text",
-            "content": "模型：deepseek-v4-flash · Token：输入 4553 / 输出 618 / 合计 5171",
+            "content": "Token：输入 4553 / 输出 618 / 合计 5171",
         }
     ]
 
@@ -527,7 +525,7 @@ def test_feishu_channel_sends_image_attachments_once(monkeypatch) -> None:
     assert json.loads(sent[1][2]) == {"image_key": "img_key_1"}
 
 
-def test_feishu_channel_sends_attachments_when_codex_requests_approval(monkeypatch) -> None:
+def test_feishu_channel_sends_attachments_when_structured_codex_approval_requested(monkeypatch) -> None:
     channel = FeishuChannel(app_id="app", app_secret="secret")
     updated: list[tuple[str, str]] = []
     sent_attachments: list[tuple[str, tuple[ChannelAttachment, ...]]] = []
@@ -549,14 +547,20 @@ def test_feishu_channel_sends_attachments_when_codex_requests_approval(monkeypat
                 conversation_id=7,
                 status="completed",
                 message=ChannelMessage(
-                    content=(
-                        "Codex requested approval (item/commandExecution/requestApproval).\n"
-                        "Approval ID: approval_1\n"
-                        "Command: Remove-Item tmp\n"
-                        "Reason: Cleanup temp file."
-                    ),
+                    content="该操作需要确认后继续。",
                     content_type="markdown",
                     attachments=(attachment,),
+                    metadata={
+                        "approval_requests": [
+                            {
+                                "approval_id": "approval_1",
+                                "action_kind": "dangerous_command",
+                                "command": "Remove-Item tmp",
+                                "reason": "Cleanup temp file.",
+                                "payload": {"source": "codex_provider"},
+                            }
+                        ]
+                    },
                 ),
             )
 
@@ -578,7 +582,62 @@ def test_feishu_channel_sends_attachments_when_codex_requests_approval(monkeypat
 
     assert updated == [("om_thinking", "interactive")]
     assert sent_attachments == [("chat_1", (attachment,))]
-    assert metadata_patches[0][1]["codex_approvals"]["approval_1"]["status"] == "pending"
+    assert metadata_patches[0][1]["approvals"]["approval_1"]["status"] == "pending"
+
+
+def test_feishu_channel_renders_structured_runtime_git_approval(monkeypatch) -> None:
+    channel = FeishuChannel(app_id="app", app_secret="secret")
+    updated: list[tuple[str, str, str]] = []
+    metadata_patches: list[tuple[int, dict]] = []
+
+    class FakeRuntime:
+        def run_turn(self, turn_id: int) -> TurnResult:
+            return TurnResult(
+                turn_id=turn_id,
+                conversation_id=7,
+                status="completed",
+                message=ChannelMessage(
+                    content="该操作需要确认后继续。",
+                    content_type="markdown",
+                    metadata={
+                        "approval_requests": [
+                            {
+                                "approval_id": "runtime_git_1",
+                                "action_kind": "merge_to_protected",
+                                "command": "git merge --no-ff node_branch",
+                                "reason": "Merge to main.",
+                                "payload": {
+                                    "source": "runtime_git",
+                                    "operation": "merge_to_protected",
+                                },
+                            }
+                        ]
+                    },
+                ),
+            )
+
+    class FakeStore:
+        def update_conversation_metadata(self, conversation_id: int, patch: dict) -> None:
+            metadata_patches.append((conversation_id, patch))
+
+    monkeypatch.setattr("app.channels.feishu.get_agent_runtime", lambda: FakeRuntime())
+    monkeypatch.setattr("app.channels.feishu.get_conversation_store", lambda: FakeStore())
+    monkeypatch.setattr(channel, "_send_thinking_card", lambda chat_id, text: "om_thinking")
+    monkeypatch.setattr(
+        channel,
+        "_update_card_message",
+        lambda message_id, delivery: updated.append(
+            (message_id, delivery.msg_type, json.loads(delivery.content)["elements"][-1]["actions"][0]["behaviors"][0]["value"]["approval_source"])
+        ),
+    )
+
+    channel._handle_agent_run("ou_1", "chat_1", "dm", "合并到 main", 7, 42)
+
+    assert updated == [("om_thinking", "interactive", "runtime_git")]
+    approval = metadata_patches[0][1]["approvals"]["runtime_git_1"]
+    assert approval["status"] == "pending"
+    assert approval["approval_source"] == "runtime_git"
+    assert approval["payload"]["operation"] == "merge_to_protected"
 
 
 def test_feishu_image_upload_error_includes_response_payload(monkeypatch) -> None:
@@ -639,7 +698,7 @@ def test_feishu_card_action_updates_approval_card(monkeypatch) -> None:
 
     class FakeStore:
         def get_conversation(self, conversation_id: int):
-            return SimpleNamespace(id=conversation_id, metadata={"codex_approvals": {"approval_1": {"status": "pending"}}})
+            return SimpleNamespace(id=conversation_id, metadata={"approvals": {"approval_1": {"status": "pending"}}})
 
         def update_conversation_metadata(self, conversation_id: int, patch: dict) -> None:
             metadata_patches.append((conversation_id, patch))
@@ -671,13 +730,13 @@ def test_feishu_card_action_updates_approval_card(monkeypatch) -> None:
 
     response = channel._on_card_action(payload)
 
-    assert response.toast.content == "已同意 Codex 审批请求。"
+    assert response.toast.content == "已同意审批请求。"
     assert response.card.type == "raw"
-    assert response.card.data["elements"][0]["text"]["content"] == "**Codex 权限审批：已同意**"
+    assert response.card.data["elements"][0]["text"]["content"] == "**Jarvis 权限审批：已同意**"
     assert all(element.get("tag") != "action" for element in response.card.data["elements"])
-    assert updated == [("om_approval", "interactive", "**Codex 权限审批：已同意**")]
+    assert updated == [("om_approval", "interactive", "**Jarvis 权限审批：已同意**")]
     assert metadata_patches[0][0] == 7
-    assert metadata_patches[0][1]["codex_approvals"]["approval_1"]["status"] == "approved"
+    assert metadata_patches[0][1]["approvals"]["approval_1"]["status"] == "approved"
 
 
 def test_feishu_card_action_refreshes_already_processed_card(monkeypatch) -> None:
@@ -686,7 +745,7 @@ def test_feishu_card_action_refreshes_already_processed_card(monkeypatch) -> Non
 
     class FakeStore:
         def get_conversation(self, conversation_id: int):
-            return SimpleNamespace(id=conversation_id, metadata={"codex_approvals": {"approval_1": {"status": "approved"}}})
+            return SimpleNamespace(id=conversation_id, metadata={"approvals": {"approval_1": {"status": "approved"}}})
 
     def fake_update(message_id: str, delivery) -> None:
         card = json.loads(delivery.content)
@@ -717,9 +776,9 @@ def test_feishu_card_action_refreshes_already_processed_card(monkeypatch) -> Non
 
     assert response.toast.content == "该审批已处理。"
     assert response.card.type == "raw"
-    assert response.card.data["elements"][0]["text"]["content"] == "**Codex 权限审批：已同意**"
+    assert response.card.data["elements"][0]["text"]["content"] == "**Jarvis 权限审批：已同意**"
     assert all(element.get("tag") != "action" for element in response.card.data["elements"])
-    assert updated == [("om_approval", "interactive", "**Codex 权限审批：已同意**")]
+    assert updated == [("om_approval", "interactive", "**Jarvis 权限审批：已同意**")]
 
 
 def test_feishu_ws_card_payload_routes_legacy_card_action(monkeypatch) -> None:
@@ -729,7 +788,7 @@ def test_feishu_ws_card_payload_routes_legacy_card_action(monkeypatch) -> None:
 
     class FakeStore:
         def get_conversation(self, conversation_id: int):
-            return SimpleNamespace(id=conversation_id, metadata={"codex_approvals": {"approval_1": {"status": "pending"}}})
+            return SimpleNamespace(id=conversation_id, metadata={"approvals": {"approval_1": {"status": "pending"}}})
 
         def update_conversation_metadata(self, conversation_id: int, patch: dict) -> None:
             metadata_patches.append((conversation_id, patch))
@@ -760,24 +819,23 @@ def test_feishu_ws_card_payload_routes_legacy_card_action(monkeypatch) -> None:
 
     response = channel._on_ws_card_payload(json.dumps(payload).encode("utf-8"))
 
-    assert response.toast.content == "已同意 Codex 审批请求。"
+    assert response.toast.content == "已同意审批请求。"
     assert response.card.type == "raw"
-    assert response.card.data["elements"][0]["text"]["content"] == "**Codex 权限审批：已同意**"
+    assert response.card.data["elements"][0]["text"]["content"] == "**Jarvis 权限审批：已同意**"
     assert all(element.get("tag") != "action" for element in response.card.data["elements"])
-    assert updated == [("om_approval", "interactive", "**Codex 权限审批：已同意**")]
-    assert metadata_patches[0][1]["codex_approvals"]["approval_1"]["status"] == "approved"
+    assert updated == [("om_approval", "interactive", "**Jarvis 权限审批：已同意**")]
+    assert metadata_patches[0][1]["approvals"]["approval_1"]["status"] == "approved"
 
 
 def test_feishu_approval_completion_responds_to_live_codex_session(monkeypatch) -> None:
     channel = FeishuChannel(app_id="app", app_secret="secret")
     sent: list[tuple[str, str, str]] = []
-    calls: list[tuple[str, bool]] = []
+    calls: list[tuple[str, str, bool]] = []
     metadata_patches: list[tuple[int, dict]] = []
 
-    def fake_resume(approval_id: str, *, approved: bool, timeout_seconds: int, provider: str = "codex", trusted_command_prefixes=None):
-        assert provider == "codex"
-        calls.append((approval_id, approved))
-        return CoderApprovalContinuationResult(status="completed", final_text="Codex finished in-place.")
+    def fake_continue(**kwargs):
+        calls.append((kwargs["source"], kwargs["approval_id"], kwargs["approved"]))
+        return ApprovalContinuationResult(status="completed", final_text="Codex finished in-place.")
 
     class FakeStore:
         def get_conversation(self, conversation_id: int):
@@ -787,18 +845,69 @@ def test_feishu_approval_completion_responds_to_live_codex_session(monkeypatch) 
             metadata_patches.append((conversation_id, patch))
 
     monkeypatch.setattr("app.channels.feishu.get_conversation_store", lambda: FakeStore())
-    monkeypatch.setattr("app.channels.feishu.resume_coder_approval", fake_resume)
+    monkeypatch.setattr("app.channels.feishu.continue_approval", fake_continue)
     monkeypatch.setattr(
         channel,
         "_send_channel_message",
         lambda chat_id, message: sent.append((chat_id, message.content_type, message.content)),
     )
 
-    channel._complete_codex_approval("chat_1", 7, 42, "approval_1", True)
+    channel._complete_approval("chat_1", 7, 42, "approval_1", True, "codex_provider", {})
 
-    assert calls == [("approval_1", True)]
+    assert calls == [("codex_provider", "approval_1", True)]
     assert sent == [("chat_1", "markdown", "Codex finished in-place.")]
-    assert metadata_patches[0][1]["codex_approvals"]["approval_1"]["status"] == "completed"
+    assert metadata_patches[0][1]["approvals"]["approval_1"]["status"] == "completed"
+
+
+def test_feishu_runtime_git_approval_completion_reports_runtime_result(monkeypatch) -> None:
+    channel = FeishuChannel(app_id="app", app_secret="secret")
+    metadata_patches: list[tuple[int, dict]] = []
+    sent: list[str] = []
+
+    class FakeStore:
+        def get_conversation(self, conversation_id: int):
+            return SimpleNamespace(id=conversation_id, metadata={})
+
+        def update_conversation_metadata(self, conversation_id: int, patch: dict) -> None:
+            metadata_patches.append((conversation_id, patch))
+
+    def fake_continue(**kwargs):
+        assert kwargs["source"] == "runtime_git"
+        assert kwargs["approved"] is True
+        return ApprovalContinuationResult(
+            status="completed",
+            final_text="已完成受保护分支合并：jarvis-nodes/jarvis/session/write -> main (abcdef123456)",
+        )
+
+    monkeypatch.setattr("app.channels.feishu.get_conversation_store", lambda: FakeStore())
+    monkeypatch.setattr("app.channels.feishu.continue_approval", fake_continue)
+    monkeypatch.setattr(channel, "_send_channel_message", lambda chat_id, message: sent.append(message.content))
+    monkeypatch.setattr(channel, "_submit_next_queued_turn", lambda conversation_id, chat_id: None)
+    payload = {
+        "source": "runtime_git",
+        "command": "git merge --no-ff node_branch",
+        "reason": "Merge to main.",
+        "repo_workspace": {
+            "repo_path": "E:/repo-node",
+            "repo_id": "jarvis",
+            "source_branch": "main",
+            "target_branch": "main",
+            "node_branch": "jarvis-nodes/jarvis/session/write",
+            "base_commit": "base",
+            "integration_path": "E:/repo",
+        },
+        "node_commit": {
+            "commit_hash": "commit",
+            "short_hash": "c0ffee",
+            "subject": "Write",
+            "files": ["node-output.txt"],
+        },
+    }
+
+    channel._complete_approval("chat_1", 7, 42, "runtime_git_1", True, "runtime_git", payload)
+
+    assert metadata_patches[0][1]["approvals"]["runtime_git_1"]["status"] == "completed"
+    assert "jarvis-nodes/jarvis/session/write -> main" in sent[0]
 
 
 def test_feishu_approval_completion_sends_new_card_for_next_codex_approval(monkeypatch) -> None:
@@ -806,9 +915,9 @@ def test_feishu_approval_completion_sends_new_card_for_next_codex_approval(monke
     sent: list[tuple[str, str, str]] = []
     metadata_patches: list[tuple[int, dict]] = []
 
-    def fake_resume(approval_id: str, *, approved: bool, timeout_seconds: int, provider: str = "codex", trusted_command_prefixes=None):
-        assert provider == "codex"
-        return CoderApprovalContinuationResult(
+    def fake_continue(**kwargs):
+        assert kwargs["source"] == "codex_provider"
+        return ApprovalContinuationResult(
             status="approval_requested",
             approval_requests=[
                 SimpleNamespace(
@@ -833,14 +942,14 @@ def test_feishu_approval_completion_sends_new_card_for_next_codex_approval(monke
         return {"code": 0, "data": {"message_id": "om_next_approval"}}
 
     monkeypatch.setattr("app.channels.feishu.get_conversation_store", lambda: FakeStore())
-    monkeypatch.setattr("app.channels.feishu.resume_coder_approval", fake_resume)
+    monkeypatch.setattr("app.channels.feishu.continue_approval", fake_continue)
     monkeypatch.setattr(channel, "_send_delivery", fake_send)
 
-    channel._complete_codex_approval("chat_1", 7, 42, "approval_1", True, "om_approval")
+    channel._complete_approval("chat_1", 7, 42, "approval_1", True, "codex_provider", {})
 
     assert sent == [("chat_1", "interactive", "git commit -m test")]
-    assert metadata_patches[0][1]["codex_approvals"]["approval_2"]["status"] == "pending"
-    assert metadata_patches[0][1]["codex_approvals"]["approval_2"]["turn_id"] == 42
+    assert metadata_patches[0][1]["approvals"]["approval_2"]["status"] == "pending"
+    assert metadata_patches[0][1]["approvals"]["approval_2"]["turn_id"] == 42
 
 
 def test_feishu_approval_completion_reports_expired_codex_session(monkeypatch) -> None:
@@ -848,9 +957,9 @@ def test_feishu_approval_completion_reports_expired_codex_session(monkeypatch) -
     sent: list[tuple[str, str]] = []
     metadata_patches: list[tuple[int, dict]] = []
 
-    def fake_resume(approval_id: str, *, approved: bool, timeout_seconds: int, provider: str = "codex", trusted_command_prefixes=None):
-        assert provider == "codex"
-        return CoderApprovalContinuationResult(
+    def fake_continue(**kwargs):
+        assert kwargs["source"] == "codex_provider"
+        return ApprovalContinuationResult(
             status="missing",
             error="Codex approval session is no longer active.",
         )
@@ -863,14 +972,14 @@ def test_feishu_approval_completion_reports_expired_codex_session(monkeypatch) -
             metadata_patches.append((conversation_id, patch))
 
     monkeypatch.setattr("app.channels.feishu.get_conversation_store", lambda: FakeStore())
-    monkeypatch.setattr("app.channels.feishu.resume_coder_approval", fake_resume)
+    monkeypatch.setattr("app.channels.feishu.continue_approval", fake_continue)
     monkeypatch.setattr(
         channel,
         "_send_text_message",
         lambda chat_id, text: sent.append((chat_id, text)),
     )
 
-    channel._complete_codex_approval("chat_1", 7, 42, "approval_1", True)
+    channel._complete_approval("chat_1", 7, 42, "approval_1", True, "codex_provider", {})
 
     assert sent == [
         (
@@ -878,7 +987,7 @@ def test_feishu_approval_completion_reports_expired_codex_session(monkeypatch) -
             "Codex 审批会话已失效，通常是 Jarvis 重启或审批卡过期导致。请重新发起任务。",
         )
     ]
-    assert metadata_patches[0][1]["codex_approvals"]["approval_1"]["status"] == "missing"
+    assert metadata_patches[0][1]["approvals"]["approval_1"]["status"] == "missing"
 
 
 def test_feishu_channel_submits_next_queued_turn(monkeypatch) -> None:
@@ -909,22 +1018,6 @@ def test_feishu_channel_submits_next_queued_turn(monkeypatch) -> None:
             ("queued", "chat_1", "dm", "second task", 7, 43),
         )
     ]
-
-
-def test_extract_codex_approval_from_reply() -> None:
-    approval = _extract_codex_approval_from_reply(
-        "Codex requested approval (exec-approval).\n"
-        "Approval ID: approval_1\n"
-        "Command: uv add httpx\n"
-        "Reason: Install dependency.\n"
-        "Approve this request, reject it, or ask Jarvis to continue with a safer alternative."
-    )
-
-    assert approval == {
-        "approval_id": "approval_1",
-        "command": "uv add httpx",
-        "reason": "Install dependency.",
-    }
 
 
 def test_extract_message_id_reads_feishu_send_payload() -> None:

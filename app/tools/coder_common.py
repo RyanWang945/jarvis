@@ -18,6 +18,9 @@ def build_coder_instruction(instruction: str, request_args: dict[str, Any]) -> s
             "read_only": read_only,
             "allow_commit": bool(request_args.get("allow_commit")) and not read_only,
             "allow_push": bool(request_args.get("allow_push")) and not read_only,
+            "source_branch": str(request_args.get("source_branch") or "").strip(),
+            "target_branch": str(request_args.get("target_branch") or "").strip(),
+            "node_branch": str(request_args.get("node_branch") or "").strip(),
             "verification_cmd": str(request_args.get("verification_cmd") or "").strip(),
         }
     )

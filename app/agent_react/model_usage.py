@@ -8,8 +8,8 @@ _TOKEN_USAGE_FOOTER_PATTERN = re.compile(
     (?P<body>.*?)
     (?:\n{2,}|\A)
     (?:---\s*\n)?
-    -?\s*模型：`?[^`\n]+`?\s*
-    \n-?\s*Token：输入\s*`?\d+`?\s*/\s*输出\s*`?\d+`?\s*/\s*合计\s*`?\d+`?\s*
+    (?:-?\s*模型：`?[^`\n]+`?\s*\n)?
+    -?\s*Token：输入\s*`?\d+`?\s*/\s*输出\s*`?\d+`?\s*/\s*合计\s*`?\d+`?\s*
     \Z
     """,
     flags=re.DOTALL | re.VERBOSE,
@@ -19,7 +19,7 @@ _TOKEN_USAGE_INLINE_PATTERN = re.compile(
     r"""
     (?P<body>.*?)
     (?:\n{2,}|\A)
-    模型：[^·\n]+·\s*Token：输入\s*\d+\s*/\s*输出\s*\d+\s*/\s*合计\s*\d+\s*
+    (?:模型：[^·\n]+·\s*)?Token：输入\s*\d+\s*/\s*输出\s*\d+\s*/\s*合计\s*\d+\s*
     \Z
     """,
     flags=re.DOTALL | re.VERBOSE,

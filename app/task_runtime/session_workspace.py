@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import subprocess
+import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -16,6 +17,8 @@ from app.task_runtime.node_result import NodeResult, ResolvedInput
 from app.task_runtime.planner import ExecutionPlan, PlanNode
 
 logger = logging.getLogger(__name__)
+_MERGE_LOCKS: dict[str, threading.RLock] = {}
+_MERGE_LOCKS_GUARD = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -26,6 +29,7 @@ class NodeWorkspaceRef:
     input_snapshot_path: Path
     output_path: Path
     result_path: Path
+    manifest_path: Path
     provider_run_dir: Path
     repos_dir: Path
 
@@ -36,6 +40,7 @@ class NodeWorkspaceRef:
             "node_input_snapshot_path": str(self.input_snapshot_path),
             "node_output_path": str(self.output_path),
             "node_result_path": str(self.result_path),
+            "node_manifest_path": str(self.manifest_path),
             "provider_run_dir": str(self.provider_run_dir),
         }
 
@@ -77,6 +82,7 @@ class SessionWorkspaceRef:
             "artifacts_dir": str(self.artifacts_dir),
             "approvals_dir": str(self.approvals_dir),
             "nodes_dir": str(self.nodes_dir),
+            "repos_dir": str(self.root_path / "repos"),
             "nodes": {
                 node_id: {
                     "safe_node_id": node.safe_node_id,
@@ -103,6 +109,56 @@ class NodeRepoCommit:
             "subject": self.subject,
             "files": list(self.files),
         }
+
+
+@dataclass(frozen=True)
+class NodeRepoWorkspace:
+    repo_path: Path
+    repo_id: str
+    source_branch: str
+    target_branch: str
+    node_branch: str
+    base_commit: str
+    integration_path: Path | None = None
+
+    def metadata(self) -> dict[str, Any]:
+        return {
+            "repo_path": str(self.repo_path),
+            "repo_id": self.repo_id,
+            "source_branch": self.source_branch,
+            "target_branch": self.target_branch,
+            "node_branch": self.node_branch,
+            "base_commit": self.base_commit,
+            "integration_path": str(self.integration_path) if self.integration_path is not None else None,
+        }
+
+
+@dataclass(frozen=True)
+class NodeRepoMerge:
+    target_branch: str
+    node_branch: str
+    target_before: str
+    target_after: str
+    merge_commit: str
+    status: str = "merged"
+
+    def metadata(self) -> dict[str, Any]:
+        return {
+            "target_branch": self.target_branch,
+            "node_branch": self.node_branch,
+            "target_before": self.target_before,
+            "target_after": self.target_after,
+            "merge_commit": self.merge_commit,
+            "short_hash": self.merge_commit[:12],
+            "status": self.status,
+        }
+
+
+@dataclass(frozen=True)
+class GitCommandResult:
+    exit_code: int
+    stdout: str
+    stderr: str
 
 
 class SessionWorkspaceManager:
@@ -134,6 +190,7 @@ class SessionWorkspaceManager:
             root / "artifacts",
             root / "approvals",
             root / "nodes",
+            root / "repos",
         ):
             path.mkdir(parents=True, exist_ok=True)
         for node in node_refs.values():
@@ -212,7 +269,10 @@ def write_node_input_snapshot(
 
 
 def write_node_result(node_workspace: NodeWorkspaceRef, result: NodeResult) -> None:
-    node_workspace.output_path.write_text(result.summary or "", encoding="utf-8")
+    output_path = node_workspace.output_path
+    if output_path.exists():
+        output_path = output_path.with_name("node_summary.md")
+    output_path.write_text(result.summary or "", encoding="utf-8")
     _write_json(node_workspace.result_path, result.model_dump(mode="json", exclude_none=True))
 
 
@@ -243,6 +303,92 @@ def prepare_node_repo(
         logger.info("git worktree add failed; falling back to clone --reference repo_id=%s error=%s", repo_id, exc)
     _run_git(project.parent, "clone", "--reference", str(project), str(project), str(node_repo))
     return node_repo
+
+
+def prepare_node_repo_workspace(
+    *,
+    repo_id: str,
+    project_path: Path,
+    runtime_hints: dict[str, Any],
+    node_id: str,
+) -> NodeRepoWorkspace | None:
+    raw_repos_dir = runtime_hints.get("node_repos_dir")
+    if not raw_repos_dir:
+        return None
+
+    repos_dir = Path(str(raw_repos_dir)).resolve()
+    node_repo = (repos_dir / _safe_component(repo_id, fallback="repo")).resolve()
+    _assert_child(node_repo, repos_dir)
+
+    project = project_path.resolve()
+    _assert_git_worktree(project)
+    session_id = _safe_component(runtime_hints.get("session_id") or "session", fallback="session")
+    source_branch = _resolve_source_branch(project, runtime_hints)
+    target_branch = _resolve_target_branch(repo_id=repo_id, session_id=session_id, runtime_hints=runtime_hints)
+    node_branch = _node_branch_name(repo_id=repo_id, session_id=session_id, node_id=node_id)
+    integration_path = _integration_repo_path(repo_id=repo_id, runtime_hints=runtime_hints)
+
+    _ensure_target_branch(project, target_branch=target_branch, source_branch=source_branch)
+    base_commit = _git_stdout(project, "rev-parse", target_branch)
+
+    if node_repo.exists():
+        _assert_git_worktree(node_repo)
+    else:
+        repos_dir.mkdir(parents=True, exist_ok=True)
+        _delete_branch_if_exists(project, node_branch)
+        _run_git(project, "worktree", "add", "-b", node_branch, str(node_repo), base_commit)
+
+    if integration_path is not None:
+        if _git_stdout(project, "branch", "--show-current") == target_branch:
+            integration_path = project
+        else:
+            _ensure_integration_worktree(project, integration_path=integration_path, target_branch=target_branch)
+
+    return NodeRepoWorkspace(
+        repo_path=node_repo,
+        repo_id=repo_id,
+        source_branch=source_branch,
+        target_branch=target_branch,
+        node_branch=node_branch,
+        base_commit=base_commit,
+        integration_path=integration_path,
+    )
+
+
+def merge_node_repo_to_target(workspace: NodeRepoWorkspace, *, node_commit: NodeRepoCommit) -> NodeRepoMerge:
+    if workspace.integration_path is None:
+        raise RuntimeError("Cannot merge node repo without an integration worktree.")
+    lock = _merge_lock(workspace.repo_id, workspace.target_branch)
+    with lock:
+        integration = workspace.integration_path.resolve()
+        _assert_git_worktree(integration)
+        current = _git_stdout(integration, "branch", "--show-current")
+        if current != workspace.target_branch:
+            raise RuntimeError(f"Integration worktree is on {current or 'detached HEAD'}, expected {workspace.target_branch}.")
+        dirty = _git_stdout(integration, "status", "--porcelain", "--untracked-files=all")
+        if dirty.strip():
+            raise RuntimeError(f"Integration worktree is dirty and cannot merge: {dirty}")
+        target_before = _git_stdout(integration, "rev-parse", "HEAD")
+        _run_git(
+            integration,
+            "-c",
+            "user.name=Jarvis",
+            "-c",
+            "user.email=jarvis@example.local",
+            "merge",
+            "--no-ff",
+            workspace.node_branch,
+            "-m",
+            f"Merge {workspace.node_branch} into {workspace.target_branch}",
+        )
+        target_after = _git_stdout(integration, "rev-parse", "HEAD")
+        return NodeRepoMerge(
+            target_branch=workspace.target_branch,
+            node_branch=workspace.node_branch,
+            target_before=target_before,
+            target_after=target_after,
+            merge_commit=target_after,
+        )
 
 
 def commit_node_repo(
@@ -303,6 +449,7 @@ def _node_refs(root: Path, nodes: list[PlanNode]) -> dict[str, NodeWorkspaceRef]
             input_snapshot_path=node_root / "input_snapshot.md",
             output_path=node_root / "output.md",
             result_path=node_root / "result.json",
+            manifest_path=node_root / "node_manifest.json",
             provider_run_dir=node_root / "provider_run",
             repos_dir=node_root / "repo",
         )
@@ -345,45 +492,148 @@ def _assert_child(path: Path, root: Path) -> None:
 def _assert_git_worktree(path: Path) -> None:
     if not path.is_dir():
         raise RuntimeError(f"Repository path does not exist: {path}")
-    completed = subprocess.run(
-        ["git", "-C", str(path), "rev-parse", "--is-inside-work-tree"],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=30,
-    )
-    if completed.returncode != 0 or completed.stdout.strip() != "true":
+    result = _run_git_result(path, "rev-parse", "--is-inside-work-tree", timeout=30)
+    if result.exit_code != 0 or result.stdout.strip() != "true":
         raise RuntimeError(f"Path is not a git worktree: {path}")
 
 
-def _run_git(workdir: Path, *args: str) -> None:
-    completed = subprocess.run(
-        ["git", "-c", f"safe.directory={workdir.resolve()}", *args],
-        cwd=str(workdir),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=60,
+def _resolve_source_branch(project: Path, runtime_hints: dict[str, Any]) -> str:
+    explicit = _branch_hint(runtime_hints, "source_branch")
+    if explicit:
+        return explicit
+    for candidate in ("master", "main"):
+        if _branch_exists(project, candidate):
+            return candidate
+    current = _git_stdout(project, "branch", "--show-current")
+    return current or "HEAD"
+
+
+def _resolve_target_branch(*, repo_id: str, session_id: str, runtime_hints: dict[str, Any]) -> str:
+    explicit = (
+        _branch_hint(runtime_hints, "target_branch")
+        or _branch_hint(runtime_hints, "active_branch")
+        or _branch_hint(runtime_hints, "git_branch")
     )
-    if completed.returncode != 0:
-        raise RuntimeError((completed.stdout + completed.stderr).strip() or f"git {' '.join(args)} failed")
+    if explicit:
+        return explicit
+    return f"jarvis/{_safe_component(repo_id, fallback='repo')}/{_safe_component(session_id, fallback='session')}"
+
+
+def _branch_hint(runtime_hints: dict[str, Any], key: str) -> str | None:
+    value = runtime_hints.get(key)
+    if not isinstance(value, str):
+        return None
+    branch = value.strip()
+    if not branch:
+        return None
+    _validate_branch_name(branch)
+    return branch
+
+
+def _node_branch_name(*, repo_id: str, session_id: str, node_id: str) -> str:
+    branch = "/".join(
+        [
+            "jarvis-nodes",
+            _safe_component(repo_id, fallback="repo"),
+            _safe_component(session_id, fallback="session"),
+            _safe_component(node_id, fallback="node"),
+        ]
+    )
+    _validate_branch_name(branch)
+    return branch
+
+
+def _integration_repo_path(*, repo_id: str, runtime_hints: dict[str, Any]) -> Path | None:
+    raw_session_dir = runtime_hints.get("session_workspace_dir")
+    if not raw_session_dir:
+        return None
+    session_dir = Path(str(raw_session_dir)).resolve()
+    integration_root = (session_dir / "repos").resolve()
+    integration_path = (integration_root / _safe_component(repo_id, fallback="repo")).resolve()
+    _assert_child(integration_path, integration_root)
+    return integration_path
+
+
+def _ensure_target_branch(project: Path, *, target_branch: str, source_branch: str) -> None:
+    _validate_branch_name(target_branch)
+    if _branch_exists(project, target_branch):
+        return
+    _run_git(project, "branch", target_branch, source_branch)
+
+
+def _ensure_integration_worktree(project: Path, *, integration_path: Path, target_branch: str) -> None:
+    if integration_path.exists():
+        _assert_git_worktree(integration_path)
+        current = _git_stdout(integration_path, "branch", "--show-current")
+        if current != target_branch:
+            raise RuntimeError(f"Integration worktree is on {current or 'detached HEAD'}, expected {target_branch}.")
+        return
+    integration_path.parent.mkdir(parents=True, exist_ok=True)
+    _run_git(project, "worktree", "add", str(integration_path), target_branch)
+
+
+def _delete_branch_if_exists(project: Path, branch: str) -> None:
+    if not _branch_exists(project, branch):
+        return
+    _run_git(project, "branch", "-D", branch)
+
+
+def _branch_exists(project: Path, branch: str) -> bool:
+    result = _run_git_result(project, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}", timeout=30)
+    return result.exit_code == 0
+
+
+def _validate_branch_name(branch: str) -> None:
+    if not branch:
+        raise ValueError("Git branch name cannot be empty.")
+    result = _run_git_result(Path.cwd(), "check-ref-format", "--branch", branch, timeout=30)
+    if result.exit_code != 0:
+        raise ValueError(f"Invalid git branch name: {branch}")
+
+
+def _merge_lock(repo_id: str, target_branch: str) -> threading.RLock:
+    key = f"{repo_id}:{target_branch}"
+    with _MERGE_LOCKS_GUARD:
+        lock = _MERGE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _MERGE_LOCKS[key] = lock
+        return lock
+
+
+def _run_git(workdir: Path, *args: str) -> None:
+    result = _run_git_result(workdir, *args)
+    if result.exit_code != 0:
+        raise RuntimeError(_git_error_message(result, args))
 
 
 def _git_stdout(workdir: Path, *args: str) -> str:
+    result = _run_git_result(workdir, *args)
+    if result.exit_code != 0:
+        raise RuntimeError(_git_error_message(result, args))
+    return result.stdout.strip()
+
+
+def _run_git_result(workdir: Path, *args: str, timeout: int = 60) -> GitCommandResult:
+    safe_directory = workdir.resolve().as_posix()
     completed = subprocess.run(
-        ["git", "-c", f"safe.directory={workdir.resolve()}", *args],
+        ["git", "-c", f"safe.directory={safe_directory}", *args],
         cwd=str(workdir),
         capture_output=True,
         text=True,
         encoding="utf-8",
         errors="replace",
-        timeout=60,
+        timeout=timeout,
     )
-    if completed.returncode != 0:
-        raise RuntimeError((completed.stdout + completed.stderr).strip() or f"git {' '.join(args)} failed")
-    return completed.stdout.strip()
+    return GitCommandResult(
+        exit_code=completed.returncode,
+        stdout=completed.stdout,
+        stderr=completed.stderr,
+    )
+
+
+def _git_error_message(result: GitCommandResult, args: tuple[str, ...]) -> str:
+    return (result.stdout + result.stderr).strip() or f"git {' '.join(args)} failed"
 
 
 def _modified_files_from_status(status_stdout: str) -> list[str]:

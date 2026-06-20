@@ -8,7 +8,12 @@ import pytest
 from app.tools.codex import run_codex_coder_tool
 from app.tools.common import ToolExecutionRequest
 
-REAL_REPO = Path(os.environ.get("JARVIS_REAL_CODER_REPO", r"G:\pycharm-project\nltk"))
+REAL_REPO = Path(
+    os.environ.get(
+        "JARVIS_REAL_CODER_REPO",
+        str(Path(__file__).resolve().parents[1] / "data" / "projects" / "smoke-test"),
+    )
+)
 RUN_REAL_TESTS = os.environ.get("JARVIS_RUN_REAL_CODER_TESTS") == "1"
 
 

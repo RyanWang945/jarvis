@@ -10,6 +10,8 @@ wheels/
 pytest_tmp*/
 tmp_pytest_root*/
 pytest-cache-files-*/
+.coverage
+coverage.xml
 
 # IDE files
 .idea/
@@ -28,6 +30,10 @@ sessions/
 projects/
 *.db
 *.db-journal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.spec
 nul
 data/*
 !data/skills/

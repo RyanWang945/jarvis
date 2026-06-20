@@ -26,6 +26,7 @@ jarvis-cli = "app.cli:main"
 [dependency-groups]
 dev = [
     "httpx>=0.28.0",
+    "pyinstaller>=6.21.0",
     "pytest>=8.3.0",
 ]
 
@@ -38,3 +39,20 @@ packages = ["app"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "prompt" = "prompt"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = [
+    ".git",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".venv",
+    "build",
+    "data",
+    "dist",
+    "htmlcov",
+    "logs",
+    "sandbox",
+    "sessions",
+]

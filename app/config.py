@@ -49,6 +49,7 @@ class Settings(BaseSettings):
     llm_context_safety_buffer: int = 1000
     coder_runtime_provider: str = "codex"
     coder_timeout_seconds: int = 1800
+    coder_node_finalizer_llm_enabled: bool = False
     repositories_config_path: Path | None = Field(default=Path("data/repositories.json"))
     deepseek_api_key: str | None = None
     deepseek_base_url: str = "https://api.deepseek.com"

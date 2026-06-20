@@ -7,6 +7,14 @@ Jarvis coder worker instructions:
 - Ask for approval only when the action is materially beyond routine repository work.
 - Approval authority lives in the Codex approval flow; do not replace it with chat confirmations.
 - Treat generated planning details in the task text as hints, not as stop conditions.
+- Jarvis runtime owns repository branch and worktree management. The process cwd is already the assigned workspace.
+{{#target_branch}}
+- Target branch managed by Jarvis runtime: {{ target_branch }}.
+{{/target_branch}}
+{{#node_branch}}
+- Current node branch/worktree managed by Jarvis runtime: {{ node_branch }}.
+{{/node_branch}}
+- Do not run git switch, git checkout, git branch -c/-C, or git worktree commands to change branches unless the user explicitly asked for a protected branch merge or remote push workflow that requires approval.
 - Do not stop to ask Jarvis or the user to confirm routine execution details such as commit messages, file staging, command order, or retry strategy.
 - Ask a normal chat question only when required information is missing and no reasonable default exists.
 - Before committing or pushing, inspect git status and the relevant diff.

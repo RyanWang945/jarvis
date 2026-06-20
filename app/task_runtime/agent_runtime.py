@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import mimetypes
 import re
 import shutil
 import time
@@ -20,14 +21,16 @@ from app.agent_react.session_state import (
 )
 from app.config import get_settings
 from app.progress import ProgressReporter, ensure_progress
+from app.runtime_usage import append_usage_footer, collect_usage_records, usage_totals
 from app.runtime_types import ChannelMessage, ConversationStore, TurnResult
+from app.task_runtime.approval_types import approval_request_dicts
 from app.task_runtime.node_execute_runtime import (
     CoderNodeExecuteRuntime,
     LLMNodeExecuteRuntime,
     ReactNodeExecuteRuntime,
 )
 from app.task_runtime.node_executor import NodeExecutor
-from app.task_runtime.node_result import ExecutionReport, NodeResult
+from app.task_runtime.node_result import ExecutionReport, NodeArtifact, NodeResult
 from app.task_runtime.planning_router import PlanningRouter
 from app.task_runtime.result_aggregator import AggregationResult, ResultAggregator
 from app.task_runtime.session_workspace import SessionWorkspaceManager, SessionWorkspaceRef
@@ -140,10 +143,14 @@ class TaskAgentRuntime:
             )
             if router_result.route == "fast_reply":
                 report = _fast_reply_report(router_result.fast_intent.reply)
+                usage_records = collect_usage_records(router_result.fast_intent, router_result.plan, report.node_results)
+                token_usage = usage_totals(usage_records)
+                reply = append_usage_footer(router_result.fast_intent.reply, token_usage)
                 aggregation = AggregationResult(
                     status="completed",
-                    reply=router_result.fast_intent.reply,
+                    reply=reply,
                     data={"finalization": "fast_reply"},
+                    usage_records=usage_records,
                 )
                 raw_payload = {
                     "source": "task_runtime",
@@ -153,17 +160,21 @@ class TaskAgentRuntime:
                     "execution_report": report.model_dump(mode="json", exclude_none=True),
                     "aggregation": aggregation.model_dump(mode="json", exclude_none=True),
                 }
+                if usage_records:
+                    raw_payload["usage_records"] = usage_records
+                if token_usage is not None:
+                    raw_payload["usage"] = token_usage
                 self._store.finalize_turn_success(
                     turn_id=turn_id,
                     conversation_id=turn.conversation_id,
-                    content=aggregation.reply,
+                    content=reply,
                     content_type="markdown",
                     raw_payload=raw_payload,
                 )
                 logger.info(
                     "task runtime fast reply finished turn_id=%s reply_len=%s elapsed_ms=%s",
                     turn_id,
-                    len(aggregation.reply),
+                    len(reply),
                     int((time.perf_counter() - started) * 1000),
                 )
                 progress.emit(
@@ -178,7 +189,7 @@ class TaskAgentRuntime:
                     conversation_id=turn.conversation_id,
                     turn_id=turn_id,
                     status="completed",
-                    reply=aggregation.reply,
+                    reply=reply,
                     current_user_input=user_input,
                 )
                 return TurnResult(
@@ -186,9 +197,9 @@ class TaskAgentRuntime:
                     conversation_id=turn.conversation_id,
                     status="completed",
                     message=ChannelMessage(
-                        content=aggregation.reply,
+                        content=reply,
                         content_type="markdown",
-                        summary=aggregation.reply,
+                        summary=reply,
                         metadata={
                             "conversation_id": turn.conversation_id,
                             "turn_id": turn_id,
@@ -249,6 +260,16 @@ class TaskAgentRuntime:
                 report.data.get("completed_order"),
                 int((time.perf_counter() - execution_started) * 1000),
             )
+            artifact_records = _publish_artifacts_from_report(
+                report,
+                turn_id=turn_id,
+                session_workspace=session_workspace,
+            )
+            _persist_artifacts(self._store, turn.conversation_id, artifact_records)
+            current_artifact_context = [
+                *recent_artifacts,
+                *[artifact_to_payload(item) for item in artifact_records],
+            ]
             aggregation_started = time.perf_counter()
             progress.emit(
                 "aggregation_started",
@@ -265,18 +286,13 @@ class TaskAgentRuntime:
                 current_user_input=user_input,
                 route=router_result.route,
                 fast_intent=router_result.fast_intent.model_dump(mode="json"),
-                artifacts=recent_artifacts,
+                artifacts=current_artifact_context,
                 runtime_hints=execution_runtime_hints,
                 instructions=[],
                 conversation_metadata=conversation.metadata,
             )
-            tool_artifacts = _promote_tool_artifacts_to_session(
-                _tool_artifacts_from_report(report, turn_id=turn_id),
-                session_workspace,
-            )
-            _persist_tool_artifacts(self._store, turn.conversation_id, tool_artifacts)
             artifact_resolution = resolve_channel_attachments(
-                tool_artifacts,
+                artifact_records,
                 turn_id=turn_id,
                 extra_allowed_roots=[session_workspace.artifacts_dir],
             )
@@ -305,7 +321,7 @@ class TaskAgentRuntime:
             logger.info(
                 "task runtime artifacts resolved turn_id=%s artifact_count=%s attachment_count=%s rejected_count=%s",
                 turn_id,
-                len(tool_artifacts),
+                len(artifact_records),
                 len(artifact_resolution.attachments),
                 len(artifact_resolution.rejected),
             )
@@ -318,13 +334,22 @@ class TaskAgentRuntime:
                 "aggregation": aggregation.model_dump(mode="json", exclude_none=True),
                 "session_workspace": session_workspace.metadata(),
             }
-            if tool_artifacts:
-                raw_payload["artifacts"] = [artifact_to_payload(item) for item in tool_artifacts]
+            if artifact_records:
+                raw_payload["artifacts"] = [artifact_to_payload(item) for item in artifact_records]
             if artifact_resolution.attachments:
                 raw_payload["attachments"] = [attachment.__dict__ for attachment in artifact_resolution.attachments]
             if artifact_resolution.rejected:
                 raw_payload["artifact_rejections"] = [item.__dict__ for item in artifact_resolution.rejected]
-            reply = aggregation.reply
+            approval_requests = _approval_requests_from_aggregation(aggregation)
+            if approval_requests:
+                raw_payload["approval_requests"] = approval_requests
+            usage_records = collect_usage_records(router_result.fast_intent, router_result.plan, report.node_results, aggregation)
+            token_usage = usage_totals(usage_records)
+            reply = append_usage_footer(aggregation.reply, token_usage)
+            if usage_records:
+                raw_payload["usage_records"] = usage_records
+            if token_usage is not None:
+                raw_payload["usage"] = token_usage
             if aggregation.status == "failed":
                 self._store.finalize_turn_failure(turn_id, error_message=reply)
                 status = "failed"
@@ -373,6 +398,7 @@ class TaskAgentRuntime:
                         "conversation_id": turn.conversation_id,
                         "turn_id": turn_id,
                         "aggregation_status": aggregation.status,
+                        **({"approval_requests": approval_requests} if approval_requests else {}),
                     },
                 ),
             )
@@ -468,34 +494,152 @@ def _recent_artifacts(store: ConversationStore, conversation_id: int) -> list[di
         return []
 
 
-def _tool_artifacts_from_report(report: ExecutionReport, *, turn_id: int) -> list[ToolArtifact]:
+def _publish_artifacts_from_report(
+    report: ExecutionReport,
+    *,
+    turn_id: int,
+    session_workspace: SessionWorkspaceRef,
+) -> list[ToolArtifact]:
+    artifacts = _artifact_records_from_report(report, turn_id=turn_id, session_workspace=session_workspace)
+    return _promote_tool_artifacts_to_session(artifacts, session_workspace)
+
+
+def _artifact_records_from_report(
+    report: ExecutionReport,
+    *,
+    turn_id: int,
+    session_workspace: SessionWorkspaceRef,
+) -> list[ToolArtifact]:
     artifacts: list[ToolArtifact] = []
     seen: set[str] = set()
     for result in report.node_results:
-        raw_items = result.data.get("tool_artifacts")
-        if not isinstance(raw_items, list):
-            continue
-        for raw in raw_items:
-            if not isinstance(raw, dict):
+        for node_artifact in result.artifacts:
+            artifact = _artifact_record_from_node_artifact(
+                node_artifact,
+                result=result,
+                turn_id=turn_id,
+                session_workspace=session_workspace,
+            )
+            if artifact is None:
                 continue
+            if artifact.artifact_id not in seen:
+                seen.add(artifact.artifact_id)
+                artifacts.append(artifact)
+        for raw in _tool_artifact_payloads(result):
             artifact = artifact_from_payload(raw)
             if artifact is None:
                 continue
-            updates: dict[str, Any] = {}
-            if artifact.turn_id is None:
-                updates["turn_id"] = turn_id
-            if not artifact.tool_call_id:
-                updates["tool_call_id"] = f"node:{result.node_id}"
-            if not artifact.source_tool:
-                provider = str(result.data.get("provider") or "")
-                updates["source_tool"] = "coder" if result.runtime in {"coder", "codex"} and provider in {"", "codex"} else result.runtime
-            if updates:
-                artifact = replace(artifact, **updates)
-            if artifact.artifact_id in seen:
-                continue
-            seen.add(artifact.artifact_id)
-            artifacts.append(artifact)
+            artifact = _normalize_tool_artifact(
+                artifact,
+                result=result,
+                turn_id=turn_id,
+                session_workspace=session_workspace,
+            )
+            if artifact is not None and artifact.artifact_id not in seen:
+                seen.add(artifact.artifact_id)
+                artifacts.append(artifact)
     return artifacts
+
+
+def _tool_artifact_payloads(result: NodeResult) -> list[dict[str, Any]]:
+    payloads: list[dict[str, Any]] = []
+    raw_items = result.data.get("tool_artifacts")
+    if isinstance(raw_items, list):
+        payloads.extend(item for item in raw_items if isinstance(item, dict))
+    raw_calls = result.data.get("tool_calls")
+    if isinstance(raw_calls, list):
+        for call in raw_calls:
+            if not isinstance(call, dict):
+                continue
+            call_artifacts = call.get("tool_artifacts")
+            if isinstance(call_artifacts, list):
+                payloads.extend(item for item in call_artifacts if isinstance(item, dict))
+    return payloads
+
+
+def _artifact_record_from_node_artifact(
+    node_artifact: NodeArtifact,
+    *,
+    result: NodeResult,
+    turn_id: int,
+    session_workspace: SessionWorkspaceRef,
+) -> ToolArtifact | None:
+    if not node_artifact.publish:
+        return None
+    path_info = _resolve_session_artifact_path(
+        node_artifact.session_relative_path or node_artifact.path,
+        session_workspace=session_workspace,
+        allow_absolute=False,
+    )
+    if path_info is None and node_artifact.kind in {"file", "image", "log", "directory"}:
+        logger.warning(
+            "node artifact skipped node_id=%s ref=%s reason=invalid_session_relative_path path=%s",
+            result.node_id,
+            node_artifact.ref,
+            node_artifact.path,
+        )
+        return None
+    absolute_path, relative_path = path_info if path_info is not None else (None, None)
+    stat = _stat_file(absolute_path)
+    metadata = dict(node_artifact.metadata)
+    if relative_path:
+        metadata.setdefault("session_relative_path", relative_path)
+    metadata.setdefault("node_artifact_ref", node_artifact.ref)
+    return ToolArtifact(
+        artifact_id=node_artifact.artifact_id
+        or _stable_session_artifact_id(session_workspace.session_id, result.node_id, node_artifact.ref, relative_path),
+        kind=_artifact_kind(node_artifact.kind, absolute_path),
+        turn_id=turn_id,
+        tool_call_id=f"node:{result.node_id}",
+        path=str(absolute_path) if absolute_path is not None else node_artifact.path,
+        session_relative_path=relative_path,
+        mime_type=node_artifact.mime_type or (_guess_mime(absolute_path) if absolute_path is not None else None),
+        filename=node_artifact.filename or node_artifact.name or (absolute_path.name if absolute_path is not None else None),
+        size_bytes=node_artifact.size_bytes or (stat.st_size if stat is not None else None),
+        source_tool=node_artifact.source_tool or result.runtime,
+        node_id=result.node_id,
+        publish=node_artifact.publish,
+        metadata=metadata,
+    )
+
+
+def _normalize_tool_artifact(
+    artifact: ToolArtifact,
+    *,
+    result: NodeResult,
+    turn_id: int,
+    session_workspace: SessionWorkspaceRef,
+) -> ToolArtifact | None:
+    updates: dict[str, Any] = {}
+    if artifact.turn_id is None:
+        updates["turn_id"] = turn_id
+    if not artifact.tool_call_id:
+        updates["tool_call_id"] = f"node:{result.node_id}"
+    if not artifact.source_tool:
+        provider = str(result.data.get("provider") or "")
+        updates["source_tool"] = "coder" if result.runtime in {"coder", "codex"} and provider in {"", "codex"} else result.runtime
+    if artifact.node_id is None:
+        updates["node_id"] = result.node_id
+    path_info = _resolve_session_artifact_path(
+        artifact.session_relative_path or artifact.path,
+        session_workspace=session_workspace,
+        allow_absolute=True,
+    )
+    if path_info is not None:
+        absolute_path, relative_path = path_info
+        updates["path"] = str(absolute_path)
+        updates["session_relative_path"] = relative_path
+        metadata = dict(artifact.metadata)
+        metadata.setdefault("session_relative_path", relative_path)
+        updates["metadata"] = metadata
+        stat = _stat_file(absolute_path)
+        if artifact.size_bytes is None and stat is not None:
+            updates["size_bytes"] = stat.st_size
+        if not artifact.filename:
+            updates["filename"] = absolute_path.name
+        if not artifact.mime_type:
+            updates["mime_type"] = _guess_mime(absolute_path)
+    return replace(artifact, **updates) if updates else artifact
 
 
 def _promote_tool_artifacts_to_session(
@@ -509,6 +653,8 @@ def _promote_tool_artifact_to_session(
     artifact: ToolArtifact,
     session_workspace: SessionWorkspaceRef,
 ) -> ToolArtifact:
+    if not artifact.publish:
+        return artifact
     if artifact.kind not in {"image", "file"} or not artifact.path:
         return artifact
     try:
@@ -520,7 +666,7 @@ def _promote_tool_artifact_to_session(
     artifacts_dir = session_workspace.artifacts_dir.resolve()
     try:
         source.relative_to(artifacts_dir)
-        return artifact
+        return _with_session_relative_path(artifact, source, session_workspace)
     except ValueError:
         pass
 
@@ -545,12 +691,15 @@ def _promote_tool_artifact_to_session(
             "session_id": session_workspace.session_id,
             "session_artifacts_dir": str(session_workspace.artifacts_dir),
             "source_path": str(source),
+            "source_session_relative_path": artifact.session_relative_path,
             "promoted_to_session_artifacts": True,
         }
     )
+    session_relative_path = _session_relative(target, session_workspace.root_path)
     return replace(
         artifact,
         path=str(target),
+        session_relative_path=session_relative_path,
         filename=target.name,
         size_bytes=stat.st_size,
         metadata=metadata,
@@ -568,7 +717,86 @@ def _session_artifact_filename(artifact: ToolArtifact, source: Path) -> str:
     return f"{stem}-{digest}{suffix}"
 
 
-def _persist_tool_artifacts(store: ConversationStore, conversation_id: int, artifacts: list[Any]) -> None:
+def _with_session_relative_path(
+    artifact: ToolArtifact,
+    path: Path,
+    session_workspace: SessionWorkspaceRef,
+) -> ToolArtifact:
+    relative = _session_relative(path, session_workspace.root_path)
+    if artifact.session_relative_path == relative:
+        return artifact
+    metadata = dict(artifact.metadata)
+    metadata.setdefault("session_relative_path", relative)
+    return replace(artifact, session_relative_path=relative, metadata=metadata)
+
+
+def _resolve_session_artifact_path(
+    path_text: str | None,
+    *,
+    session_workspace: SessionWorkspaceRef,
+    allow_absolute: bool,
+) -> tuple[Path, str] | None:
+    text = str(path_text or "").strip()
+    if not text:
+        return None
+    path = Path(text)
+    session_root = session_workspace.root_path.resolve()
+    try:
+        if path.is_absolute():
+            if not allow_absolute:
+                return None
+            resolved = path.expanduser().resolve(strict=True)
+        else:
+            if any(part == ".." for part in path.parts):
+                return None
+            resolved = (session_root / path).resolve(strict=True)
+        relative = resolved.relative_to(session_root)
+    except (OSError, ValueError):
+        return None
+    return resolved, relative.as_posix()
+
+
+def _session_relative(path: Path, session_root: Path) -> str | None:
+    try:
+        return path.resolve().relative_to(session_root.resolve()).as_posix()
+    except (OSError, ValueError):
+        return None
+
+
+def _stat_file(path: Path | None):
+    if path is None:
+        return None
+    try:
+        return path.stat() if path.is_file() else None
+    except OSError:
+        return None
+
+
+def _guess_mime(path: Path | None) -> str | None:
+    if path is None:
+        return None
+    return mimetypes.guess_type(str(path))[0]
+
+
+def _artifact_kind(kind: str, path: Path | None) -> Any:
+    normalized = str(kind or "").strip().lower()
+    if normalized in {"image", "file", "directory", "log", "git_ref"}:
+        return normalized
+    if path is not None and path.is_dir():
+        return "directory"
+    if path is not None and _guess_mime(path or None) in {"image/png", "image/jpeg", "image/webp", "image/gif", "image/svg+xml"}:
+        return "image"
+    return "file" if path is not None else "git_ref"
+
+
+def _stable_session_artifact_id(session_id: str, node_id: str, ref: str, relative_path: str | None) -> str:
+    identity = relative_path or ref
+    digest = hashlib.sha256(f"{session_id}|{node_id}|{identity}".encode("utf-8", errors="replace")).hexdigest()[:16]
+    safe_ref = re.sub(r"[^A-Za-z0-9._:-]+", "_", ref).strip("._:-")[:48] or "artifact"
+    return f"{session_id}:{node_id}:{safe_ref}:{digest}"
+
+
+def _persist_artifacts(store: ConversationStore, conversation_id: int, artifacts: list[Any]) -> None:
     upsert = getattr(store, "upsert_artifact", None)
     if not callable(upsert):
         return
@@ -616,3 +844,10 @@ def _fast_reply_report(reply: str) -> ExecutionReport:
         ],
         data={"completed_order": ["fast_reply"], "fast_path": True},
     )
+
+
+def _approval_requests_from_aggregation(aggregation: AggregationResult) -> list[dict[str, Any]]:
+    raw = aggregation.data.get("approval_requests")
+    if not isinstance(raw, list):
+        return []
+    return approval_request_dicts(raw)

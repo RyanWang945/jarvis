@@ -1,0 +1,18 @@
+{
+  "id": "react_node_execute:v2",
+  "scenario": "react_node_execute",
+  "version": "v2",
+  "description": "Execute one tool-using non-repository Jarvis plan node with strict artifact creation rules.",
+  "response_format": "text",
+  "variables": ["input_json"],
+  "messages": [
+    {
+      "role": "system",
+      "template": "system.md"
+    },
+    {
+      "role": "user",
+      "template": "user.md"
+    }
+  ]
+}

@@ -15,6 +15,7 @@ from app.llm.client import LLMMessage, parse_json_content
 from app.llm.model_profiles import LLMNode
 from app.llm.model_router import ModelRouter
 from app.prompting import PromptRegistry
+from app.runtime_usage import usage_record_from_response
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +103,7 @@ class ExecutionPlan(BaseModel):
     nodes: list[PlanNode]
     # 执行完任务后，最终回复如何收口；mode/reason 由 runtime 根据 nodes 推导。
     finalization_hint: FinalizationHint = Field(default_factory=FinalizationHint)
+    usage_records: list[dict[str, Any]] = Field(default_factory=list)
 
     @field_validator("user_objective")
     @classmethod
@@ -226,6 +228,9 @@ class TurnPlanner:
             runtime_hints=plan_input.runtime_hints,
             previous_node_results=plan_input.previous_node_results,
         )
+        usage_record = usage_record_from_response(response, stage="planner")
+        if usage_record is not None:
+            plan.usage_records.append(usage_record)
         logger.info("turn planner plan output=%s", _json_for_log(plan.model_dump(mode="json")))
         return plan
 

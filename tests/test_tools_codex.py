@@ -6,14 +6,17 @@ from uuid import uuid4
 
 import pytest
 
+from app.llm.provider_adapters import TokenUsage
 from app.repositories import RepositoryRef, RepositoryRegistry
 from app.tools.codex import run_codex_coder_tool
 from app.tools.codex_app_server import (
     CodexAppServerSession,
     CodexAppServerRunResult,
     _approval_decision,
+    _is_auto_approved_workspace_approval,
     _is_routine_repo_git_approval,
     _matches_trusted_command_prefix,
+    _thread_token_usage_from_event,
     approval_command_prefix,
 )
 from app.tools.coder_common import build_coder_instruction, check_coder_permissions
@@ -55,7 +58,13 @@ def test_codex_coder_runs_with_clean_stdout_and_jsonl_artifact(monkeypatch, tmp_
             {"type": "agent_message", "message": "Changed README and ran tests."},
         ]
         stdout = "\n".join(json.dumps(event) for event in events)
-        return CodexAppServerRunResult(status="completed", raw_events=stdout, exit_code=0, final_text="Changed README and ran tests.")
+        return CodexAppServerRunResult(
+            status="completed",
+            raw_events=stdout,
+            exit_code=0,
+            final_text="Changed README and ran tests.",
+            usage=TokenUsage(prompt_tokens=1200, completion_tokens=300, total_tokens=1500),
+        )
 
     monkeypatch.setattr("app.tools.codex._run_codex_app_server", _fake_run)
 
@@ -80,8 +89,58 @@ def test_codex_coder_runs_with_clean_stdout_and_jsonl_artifact(monkeypatch, tmp_
     assert "Changed README and ran tests." in result.stdout
     assert "{\"type\"" not in result.stdout
     assert "[JARVIS_" not in result.stdout
+    assert result.metadata["usage_records"][0]["provider"] == "codex"
+    assert result.metadata["usage_records"][0]["prompt_tokens"] == 1200
+    assert result.metadata["usage_records"][0]["completion_tokens"] == 300
     assert any(str(artifact).startswith("codex_events:") for artifact in result.artifacts)
     assert any(str(artifact).startswith("jarvis_audit:") for artifact in result.artifacts)
+
+
+def test_codex_thread_token_usage_updated_event_is_parsed() -> None:
+    usage = _thread_token_usage_from_event(
+        {
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "threadId": "thread_1",
+                "tokenUsage": {
+                    "inputTokens": 42,
+                    "outputTokens": 8,
+                    "totalTokens": 50,
+                },
+            },
+        }
+    )
+
+    assert usage == TokenUsage(prompt_tokens=42, completion_tokens=8, total_tokens=50)
+
+
+def test_codex_thread_token_usage_updated_event_parses_nested_total_usage() -> None:
+    usage = _thread_token_usage_from_event(
+        {
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "threadId": "thread_1",
+                "turnId": "turn_1",
+                "tokenUsage": {
+                    "total": {
+                        "inputTokens": 203939,
+                        "outputTokens": 3970,
+                        "totalTokens": 207909,
+                        "cachedInputTokens": 171776,
+                        "reasoningOutputTokens": 1593,
+                    },
+                    "last": {
+                        "inputTokens": 22868,
+                        "outputTokens": 164,
+                        "totalTokens": 23032,
+                    },
+                    "modelContextWindow": 258400,
+                },
+            },
+        }
+    )
+
+    assert usage == TokenUsage(prompt_tokens=203939, completion_tokens=3970, total_tokens=207909)
 
 
 def test_codex_coder_uses_runtime_workdir_and_run_dir(monkeypatch, tmp_path: Path) -> None:
@@ -528,6 +587,108 @@ def test_codex_auto_approves_only_routine_local_git_commands() -> None:
     assert not _is_routine_repo_git_approval({"command": "git restore ."})
     assert not _is_routine_repo_git_approval({"command": "Remove-Item -Recurse data"})
     assert not _is_routine_repo_git_approval({"command": "git add .; Remove-Item -Recurse data"})
+
+
+def test_codex_auto_approves_workspace_file_changes_and_manifest_writes(tmp_path: Path) -> None:
+    node_workspace = tmp_path / "sessions" / "s1" / "nodes" / "n1"
+    repo = node_workspace / "repo" / "smoke-test"
+    repo.mkdir(parents=True)
+    allowed_roots = (repo.resolve(), node_workspace.resolve())
+
+    assert _is_auto_approved_workspace_approval(
+        {
+            "type": "item/fileChange/requestApproval",
+            "cwd": str(repo),
+        },
+        allowed_roots=allowed_roots,
+    )
+    assert _is_auto_approved_workspace_approval(
+        {
+            "type": "item/commandExecution/requestApproval",
+            "cwd": str(repo),
+            "command": "python -m pytest -q -p no:cacheprovider",
+        },
+        allowed_roots=allowed_roots,
+    )
+    assert _is_auto_approved_workspace_approval(
+        {
+            "type": "item/commandExecution/requestApproval",
+            "cwd": str(repo),
+            "command": f"powershell.exe -Command \"Set-Content -LiteralPath '{node_workspace / 'node_manifest.json'}' -Value '{{}}'\"",
+        },
+        allowed_roots=allowed_roots,
+    )
+
+
+def test_codex_auto_approval_rejects_protected_or_outside_actions(tmp_path: Path) -> None:
+    node_workspace = tmp_path / "sessions" / "s1" / "nodes" / "n1"
+    repo = node_workspace / "repo" / "smoke-test"
+    outside = tmp_path / "outside"
+    repo.mkdir(parents=True)
+    outside.mkdir()
+    allowed_roots = (repo.resolve(), node_workspace.resolve())
+
+    assert not _is_auto_approved_workspace_approval(
+        {
+            "type": "item/commandExecution/requestApproval",
+            "cwd": str(repo),
+            "command": "git push origin main",
+        },
+        allowed_roots=allowed_roots,
+    )
+    assert not _is_auto_approved_workspace_approval(
+        {
+            "type": "item/fileChange/requestApproval",
+            "cwd": str(outside),
+        },
+        allowed_roots=allowed_roots,
+    )
+
+
+def test_codex_auto_approves_workspace_cache_cleanup(tmp_path: Path) -> None:
+    node_workspace = tmp_path / "sessions" / "s1" / "nodes" / "n1"
+    repo = node_workspace / "repo" / "smoke-test"
+    repo.mkdir(parents=True)
+    allowed_roots = (repo.resolve(), node_workspace.resolve())
+
+    assert _is_auto_approved_workspace_approval(
+        {
+            "type": "item/commandExecution/requestApproval",
+            "cwd": str(repo),
+            "command": (
+                "pwsh.exe -Command "
+                "'$root = (Resolve-Path .).Path; "
+                "$targets = @((Resolve-Path .\\__pycache__ -ErrorAction SilentlyContinue)); "
+                "foreach ($target in $targets) { "
+                "if ($target -and $target.Path.StartsWith($root)) { "
+                "Remove-Item -LiteralPath $target.Path -Recurse -Force } }'"
+            ),
+            "raw_params": {
+                "commandActions": [
+                    {
+                        "type": "unknown",
+                        "command": (
+                            "$root = (Resolve-Path .).Path; "
+                            "$targets = @((Resolve-Path .\\__pycache__ -ErrorAction SilentlyContinue)); "
+                            "foreach ($target in $targets) { "
+                            "if ($target -and $target.Path.StartsWith($root)) { "
+                            "Remove-Item -LiteralPath $target.Path -Recurse -Force } }"
+                        ),
+                    }
+                ]
+            },
+        },
+        allowed_roots=allowed_roots,
+    )
+
+    assert not _is_auto_approved_workspace_approval(
+        {
+            "type": "item/commandExecution/requestApproval",
+            "cwd": str(repo),
+            "command": "Remove-Item -LiteralPath data -Recurse -Force",
+        },
+        allowed_roots=allowed_roots,
+    )
 
 
 def test_codex_approval_prefix_matching_normalizes_shell_wrappers() -> None:

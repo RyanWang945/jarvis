@@ -5,8 +5,8 @@ import json
 import pytest
 
 from app.config import get_settings
+from app.task_runtime.approval_types import ApprovalRequest
 from app.task_runtime.coder_provider import (
-    CoderApprovalRequest,
     CoderApprovalContinuationResult,
     CoderPolicy,
     CoderRunRequest,
@@ -27,9 +27,14 @@ class RecordingProvider:
     def __init__(self) -> None:
         self.requests = []
 
-    def run(self, request, *, decide_action):
-        self.requests.append((request, decide_action))
+    def run(self, request):
+        self.requests.append(request)
         return CoderRunResult(ok=True, stdout="coder done", artifacts=["git_worktree:clean"])
+
+
+def _noop_git_context(**kwargs):
+    del kwargs
+    return {}
 
 
 def test_coder_provider_factory_defaults_to_codex(monkeypatch) -> None:
@@ -69,7 +74,7 @@ def test_coder_provider_factory_rejects_unknown_provider(monkeypatch) -> None:
 
 def test_coder_node_runtime_builds_provider_request_with_policy() -> None:
     provider = RecordingProvider()
-    runtime = CoderNodeExecuteRuntime(provider=provider)
+    runtime = CoderNodeExecuteRuntime(provider=provider, git_context_resolver=_noop_git_context)
 
     result = runtime.run(
         NodeExecutionContext(
@@ -84,7 +89,7 @@ def test_coder_node_runtime_builds_provider_request_with_policy() -> None:
         )
     )
 
-    request, _decide_action = provider.requests[0]
+    request = provider.requests[0]
     assert request.repo_id == "jarvis"
     assert request.workdir.name == "jarvis"
     assert request.policy.access_mode == "write"
@@ -98,7 +103,7 @@ def test_coder_node_runtime_builds_provider_request_with_policy() -> None:
 
 def test_coder_node_runtime_defaults_to_read_policy() -> None:
     provider = RecordingProvider()
-    runtime = CoderNodeExecuteRuntime(provider=provider)
+    runtime = CoderNodeExecuteRuntime(provider=provider, git_context_resolver=_noop_git_context)
 
     runtime.run(
         NodeExecutionContext(
@@ -108,7 +113,7 @@ def test_coder_node_runtime_defaults_to_read_policy() -> None:
         )
     )
 
-    request, _decide_action = provider.requests[0]
+    request = provider.requests[0]
     assert request.policy.access_mode == "read"
     assert request.policy.allow_commit is False
     assert request.policy.allow_push is False
@@ -146,8 +151,7 @@ def test_codex_provider_surfaces_approval_request_artifact(tmp_path) -> None:
             workdir=tmp_path,
             instruction="Push the change.",
             policy=CoderPolicy(access_mode="write", allow_commit=True, allow_push=True),
-        ),
-        decide_action=lambda action: None,  # type: ignore[arg-type]
+        )
     )
 
     assert result.approval_requests[0].approval_id == "approval_1"
@@ -179,8 +183,7 @@ def test_claude_code_provider_delegates_to_claude_tool(monkeypatch, tmp_path) ->
             instruction="Review runtime.",
             policy=CoderPolicy(access_mode="read"),
             timeout_seconds=123,
-        ),
-        decide_action=lambda action: None,  # type: ignore[arg-type]
+        )
     )
 
     request = captured["request"]
@@ -214,8 +217,7 @@ def test_claude_code_provider_passes_write_permissions(monkeypatch, tmp_path) ->
             workdir=tmp_path,
             instruction="Commit the change.",
             policy=CoderPolicy(access_mode="write", allow_commit=True, allow_push=True),
-        ),
-        decide_action=lambda action: None,  # type: ignore[arg-type]
+        )
     )
 
     args = captured["request"].args
@@ -224,27 +226,56 @@ def test_claude_code_provider_passes_write_permissions(monkeypatch, tmp_path) ->
     assert args["allow_push"] is True
 
 
+def test_claude_code_provider_passes_runtime_branch_context(monkeypatch, tmp_path) -> None:
+    captured = {}
+
+    def _runner(request):
+        captured["request"] = request
+        return ToolExecutionResult(ok=True, exit_code=0, summary="ok")
+
+    monkeypatch.setattr("app.task_runtime.coder_provider.run_coder_tool", _runner)
+
+    ClaudeCodeCoderProvider().run(
+        CoderRunRequest(
+            repo_id="smoke-test",
+            workdir=tmp_path,
+            instruction="Write quicksort.",
+            policy=CoderPolicy(access_mode="write"),
+            metadata={
+                "source_branch": "main",
+                "target_branch": "feat/test",
+                "node_branch": "jarvis-nodes/smoke-test/session/write_quicksort",
+            },
+        )
+    )
+
+    args = captured["request"].args
+    assert args["source_branch"] == "main"
+    assert args["target_branch"] == "feat/test"
+    assert args["node_branch"] == "jarvis-nodes/smoke-test/session/write_quicksort"
+
+
 def test_coder_node_runtime_blocks_when_approval_required() -> None:
     class ApprovalProvider:
         name = "fake"
 
-        def run(self, request, *, decide_action):
-            del request, decide_action
+        def run(self, request):
+            del request
             return CoderRunResult(
                 ok=False,
                 summary="Approval is required.",
                 approval_requests=[
-                    CoderApprovalRequest(
+                    ApprovalRequest(
                         approval_id="approval_42",
                         action_kind="commit",
                         command="git commit -m change",
                         reason="Create the requested commit.",
-                        raw_provider_payload={"id": "approval_42"},
+                        payload={"id": "approval_42"},
                     )
                 ],
             )
 
-    result = CoderNodeExecuteRuntime(provider=ApprovalProvider()).run(
+    result = CoderNodeExecuteRuntime(provider=ApprovalProvider(), git_context_resolver=_noop_git_context).run(
         NodeExecutionContext(
             user_objective="commit changes",
             node=PlanNode(id="commit", runtime="coder", objective="Commit changes", runtime_hints={"access_mode": "write"}),
@@ -255,11 +286,10 @@ def test_coder_node_runtime_blocks_when_approval_required() -> None:
     assert result.status == "blocked"
     assert result.error is not None
     assert result.error.code == "coder_approval_required"
-    assert result.data["approval_required"] is True
     assert result.data["approval_id"] == "approval_42"
     assert result.data["action_kind"] == "commit"
     assert result.data["command"] == "git commit -m change"
-    assert result.data["approval_requests"][0]["raw_provider_payload"] == {"id": "approval_42"}
+    assert result.data["approval_requests"][0]["payload"] == {"id": "approval_42"}
 
 
 def test_resume_coder_approval_delegates_to_codex(monkeypatch) -> None:

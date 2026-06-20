@@ -43,6 +43,16 @@
               "access_mode": {
                 "type": "string",
                 "enum": ["read", "write"]
+              },
+              "source_branch": {
+                "type": "string"
+              },
+              "target_branch": {
+                "type": "string"
+              },
+              "worktree_mode": {
+                "type": "string",
+                "enum": ["node_branch_worktree"]
               }
             }
           }

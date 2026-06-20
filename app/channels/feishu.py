@@ -47,7 +47,9 @@ from app.config import get_settings
 from app.gateway import InboundEvent, get_gateway_service
 from app.progress import NoopProgressReporter, ProgressEvent, ProgressReporter
 from app.persistence.models import DeliveryRecord
-from app.task_runtime.coder_provider import resume_coder_approval
+from app.runtime_usage import append_usage_footer, collect_usage_records, usage_totals
+from app.task_runtime.approval_types import approval_request_from_mapping
+from app.task_runtime.approval_runtime import continue_approval
 from app.tools.codex_app_server import approval_command_prefix
 
 logger = logging.getLogger(__name__)
@@ -387,7 +389,9 @@ class FeishuChannel:
             approval_id = str(value.get("approval_id") or "")
             command = str(value.get("command") or "")
             reason = str(value.get("reason") or "")
-            language = str(value.get("language") or _codex_approval_language(conversation_id or 0))
+            language = str(value.get("language") or _approval_language(conversation_id or 0))
+            approval_source = str(value.get("approval_source") or "codex_provider")
+            approval_payload = value.get("payload") if isinstance(value.get("payload"), dict) else {}
             context = getattr(event, "context", None)
             message_id = getattr(context, "open_message_id", None)
             chat_id = getattr(context, "open_chat_id", None) or str(value.get("chat_id") or "")
@@ -396,9 +400,10 @@ class FeishuChannel:
                 value.get("sender_open_id") or "feishu_approval"
             )
             logger.info(
-                "feishu codex approval action received decision=%s conversation_id=%s "
+                "feishu approval action received decision=%s source=%s conversation_id=%s "
                 "turn_id=%s approval_id=%s chat_id=%s message_id=%s",
                 decision,
+                approval_source,
                 conversation_id,
                 turn_id,
                 approval_id,
@@ -409,7 +414,7 @@ class FeishuChannel:
                 return _card_action_toast("error", "审批上下文缺失。")
 
             terminal_statuses = {"approved", "rejected", "completed", "failed", "timeout", "missing"}
-            approval_status = _codex_approval_status(conversation_id, approval_id)
+            approval_status = _approval_status(conversation_id, approval_id)
             if approval_status in terminal_statuses:
                 delivery = self._renderer.render_approval_decision_card(
                     decision=approval_status or "completed",
@@ -424,13 +429,13 @@ class FeishuChannel:
                         logger.exception("failed to refresh processed approval card message_id=%s", message_id)
                 return _card_action_response("info", "该审批已处理。", delivery=delivery)
 
-            _record_codex_approval_decision(
+            _record_approval_decision(
                 conversation_id=conversation_id,
                 approval_id=approval_id,
                 decision="approved" if decision == "approve" else "rejected",
                 decided_by=sender_open_id,
             )
-            if decision == "approve":
+            if decision == "approve" and approval_source == "codex_provider":
                 _remember_codex_approval_prefix(conversation_id, command)
             delivery = self._renderer.render_approval_decision_card(
                 decision=decision,
@@ -444,22 +449,24 @@ class FeishuChannel:
                 except Exception:
                     logger.exception("failed to update approval card message_id=%s", message_id)
 
-            content = "已同意 Codex 审批请求。" if decision == "approve" else "已拒绝 Codex 审批请求。"
+            content = "已同意审批请求。" if decision == "approve" else "已拒绝审批请求。"
             logger.info(
-                "feishu codex approval decision decision=%s turn_id=%s approval_id=%s command=%s",
+                "feishu approval decision decision=%s source=%s turn_id=%s approval_id=%s command=%s",
                 decision,
+                approval_source,
                 turn_id,
                 approval_id,
                 _safe_preview(command),
             )
             self._executor.submit(
-                self._complete_codex_approval,
+                self._complete_approval,
                 chat_id,
                 conversation_id,
                 turn_id,
                 approval_id,
                 decision == "approve",
-                message_id,
+                approval_source,
+                approval_payload,
             )
             return _card_action_response("success", content, delivery=delivery)
         except Exception:
@@ -491,39 +498,46 @@ class FeishuChannel:
         )
         return self._on_card_action(SimpleNamespace(event=event))
 
-    def _complete_codex_approval(
+    def _complete_approval(
         self,
         chat_id: str,
         conversation_id: int,
         turn_id: int,
         approval_id: str,
         approved: bool,
-        message_id: str | None = None,
+        approval_source: str,
+        payload: dict[str, Any],
     ) -> None:
         drain_after = True
         try:
-            result = resume_coder_approval(
-                approval_id,
+            result = continue_approval(
+                source=approval_source,
+                approval_id=approval_id,
                 approved=approved,
                 timeout_seconds=get_settings().coder_timeout_seconds,
-                provider="codex",
+                payload=payload,
                 trusted_command_prefixes=_codex_approval_prefixes(conversation_id),
             )
             logger.info(
-                "codex approval continuation finished approval_id=%s status=%s final_len=%s error=%s",
+                "approval continuation finished approval_id=%s source=%s status=%s final_len=%s error=%s",
                 approval_id,
+                approval_source,
                 result.status,
                 len(result.final_text or ""),
                 _safe_preview(result.error or ""),
             )
             if result.status == "completed":
-                _record_codex_approval_decision(
+                _record_approval_decision(
                     conversation_id=conversation_id,
                     approval_id=approval_id,
                     decision="completed",
-                    decided_by="codex_app_server",
+                    decided_by=approval_source or "approval_runtime",
                 )
-                reply = result.final_text.strip() or "Codex completed after the approval decision."
+                token_usage = usage_totals(collect_usage_records(result.metadata))
+                reply = append_usage_footer(
+                    result.final_text.strip() or "Approval continuation completed.",
+                    token_usage,
+                )
                 self._send_channel_message(chat_id, ChannelMessage(content=reply, content_type="markdown"))
                 return
 
@@ -539,14 +553,16 @@ class FeishuChannel:
                     _safe_preview(next_command),
                     _safe_preview(next_reason),
                 )
-                _record_codex_approval(
+                _record_approval(
                     conversation_id=conversation_id,
                     approval_id=next_approval_id,
                     turn_id=turn_id,
                     chat_id=chat_id,
                     command=next_command,
                     reason=next_reason,
-                    language=_codex_approval_language(conversation_id),
+                    language=_approval_language(conversation_id),
+                    approval_source=approval_source,
+                    payload={},
                 )
                 delivery = self._renderer.render_approval_card(
                     approval_id=next_approval_id,
@@ -555,26 +571,30 @@ class FeishuChannel:
                     chat_id=chat_id,
                     command=next_command,
                     reason=next_reason,
-                    language=_codex_approval_language(conversation_id),
+                    language=_approval_language(conversation_id),
+                    approval_source=approval_source,
+                    payload={},
                 )
                 self._send_delivery(chat_id, delivery)
                 drain_after = False
                 return
 
-            _record_codex_approval_decision(
+            _record_approval_decision(
                 conversation_id=conversation_id,
                 approval_id=approval_id,
                 decision=result.status,
-                decided_by="codex_app_server",
+                decided_by=approval_source or "approval_runtime",
             )
             if result.status == "missing":
                 message = "Codex 审批会话已失效，通常是 Jarvis 重启或审批卡过期导致。请重新发起任务。"
+            elif result.status == "rejected":
+                message = "已拒绝审批请求。"
             else:
-                message = result.error or f"Codex approval continuation ended with status: {result.status}"
+                message = result.error or f"Approval continuation ended with status: {result.status}"
             self._send_text_message(chat_id, message)
         except Exception:
-            logger.exception("failed to complete codex approval approval_id=%s", approval_id)
-            self._send_text_message(chat_id, "Codex approval continuation failed.")
+            logger.exception("failed to complete approval approval_id=%s source=%s", approval_id, approval_source)
+            self._send_text_message(chat_id, "Approval continuation failed.")
         finally:
             if drain_after:
                 self._submit_next_queued_turn(conversation_id, chat_id)
@@ -657,11 +677,13 @@ class FeishuChannel:
                 self._submit_next_queued_turn(conversation_id, chat_id)
             return
 
-        approval = _extract_codex_approval_from_reply(result.reply)
+        approval = _extract_approval_from_turn_result(result)
         if approval is not None:
             approval_id = approval.get("approval_id", "") or f"turn_{turn_id}"
             approval["approval_id"] = approval_id
-            _record_codex_approval(
+            approval_source = approval.get("approval_source", "") or "codex_provider"
+            approval_payload = approval.get("payload") if isinstance(approval.get("payload"), dict) else {}
+            _record_approval(
                 conversation_id=conversation_id,
                 approval_id=approval_id,
                 turn_id=turn_id,
@@ -669,6 +691,8 @@ class FeishuChannel:
                 command=approval.get("command", ""),
                 reason=approval.get("reason", ""),
                 language=_detect_approval_language(text),
+                approval_source=approval_source,
+                payload=approval_payload,
             )
             delivery = self._renderer.render_approval_card(
                 approval_id=approval_id,
@@ -678,6 +702,8 @@ class FeishuChannel:
                 command=approval.get("command", ""),
                 reason=approval.get("reason", ""),
                 language=_detect_approval_language(text),
+                approval_source=approval_source,
+                payload=approval_payload,
             )
             if thinking_message_id:
                 self._update_card_message(thinking_message_id, delivery)
@@ -1240,25 +1266,27 @@ def _reply_to_bot(message: Any) -> bool:
     return False
 
 
-def _extract_codex_approval_from_reply(reply: str) -> dict[str, str] | None:
-    text = str(reply or "").strip()
-    if not text.startswith("Codex requested approval"):
-        return None
-    approval_id = ""
-    command = ""
-    reason = ""
-    for line in text.splitlines():
-        if line.startswith("Approval ID:"):
-            approval_id = line.split(":", 1)[1].strip()
-        elif line.startswith("Command:"):
-            command = line.split(":", 1)[1].strip()
-        elif line.startswith("Reason:"):
-            reason = line.split(":", 1)[1].strip()
-    return {
-        "approval_id": approval_id,
-        "command": command,
-        "reason": reason,
-    }
+def _extract_approval_from_turn_result(result: TurnResult) -> dict[str, Any] | None:
+    metadata = result.message.metadata if isinstance(result.message.metadata, dict) else {}
+    raw_requests = metadata.get("approval_requests")
+    if isinstance(raw_requests, list):
+        for item in raw_requests:
+            request = approval_request_from_mapping(item)
+            if request is None:
+                continue
+            payload = dict(request.payload)
+            command = request.command or ""
+            reason = request.reason
+            payload.setdefault("command", command)
+            payload.setdefault("reason", reason)
+            return {
+                "approval_id": request.approval_id,
+                "command": command,
+                "reason": reason,
+                "approval_source": str(payload.get("source") or "codex_provider"),
+                "payload": payload,
+            }
+    return None
 
 
 def _approval_value(approval: Any, key: str) -> str:
@@ -1267,7 +1295,7 @@ def _approval_value(approval: Any, key: str) -> str:
     return str(getattr(approval, key, "") or "").strip()
 
 
-def _record_codex_approval(
+def _record_approval(
     *,
     conversation_id: int,
     approval_id: str,
@@ -1276,10 +1304,12 @@ def _record_codex_approval(
     command: str,
     reason: str,
     language: str = "zh",
+    approval_source: str = "codex_provider",
+    payload: dict[str, Any] | None = None,
 ) -> None:
     patch = {
-        "codex_approval_language": language,
-        "codex_approvals": {
+        "approval_language": language,
+        "approvals": {
             approval_id: {
                 "status": "pending",
                 "turn_id": turn_id,
@@ -1287,6 +1317,8 @@ def _record_codex_approval(
                 "command": command,
                 "reason": reason,
                 "language": language,
+                "approval_source": approval_source,
+                "payload": payload or {},
                 "created_at": int(time.time()),
             }
         }
@@ -1294,10 +1326,10 @@ def _record_codex_approval(
     try:
         get_conversation_store().update_conversation_metadata(conversation_id, patch)
     except Exception:
-        logger.exception("failed to record codex approval conversation_id=%s approval_id=%s", conversation_id, approval_id)
+        logger.exception("failed to record approval conversation_id=%s approval_id=%s", conversation_id, approval_id)
 
 
-def _record_codex_approval_decision(
+def _record_approval_decision(
     *,
     conversation_id: int,
     approval_id: str,
@@ -1305,7 +1337,7 @@ def _record_codex_approval_decision(
     decided_by: str,
 ) -> None:
     patch = {
-        "codex_approvals": {
+        "approvals": {
             approval_id: {
                 "status": decision,
                 "decided_by": decided_by,
@@ -1344,12 +1376,12 @@ def _codex_approval_prefixes(conversation_id: int) -> list[str]:
     return [str(item) for item in prefixes if str(item).strip()]
 
 
-def _codex_approval_status(conversation_id: int, approval_id: str) -> str | None:
+def _approval_status(conversation_id: int, approval_id: str) -> str | None:
     conversation = get_conversation_store().get_conversation(conversation_id)
     if conversation is None:
         return None
     metadata = getattr(conversation, "metadata", None) or {}
-    approvals = metadata.get("codex_approvals")
+    approvals = metadata.get("approvals")
     if not isinstance(approvals, dict):
         return None
     approval = approvals.get(approval_id)
@@ -1359,16 +1391,16 @@ def _codex_approval_status(conversation_id: int, approval_id: str) -> str | None
     return str(status) if status else None
 
 
-def _codex_approval_language(conversation_id: int) -> str:
+def _approval_language(conversation_id: int) -> str:
     try:
         conversation = get_conversation_store().get_conversation(conversation_id)
     except Exception:
-        logger.exception("failed to load codex approval language conversation_id=%s", conversation_id)
+        logger.exception("failed to load approval language conversation_id=%s", conversation_id)
         return "zh"
     if conversation is None:
         return "zh"
     metadata = getattr(conversation, "metadata", None) or {}
-    language = str(metadata.get("codex_approval_language") or "").strip().lower()
+    language = str(metadata.get("approval_language") or "").strip().lower()
     return "en" if language == "en" else "zh"
 
 

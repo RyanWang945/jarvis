@@ -13,6 +13,7 @@ from app.llm.provider_adapters import NormalizedLLMResponse, NormalizedToolCall
 from app.llm.model_profiles import LLMNode
 from app.llm.model_router import ModelRouter
 from app.prompting import PromptRegistry
+from app.runtime_usage import usage_record_from_response
 from app.task_runtime.planner import FinalizationHint, NodeRuntime
 
 logger = logging.getLogger(__name__)
@@ -34,6 +35,7 @@ class FastIntentDecision(BaseModel):
     tool_name: str | None = None
     input_refs: list[str] = Field(default_factory=list)
     finalization_hint: FinalizationHint = Field(default_factory=FinalizationHint)
+    usage_records: list[dict[str, Any]] = Field(default_factory=list)
     reply: str = ""
     reason: str = ""
 
@@ -185,22 +187,43 @@ def _decision_from_payload(payload: dict[str, Any]) -> FastIntentDecision:
 
 def _decision_from_response(response: NormalizedLLMResponse) -> FastIntentDecision:
     if response.tool_calls:
-        return _decision_from_tool_call(response.tool_calls[0])
+        return _with_response_usage(_decision_from_tool_call(response.tool_calls[0]), response, stage="fast_intent")
 
     reply = (response.content or "").strip()
     if reply:
         payload = parse_json_content({"content": reply})
         if payload:
-            return _decision_from_payload(payload)
-        return FastIntentDecision(
-            route="fast_reply",
-            confidence=1.0,
-            reply=reply,
-            reason="fast intent returned assistant content",
+            return _with_response_usage(_decision_from_payload(payload), response, stage="fast_intent")
+        return _with_response_usage(
+            FastIntentDecision(
+                route="fast_reply",
+                confidence=1.0,
+                reply=reply,
+                reason="fast intent returned assistant content",
+            ),
+            response,
+            stage="fast_intent",
         )
 
     logger.info("fast intent returned no content or tool call; needs_plan")
-    return FastIntentDecision(route="needs_plan", confidence=0.0, reason="empty fast intent response")
+    return _with_response_usage(
+        FastIntentDecision(route="needs_plan", confidence=0.0, reason="empty fast intent response"),
+        response,
+        stage="fast_intent",
+    )
+
+
+def _with_response_usage(
+    decision: FastIntentDecision,
+    response: NormalizedLLMResponse,
+    *,
+    stage: str,
+) -> FastIntentDecision:
+    record = usage_record_from_response(response, stage=stage)
+    if record is None:
+        return decision
+    decision.usage_records.append(record)
+    return decision
 
 
 def _decision_from_tool_call(tool_call: NormalizedToolCall) -> FastIntentDecision:

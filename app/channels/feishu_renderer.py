@@ -28,7 +28,7 @@ class _ParsedTable:
 @dataclass(frozen=True)
 class _ModelUsageFooter:
     body: str
-    model: str
+    model: str | None
     prompt_tokens: str
     completion_tokens: str
     total_tokens: str
@@ -135,8 +135,10 @@ class FeishuRenderer:
         command: str = "",
         reason: str = "",
         language: str = "zh",
+        approval_source: str = "codex_provider",
+        payload: dict[str, Any] | None = None,
     ) -> FeishuDelivery:
-        blocks = ["**Codex 权限审批**"]
+        blocks = ["**Jarvis 权限审批**"]
         elements = self._blocks_to_elements(blocks)
         if command:
             elements.extend(_command_elements(command))
@@ -152,6 +154,8 @@ class FeishuRenderer:
             "command": command,
             "reason": reason,
             "language": language,
+            "approval_source": approval_source,
+            "payload": payload or {},
         }
         elements.append(
             {
@@ -202,7 +206,7 @@ class FeishuRenderer:
             "timeout": "已超时",
             "missing": "已失效",
         }.get(decision, "已处理")
-        blocks = [f"**Codex 权限审批：{label}**"]
+        blocks = [f"**Jarvis 权限审批：{label}**"]
         elements = self._blocks_to_elements(blocks)
         if command:
             elements.extend(_command_elements(command))
@@ -302,8 +306,8 @@ def extract_model_usage_footer(markdown: str) -> _ModelUsageFooter | None:
         (?P<body>.*?)
         (?:\n{2,}|\A)
         ---\s*
-        \n-\s*模型：`(?P<model>[^`]+)`\s*
-        \n-\s*Token：输入\s*`(?P<prompt>\d+)`\s*/\s*输出\s*`(?P<completion>\d+)`\s*/\s*合计\s*`(?P<total>\d+)`\s*
+        \n(?:-\s*模型：`(?P<model>[^`]+)`\s*\n)?
+        -\s*Token：输入\s*`(?P<prompt>\d+)`\s*/\s*输出\s*`(?P<completion>\d+)`\s*/\s*合计\s*`(?P<total>\d+)`\s*
         \Z
         """,
         flags=re.DOTALL | re.VERBOSE,
@@ -313,7 +317,7 @@ def extract_model_usage_footer(markdown: str) -> _ModelUsageFooter | None:
         return None
     return _ModelUsageFooter(
         body=match.group("body").rstrip(),
-        model=match.group("model").strip(),
+        model=match.group("model").strip() if match.group("model") else None,
         prompt_tokens=match.group("prompt").strip(),
         completion_tokens=match.group("completion").strip(),
         total_tokens=match.group("total").strip(),
@@ -597,10 +601,7 @@ def _model_usage_elements(footer: _ModelUsageFooter) -> list[dict]:
             "elements": [
                 {
                     "tag": "plain_text",
-                    "content": (
-                        f"模型：{footer.model} · "
-                        f"Token：输入 {footer.prompt_tokens} / 输出 {footer.completion_tokens} / 合计 {footer.total_tokens}"
-                    ),
+                    "content": f"Token：输入 {footer.prompt_tokens} / 输出 {footer.completion_tokens} / 合计 {footer.total_tokens}",
                 }
             ],
         },

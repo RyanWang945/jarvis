@@ -1,0 +1,23 @@
+{
+  "id": "coder_node_execute:v2",
+  "scenario": "coder_node_execute",
+  "version": "v2",
+  "description": "Build the instruction passed from a Jarvis coder runtime node to a coder provider, including the node manifest artifact contract.",
+  "response_format": "text",
+  "variables": [
+    "temporal_context",
+    "user_objective",
+    "node_id",
+    "node_objective",
+    "expected_output",
+    "node_manifest_path",
+    "resolved_inputs_section",
+    "additional_instructions_section"
+  ],
+  "messages": [
+    {
+      "role": "user",
+      "template": "instruction.md"
+    }
+  ]
+}

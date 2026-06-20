@@ -11,6 +11,8 @@ from app.llm.client import parse_json_content
 from app.llm.model_profiles import LLMNode
 from app.llm.model_router import ModelRouter
 from app.prompting import PromptRegistry
+from app.runtime_usage import usage_record_from_response
+from app.task_runtime.approval_types import approval_request_dicts
 from app.task_runtime.node_result import ExecutionReport, NodeResult
 from app.task_runtime.planner import ExecutionPlan
 
@@ -27,6 +29,7 @@ class AggregationResult(BaseModel):
     replan_instructions: list[str] = Field(default_factory=list)
     missing_info_question: str | None = None
     data: dict[str, Any] = Field(default_factory=dict)
+    usage_records: list[dict[str, Any]] = Field(default_factory=list)
 
     @field_validator("reply")
     @classmethod
@@ -124,6 +127,9 @@ class ResultAggregator:
             )
             parsed = parse_json_content({"content": response.content})
             result = _aggregation_from_payload(parsed, fallback=fallback, report=report)
+            usage_record = usage_record_from_response(response, stage="result_aggregator")
+            if usage_record is not None:
+                result.usage_records.append(usage_record)
             logger.info(
                 "result aggregator llm completed status=%s reply_len=%s artifact_refs=%s elapsed_ms=%s",
                 result.status,
@@ -185,7 +191,7 @@ def _local_aggregation_result(
     result = report.node_results[0]
     if result.status != "completed":
         return None
-    reply = result.summary.strip()
+    reply = _pass_through_reply(result)
     if not reply:
         return None
     return AggregationResult(
@@ -197,6 +203,104 @@ def _local_aggregation_result(
             "fallback": False,
         },
     )
+
+
+def _pass_through_reply(result: NodeResult) -> str:
+    explicit = _first_text(result.data, ("reply", "final_answer", "answer", "result"))
+    if explicit:
+        return explicit
+    structured = _structured_data_reply(result)
+    if structured:
+        return structured
+    return result.summary.strip()
+
+
+def _structured_data_reply(result: NodeResult) -> str:
+    if result.runtime != "llm" or not result.data:
+        return ""
+    rendered_fields: list[str] = []
+    for key, value in result.data.items():
+        if key in {"reply", "final_answer", "answer", "result", "tool_calls"}:
+            continue
+        rendered = _render_data_field(key, value)
+        if rendered:
+            rendered_fields.append(rendered)
+    if not rendered_fields:
+        return ""
+    parts: list[str] = []
+    summary = result.summary.strip()
+    if summary:
+        parts.append(summary)
+    parts.extend(rendered_fields)
+    text = "\n\n".join(parts).strip()
+    if summary and text == summary:
+        return ""
+    return text
+
+
+def _render_data_field(key: str, value: Any) -> str:
+    if isinstance(value, str):
+        text = value.strip()
+        return f"**{_field_label(key)}**：{text}" if text else ""
+    if isinstance(value, list):
+        return _render_list_field(key, value)
+    if isinstance(value, dict):
+        lines: list[str] = []
+        for item_key, item_value in value.items():
+            rendered = _render_scalar(item_value)
+            if rendered:
+                lines.append(f"- **{_field_label(str(item_key))}**：{rendered}")
+        if lines:
+            return f"**{_field_label(key)}**\n" + "\n".join(lines)
+    return ""
+
+
+def _render_list_field(key: str, value: list[Any]) -> str:
+    lines: list[str] = []
+    for item in value:
+        if isinstance(item, str):
+            text = item.strip()
+            if text:
+                lines.append(f"- {text}")
+        elif isinstance(item, dict):
+            label = _first_text(item, ("factor", "title", "name", "topic", "key"))
+            detail = _first_text(item, ("explanation", "summary", "description", "value", "result", "answer"))
+            if label and detail:
+                lines.append(f"- **{label}**：{detail}")
+            elif label:
+                lines.append(f"- **{label}**")
+            elif detail:
+                lines.append(f"- {detail}")
+    if not lines:
+        return ""
+    return f"**{_field_label(key)}**\n" + "\n".join(lines)
+
+
+def _render_scalar(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    return ""
+
+
+def _first_text(value: dict[str, Any], keys: tuple[str, ...]) -> str:
+    for key in keys:
+        item = value.get(key)
+        if isinstance(item, str) and item.strip():
+            return item.strip()
+    return ""
+
+
+def _field_label(key: str) -> str:
+    labels = {
+        "primary_factors": "主要因素",
+        "typical_pattern": "典型走势",
+        "current_context": "当前判断",
+        "findings": "要点",
+        "sources": "来源",
+    }
+    return labels.get(key, key.replace("_", " "))
 
 
 def _aggregation_from_payload(
@@ -237,13 +341,17 @@ def _fallback_aggregation(*, plan: ExecutionPlan, report: ExecutionReport) -> Ag
         )
     blocked = [result for result in report.node_results if result.status == "blocked"]
     if blocked and not any(result.status == "failed" for result in report.node_results):
-        question = _blocked_question(blocked)
+        approval_requests = _approval_requests(blocked)
+        question = _blocked_question(blocked, approval_requested=bool(approval_requests))
         return AggregationResult(
             status="needs_user_input",
             reply=question,
             missing_info_question=question,
             artifact_refs=refs,
-            data={"fallback": True},
+            data={
+                "fallback": True,
+                **({"approval_requests": approval_requests} if approval_requests else {}),
+            },
         )
     failed = [result for result in report.node_results if result.status == "failed"]
     return AggregationResult(
@@ -266,14 +374,26 @@ def _completed_reply(plan: ExecutionPlan, report: ExecutionReport) -> str:
     return "\n".join(lines)
 
 
-def _blocked_question(blocked: list[NodeResult]) -> str:
+def _blocked_question(blocked: list[NodeResult], *, approval_requested: bool = False) -> str:
     first = blocked[0]
+    if approval_requested:
+        return "该操作需要确认后继续。"
     message = first.summary or (first.error.message if first.error else "")
     if first.error and first.error.code == "missing_active_repo":
         return "需要先指定要操作的仓库。"
     if first.error and first.error.code == "missing_api_key":
         return "当前运行所需的 LLM API key 未配置，无法继续执行。"
     return message or "当前任务缺少必要输入，需要补充信息后继续。"
+
+
+def _approval_requests(results: list[NodeResult]) -> list[dict[str, Any]]:
+    raw_requests: list[Any] = []
+    for result in results:
+        raw = result.data.get("approval_requests")
+        if not isinstance(raw, list):
+            continue
+        raw_requests.extend(raw)
+    return approval_request_dicts(raw_requests)
 
 
 def _failure_reply(results: list[NodeResult]) -> str:

@@ -550,6 +550,31 @@ def test_llm_node_execute_runtime_can_load_skill_for_own_call(monkeypatch, tmp_p
     assert "<system-reminder>\nLoaded skills for this turn." not in second_call_text
 
 
+def test_llm_node_execute_runtime_preserves_explicit_reply() -> None:
+    from app.task_runtime.node_execute_runtime import LLMNodeExecuteRuntime
+
+    chat = ScriptedNodeChat(
+        [
+            llm_response(
+                '{"summary":"短摘要","reply":"这是完整回复。","data":{"confidence":"high"}}'
+            )
+        ]
+    )
+    runtime = LLMNodeExecuteRuntime(model_resolver=lambda context: FakeResolvedModel(chat))
+
+    result = runtime.run(
+        NodeExecutionContext(
+            user_objective="解释关系",
+            node=PlanNode(id="answer", runtime="llm", objective="Answer directly"),
+        )
+    )
+
+    assert result.status == "completed"
+    assert result.summary == "短摘要"
+    assert result.data["reply"] == "这是完整回复。"
+    assert result.data["confidence"] == "high"
+
+
 def _install_test_skill_registry(monkeypatch, tmp_path, skill_id: str) -> SkillRegistry:
     skill_dir = tmp_path / skill_id
     skill_dir.mkdir()

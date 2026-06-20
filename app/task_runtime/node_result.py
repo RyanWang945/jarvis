@@ -14,10 +14,17 @@ class NodeArtifact(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     ref: str
+    artifact_id: str | None = None
     kind: str = "artifact"
     name: str | None = None
     description: str = ""
     path: str | None = None
+    session_relative_path: str | None = None
+    mime_type: str | None = None
+    filename: str | None = None
+    size_bytes: int | None = None
+    source_tool: str = ""
+    publish: bool = True
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("ref")
@@ -27,6 +34,14 @@ class NodeArtifact(BaseModel):
         if not text:
             raise ValueError("artifact ref must not be empty")
         return text.removeprefix("artifact:")
+
+    @field_validator("artifact_id")
+    @classmethod
+    def _artifact_id_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
 
 
 class NodeError(BaseModel):

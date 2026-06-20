@@ -172,6 +172,53 @@ def test_plan_from_payload_normalizes_null_node_runtime_hints() -> None:
     assert plan.nodes[1].input_refs == ["node:review"]
 
 
+def test_plan_from_payload_does_not_parse_branch_hints_in_backend() -> None:
+    plan = _plan_from_payload(
+        {
+            "user_objective": "在feat/test 里写个快排吧，用python写",
+            "nodes": [
+                {
+                    "id": "write_quicksort",
+                    "runtime": "coder",
+                    "objective": "实现 quicksort.py",
+                    "runtime_hints": {"access_mode": "write"},
+                }
+            ],
+        },
+        fallback_objective="在feat/test 里写个快排吧，用python写",
+        runtime_hints={"active_repo": "smoke-test"},
+    )
+
+    assert plan.nodes[0].runtime_hints == {"access_mode": "write"}
+
+
+def test_plan_from_payload_preserves_llm_branch_hints() -> None:
+    plan = _plan_from_payload(
+        {
+            "user_objective": "基于 main 创建 feat/my-skill 分支继续开发",
+            "nodes": [
+                {
+                    "id": "implement",
+                    "runtime": "coder",
+                    "objective": "继续开发",
+                    "runtime_hints": {
+                        "access_mode": "write",
+                        "source_branch": "main",
+                        "target_branch": "feat/my-skill",
+                        "worktree_mode": "node_branch_worktree",
+                    },
+                }
+            ],
+        },
+        fallback_objective="基于 main 创建 feat/my-skill 分支继续开发",
+        runtime_hints={"active_repo": "smoke-test"},
+    )
+
+    assert plan.nodes[0].runtime_hints["source_branch"] == "main"
+    assert plan.nodes[0].runtime_hints["target_branch"] == "feat/my-skill"
+    assert plan.nodes[0].runtime_hints["worktree_mode"] == "node_branch_worktree"
+
+
 def test_plan_from_payload_falls_back_to_artifact_delivery_for_empty_nodes() -> None:
     plan = _plan_from_payload(
         {"user_objective": "把刚刚那个报告发我", "nodes": []},

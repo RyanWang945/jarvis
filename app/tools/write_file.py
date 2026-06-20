@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 from app.config import get_settings
-from app.tools.common import ToolExecutionRequest, ToolExecutionResult
+from app.tools.common import ToolArtifact, ToolExecutionRequest, ToolExecutionResult
 
 
 def run_write_file(request: ToolExecutionRequest) -> ToolExecutionResult:
@@ -64,11 +65,25 @@ def run_write_file(request: ToolExecutionRequest) -> ToolExecutionResult:
         )
 
     full_path.write_text(content, encoding="utf-8")
+    size_bytes = full_path.stat().st_size
+    artifact_id = f"file:{hashlib.sha256(str(full_path).encode('utf-8')).hexdigest()[:16]}"
     return ToolExecutionResult(
         ok=True,
         exit_code=0,
         stdout=str(full_path),
         artifacts=[str(full_path)],
+        tool_artifacts=[
+            ToolArtifact(
+                artifact_id=artifact_id,
+                kind="file",
+                path=str(full_path),
+                mime_type="text/markdown",
+                filename=full_path.name,
+                size_bytes=size_bytes,
+                source_tool="write_file",
+                metadata={"relative_path": relative_path},
+            )
+        ],
         summary=f"File written to {full_path}",
     )
 

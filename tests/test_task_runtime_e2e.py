@@ -10,7 +10,7 @@ from app.progress import ProgressEvent
 from app.task_runtime import TaskAgentRuntime
 from app.task_runtime.fast_intent import FastIntentDecision
 from app.task_runtime.node_executor import NodeExecutor
-from app.task_runtime.node_result import NodeResult
+from app.task_runtime.node_result import NodeArtifact, NodeResult
 from app.task_runtime.planner import ExecutionPlan, PlanNode
 from app.task_runtime.planning_router import PlanningRouterResult
 from app.task_runtime.result_aggregator import ResultAggregator
@@ -73,6 +73,38 @@ class EchoRuntime:
         )
 
 
+class UsageRuntime:
+    def run(self, context):
+        return NodeResult(
+            node_id=context.node.id,
+            runtime=context.node.runtime,
+            status="completed",
+            summary="node result with usage",
+            data={
+                "usage_records": [
+                    {
+                        "source": "llm",
+                        "provider": "deepseek",
+                        "model": "deepseek-v4-flash",
+                        "stage": "llm_node",
+                        "prompt_tokens": 100,
+                        "completion_tokens": 25,
+                        "total_tokens": 125,
+                    },
+                    {
+                        "source": "codex_app_server",
+                        "provider": "codex",
+                        "model": "codex",
+                        "stage": "coder",
+                        "prompt_tokens": 200,
+                        "completion_tokens": 50,
+                        "total_tokens": 250,
+                    },
+                ]
+            },
+        )
+
+
 class ArtifactRuntime:
     def __init__(self, image_path: Path, artifact_id: str) -> None:
         self.image_path = image_path
@@ -98,6 +130,64 @@ class ArtifactRuntime:
                     }
                 ]
             },
+        )
+
+
+class NestedToolArtifactRuntime(ArtifactRuntime):
+    def run(self, context):
+        return NodeResult(
+            node_id=context.node.id,
+            runtime=context.node.runtime,
+            status="completed",
+            summary="generated image",
+            data={
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "tool_name": "write_image",
+                        "status": "completed",
+                        "tool_artifacts": [
+                            {
+                                "artifact_id": self.artifact_id,
+                                "kind": "image",
+                                "path": str(self.image_path),
+                                "mime_type": "image/png",
+                                "filename": self.image_path.name,
+                                "size_bytes": self.image_path.stat().st_size,
+                                "source_tool": "write_image",
+                            }
+                        ],
+                    }
+                ]
+            },
+        )
+
+
+class NodeManifestArtifactRuntime:
+    def __init__(self, *, absolute: bool = False) -> None:
+        self.absolute = absolute
+
+    def run(self, context):
+        session_root = Path(context.runtime_hints["session_workspace_dir"])
+        node_dir = Path(context.runtime_hints["node_workspace_dir"])
+        report_path = node_dir / "report.md"
+        report_path.write_text("# Report\n\nbody", encoding="utf-8")
+        relative_path = report_path.relative_to(session_root).as_posix()
+        return NodeResult(
+            node_id=context.node.id,
+            runtime=context.node.runtime,
+            status="completed",
+            summary="report generated",
+            artifacts=[
+                NodeArtifact(
+                    ref="report",
+                    kind="file",
+                    path=str(report_path) if self.absolute else relative_path,
+                    filename="report.md",
+                    mime_type="text/markdown",
+                    description="Generated report",
+                )
+            ],
         )
 
 
@@ -157,6 +247,42 @@ def test_feishu_gateway_can_run_task_runtime_e2e_without_network(tmp_path: Path)
     assert messages[-1].raw_payload["plan"]["nodes"][0]["id"] == "answer"
     assert messages[-1].raw_payload["execution_report"]["status"] == "completed"
     assert messages[-1].raw_payload["aggregation"]["status"] == "completed"
+
+
+def test_task_runtime_appends_combined_usage_footer(tmp_path: Path) -> None:
+    store = InMemoryConversationStore()
+    gateway = GatewayService(conversation_store=store)
+    plan = ExecutionPlan(
+        user_objective="hello with usage",
+        nodes=[PlanNode(id="answer", runtime="llm", objective="Answer simply")],
+    )
+    runtime = TaskAgentRuntime(
+        store,
+        planning_router=StaticPlanningRouter(plan),
+        node_executor=NodeExecutor(runtimes={"llm": UsageRuntime()}),
+        result_aggregator=ResultAggregator(model_resolver=lambda metadata: _missing_key_model()),
+        session_workspace_manager=SessionWorkspaceManager(workdir=tmp_path),
+    )
+    gateway_result = gateway.handle_inbound_event(
+        InboundEvent(
+            platform="feishu",
+            external_chat_id="chat-task-runtime-usage",
+            external_message_id="msg-task-runtime-usage-1",
+            chat_type="dm",
+            sender_id="ou_1",
+            sender_name="Ryan",
+            text="hello with usage",
+        )
+    )
+
+    run_result = runtime.run_turn(gateway_result.turn_id)
+
+    assert "node result with usage" in run_result.reply
+    assert "- 模型：" not in run_result.reply
+    assert "- Token：输入 `300` / 输出 `75` / 合计 `375`" in run_result.reply
+    messages = store.list_messages(gateway_result.conversation_id)
+    assert messages[-1].raw_payload["usage"]["prompt_tokens"] == 300
+    assert len(messages[-1].raw_payload["usage_records"]) == 2
 
 
 def test_task_runtime_emits_progress_events(tmp_path: Path) -> None:
@@ -345,6 +471,117 @@ def test_task_runtime_persists_and_returns_node_tool_artifacts(tmp_path: Path) -
         assert raw_payload["attachments"][0]["path"] == str(promoted_path.resolve())
     finally:
         image_path.unlink(missing_ok=True)
+
+
+def test_task_runtime_persists_nested_tool_call_artifacts(tmp_path: Path) -> None:
+    store = InMemoryConversationStore()
+    gateway = GatewayService(conversation_store=store)
+    image_path = Path("data") / "artifact_previews" / f"task-runtime-nested-{uuid4().hex}.png"
+    image_path.parent.mkdir(parents=True, exist_ok=True)
+    image_path.write_bytes(b"\x89PNG\r\n\x1a\n")
+    artifact_id = f"task_runtime_nested_image:{uuid4().hex}"
+    plan = ExecutionPlan(
+        user_objective="生成图片",
+        nodes=[PlanNode(id="generate_image", runtime="react", objective="Generate image")],
+    )
+    runtime = TaskAgentRuntime(
+        store,
+        planning_router=StaticPlanningRouter(plan),
+        node_executor=NodeExecutor(runtimes={"react": NestedToolArtifactRuntime(image_path, artifact_id)}),
+        result_aggregator=ResultAggregator(model_resolver=lambda metadata: _missing_key_model()),
+        session_workspace_manager=SessionWorkspaceManager(workdir=tmp_path),
+    )
+
+    try:
+        gateway_result = gateway.handle_inbound_event(
+            InboundEvent(
+                platform="feishu",
+                external_chat_id="chat-task-runtime-nested-artifact",
+                external_message_id="msg-task-runtime-nested-artifact-1",
+                chat_type="dm",
+                sender_id="ou_1",
+                sender_name="Ryan",
+                text="生成图片",
+            )
+        )
+        run_result = runtime.run_turn(gateway_result.turn_id)
+
+        assert len(run_result.message.attachments) == 1
+        assert run_result.message.attachments[0].artifact_id == artifact_id
+        assert store.get_artifact(artifact_id) is not None
+    finally:
+        image_path.unlink(missing_ok=True)
+
+
+def test_task_runtime_publishes_node_manifest_artifact_from_session_relative_path(tmp_path: Path) -> None:
+    store = InMemoryConversationStore()
+    gateway = GatewayService(conversation_store=store)
+    plan = ExecutionPlan(
+        user_objective="生成报告",
+        nodes=[PlanNode(id="write_report", runtime="react", objective="Write report")],
+    )
+    runtime = TaskAgentRuntime(
+        store,
+        planning_router=StaticPlanningRouter(plan),
+        node_executor=NodeExecutor(runtimes={"react": NodeManifestArtifactRuntime()}),
+        result_aggregator=ResultAggregator(model_resolver=lambda metadata: _missing_key_model()),
+        session_workspace_manager=SessionWorkspaceManager(workdir=tmp_path),
+    )
+
+    gateway_result = gateway.handle_inbound_event(
+        InboundEvent(
+            platform="feishu",
+            external_chat_id="chat-task-runtime-node-artifact",
+            external_message_id="msg-task-runtime-node-artifact-1",
+            chat_type="dm",
+            sender_id="ou_1",
+            sender_name="Ryan",
+            text="生成报告",
+        )
+    )
+    run_result = runtime.run_turn(gateway_result.turn_id)
+
+    assert run_result.status == "completed"
+    raw_payload = store.list_messages(gateway_result.conversation_id)[-1].raw_payload
+    artifact = raw_payload["artifacts"][0]
+    assert artifact["node_id"] == "write_report"
+    assert artifact["session_relative_path"].startswith("artifacts/")
+    assert artifact["metadata"]["source_session_relative_path"].startswith("nodes/write_report/")
+    assert Path(artifact["path"]).parent.name == "artifacts"
+    assert store.get_artifact(artifact["artifact_id"]) is not None
+
+
+def test_task_runtime_rejects_absolute_path_in_node_manifest_artifact(tmp_path: Path) -> None:
+    store = InMemoryConversationStore()
+    gateway = GatewayService(conversation_store=store)
+    plan = ExecutionPlan(
+        user_objective="生成报告",
+        nodes=[PlanNode(id="write_report", runtime="react", objective="Write report")],
+    )
+    runtime = TaskAgentRuntime(
+        store,
+        planning_router=StaticPlanningRouter(plan),
+        node_executor=NodeExecutor(runtimes={"react": NodeManifestArtifactRuntime(absolute=True)}),
+        result_aggregator=ResultAggregator(model_resolver=lambda metadata: _missing_key_model()),
+        session_workspace_manager=SessionWorkspaceManager(workdir=tmp_path),
+    )
+
+    gateway_result = gateway.handle_inbound_event(
+        InboundEvent(
+            platform="feishu",
+            external_chat_id="chat-task-runtime-node-artifact-absolute",
+            external_message_id="msg-task-runtime-node-artifact-absolute-1",
+            chat_type="dm",
+            sender_id="ou_1",
+            sender_name="Ryan",
+            text="生成报告",
+        )
+    )
+    run_result = runtime.run_turn(gateway_result.turn_id)
+
+    assert run_result.status == "completed"
+    raw_payload = store.list_messages(gateway_result.conversation_id)[-1].raw_payload
+    assert "artifacts" not in raw_payload
 
 
 def test_get_agent_runtime_returns_task_runtime_by_default(monkeypatch) -> None:
