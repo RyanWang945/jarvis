@@ -200,15 +200,20 @@ class CodeNodeFinalizer:
         }
         if approval_data:
             data.update(approval_data)
-        data.update(metadata)
+        metadata_payload = dict(metadata)
+        git = {
+            key: metadata_payload.pop(key)
+            for key in ("repo_workspace", "node_commit", "node_merge")
+            if key in metadata_payload
+        }
+        metadata_usage_records = metadata_payload.pop("usage_records", None)
+        data.update(metadata_payload)
         usage_records = []
+        if isinstance(metadata_usage_records, list):
+            usage_records.extend(item for item in metadata_usage_records if isinstance(item, dict))
         for payload in (manifest_payload, llm_payload):
             if isinstance(payload, dict) and isinstance(payload.get("usage_records"), list):
                 usage_records.extend(item for item in payload["usage_records"] if isinstance(item, dict))
-        if usage_records:
-            existing = data.get("usage_records")
-            merged = [*(existing if isinstance(existing, list) else []), *usage_records]
-            data["usage_records"] = merged
         finalizer_data = {
             "manifest_path": str(manifest_path) if manifest_path is not None else None,
             "manifest_loaded": manifest_payload is not None,
@@ -229,6 +234,8 @@ class CodeNodeFinalizer:
             summary=summary,
             artifacts=artifacts,
             approval_requests=approval_requests or [],
+            usage_records=usage_records,
+            git=git,
             data=data,
             error=_final_error(
                 status=status,

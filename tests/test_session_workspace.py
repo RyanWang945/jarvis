@@ -171,13 +171,13 @@ def test_write_coder_node_auto_commits_node_worktree(monkeypatch, tmp_path: Path
 
     result = report.node_results[0]
     node_repo = workspace.node("write_node").repo_dir("jarvis").resolve()
-    node_commit = result.data["node_commit"]
-    node_merge = result.data["node_merge"]
+    node_commit = result.git["node_commit"]
+    node_merge = result.git["node_merge"]
     assert result.status == "completed"
     assert node_commit["short_hash"] == _git_stdout(node_repo, "rev-parse", "--short", "HEAD")
     assert node_commit["files"] == ["node-output.txt"]
-    assert result.data["repo_workspace"]["target_branch"] == "jarvis/jarvis/session-commit"
-    assert result.data["repo_workspace"]["node_branch"] == "jarvis-nodes/jarvis/session-commit/write_node"
+    assert result.git["repo_workspace"]["target_branch"] == "jarvis/jarvis/session-commit"
+    assert result.git["repo_workspace"]["node_branch"] == "jarvis-nodes/jarvis/session-commit/write_node"
     assert node_merge["target_branch"] == "jarvis/jarvis/session-commit"
     assert node_merge["node_branch"] == "jarvis-nodes/jarvis/session-commit/write_node"
     assert node_merge["merge_commit"] == _git_stdout(workspace.root_path / "repos" / "jarvis", "rev-parse", "HEAD")
@@ -241,9 +241,9 @@ def test_write_coder_node_uses_resolved_target_branch_without_provider_checkout(
     result = report.node_results[0]
     integration = workspace.root_path / "repos" / "smoke-test"
     assert report.status == "completed"
-    assert result.data["repo_workspace"]["target_branch"] == "feat/test"
-    assert result.data["repo_workspace"]["node_branch"] == "jarvis-nodes/smoke-test/session-target/write_quicksort"
-    assert result.data["node_merge"]["target_branch"] == "feat/test"
+    assert result.git["repo_workspace"]["target_branch"] == "feat/test"
+    assert result.git["repo_workspace"]["node_branch"] == "jarvis-nodes/smoke-test/session-target/write_quicksort"
+    assert result.git["node_merge"]["target_branch"] == "feat/test"
     assert _git_stdout(integration, "branch", "--show-current") == "feat/test"
     assert _git_stdout(integration, "show", "--pretty=", "HEAD:node-output.txt").strip() == "created by node"
 
@@ -302,8 +302,8 @@ def test_write_coder_node_requests_approval_before_merging_to_protected_branch(m
     assert approval["action_kind"] == "merge_to_protected"
     assert approval["payload"]["source"] == "runtime_git"
     assert approval["payload"]["repo_workspace"]["target_branch"] == default_branch
-    assert result.data["node_commit"]["short_hash"]
-    assert "node_merge" not in result.data
+    assert result.git["node_commit"]["short_hash"]
+    assert "node_merge" not in result.git
     assert len(provider.requests) == 1
 
 
@@ -448,7 +448,7 @@ def test_coder_runtime_does_not_auto_commit_registered_repo_without_node_workspa
     )
 
     assert result.status == "completed"
-    assert "node_commit" not in result.data
+    assert "node_commit" not in result.git
     assert _git_stdout(project, "rev-parse", "HEAD") == initial_head
     assert _git_stdout(project, "status", "--porcelain", "--untracked-files=all") == "?? node-output.txt"
 

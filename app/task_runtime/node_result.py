@@ -65,6 +65,7 @@ class NodeResult(BaseModel):
     approval_requests: list[dict[str, Any]] = Field(default_factory=list)
     tool_calls: list[dict[str, Any]] = Field(default_factory=list)
     usage_records: list[dict[str, Any]] = Field(default_factory=list)
+    git: dict[str, Any] = Field(default_factory=dict)
     data: dict[str, Any] = Field(default_factory=dict)
     error: NodeError | None = None
 
