@@ -740,7 +740,7 @@ class RepoExecutionPolicy:
     dirty_after_node_allowed: bool = False
 ```
 
-2. `PlanNode.runtime_hints` 仅作为迁移期输入兼容字段保留，新写入路径一律归空；planner prompt 不再要求节点输出 `runtime_hints`。
+2. `PlanNode.runtime_hints` 已从核心模型移除；旧 payload 中的节点级 `runtime_hints` 由 Pydantic extra ignore 丢弃；planner prompt 不再要求节点输出 `runtime_hints`。
 3. `CoderRunRequest` 不再携带 policy。
 4. `CodexCoderProvider` 和 `ClaudeCodeCoderProvider` 固定传：
 
@@ -754,7 +754,7 @@ _read_only=False
 6. `commit_node_repo()` 在 commit 后再次检查 `git status --porcelain --untracked-files=all`，仍 dirty 则失败。
 7. push 不通过 DAG runtime 开放；未来如需要 push，应作为显式 effect/approval，而不是恢复 `allow_push` 字段。
 
-已执行迁移：新增 `heavy_plan:v5` 并切为默认版本。v5 不再要求节点输出 `runtime_hints`；`PlanNode` 会清空旧 payload 中的节点级 `runtime_hints`；`NodeExecutor` 和 `CoderNodeExecuteRuntime` 不再合并或读取 `node.runtime_hints`。全局/session/workspace 级 runtime hints 暂时保留，等待 Phase 3 拆成强类型上下文。
+已执行迁移：新增 `heavy_plan:v5` 并切为默认版本。v5 不再要求节点输出 `runtime_hints`；`PlanNode` 已删除节点级 `runtime_hints` 字段；`NodeExecutor` 和 `CoderNodeExecuteRuntime` 不再合并或读取 `node.runtime_hints`。全局/session/workspace 级 runtime hints 暂时保留，等待 Phase 3 拆成强类型上下文。
 
 验收：
 

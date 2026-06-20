@@ -32,7 +32,6 @@ class PlanNode(BaseModel):
     objective: str
     input_refs: list[str] = Field(default_factory=list)
     output_hint: str = Field(default="", validation_alias=AliasChoices("output_hint", "expected_output"))
-    runtime_hints: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("runtime", mode="before")
     @classmethod
@@ -61,12 +60,6 @@ class PlanNode(BaseModel):
     @classmethod
     def _output_hint_text(cls, value: str) -> str:
         return str(value or "").strip()
-
-    @field_validator("runtime_hints")
-    @classmethod
-    def _runtime_hints_mapping(cls, value: dict[str, Any]) -> dict[str, Any]:
-        del value
-        return {}
 
 
 class FinalizationHint(BaseModel):
@@ -476,7 +469,6 @@ def _normalize_node_payload(
     node.pop("expected_output", None)
 
     node["input_refs"] = _normalize_input_refs(node.get("input_refs"), known_artifact_refs=known_artifact_refs)
-    node["runtime_hints"] = {}
     return node
 
 

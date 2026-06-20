@@ -148,7 +148,7 @@ def test_plan_from_payload_normalizes_legacy_tool_node_to_react() -> None:
     assert plan.finalization_hint.user_facing is False
 
 
-def test_plan_from_payload_normalizes_null_node_runtime_hints() -> None:
+def test_plan_from_payload_ignores_null_node_runtime_hints() -> None:
     plan = _plan_from_payload(
         {
             "user_objective": "review repo and remind me",
@@ -172,7 +172,7 @@ def test_plan_from_payload_normalizes_null_node_runtime_hints() -> None:
     )
 
     assert [node.runtime for node in plan.nodes] == ["coder", "react"]
-    assert plan.nodes[1].runtime_hints == {}
+    assert not hasattr(plan.nodes[1], "runtime_hints")
     assert plan.nodes[1].input_refs == ["node:review"]
 
 
@@ -193,7 +193,7 @@ def test_plan_from_payload_does_not_parse_branch_hints_in_backend() -> None:
         runtime_hints={"active_repo": "smoke-test"},
     )
 
-    assert plan.nodes[0].runtime_hints == {}
+    assert not hasattr(plan.nodes[0], "runtime_hints")
 
 
 def test_plan_from_payload_ignores_node_runtime_hints() -> None:
@@ -217,7 +217,7 @@ def test_plan_from_payload_ignores_node_runtime_hints() -> None:
         runtime_hints={"active_repo": "smoke-test"},
     )
 
-    assert plan.nodes[0].runtime_hints == {}
+    assert not hasattr(plan.nodes[0], "runtime_hints")
 
 
 def test_plan_from_payload_falls_back_to_artifact_delivery_for_empty_nodes() -> None:
@@ -242,7 +242,7 @@ def test_plan_from_payload_falls_back_to_repo_then_reminder_dag_for_empty_nodes(
     )
 
     assert [node.runtime for node in plan.nodes] == ["coder", "react"]
-    assert plan.nodes[0].runtime_hints == {}
+    assert not hasattr(plan.nodes[0], "runtime_hints")
     assert plan.nodes[1].input_refs == ["node:repo_report"]
     assert "报告" in plan.nodes[0].objective
     assert "提醒" in plan.nodes[1].objective
@@ -262,8 +262,8 @@ def test_plan_from_payload_falls_back_to_coarse_code_business_dag_for_empty_node
     assert [node.id for node in plan.nodes[-2:]] == ["integrate_business_code", "code_review"]
     assert plan.nodes[-2].input_refs == ["node:implement_area_1", "node:implement_area_2", "node:implement_area_3"]
     assert plan.nodes[-1].input_refs == ["node:integrate_business_code"]
-    assert plan.nodes[0].runtime_hints == {}
-    assert plan.nodes[-1].runtime_hints == {}
+    assert not hasattr(plan.nodes[0], "runtime_hints")
+    assert not hasattr(plan.nodes[-1], "runtime_hints")
     assert any("订单业务" in node.output_hint for node in plan.nodes)
     assert any("支付/退款业务" in node.output_hint for node in plan.nodes)
     assert "合并" in plan.nodes[-2].objective
