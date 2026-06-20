@@ -197,7 +197,7 @@ def test_result_aggregator_blocked_missing_repo_needs_user_input() -> None:
     result = aggregator.aggregate(plan=_plan(), report=report)
 
     assert result.status == "needs_user_input"
-    assert result.missing_info_question == "需要先指定要操作的仓库。"
+    assert result.reply == "需要先指定要操作的仓库。"
 
 
 def test_result_aggregator_preserves_blocked_approval_requests() -> None:
@@ -230,7 +230,7 @@ def test_result_aggregator_preserves_blocked_approval_requests() -> None:
     assert result.data["approval_requests"] == [approval]
 
 
-def test_result_aggregator_failed_result_includes_replan_instruction() -> None:
+def test_result_aggregator_failed_result_returns_failed_reply_without_replan_contract() -> None:
     aggregator = ResultAggregator(model_resolver=lambda metadata: _missing_key_model())
     report = ExecutionReport(
         status="failed",
@@ -243,7 +243,8 @@ def test_result_aggregator_failed_result_includes_replan_instruction() -> None:
 
     assert result.status == "failed"
     assert result.reply == "Search backend unavailable."
-    assert result.replan_instructions == ["Replan around failed node research: Search backend unavailable."]
+    assert not hasattr(result, "replan_instructions")
+    assert not hasattr(result, "missing_info_question")
 
 
 def _missing_key_model():

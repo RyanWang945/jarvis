@@ -18,7 +18,7 @@ from app.task_runtime.planner import ExecutionPlan
 
 logger = logging.getLogger(__name__)
 
-AggregationStatus = Literal["completed", "needs_replan", "needs_user_input", "failed"]
+AggregationStatus = Literal["completed", "needs_user_input", "failed"]
 
 class AggregationResult(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -26,8 +26,6 @@ class AggregationResult(BaseModel):
     status: AggregationStatus
     reply: str
     artifact_refs: list[str] = Field(default_factory=list)
-    replan_instructions: list[str] = Field(default_factory=list)
-    missing_info_question: str | None = None
     data: dict[str, Any] = Field(default_factory=dict)
     usage_records: list[dict[str, Any]] = Field(default_factory=list)
 
@@ -39,7 +37,7 @@ class AggregationResult(BaseModel):
             raise ValueError("reply must not be empty")
         return text
 
-    @field_validator("artifact_refs", "replan_instructions")
+    @field_validator("artifact_refs")
     @classmethod
     def _dedupe_text_list(cls, value: list[str]) -> list[str]:
         result: list[str] = []
@@ -313,11 +311,10 @@ def _aggregation_from_payload(
         return fallback
     normalized = dict(payload)
     status = normalized.get("status")
-    if status not in {"completed", "needs_replan", "needs_user_input", "failed"}:
+    if status not in {"completed", "needs_user_input", "failed"}:
         normalized["status"] = fallback.status
     normalized.setdefault("reply", fallback.reply)
     normalized.setdefault("artifact_refs", _artifact_refs(report.node_results))
-    normalized.setdefault("replan_instructions", [])
     normalized.setdefault("data", {})
     try:
         return AggregationResult.model_validate(normalized)
@@ -346,7 +343,6 @@ def _fallback_aggregation(*, plan: ExecutionPlan, report: ExecutionReport) -> Ag
         return AggregationResult(
             status="needs_user_input",
             reply=question,
-            missing_info_question=question,
             artifact_refs=refs,
             data={
                 "fallback": True,
@@ -358,7 +354,6 @@ def _fallback_aggregation(*, plan: ExecutionPlan, report: ExecutionReport) -> Ag
         status="failed",
         reply=_failure_reply(failed or report.node_results),
         artifact_refs=refs,
-        replan_instructions=_replan_instructions(report.node_results),
         data={"fallback": True},
     )
 
@@ -400,16 +395,6 @@ def _failure_reply(results: list[NodeResult]) -> str:
     first = results[0]
     message = first.summary or (first.error.message if first.error else "")
     return message or "任务执行失败。"
-
-
-def _replan_instructions(results: list[NodeResult]) -> list[str]:
-    instructions: list[str] = []
-    for result in results:
-        if result.status == "failed":
-            instructions.append(f"Replan around failed node {result.node_id}: {result.summary}")
-        elif result.status == "blocked":
-            instructions.append(f"Resolve blocked node {result.node_id}: {result.summary}")
-    return instructions
 
 
 def _artifact_refs(results: list[NodeResult]) -> list[str]:
