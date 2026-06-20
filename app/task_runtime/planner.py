@@ -65,9 +65,8 @@ class PlanNode(BaseModel):
     @field_validator("runtime_hints")
     @classmethod
     def _runtime_hints_mapping(cls, value: dict[str, Any]) -> dict[str, Any]:
-        if not isinstance(value, dict):
-            return {}
-        return {key: value for key, value in dict(value).items() if key not in {"access_mode", "allow_commit", "allow_push"}}
+        del value
+        return {}
 
 
 class FinalizationHint(BaseModel):
@@ -477,8 +476,7 @@ def _normalize_node_payload(
     node.pop("expected_output", None)
 
     node["input_refs"] = _normalize_input_refs(node.get("input_refs"), known_artifact_refs=known_artifact_refs)
-    if not isinstance(node.get("runtime_hints"), dict):
-        node["runtime_hints"] = {}
+    node["runtime_hints"] = {}
     return node
 
 

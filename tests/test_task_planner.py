@@ -196,7 +196,7 @@ def test_plan_from_payload_does_not_parse_branch_hints_in_backend() -> None:
     assert plan.nodes[0].runtime_hints == {}
 
 
-def test_plan_from_payload_preserves_llm_branch_hints() -> None:
+def test_plan_from_payload_ignores_node_runtime_hints() -> None:
     plan = _plan_from_payload(
         {
             "user_objective": "基于 main 创建 feat/my-skill 分支继续开发",
@@ -217,9 +217,7 @@ def test_plan_from_payload_preserves_llm_branch_hints() -> None:
         runtime_hints={"active_repo": "smoke-test"},
     )
 
-    assert plan.nodes[0].runtime_hints["source_branch"] == "main"
-    assert plan.nodes[0].runtime_hints["target_branch"] == "feat/my-skill"
-    assert plan.nodes[0].runtime_hints["worktree_mode"] == "node_branch_worktree"
+    assert plan.nodes[0].runtime_hints == {}
 
 
 def test_plan_from_payload_falls_back_to_artifact_delivery_for_empty_nodes() -> None:
@@ -281,7 +279,7 @@ real_llm = pytest.mark.skipif(
 @real_llm
 def test_turn_planner_real_llm_creates_artifact_delivery_node() -> None:
     get_settings.cache_clear()
-    plan = TurnPlanner(prompt_version="v4").plan(
+    plan = TurnPlanner(prompt_version="v5").plan(
         content="把刚刚那个报告发我",
         recent_artifacts=[
             {
@@ -306,7 +304,7 @@ def test_turn_planner_real_llm_creates_artifact_delivery_node() -> None:
 @real_llm
 def test_turn_planner_real_llm_reuses_previous_node_result_for_replan() -> None:
     get_settings.cache_clear()
-    plan = TurnPlanner(prompt_version="v4").plan(
+    plan = TurnPlanner(prompt_version="v5").plan(
         content="根据刚才的调研结果，评估 jarvis 是否需要调整。",
         session_state=ConversationSessionState(session_mode="coding", active_repo_id="jarvis"),
         previous_node_results=[

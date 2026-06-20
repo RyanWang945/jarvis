@@ -21,7 +21,7 @@
 5. provider 底层参数固定为 `allow_commit=true`、`allow_push=false`、`_read_only=false`，push 不在本轮 DAG 路径开放。
 6. 一个 coder 节点执行完成后，节点 worktree 不允许留下未提交文件；如果 commit 后仍 dirty，节点失败。
 7. 第一轮允许破坏旧 `raw_payload` 结构。
-8. prompt 修改必须新增版本；本轮已从 `heavy_plan:v2` 逐步派生到 `heavy_plan:v4`。
+8. prompt 修改必须新增版本；本轮已从 `heavy_plan:v2` 逐步派生到 `heavy_plan:v5`。
 9. DAG 恢复和审批后继续执行不在第一轮实现，只在后续状态机阶段处理。
 
 ---
@@ -740,7 +740,7 @@ class RepoExecutionPolicy:
     dirty_after_node_allowed: bool = False
 ```
 
-2. `PlanNode.runtime_hints` 过滤 `access_mode`、`allow_commit`、`allow_push`。
+2. `PlanNode.runtime_hints` 仅作为迁移期输入兼容字段保留，新写入路径一律归空；planner prompt 不再要求节点输出 `runtime_hints`。
 3. `CoderRunRequest` 不再携带 policy。
 4. `CodexCoderProvider` 和 `ClaudeCodeCoderProvider` 固定传：
 
@@ -754,9 +754,11 @@ _read_only=False
 6. `commit_node_repo()` 在 commit 后再次检查 `git status --porcelain --untracked-files=all`，仍 dirty 则失败。
 7. push 不通过 DAG runtime 开放；未来如需要 push，应作为显式 effect/approval，而不是恢复 `allow_push` 字段。
 
+已执行迁移：新增 `heavy_plan:v5` 并切为默认版本。v5 不再要求节点输出 `runtime_hints`；`PlanNode` 会清空旧 payload 中的节点级 `runtime_hints`；`NodeExecutor` 和 `CoderNodeExecuteRuntime` 不再合并或读取 `node.runtime_hints`。全局/session/workspace 级 runtime hints 暂时保留，等待 Phase 3 拆成强类型上下文。
+
 验收：
 
-1. planner 输出旧权限字段时会被忽略。
+1. planner 输出旧权限字段或节点级 runtime hints 时会被忽略。
 2. coder provider 请求固定可 commit、不可 push、非 readonly。
 3. node worktree 有文件变化时产生 node commit。
 4. node worktree commit 后仍 dirty 会导致节点失败。

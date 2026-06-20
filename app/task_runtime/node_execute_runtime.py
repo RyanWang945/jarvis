@@ -394,14 +394,6 @@ class CoderNodeExecuteRuntime:
 
     def run(self, context: NodeExecutionContext) -> NodeResult:
         started = time.perf_counter()
-        if context.node.runtime_hints:
-            context = NodeExecutionContext(
-                user_objective=context.user_objective,
-                node=context.node,
-                resolved_inputs=context.resolved_inputs,
-                runtime_hints={**context.runtime_hints, **context.node.runtime_hints},
-                instructions=context.instructions,
-            )
         try:
             registry = get_repository_registry()
         except RepositoryRegistryError as exc:
@@ -1248,7 +1240,6 @@ def _llm_coder_git_context(
             "id": context.node.id,
             "objective": context.node.objective,
             "output_hint": context.node.output_hint,
-            "runtime_hints": context.node.runtime_hints,
         },
         "merged_runtime_hints": context.runtime_hints,
         "selected_repo": getattr(repo, "repo_id", None),

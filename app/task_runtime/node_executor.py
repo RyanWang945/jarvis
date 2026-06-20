@@ -88,7 +88,6 @@ class NodeExecutor:
                 if session_workspace is not None:
                     merged_runtime_hints.update(session_workspace.runtime_hints())
                 merged_runtime_hints.update(node_workspace_hints(session_workspace, node.id))
-                merged_runtime_hints.update(node.runtime_hints)
                 node_workspace = session_workspace.node(node.id) if session_workspace is not None else None
                 if node_workspace is not None:
                     write_node_input_snapshot(
@@ -155,7 +154,6 @@ class NodeExecutor:
                         merged_runtime_hints = dict(runtime_hints or {})
                         merged_runtime_hints.update(session_workspace.runtime_hints())
                         merged_runtime_hints.update(node_workspace_hints(session_workspace, node.id))
-                        merged_runtime_hints.update(node.runtime_hints)
                         write_node_input_snapshot(
                             node_workspace,
                             user_objective=plan.user_objective,

@@ -35,22 +35,6 @@
           },
           "output_hint": {
             "type": "string"
-          },
-          "runtime_hints": {
-            "type": "object",
-            "additionalProperties": true,
-            "properties": {
-              "source_branch": {
-                "type": "string"
-              },
-              "target_branch": {
-                "type": "string"
-              },
-              "worktree_mode": {
-                "type": "string",
-                "enum": ["node_branch_worktree"]
-              }
-            }
           }
         }
       }
