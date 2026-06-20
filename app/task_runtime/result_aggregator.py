@@ -176,8 +176,6 @@ def _local_aggregation_result(
     hint = plan.finalization_hint
     if report.status == "blocked":
         return fallback
-    if hint.mode == "deterministic":
-        return fallback
     if report.status != "completed":
         return None
     if hint.mode != "pass_through":

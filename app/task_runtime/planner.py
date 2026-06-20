@@ -21,7 +21,7 @@ from app.runtime_usage import usage_record_from_response
 logger = logging.getLogger(__name__)
 
 NodeRuntime = Literal["llm", "react", "coder"]
-FinalizationMode = Literal["pass_through", "deterministic", "llm", "auto"]
+FinalizationMode = Literal["pass_through", "llm"]
 _RUNTIMES = {"llm", "react", "coder"}
 
 
@@ -66,7 +66,7 @@ class PlanNode(BaseModel):
 class FinalizationHint(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    mode: FinalizationMode = "auto"
+    mode: FinalizationMode = "llm"
     user_facing: bool = False
 
 

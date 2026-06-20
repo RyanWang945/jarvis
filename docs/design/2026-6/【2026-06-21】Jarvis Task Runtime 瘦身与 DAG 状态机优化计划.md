@@ -317,6 +317,8 @@ class ExecutionPlan:
 
 已执行迁移：`FinalizationHint.reason` 已移除。当前 `finalization_hint` 只保留影响行为的 `mode` 和 `user_facing`；旧 planner payload 中的 `reason` 会被忽略，调试解释不再进入核心 plan 协议。
 
+已执行迁移：`FinalizationMode` 已收缩为 `pass_through | llm`，删除 `auto` 和 `deterministic` 协议值。新增 `result_aggregator:v4` 并切为默认版本，prompt 文案同步删除 deterministic 分支。
+
 ### 3.3 `FastIntentDecision`
 
 当前字段：
