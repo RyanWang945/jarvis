@@ -543,6 +543,7 @@ def _artifact_records_from_report(
 
 def _tool_artifact_payloads(result: NodeResult) -> list[dict[str, Any]]:
     payloads: list[dict[str, Any]] = []
+    payloads.extend(item for item in result.tool_artifacts if isinstance(item, dict))
     raw_items = result.data.get("tool_artifacts")
     if isinstance(raw_items, list):
         payloads.extend(item for item in raw_items if isinstance(item, dict))

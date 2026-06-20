@@ -28,7 +28,21 @@ class RecordingProvider:
 
     def run(self, request):
         self.requests.append(request)
-        return CoderRunResult(ok=True, stdout="coder done", artifacts=["git_worktree:clean"])
+        return CoderRunResult(
+            ok=True,
+            stdout="coder done",
+            artifacts=["git_worktree:clean"],
+            metadata={
+                "tool_artifacts": [
+                    {
+                        "artifact_id": "artifact_1",
+                        "kind": "file",
+                        "path": "report.txt",
+                        "source_tool": "delegate_to_codex",
+                    }
+                ]
+            },
+        )
 
 
 def _noop_git_context(**kwargs):
@@ -94,6 +108,8 @@ def test_coder_node_runtime_builds_provider_request() -> None:
     assert result.runtime == "coder"
     assert result.status == "completed"
     assert result.debug["provider"] == "fake"
+    assert result.tool_artifacts[0]["artifact_id"] == "artifact_1"
+    assert "tool_artifacts" not in result.data
 
 
 def test_coder_node_runtime_ignores_legacy_permission_hints() -> None:
@@ -276,9 +292,12 @@ def test_coder_node_runtime_blocks_when_approval_required() -> None:
     assert result.status == "blocked"
     assert result.error is not None
     assert result.error.code == "coder_approval_required"
-    assert result.data["approval_id"] == "approval_42"
-    assert result.data["action_kind"] == "commit"
-    assert result.data["command"] == "git commit -m change"
+    assert result.approval_requests[0]["approval_id"] == "approval_42"
+    assert result.approval_requests[0]["action_kind"] == "commit"
+    assert result.approval_requests[0]["command"] == "git commit -m change"
+    assert "approval_id" not in result.data
+    assert "action_kind" not in result.data
+    assert "command" not in result.data
     assert result.approval_requests[0]["payload"] == {"id": "approval_42"}
     assert "approval_requests" not in result.data
 

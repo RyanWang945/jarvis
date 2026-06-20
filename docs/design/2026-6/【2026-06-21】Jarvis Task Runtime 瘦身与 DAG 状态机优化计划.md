@@ -21,7 +21,7 @@
 5. provider 底层参数固定为 `allow_commit=true`、`allow_push=false`、`_read_only=false`，push 不在本轮 DAG 路径开放。
 6. 一个 coder 节点执行完成后，节点 worktree 不允许留下未提交文件；如果 commit 后仍 dirty，节点失败。
 7. 第一轮允许破坏旧 `raw_payload` 结构。
-8. prompt 修改必须新增版本；本轮从 `heavy_plan:v2` 派生 `heavy_plan:v3`。
+8. prompt 修改必须新增版本；本轮已从 `heavy_plan:v2` 逐步派生到 `heavy_plan:v4`。
 9. DAG 恢复和审批后继续执行不在第一轮实现，只在后续状态机阶段处理。
 
 ---
@@ -433,6 +433,10 @@ debug
 已执行迁移：`NodeResult` 已新增顶层 `git` 字段。coder node 新写入路径将 `repo_workspace`、`node_commit`、`node_merge` 写入 `result.git`，不再写入 `result.data`。
 
 已执行迁移：`NodeResult` 已新增顶层 `debug` 字段。coder finalizer 新写入路径将 `provider`、`stdout`、`stderr`、`exit_code`、`finalizer` 诊断信息写入 `result.debug`，不再写入 `result.data`。
+
+已执行迁移：`NodeResult` 已新增顶层 `tool_artifacts` 字段。React runtime 新写入路径会从 tool call 记录中提取结构化工具产物到顶层；coder finalizer 会从 provider metadata 中弹出 `tool_artifacts` 写入顶层，不再把它并入 `result.data`。artifact 发布器优先读取 `result.tool_artifacts`，仍保留旧 `data["tool_artifacts"]` 和 `tool_calls[].tool_artifacts` 读取 fallback。
+
+已执行迁移：coder blocked approval 结果不再把 `approval_id`、`action_kind`、`command`、`path`、`reason` 这些单个审批字段重复写入 `result.data`。审批详情只通过 `result.approval_requests` 表达，聚合层和 channel 层继续使用顶层 approval request 协议。
 
 ### 3.6 `runtime_hints`
 

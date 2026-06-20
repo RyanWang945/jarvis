@@ -770,6 +770,7 @@ def _react_result_from_response(
         status="completed",
         summary=summary or "React runtime completed.",
         tool_calls=tool_calls,
+        tool_artifacts=_tool_artifacts_from_tool_calls(tool_calls),
         usage_records=usage_records,
         data=data,
         artifacts=_artifacts_from_payload(payload),
@@ -812,6 +813,15 @@ def _react_summary(payload: dict[str, Any], response_content: str) -> str:
     if text in {"{}", "[]", "null"}:
         return ""
     return text
+
+
+def _tool_artifacts_from_tool_calls(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    artifacts: list[dict[str, Any]] = []
+    for call in tool_calls:
+        call_artifacts = call.get("tool_artifacts")
+        if isinstance(call_artifacts, list):
+            artifacts.extend(item for item in call_artifacts if isinstance(item, dict))
+    return artifacts
 
 
 def _react_summary_from_tool_calls(tool_calls: list[dict[str, Any]]) -> str:
@@ -974,17 +984,6 @@ def _finalize_coder_node_result(
 ) -> NodeResult:
     approval_required = bool(result.approval_requests)
     approval_requests = [approval_request_to_dict(item) for item in result.approval_requests]
-    approval_data: dict[str, Any] = {}
-    if approval_required:
-        first = result.approval_requests[0]
-        approval_data["approval_id"] = first.approval_id
-        approval_data["action_kind"] = first.action_kind
-        if first.command:
-            approval_data["command"] = first.command
-        if first.path:
-            approval_data["path"] = first.path
-        if first.reason:
-            approval_data["reason"] = first.reason
     return finalizer.finalize(
         node=context.node,
         user_objective=context.user_objective,
@@ -998,7 +997,6 @@ def _finalize_coder_node_result(
         legacy_artifacts=result.artifacts,
         metadata=result.metadata,
         approval_required=approval_required,
-        approval_data=approval_data,
         approval_requests=approval_requests,
         session_root=_optional_path(context.runtime_hints.get("session_workspace_dir")),
         node_workspace=_optional_path(context.runtime_hints.get("node_workspace_dir")),

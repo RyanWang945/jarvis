@@ -64,6 +64,7 @@ class NodeResult(BaseModel):
     artifacts: list[NodeArtifact] = Field(default_factory=list)
     approval_requests: list[dict[str, Any]] = Field(default_factory=list)
     tool_calls: list[dict[str, Any]] = Field(default_factory=list)
+    tool_artifacts: list[dict[str, Any]] = Field(default_factory=list)
     usage_records: list[dict[str, Any]] = Field(default_factory=list)
     git: dict[str, Any] = Field(default_factory=dict)
     debug: dict[str, Any] = Field(default_factory=dict)
@@ -85,7 +86,7 @@ class NodeResult(BaseModel):
             return []
         return approval_request_dicts(value)
 
-    @field_validator("tool_calls", "usage_records", mode="before")
+    @field_validator("tool_calls", "tool_artifacts", "usage_records", mode="before")
     @classmethod
     def _dict_list(cls, value: Any) -> list[dict[str, Any]]:
         if not isinstance(value, list):

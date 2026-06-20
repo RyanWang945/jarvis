@@ -135,7 +135,6 @@ class CodeNodeFinalizer:
         legacy_artifacts: list[str],
         metadata: dict[str, Any],
         approval_required: bool = False,
-        approval_data: dict[str, Any] | None = None,
         approval_requests: list[dict[str, Any]] | None = None,
         session_root: Path | None = None,
         node_workspace: Path | None = None,
@@ -199,16 +198,18 @@ class CodeNodeFinalizer:
             "exit_code": exit_code,
         }
         data: dict[str, Any] = {}
-        if approval_data:
-            data.update(approval_data)
         metadata_payload = dict(metadata)
         git = {
             key: metadata_payload.pop(key)
             for key in ("repo_workspace", "node_commit", "node_merge")
             if key in metadata_payload
         }
+        metadata_tool_artifacts = metadata_payload.pop("tool_artifacts", None)
         metadata_usage_records = metadata_payload.pop("usage_records", None)
         data.update(metadata_payload)
+        tool_artifacts = []
+        if isinstance(metadata_tool_artifacts, list):
+            tool_artifacts.extend(item for item in metadata_tool_artifacts if isinstance(item, dict))
         usage_records = []
         if isinstance(metadata_usage_records, list):
             usage_records.extend(item for item in metadata_usage_records if isinstance(item, dict))
@@ -235,6 +236,7 @@ class CodeNodeFinalizer:
             summary=summary,
             artifacts=artifacts,
             approval_requests=approval_requests or [],
+            tool_artifacts=tool_artifacts,
             usage_records=usage_records,
             git=git,
             debug=debug,

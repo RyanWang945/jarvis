@@ -114,20 +114,18 @@ class ArtifactRuntime:
             runtime=context.node.runtime,
             status="completed",
             summary="generated image",
-            data={
-                "tool_artifacts": [
-                    {
-                        "artifact_id": self.artifact_id,
-                        "kind": "image",
-                        "path": str(self.image_path),
-                        "mime_type": "image/png",
-                        "filename": self.image_path.name,
-                        "size_bytes": self.image_path.stat().st_size,
-                        "source_tool": "delegate_to_codex",
-                        "metadata": {"codex_item_id": "ig_test"},
-                    }
-                ]
-            },
+            tool_artifacts=[
+                {
+                    "artifact_id": self.artifact_id,
+                    "kind": "image",
+                    "path": str(self.image_path),
+                    "mime_type": "image/png",
+                    "filename": self.image_path.name,
+                    "size_bytes": self.image_path.stat().st_size,
+                    "source_tool": "delegate_to_codex",
+                    "metadata": {"codex_item_id": "ig_test"},
+                }
+            ],
         )
 
 
