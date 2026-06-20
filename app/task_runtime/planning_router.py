@@ -212,7 +212,7 @@ def fallback_llm_plan(content: str) -> ExecutionPlan:
                 objective=content,
                 runtime="llm",
                 input_refs=[],
-                expected_output="User-facing answer.",
+                output_hint="User-facing answer.",
             )
         ],
     )
@@ -228,7 +228,7 @@ def fast_reply_plan(content: str, decision: FastIntentDecision) -> ExecutionPlan
                 objective=content,
                 runtime="llm",
                 input_refs=[],
-                expected_output="User-facing fast reply.",
+                output_hint="User-facing fast reply.",
             )
         ],
     )
@@ -253,7 +253,7 @@ def _artifact_delivery_plan(content: str, artifacts: list[dict[str, Any]]) -> Ex
                 runtime="react",
                 objective="Deliver the requested existing artifact to the user by calling the deliver_file tool.",
                 input_refs=[artifact_ref],
-                expected_output="Artifact delivered to the user.",
+                output_hint="Artifact delivered to the user.",
             )
         ],
     )

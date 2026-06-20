@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta, timezone
 from typing import Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from app.agent_react.context_manager import ConversationContext
 from app.agent_react.session_state import ConversationSessionState
@@ -25,13 +25,13 @@ _RUNTIMES = {"llm", "react", "coder"}
 
 
 class PlanNode(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
     id: str
     runtime: NodeRuntime
     objective: str
     input_refs: list[str] = Field(default_factory=list)
-    expected_output: str = ""
+    output_hint: str = Field(default="", validation_alias=AliasChoices("output_hint", "expected_output"))
     runtime_hints: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("runtime", mode="before")
@@ -57,9 +57,9 @@ class PlanNode(BaseModel):
                 result.append(text)
         return result
 
-    @field_validator("expected_output")
+    @field_validator("output_hint")
     @classmethod
-    def _expected_output_text(cls, value: str) -> str:
+    def _output_hint_text(cls, value: str) -> str:
         return str(value or "").strip()
 
     @field_validator("runtime_hints")
@@ -467,13 +467,14 @@ def _normalize_node_payload(
     runtime = _normalize_runtime(node.get("runtime"))
     node["runtime"] = runtime
 
-    expected_output = node.get("expected_output")
-    if isinstance(expected_output, dict):
-        node["expected_output"] = str(expected_output.get("description") or expected_output.get("kind") or "").strip()
-    elif expected_output is None:
-        node["expected_output"] = ""
+    output_hint = node.get("output_hint", node.get("expected_output"))
+    if isinstance(output_hint, dict):
+        node["output_hint"] = str(output_hint.get("description") or output_hint.get("kind") or "").strip()
+    elif output_hint is None:
+        node["output_hint"] = ""
     else:
-        node["expected_output"] = str(expected_output).strip()
+        node["output_hint"] = str(output_hint).strip()
+    node.pop("expected_output", None)
 
     node["input_refs"] = _normalize_input_refs(node.get("input_refs"), known_artifact_refs=known_artifact_refs)
     if not isinstance(node.get("runtime_hints"), dict):
@@ -545,14 +546,14 @@ def _fallback_plan_for_objective(
                     runtime="coder",
                     objective=f"Review the {active_repo} repository for the user request and produce the requested markdown report / 报告: {objective}",
                     input_refs=previous_refs,
-                    expected_output="Markdown report / 报告 covering the repository findings.",
+                    output_hint="Markdown report / 报告 covering the repository findings.",
                 ),
                 PlanNode(
                     id="set_reminder",
                     runtime="react",
                     objective=f"Create the requested reminder / 提醒 after the report node completes: {objective}",
                     input_refs=["node:repo_report"],
-                    expected_output="Reminder / 提醒 created for the requested time.",
+                    output_hint="Reminder / 提醒 created for the requested time.",
                 ),
             ],
         )
@@ -580,7 +581,7 @@ def _fallback_plan_for_objective(
                     runtime="coder",
                     objective=f"Use the {active_repo} repository to complete the user request: {objective}",
                     input_refs=previous_refs,
-                    expected_output="Repository-grounded result for the user request.",
+                    output_hint="Repository-grounded result for the user request.",
                 )
             ],
         )
@@ -598,7 +599,7 @@ def _fallback_plan_for_objective(
                     id="set_reminder",
                     runtime="react",
                     objective=f"Create the requested reminder / 提醒: {objective}",
-                    expected_output="Reminder / 提醒 created.",
+                    output_hint="Reminder / 提醒 created.",
                 )
             ],
         )
@@ -615,7 +616,7 @@ def _fallback_single_node_plan(objective: str) -> ExecutionPlan:
                 id="main",
                 objective=objective,
                 runtime="llm",
-                expected_output="User-facing result.",
+                output_hint="User-facing result.",
             )
         ],
     )
@@ -638,7 +639,7 @@ def _fallback_artifact_delivery_plan(objective: str, known_artifact_refs: set[st
                 runtime="react",
                 objective="Deliver the requested existing artifact to the user by calling the deliver_file tool.",
                 input_refs=[refs[0]],
-                expected_output="Artifact delivered to the user.",
+                output_hint="Artifact delivered to the user.",
             )
         ],
     )
@@ -759,7 +760,7 @@ def _fallback_coarse_code_plan(
                     f"保持任务边界在业务能力层，不拆成低层文件操作或单个测试步骤：{objective}"
                 ),
                 input_refs=previous_refs,
-                expected_output=f"{area} 的代码实现说明、关键改动和本节点内完成的必要自检结果。",
+                output_hint=f"{area} 的代码实现说明、关键改动和本节点内完成的必要自检结果。",
             )
         )
 
@@ -775,7 +776,7 @@ def _fallback_coarse_code_plan(
                     f"不要拆成低层文件操作：{objective}"
                 ),
                 input_refs=implementation_refs,
-                expected_output="不同业务代码改动已完成整合，跨业务契约、冲突处理和剩余风险说明清楚。",
+                output_hint="不同业务代码改动已完成整合，跨业务契约、冲突处理和剩余风险说明清楚。",
             )
         )
 
@@ -787,7 +788,7 @@ def _fallback_coarse_code_plan(
                 f"Review / 代码审查 {active_repo} 仓库的粗粒度代码改动，聚焦业务正确性、集成风险、回归风险和是否满足用户要求：{objective}"
             ),
             input_refs=[integration_ref],
-            expected_output="代码 review 结论、发现的问题、建议修复项和可交付状态。",
+            output_hint="代码 review 结论、发现的问题、建议修复项和可交付状态。",
         )
     )
 

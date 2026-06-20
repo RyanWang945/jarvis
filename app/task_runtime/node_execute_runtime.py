@@ -913,7 +913,8 @@ def _coder_instruction(context: NodeExecutionContext) -> str:
             "user_objective": context.user_objective,
             "node_id": context.node.id,
             "node_objective": context.node.objective,
-            "expected_output": context.node.expected_output or "Repository task result.",
+            "output_hint": context.node.output_hint or "Repository task result.",
+            "expected_output": context.node.output_hint or "Repository task result.",
             "node_manifest_path": str(context.runtime_hints.get("node_manifest_path") or "node_manifest.json"),
             "coder_workspace_section": _coder_workspace_section(context.runtime_hints),
             "resolved_inputs_section": "\n".join(resolved_inputs_lines),
@@ -1252,7 +1253,7 @@ def _llm_coder_git_context(
         "node": {
             "id": context.node.id,
             "objective": context.node.objective,
-            "expected_output": context.node.expected_output,
+            "output_hint": context.node.output_hint,
             "runtime_hints": context.node.runtime_hints,
         },
         "merged_runtime_hints": context.runtime_hints,

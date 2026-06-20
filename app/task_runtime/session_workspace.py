@@ -256,7 +256,7 @@ def write_node_input_snapshot(
         "node_id": node.id,
         "runtime": node.runtime,
         "objective": node.objective,
-        "expected_output": node.expected_output,
+        "output_hint": node.output_hint,
         "input_refs": list(node.input_refs),
         "user_objective": user_objective,
         "resolved_inputs": [item.model_dump(mode="json", exclude_none=True) for item in resolved_inputs],

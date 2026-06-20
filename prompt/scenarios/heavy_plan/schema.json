@@ -14,7 +14,7 @@
       "items": {
         "type": "object",
         "additionalProperties": true,
-        "required": ["id", "runtime", "objective", "input_refs", "expected_output"],
+        "required": ["id", "runtime", "objective", "input_refs", "output_hint"],
         "properties": {
           "id": {
             "type": "string"
@@ -33,7 +33,7 @@
               "pattern": "^(artifact|node):[A-Za-z0-9_.:-]+$"
             }
           },
-          "expected_output": {
+          "output_hint": {
             "type": "string"
           },
           "runtime_hints": {

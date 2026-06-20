@@ -266,8 +266,8 @@ def test_plan_from_payload_falls_back_to_coarse_code_business_dag_for_empty_node
     assert plan.nodes[-1].input_refs == ["node:integrate_business_code"]
     assert plan.nodes[0].runtime_hints == {}
     assert plan.nodes[-1].runtime_hints == {}
-    assert any("订单业务" in node.expected_output for node in plan.nodes)
-    assert any("支付/退款业务" in node.expected_output for node in plan.nodes)
+    assert any("订单业务" in node.output_hint for node in plan.nodes)
+    assert any("支付/退款业务" in node.output_hint for node in plan.nodes)
     assert "合并" in plan.nodes[-2].objective
     assert "Review" in plan.nodes[-1].objective
 
@@ -281,7 +281,7 @@ real_llm = pytest.mark.skipif(
 @real_llm
 def test_turn_planner_real_llm_creates_artifact_delivery_node() -> None:
     get_settings.cache_clear()
-    plan = TurnPlanner(prompt_version="v3").plan(
+    plan = TurnPlanner(prompt_version="v4").plan(
         content="把刚刚那个报告发我",
         recent_artifacts=[
             {
@@ -306,7 +306,7 @@ def test_turn_planner_real_llm_creates_artifact_delivery_node() -> None:
 @real_llm
 def test_turn_planner_real_llm_reuses_previous_node_result_for_replan() -> None:
     get_settings.cache_clear()
-    plan = TurnPlanner(prompt_version="v3").plan(
+    plan = TurnPlanner(prompt_version="v4").plan(
         content="根据刚才的调研结果，评估 jarvis 是否需要调整。",
         session_state=ConversationSessionState(session_mode="coding", active_repo_id="jarvis"),
         previous_node_results=[

@@ -704,6 +704,7 @@ pytest tests/test_task_runtime_e2e.py tests/test_node_executor.py tests/test_ses
 1. planner payload 中出现 `expected_output` 时映射到 `output_hint`。
 2. 旧 raw payload 读取不做迁移。
 3. 测试中直接构造 `PlanNode(expected_output=...)` 的用例同步调整。
+4. 已执行迁移：`PlanNode` 核心字段为 `output_hint`，`expected_output` 仅作为输入 alias 和旧 `coder_node_execute` prompt 变量兼容保留。
 
 验收：
 
@@ -1173,7 +1174,7 @@ image attachment resolution
 
 风险：
 
-1. prompt 里可能仍要求 planner 输出 `expected_output`。
+1. 旧 prompt 版本里可能仍要求 planner 输出 `expected_output`。
 2. 测试里有旧字段构造。
 
 缓解：

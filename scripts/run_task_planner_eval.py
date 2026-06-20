@@ -238,7 +238,7 @@ def dataset_summary(cases: list[PlannerEvalCase]) -> dict[str, Any]:
 
 def score_case(case: PlannerEvalCase, plan: ExecutionPlan, *, elapsed_ms: int) -> dict[str, Any]:
     runtimes = [node.runtime for node in plan.nodes]
-    tool_names = [node.tool_name for node in plan.nodes if node.tool_name]
+    tool_names = []
     input_refs = [ref for node in plan.nodes for ref in node.input_refs]
     checks: list[dict[str, Any]] = []
 
@@ -254,12 +254,12 @@ def score_case(case: PlannerEvalCase, plan: ExecutionPlan, *, elapsed_ms: int) -
     for input_ref in case.required_input_refs:
         checks.append(_check(f"required_input_ref:{input_ref}", input_ref in input_refs, "present", input_refs))
 
-    objective_text = " ".join([plan.user_objective, *[node.objective for node in plan.nodes], *[node.expected_output for node in plan.nodes]])
+    objective_text = " ".join([plan.user_objective, *[node.objective for node in plan.nodes], *[node.output_hint for node in plan.nodes]])
     for fragment in case.objective_contains:
         checks.append(_check(f"objective_contains:{fragment}", _contains_fragment(objective_text, fragment), fragment, objective_text))
 
     node_texts = {
-        node.id: " ".join([node.objective, node.expected_output])
+        node.id: " ".join([node.objective, node.output_hint])
         for node in plan.nodes
     }
     for fragments in case.required_node_objective_contains:
