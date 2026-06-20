@@ -67,13 +67,7 @@ class FinalizationHint(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     mode: FinalizationMode = "auto"
-    reason: str = ""
     user_facing: bool = False
-
-    @field_validator("reason")
-    @classmethod
-    def _reason_text(cls, value: str) -> str:
-        return str(value or "").strip()
 
 
 class ExecutionPlan(BaseModel):
@@ -81,7 +75,7 @@ class ExecutionPlan(BaseModel):
 
     user_objective: str
     nodes: list[PlanNode]
-    # 执行完任务后，最终回复如何收口；mode/reason 由 runtime 根据 nodes 推导。
+    # 执行完任务后，最终回复如何收口；mode 由 runtime 根据 nodes 推导。
     finalization_hint: FinalizationHint = Field(default_factory=FinalizationHint)
 
     @field_validator("user_objective")
@@ -459,12 +453,10 @@ def _derive_finalization_hint(nodes: Any, raw_hint: Any) -> dict[str, Any]:
         if runtime == "llm":
             return {
                 "mode": "pass_through",
-                "reason": "single llm node can be returned directly when marked user-facing",
                 "user_facing": user_facing,
             }
     return {
         "mode": "llm",
-        "reason": "multiple or non-llm node results require llm aggregation",
         "user_facing": user_facing,
     }
 
@@ -555,7 +547,6 @@ def _fallback_plan_for_objective(
             user_objective=objective,
             finalization_hint=FinalizationHint(
                 mode="llm",
-                reason="fallback DAG for repository work followed by reminder action",
                 user_facing=False,
             ),
             nodes=[
@@ -590,7 +581,6 @@ def _fallback_plan_for_objective(
             user_objective=objective,
             finalization_hint=FinalizationHint(
                 mode="llm",
-                reason="fallback coder node for repository-scoped request",
                 user_facing=False,
             ),
             nodes=[
@@ -609,7 +599,6 @@ def _fallback_plan_for_objective(
             user_objective=objective,
             finalization_hint=FinalizationHint(
                 mode="llm",
-                reason="fallback react node for reminder action",
                 user_facing=False,
             ),
             nodes=[
@@ -628,7 +617,7 @@ def _fallback_plan_for_objective(
 def _fallback_single_node_plan(objective: str) -> ExecutionPlan:
     return ExecutionPlan(
         user_objective=objective,
-        finalization_hint=FinalizationHint(mode="pass_through", user_facing=True, reason="fallback single LLM node"),
+        finalization_hint=FinalizationHint(mode="pass_through", user_facing=True),
         nodes=[
             PlanNode(
                 id="main",
@@ -648,7 +637,6 @@ def _fallback_artifact_delivery_plan(objective: str, known_artifact_refs: set[st
         user_objective=objective,
         finalization_hint=FinalizationHint(
             mode="llm",
-            reason="fallback react node for explicit existing-artifact delivery request",
             user_facing=False,
         ),
         nodes=[
@@ -814,7 +802,6 @@ def _fallback_coarse_code_plan(
         user_objective=objective,
         finalization_hint=FinalizationHint(
             mode="llm",
-            reason="fallback coarse DAG for broad multi-area code work",
             user_facing=False,
         ),
         nodes=nodes,

@@ -108,7 +108,6 @@ def test_plan_from_payload_derives_llm_finalization_for_non_llm_nodes() -> None:
     )
 
     assert plan.finalization_hint.mode == "llm"
-    assert plan.finalization_hint.reason == "multiple or non-llm node results require llm aggregation"
     assert plan.finalization_hint.user_facing is True
 
 

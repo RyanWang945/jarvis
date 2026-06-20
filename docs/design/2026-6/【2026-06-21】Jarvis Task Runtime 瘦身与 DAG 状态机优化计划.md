@@ -315,6 +315,8 @@ class ExecutionPlan:
 
 已执行迁移：`ExecutionPlan.usage_records` 已移除。Planner LLM 调用产生的 usage 由 `TurnPlannerResult.usage_records` 返回，并通过 `PlanningRouterResult.planner_usage_records` 传给 `TaskAgentRuntime` 汇总；静态 plan 的 JSON 不再携带运行期 usage 观测数据。
 
+已执行迁移：`FinalizationHint.reason` 已移除。当前 `finalization_hint` 只保留影响行为的 `mode` 和 `user_facing`；旧 planner payload 中的 `reason` 会被忽略，调试解释不再进入核心 plan 协议。
+
 ### 3.3 `FastIntentDecision`
 
 当前字段：

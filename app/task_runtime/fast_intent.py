@@ -39,7 +39,7 @@ class FastIntentDecision(BaseModel):
             object.__setattr__(self, "reply", text)
         else:
             object.__setattr__(self, "reply", "")
-        if self.finalization_hint.mode == "auto" and not self.finalization_hint.reason:
+        if self.finalization_hint.mode == "auto":
             object.__setattr__(self, "finalization_hint", _default_finalization_hint(self.route))
         return self
 
@@ -261,7 +261,6 @@ def _normalize_finalization_hint(value: Any) -> dict[str, Any]:
     if mode not in {"pass_through", "deterministic", "llm", "auto"}:
         mode = "auto"
     hint["mode"] = mode
-    hint["reason"] = str(hint.get("reason") or "").strip()
     hint["user_facing"] = bool(hint.get("user_facing"))
     return hint
 
@@ -271,7 +270,6 @@ def _default_finalization_hint(route: FastIntentRoute) -> FinalizationHint:
         return FinalizationHint(
             mode="pass_through",
             user_facing=True,
-            reason="fast intent produced a complete user-facing reply",
         )
     return FinalizationHint(mode="auto")
 

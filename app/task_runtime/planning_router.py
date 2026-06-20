@@ -206,7 +206,6 @@ def fallback_llm_plan(content: str) -> ExecutionPlan:
         finalization_hint=FinalizationHint(
             mode="pass_through",
             user_facing=True,
-            reason="planner failed; fallback LLM node should answer the user directly",
         ),
         nodes=[
             PlanNode(
@@ -246,7 +245,6 @@ def _artifact_delivery_plan(content: str, artifacts: list[dict[str, Any]]) -> Ex
         user_objective=content,
         finalization_hint=FinalizationHint(
             mode="llm",
-            reason="deterministic react node for existing-artifact delivery",
             user_facing=False,
         ),
         nodes=[

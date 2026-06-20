@@ -95,7 +95,7 @@ def test_result_aggregator_pass_through_skips_llm() -> None:
     aggregator = ResultAggregator(model_resolver=lambda metadata: FakeResolvedModel(chat))
     plan = ExecutionPlan(
         user_objective="你觉得数学难吗",
-        finalization_hint=FinalizationHint(mode="pass_through", user_facing=True, reason="simple chat"),
+        finalization_hint=FinalizationHint(mode="pass_through", user_facing=True),
         nodes=[PlanNode(id="main", runtime="llm", objective="你觉得数学难吗")],
     )
     report = ExecutionReport(
@@ -116,7 +116,7 @@ def test_result_aggregator_pass_through_renders_structured_llm_data() -> None:
     aggregator = ResultAggregator(model_resolver=lambda metadata: FakeResolvedModel(chat))
     plan = ExecutionPlan(
         user_objective="这个和金价有关系吗",
-        finalization_hint=FinalizationHint(mode="pass_through", user_facing=True, reason="single user-facing node"),
+        finalization_hint=FinalizationHint(mode="pass_through", user_facing=True),
         nodes=[PlanNode(id="explain_gold_relation", runtime="llm", objective="解释美伊局势与金价的关系")],
     )
     report = ExecutionReport(
