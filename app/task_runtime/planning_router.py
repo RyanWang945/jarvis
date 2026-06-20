@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from app.agent_react.session_state import ConversationSessionState
@@ -24,6 +24,7 @@ class PlanningRouterResult:
     fast_intent: FastIntentDecision
     elapsed_ms: int
     planner_elapsed_ms: int | None = None
+    planner_usage_records: list[dict[str, Any]] = field(default_factory=list)
 
 
 class PlanningRouter:
@@ -161,7 +162,7 @@ class PlanningRouter:
                         "reason": fast_decision.reason,
                     },
                 )
-            plan, planner_elapsed_ms = _timed_planner_call(
+            plan, planner_elapsed_ms, planner_usage_records = _timed_planner_call(
                 self._planner,
                 content=content,
                 session_state=session_state,
@@ -186,6 +187,7 @@ class PlanningRouter:
                 fast_intent=fast_decision,
                 elapsed_ms=int((time.perf_counter() - started) * 1000),
                 planner_elapsed_ms=planner_elapsed_ms,
+                planner_usage_records=planner_usage_records,
             )
         except Exception:
             logger.exception("planner failed; falling back to llm single-node plan")
@@ -349,19 +351,23 @@ def _timed_planner_call(
     previous_node_results: list[dict[str, Any]] | None,
     runtime_hints: dict[str, Any] | None,
     instructions: list[str] | None,
-) -> tuple[ExecutionPlan, int]:
+) -> tuple[ExecutionPlan, int, list[dict[str, Any]]]:
     started = time.perf_counter()
-    plan = planner.plan(
-        content=content,
-        session_state=session_state,
-        conversation_metadata=conversation_metadata,
-        recent_artifacts=recent_artifacts,
-        conversation_context=conversation_context,
-        previous_node_results=previous_node_results,
-        runtime_hints=runtime_hints,
-        instructions=instructions,
-    )
-    return plan, int((time.perf_counter() - started) * 1000)
+    kwargs = {
+        "content": content,
+        "session_state": session_state,
+        "conversation_metadata": conversation_metadata,
+        "recent_artifacts": recent_artifacts,
+        "conversation_context": conversation_context,
+        "previous_node_results": previous_node_results,
+        "runtime_hints": runtime_hints,
+        "instructions": instructions,
+    }
+    if hasattr(planner, "plan_with_usage"):
+        result = planner.plan_with_usage(**kwargs)
+        return result.plan, int((time.perf_counter() - started) * 1000), result.usage_records
+    plan = planner.plan(**kwargs)
+    return plan, int((time.perf_counter() - started) * 1000), []
 
 
 def _optional_int(value: Any) -> int | None:

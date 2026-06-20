@@ -313,6 +313,8 @@ class ExecutionPlan:
 
 如果需要保留原因，放到 planner debug 信息，不进入核心 plan。
 
+已执行迁移：`ExecutionPlan.usage_records` 已移除。Planner LLM 调用产生的 usage 由 `TurnPlannerResult.usage_records` 返回，并通过 `PlanningRouterResult.planner_usage_records` 传给 `TaskAgentRuntime` 汇总；静态 plan 的 JSON 不再携带运行期 usage 观测数据。
+
 ### 3.3 `FastIntentDecision`
 
 当前字段：

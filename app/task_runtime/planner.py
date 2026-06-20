@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -82,7 +83,6 @@ class ExecutionPlan(BaseModel):
     nodes: list[PlanNode]
     # 执行完任务后，最终回复如何收口；mode/reason 由 runtime 根据 nodes 推导。
     finalization_hint: FinalizationHint = Field(default_factory=FinalizationHint)
-    usage_records: list[dict[str, Any]] = Field(default_factory=list)
 
     @field_validator("user_objective")
     @classmethod
@@ -108,6 +108,12 @@ class ExecutionPlan(BaseModel):
             deps[node.id] = node_refs & known
         _assert_acyclic(deps)
         return self
+
+
+@dataclass(frozen=True)
+class TurnPlannerResult:
+    plan: ExecutionPlan
+    usage_records: list[dict[str, Any]] = field(default_factory=list)
 
 
 class PlanInput(BaseModel):
@@ -151,6 +157,29 @@ class TurnPlanner:
         runtime_hints: dict[str, Any] | None = None,
         instructions: list[str] | None = None,
     ) -> ExecutionPlan:
+        return self.plan_with_usage(
+            content=content,
+            session_state=session_state,
+            conversation_metadata=conversation_metadata,
+            recent_artifacts=recent_artifacts,
+            conversation_context=conversation_context,
+            previous_node_results=previous_node_results,
+            runtime_hints=runtime_hints,
+            instructions=instructions,
+        ).plan
+
+    def plan_with_usage(
+        self,
+        *,
+        content: str,
+        session_state: ConversationSessionState | None = None,
+        conversation_metadata: dict[str, Any] | None = None,
+        recent_artifacts: list[dict[str, Any]] | None = None,
+        conversation_context: ConversationContext | None = None,
+        previous_node_results: list[dict[str, Any]] | None = None,
+        runtime_hints: dict[str, Any] | None = None,
+        instructions: list[str] | None = None,
+    ) -> TurnPlannerResult:
         session = session_state or ConversationSessionState()
         plan_input = build_plan_input(
             current_user_input=content,
@@ -164,12 +193,15 @@ class TurnPlanner:
         resolved = ModelRouter().resolve(LLMNode.PLANNER, conversation_metadata)
         if not resolved.profile.api_key:
             logger.info("turn planner llm skipped reason=missing_api_key profile=%s", resolved.profile.id)
-            return _fallback_plan_for_objective(
-                plan_input.current_user_input,
-                runtime_hints=plan_input.runtime_hints,
-                known_artifact_refs=_known_artifact_refs(plan_input.artifacts),
-                previous_node_results=plan_input.previous_node_results,
-            ) or _fallback_single_node_plan(plan_input.current_user_input)
+            return TurnPlannerResult(
+                plan=_fallback_plan_for_objective(
+                    plan_input.current_user_input,
+                    runtime_hints=plan_input.runtime_hints,
+                    known_artifact_refs=_known_artifact_refs(plan_input.artifacts),
+                    previous_node_results=plan_input.previous_node_results,
+                )
+                or _fallback_single_node_plan(plan_input.current_user_input)
+            )
 
         prompt = self._prompt_registry.load("heavy_plan", self._prompt_version)
         response_format = prompt.response_format if resolved.profile.supports_json_object else None
@@ -208,10 +240,8 @@ class TurnPlanner:
             previous_node_results=plan_input.previous_node_results,
         )
         usage_record = usage_record_from_response(response, stage="planner")
-        if usage_record is not None:
-            plan.usage_records.append(usage_record)
         logger.info("turn planner plan output=%s", _json_for_log(plan.model_dump(mode="json")))
-        return plan
+        return TurnPlannerResult(plan=plan, usage_records=[usage_record] if usage_record is not None else [])
 
 
 def build_plan_input(

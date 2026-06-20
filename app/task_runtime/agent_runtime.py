@@ -143,7 +143,11 @@ class TaskAgentRuntime:
             )
             if router_result.route == "fast_reply":
                 report = _fast_reply_report(router_result.fast_intent.reply)
-                usage_records = collect_usage_records(router_result.fast_intent, router_result.plan, report.node_results)
+                usage_records = collect_usage_records(
+                    router_result.fast_intent,
+                    router_result.planner_usage_records,
+                    report.node_results,
+                )
                 token_usage = usage_totals(usage_records)
                 reply = append_usage_footer(router_result.fast_intent.reply, token_usage)
                 aggregation = AggregationResult(
@@ -343,7 +347,12 @@ class TaskAgentRuntime:
             approval_requests = _approval_requests_from_aggregation(aggregation)
             if approval_requests:
                 raw_payload["approval_requests"] = approval_requests
-            usage_records = collect_usage_records(router_result.fast_intent, router_result.plan, report.node_results, aggregation)
+            usage_records = collect_usage_records(
+                router_result.fast_intent,
+                router_result.planner_usage_records,
+                report.node_results,
+                aggregation,
+            )
             token_usage = usage_totals(usage_records)
             reply = append_usage_footer(aggregation.reply, token_usage)
             if usage_records:

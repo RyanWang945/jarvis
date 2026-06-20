@@ -6,7 +6,7 @@ from app.agent_react.context_manager import ConversationContext
 from app.agent_react.session_state import ConversationSessionState
 from app.task_runtime.fast_intent import FastIntentDecision
 from app.task_runtime.planning_router import PlanningRouter
-from app.task_runtime.planner import ExecutionPlan, PlanNode
+from app.task_runtime.planner import ExecutionPlan, PlanNode, TurnPlannerResult
 
 
 class StaticFastIntent:
@@ -32,6 +32,24 @@ class SlowPlanner:
         if self.delay_seconds:
             time.sleep(self.delay_seconds)
         return self.plan_result
+
+
+class UsagePlanner(SlowPlanner):
+    def plan_with_usage(self, **kwargs):
+        return TurnPlannerResult(
+            plan=self.plan(**kwargs),
+            usage_records=[
+                {
+                    "source": "llm",
+                    "provider": "deepseek",
+                    "model": "deepseek-v4-flash",
+                    "stage": "planner",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "total_tokens": 15,
+                }
+            ],
+        )
 
 
 class RecordingProgress:
@@ -176,7 +194,17 @@ def test_planning_router_previous_node_results_force_planner() -> None:
     assert result.route == "planned"
     assert result.plan is planned
     assert planner.calls == 1
-    assert fast.calls == 0
+
+
+def test_planning_router_surfaces_planner_usage_outside_plan() -> None:
+    fast = StaticFastIntent(FastIntentDecision(route="needs_plan", confidence=0.95, reason="needs execution"))
+    router = PlanningRouter(fast_intent=fast, planner=UsagePlanner(_planned_plan()))
+
+    result = router.plan(content="查资料")
+
+    assert result.route == "planned"
+    assert result.planner_usage_records[0]["stage"] == "planner"
+    assert "usage_records" not in result.plan.model_dump(mode="json")
 
 
 def test_planning_router_context_reference_forces_planner() -> None:
