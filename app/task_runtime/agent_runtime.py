@@ -847,6 +847,8 @@ def _fast_reply_report(reply: str) -> ExecutionReport:
 
 
 def _approval_requests_from_aggregation(aggregation: AggregationResult) -> list[dict[str, Any]]:
+    if aggregation.approval_requests:
+        return approval_request_dicts(aggregation.approval_requests)
     raw = aggregation.data.get("approval_requests")
     if not isinstance(raw, list):
         return []

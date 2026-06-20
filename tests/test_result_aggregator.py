@@ -227,7 +227,8 @@ def test_result_aggregator_preserves_blocked_approval_requests() -> None:
 
     assert result.status == "needs_user_input"
     assert result.reply == "该操作需要确认后继续。"
-    assert result.data["approval_requests"] == [approval]
+    assert result.approval_requests == [approval]
+    assert "approval_requests" not in result.data
 
 
 def test_result_aggregator_failed_result_returns_failed_reply_without_replan_contract() -> None:

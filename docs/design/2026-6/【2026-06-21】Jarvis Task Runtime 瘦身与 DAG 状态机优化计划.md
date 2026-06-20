@@ -386,6 +386,8 @@ debug
 | `data` | 拆出 `approval_requests`，剩余改 `debug` | 核心协议不应藏在 dict |
 | `usage_records` | 改名 `usage` | 统一命名 |
 
+已执行迁移：`AggregationResult` 已删除 `needs_replan`、`replan_instructions`、`missing_info_question`，并新增顶层 `approval_requests`。`TaskAgentRuntime` 优先读取 `aggregation.approval_requests`，仅保留从 `data["approval_requests"]` 读取的兼容 fallback。
+
 ### 3.5 `NodeResult`
 
 当前字段：
@@ -1191,6 +1193,8 @@ image attachment resolution
 3. `TaskAgentRuntime` 从 `aggregation.approval_requests` 读取。
 4. 保留从 `data["approval_requests"]` 读取的兼容 fallback。
 5. 删除 `missing_info_question`。
+
+状态：已落地。新写入路径使用 `aggregation.approval_requests`，raw payload 继续写顶层 `approval_requests` 供 Feishu channel 使用。
 
 风险：
 

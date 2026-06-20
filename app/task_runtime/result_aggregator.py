@@ -26,6 +26,7 @@ class AggregationResult(BaseModel):
     status: AggregationStatus
     reply: str
     artifact_refs: list[str] = Field(default_factory=list)
+    approval_requests: list[dict[str, Any]] = Field(default_factory=list)
     data: dict[str, Any] = Field(default_factory=dict)
     usage_records: list[dict[str, Any]] = Field(default_factory=list)
 
@@ -315,6 +316,11 @@ def _aggregation_from_payload(
         normalized["status"] = fallback.status
     normalized.setdefault("reply", fallback.reply)
     normalized.setdefault("artifact_refs", _artifact_refs(report.node_results))
+    data = normalized.get("data")
+    if "approval_requests" not in normalized and isinstance(data, dict):
+        raw_requests = data.get("approval_requests")
+        if isinstance(raw_requests, list):
+            normalized["approval_requests"] = approval_request_dicts(raw_requests)
     normalized.setdefault("data", {})
     try:
         return AggregationResult.model_validate(normalized)
@@ -344,10 +350,8 @@ def _fallback_aggregation(*, plan: ExecutionPlan, report: ExecutionReport) -> Ag
             status="needs_user_input",
             reply=question,
             artifact_refs=refs,
-            data={
-                "fallback": True,
-                **({"approval_requests": approval_requests} if approval_requests else {}),
-            },
+            approval_requests=approval_requests,
+            data={"fallback": True},
         )
     failed = [result for result in report.node_results if result.status == "failed"]
     return AggregationResult(
