@@ -14,7 +14,6 @@ from app.llm.model_profiles import LLMNode
 from app.llm.model_router import ModelRouter
 from app.prompting import PromptRegistry
 from app.runtime_usage import usage_record_from_response
-from app.task_runtime.planner import FinalizationHint
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +24,6 @@ class FastIntentDecision(BaseModel):
 
     route: FastIntentRoute
     confidence: float = Field(ge=0.0, le=1.0)
-    finalization_hint: FinalizationHint = Field(default_factory=FinalizationHint)
     usage_records: list[dict[str, Any]] = Field(default_factory=list)
     reply: str = ""
     reason: str = ""
@@ -39,8 +37,6 @@ class FastIntentDecision(BaseModel):
             object.__setattr__(self, "reply", text)
         else:
             object.__setattr__(self, "reply", "")
-        if self.finalization_hint.mode == "auto":
-            object.__setattr__(self, "finalization_hint", _default_finalization_hint(self.route))
         return self
 
 
@@ -155,7 +151,6 @@ def _decision_from_payload(payload: dict[str, Any]) -> FastIntentDecision:
     runtime = candidate.get("runtime")
     candidate["route"] = _normalize_route(candidate.get("route"), runtime=runtime)
     candidate["confidence"] = _coerce_confidence(candidate.get("confidence"))
-    candidate["finalization_hint"] = {"mode": "auto"}
     if isinstance(candidate.get("reply"), str):
         candidate["reply"] = candidate["reply"].strip()
     try:
@@ -248,30 +243,6 @@ def _coerce_confidence(value: Any) -> float:
         return min(max(float(value), 0.0), 1.0)
     except (TypeError, ValueError):
         return 0.0
-
-
-def _normalize_finalization_hint(value: Any) -> dict[str, Any]:
-    if isinstance(value, dict):
-        hint = dict(value)
-    elif isinstance(value, str):
-        hint = {"mode": value}
-    else:
-        return {"mode": "auto"}
-    mode = str(hint.get("mode") or "auto").strip().lower()
-    if mode not in {"pass_through", "deterministic", "llm", "auto"}:
-        mode = "auto"
-    hint["mode"] = mode
-    hint["user_facing"] = bool(hint.get("user_facing"))
-    return hint
-
-
-def _default_finalization_hint(route: FastIntentRoute) -> FinalizationHint:
-    if route == "fast_reply":
-        return FinalizationHint(
-            mode="pass_through",
-            user_facing=True,
-        )
-    return FinalizationHint(mode="auto")
 
 
 def _fast_intent_virtual_tools() -> list[dict[str, Any]]:

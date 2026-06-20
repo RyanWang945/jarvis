@@ -353,6 +353,8 @@ usage
 | `finalization_hint` | 删除 | fast reply 天然 pass-through |
 | `usage_records` | 改名 `usage` | 和其他 runtime 统一 |
 
+已执行迁移：`FastIntentDecision.finalization_hint` 已删除。Fast intent 只输出 `route/confidence/reply/reason/usage_records`；当 router 选择 fast reply 时，由 `fast_reply_plan()` 生成 `pass_through` finalization，而不是从 fast intent 透传。
+
 ### 3.4 `AggregationResult`
 
 当前字段：

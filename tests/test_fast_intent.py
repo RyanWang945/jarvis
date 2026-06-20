@@ -23,8 +23,8 @@ def test_fast_intent_decision_defaults_needs_plan_to_no_runtime() -> None:
     assert not hasattr(decision, "runtime")
     assert not hasattr(decision, "tool_name")
     assert not hasattr(decision, "input_refs")
+    assert not hasattr(decision, "finalization_hint")
     assert decision.reply == ""
-    assert decision.finalization_hint.mode == "auto"
 
 
 def test_fast_intent_decision_ignores_legacy_planning_fields() -> None:
@@ -40,6 +40,7 @@ def test_fast_intent_decision_ignores_legacy_planning_fields() -> None:
     assert not hasattr(decision, "runtime")
     assert not hasattr(decision, "tool_name")
     assert not hasattr(decision, "input_refs")
+    assert not hasattr(decision, "finalization_hint")
     assert decision.reply == ""
 
 
@@ -52,7 +53,7 @@ def test_fast_intent_decision_accepts_fast_reply() -> None:
     decision = FastIntentDecision(route="fast_reply", confidence=0.95, reply="数学有时难，但能练会。")
 
     assert decision.reply == "数学有时难，但能练会。"
-    assert decision.finalization_hint.mode == "pass_through"
+    assert not hasattr(decision, "finalization_hint")
 
 
 def test_fast_intent_payload_maps_legacy_direct_route_to_needs_plan() -> None:
