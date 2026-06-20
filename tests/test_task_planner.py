@@ -100,7 +100,7 @@ def test_plan_from_payload_derives_llm_finalization_for_non_llm_nodes() -> None:
                     "id": "research",
                     "runtime": "react",
                     "objective": "查最新资料",
-                    "expected_output": "用户可读的答案",
+                    "output_hint": "用户可读的答案",
                 }
             ],
         },

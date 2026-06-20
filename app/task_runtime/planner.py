@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta, timezone
 from typing import Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from app.agent_react.context_manager import ConversationContext
 from app.agent_react.session_state import ConversationSessionState
@@ -31,7 +31,7 @@ class PlanNode(BaseModel):
     runtime: NodeRuntime
     objective: str
     input_refs: list[str] = Field(default_factory=list)
-    output_hint: str = Field(default="", validation_alias=AliasChoices("output_hint", "expected_output"))
+    output_hint: str = ""
 
     @field_validator("runtime", mode="before")
     @classmethod
@@ -459,15 +459,13 @@ def _normalize_node_payload(
     runtime = _normalize_runtime(node.get("runtime"))
     node["runtime"] = runtime
 
-    output_hint = node.get("output_hint", node.get("expected_output"))
+    output_hint = node.get("output_hint")
     if isinstance(output_hint, dict):
         node["output_hint"] = str(output_hint.get("description") or output_hint.get("kind") or "").strip()
     elif output_hint is None:
         node["output_hint"] = ""
     else:
         node["output_hint"] = str(output_hint).strip()
-    node.pop("expected_output", None)
-
     node["input_refs"] = _normalize_input_refs(node.get("input_refs"), known_artifact_refs=known_artifact_refs)
     return node
 

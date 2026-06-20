@@ -911,7 +911,6 @@ def _coder_instruction(context: NodeExecutionContext) -> str:
             "node_id": context.node.id,
             "node_objective": context.node.objective,
             "output_hint": context.node.output_hint or "Repository task result.",
-            "expected_output": context.node.output_hint or "Repository task result.",
             "node_manifest_path": str(context.runtime_hints.get("node_manifest_path") or "node_manifest.json"),
             "coder_workspace_section": _coder_workspace_section(context.runtime_hints),
             "resolved_inputs_section": "\n".join(resolved_inputs_lines),

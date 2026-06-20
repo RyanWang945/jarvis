@@ -1,0 +1,23 @@
+{
+  "id": "coder_node_execute:v3",
+  "scenario": "coder_node_execute",
+  "version": "v3",
+  "description": "Build the instruction passed from a Jarvis coder runtime node to a coder provider using output_hint naming.",
+  "response_format": "text",
+  "variables": [
+    "temporal_context",
+    "user_objective",
+    "node_id",
+    "node_objective",
+    "output_hint",
+    "node_manifest_path",
+    "resolved_inputs_section",
+    "additional_instructions_section"
+  ],
+  "messages": [
+    {
+      "role": "user",
+      "template": "instruction.md"
+    }
+  ]
+}

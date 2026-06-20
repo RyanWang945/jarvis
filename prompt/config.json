@@ -2,7 +2,7 @@
   "default_versions": {
     "agent_system": "v1",
     "coder_temporal_context": "v1",
-    "coder_node_execute": "v2",
+    "coder_node_execute": "v3",
     "coder_node_finalize": "v1",
     "coder_worker": "v1",
     "fast_intent": "v1",
@@ -27,7 +27,7 @@
     "default": {
       "agent_system": "v1",
       "coder_temporal_context": "v1",
-      "coder_node_execute": "v2",
+      "coder_node_execute": "v3",
       "coder_node_finalize": "v1",
       "coder_worker": "v1",
       "fast_intent": "v1",

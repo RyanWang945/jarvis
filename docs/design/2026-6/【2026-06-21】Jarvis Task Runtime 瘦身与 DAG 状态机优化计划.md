@@ -711,14 +711,14 @@ pytest tests/test_task_runtime_e2e.py tests/test_node_executor.py tests/test_ses
 3. 删除或停止导出 `NodeRuntime="codex"`，旧 planner payload 中的 `runtime="codex"` 直接判为非法计划并走 fallback。
 4. 删除 `AggregationResult.missing_info_question`。
 5. 如果不实现 replan，删除 `AggregationStatus.needs_replan` 和 `replan_instructions`。
-6. 将 `expected_output` 改名为 `output_hint`，保留 alias 兼容旧 planner 输出。
+6. 将 `expected_output` 改名为 `output_hint`，并删除当前执行路径中的旧 alias。
 
 兼容策略：
 
-1. planner payload 中出现 `expected_output` 时映射到 `output_hint`。
+1. planner payload 中出现 `expected_output` 时由 `extra=ignore` 丢弃，不再映射到 `output_hint`。
 2. 旧 raw payload 读取不做迁移。
 3. 测试中直接构造 `PlanNode(expected_output=...)` 的用例同步调整。
-4. 已执行迁移：`PlanNode` 核心字段为 `output_hint`，`expected_output` 仅作为输入 alias 和旧 `coder_node_execute` prompt 变量兼容保留。
+4. 已执行迁移：`PlanNode` 核心字段为 `output_hint`，`expected_output` 输入 alias 已删除；新增 `coder_node_execute:v3` 并切为默认版本，prompt 变量也统一为 `output_hint`。旧 prompt 版本 v1/v2 保留历史内容但不在默认路径使用。
 
 验收：
 
