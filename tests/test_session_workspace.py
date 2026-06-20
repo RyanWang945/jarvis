@@ -421,7 +421,7 @@ def test_coder_node_finalizer_loads_node_manifest_artifact(monkeypatch, tmp_path
     assert result.artifacts[0].kind == "file"
     assert result.artifacts[0].session_relative_path == "nodes/write_report/report.md"
     assert result.artifacts[0].publish is True
-    assert result.data["finalizer"]["manifest_loaded"] is True
+    assert result.debug["finalizer"]["manifest_loaded"] is True
 
 
 def test_coder_runtime_does_not_auto_commit_registered_repo_without_node_workspace(monkeypatch, tmp_path: Path) -> None:

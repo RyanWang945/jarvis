@@ -432,6 +432,8 @@ debug
 
 已执行迁移：`NodeResult` 已新增顶层 `git` 字段。coder node 新写入路径将 `repo_workspace`、`node_commit`、`node_merge` 写入 `result.git`，不再写入 `result.data`。
 
+已执行迁移：`NodeResult` 已新增顶层 `debug` 字段。coder finalizer 新写入路径将 `provider`、`stdout`、`stderr`、`exit_code`、`finalizer` 诊断信息写入 `result.debug`，不再写入 `result.data`。
+
 ### 3.6 `runtime_hints`
 
 需要拆成以下对象：

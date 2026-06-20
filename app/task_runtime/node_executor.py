@@ -326,6 +326,7 @@ def _node_result_from_mapping(value: dict[str, Any]) -> NodeResult | None:
         tool_calls=value.get("tool_calls") if isinstance(value.get("tool_calls"), list) else [],
         usage_records=value.get("usage_records") if isinstance(value.get("usage_records"), list) else [],
         git=value.get("git") if isinstance(value.get("git"), dict) else {},
+        debug=value.get("debug") if isinstance(value.get("debug"), dict) else {},
         data=value.get("data") if isinstance(value.get("data"), dict) else {},
     )
 

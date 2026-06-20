@@ -192,12 +192,13 @@ class CodeNodeFinalizer:
             ),
             *[_artifact_from_legacy_string(item) for item in legacy_artifacts],
         ]
-        data = {
+        debug = {
             "provider": provider,
             "stdout": stdout,
             "stderr": stderr,
             "exit_code": exit_code,
         }
+        data: dict[str, Any] = {}
         if approval_data:
             data.update(approval_data)
         metadata_payload = dict(metadata)
@@ -225,7 +226,7 @@ class CodeNodeFinalizer:
                 *manifest.missing_expected_artifacts,
                 *llm_manifest.missing_expected_artifacts,
             ]
-        data["finalizer"] = finalizer_data
+        debug["finalizer"] = finalizer_data
 
         return NodeResult(
             node_id=node.id,
@@ -236,6 +237,7 @@ class CodeNodeFinalizer:
             approval_requests=approval_requests or [],
             usage_records=usage_records,
             git=git,
+            debug=debug,
             data=data,
             error=_final_error(
                 status=status,

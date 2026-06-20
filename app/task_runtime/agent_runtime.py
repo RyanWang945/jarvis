@@ -616,7 +616,7 @@ def _normalize_tool_artifact(
     if not artifact.tool_call_id:
         updates["tool_call_id"] = f"node:{result.node_id}"
     if not artifact.source_tool:
-        provider = str(result.data.get("provider") or "")
+        provider = str(result.debug.get("provider") or result.data.get("provider") or "")
         updates["source_tool"] = "coder" if result.runtime in {"coder", "codex"} and provider in {"", "codex"} else result.runtime
     if artifact.node_id is None:
         updates["node_id"] = result.node_id

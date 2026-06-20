@@ -93,7 +93,7 @@ def test_coder_node_runtime_builds_provider_request() -> None:
     assert "Fix failing tests" in request.instruction
     assert result.runtime == "coder"
     assert result.status == "completed"
-    assert result.data["provider"] == "fake"
+    assert result.debug["provider"] == "fake"
 
 
 def test_coder_node_runtime_ignores_legacy_permission_hints() -> None:
