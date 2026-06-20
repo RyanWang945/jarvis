@@ -20,14 +20,14 @@ from app.task_runtime.fast_intent import (
 def test_fast_intent_decision_defaults_needs_plan_to_no_runtime() -> None:
     decision = FastIntentDecision(route="needs_plan", confidence=0.9)
 
-    assert decision.runtime is None
-    assert decision.tool_name is None
-    assert decision.input_refs == []
+    assert not hasattr(decision, "runtime")
+    assert not hasattr(decision, "tool_name")
+    assert not hasattr(decision, "input_refs")
     assert decision.reply == ""
     assert decision.finalization_hint.mode == "auto"
 
 
-def test_fast_intent_decision_strips_planning_fields_from_needs_plan() -> None:
+def test_fast_intent_decision_ignores_legacy_planning_fields() -> None:
     decision = FastIntentDecision(
         route="needs_plan",
         confidence=0.9,
@@ -37,9 +37,9 @@ def test_fast_intent_decision_strips_planning_fields_from_needs_plan() -> None:
         reply="should be ignored",
     )
 
-    assert decision.runtime is None
-    assert decision.tool_name is None
-    assert decision.input_refs == []
+    assert not hasattr(decision, "runtime")
+    assert not hasattr(decision, "tool_name")
+    assert not hasattr(decision, "input_refs")
     assert decision.reply == ""
 
 
@@ -51,7 +51,6 @@ def test_fast_intent_decision_requires_reply_for_fast_reply() -> None:
 def test_fast_intent_decision_accepts_fast_reply() -> None:
     decision = FastIntentDecision(route="fast_reply", confidence=0.95, reply="数学有时难，但能练会。")
 
-    assert decision.runtime is None
     assert decision.reply == "数学有时难，但能练会。"
     assert decision.finalization_hint.mode == "pass_through"
 
@@ -68,8 +67,8 @@ def test_fast_intent_payload_maps_legacy_direct_route_to_needs_plan() -> None:
     )
 
     assert decision.route == "needs_plan"
-    assert decision.runtime is None
-    assert decision.tool_name is None
+    assert not hasattr(decision, "runtime")
+    assert not hasattr(decision, "tool_name")
 
 
 def test_fast_intent_payload_maps_legacy_direct_tool_to_needs_plan() -> None:
@@ -84,8 +83,8 @@ def test_fast_intent_payload_maps_legacy_direct_tool_to_needs_plan() -> None:
     )
 
     assert decision.route == "needs_plan"
-    assert decision.runtime is None
-    assert decision.tool_name is None
+    assert not hasattr(decision, "runtime")
+    assert not hasattr(decision, "tool_name")
     assert decision.confidence == 0.95
 
 
@@ -127,8 +126,8 @@ def test_fast_intent_virtual_tool_maps_to_needs_plan() -> None:
     )
 
     assert decision.route == "needs_plan"
-    assert decision.runtime is None
-    assert decision.input_refs == []
+    assert not hasattr(decision, "runtime")
+    assert not hasattr(decision, "input_refs")
 
 
 def test_fast_intent_messages_include_temporal_context() -> None:
@@ -167,7 +166,7 @@ def test_fast_intent_unknown_virtual_tool_falls_back_to_needs_plan() -> None:
     )
 
     assert decision.route == "needs_plan"
-    assert decision.tool_name is None
+    assert not hasattr(decision, "tool_name")
     assert "single_codex" in decision.reason
 
 
@@ -196,8 +195,8 @@ def test_fast_intent_real_llm_routes_artifact_delivery() -> None:
     )
 
     assert decision.route == "needs_plan"
-    assert decision.runtime is None
-    assert decision.tool_name is None
+    assert not hasattr(decision, "runtime")
+    assert not hasattr(decision, "tool_name")
 
 
 @real_llm
@@ -214,4 +213,4 @@ def test_fast_intent_real_llm_does_not_invent_codex_image_tool() -> None:
     decision = FastIntentNode().decide(content="用codex image gen skill生成一个抖音直播网红的图片，要包含足够多的细节")
 
     assert decision.route == "needs_plan"
-    assert decision.tool_name is None
+    assert not hasattr(decision, "tool_name")

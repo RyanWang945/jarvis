@@ -19,7 +19,7 @@ from app.runtime_usage import usage_record_from_response
 
 logger = logging.getLogger(__name__)
 
-NodeRuntime = Literal["llm", "react", "coder", "codex"]
+NodeRuntime = Literal["llm", "react", "coder"]
 FinalizationMode = Literal["pass_through", "deterministic", "llm", "auto"]
 _RUNTIMES = {"llm", "react", "coder"}
 
@@ -32,7 +32,6 @@ class PlanNode(BaseModel):
     objective: str
     input_refs: list[str] = Field(default_factory=list)
     expected_output: str = ""
-    tool_name: str | None = None
     runtime_hints: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("runtime", mode="before")
@@ -68,19 +67,7 @@ class PlanNode(BaseModel):
     def _runtime_hints_mapping(cls, value: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(value, dict):
             return {}
-        hints = dict(value)
-        access_mode = hints.get("access_mode")
-        if access_mode is not None:
-            normalized = str(access_mode).strip().lower()
-            if normalized not in {"read", "write"}:
-                raise ValueError("runtime_hints.access_mode must be read or write")
-            hints["access_mode"] = normalized
-        return hints
-
-    @model_validator(mode="after")
-    def _drop_legacy_tool_name(self) -> PlanNode:
-        self.tool_name = None
-        return self
+        return {key: value for key, value in dict(value).items() if key not in {"access_mode", "allow_commit", "allow_push"}}
 
 
 class FinalizationHint(BaseModel):
@@ -480,10 +467,6 @@ def _normalize_node_payload(
     runtime = _normalize_runtime(node.get("runtime"))
     node["runtime"] = runtime
 
-    tool_name = node.get("tool_name")
-    if isinstance(tool_name, str):
-        node["tool_name"] = tool_name.strip() or None
-
     expected_output = node.get("expected_output")
     if isinstance(expected_output, dict):
         node["expected_output"] = str(expected_output.get("description") or expected_output.get("kind") or "").strip()
@@ -500,8 +483,6 @@ def _normalize_node_payload(
 
 def _normalize_runtime(value: Any) -> NodeRuntime:
     text = str(value or "").strip().lower()
-    if text == "codex":
-        return "coder"
     if text == "tool":
         return "react"
     if text in _RUNTIMES:
@@ -565,7 +546,6 @@ def _fallback_plan_for_objective(
                     objective=f"Review the {active_repo} repository for the user request and produce the requested markdown report / 报告: {objective}",
                     input_refs=previous_refs,
                     expected_output="Markdown report / 报告 covering the repository findings.",
-                    runtime_hints={"access_mode": "read"},
                 ),
                 PlanNode(
                     id="set_reminder",
@@ -601,7 +581,6 @@ def _fallback_plan_for_objective(
                     objective=f"Use the {active_repo} repository to complete the user request: {objective}",
                     input_refs=previous_refs,
                     expected_output="Repository-grounded result for the user request.",
-                    runtime_hints={"access_mode": "read"},
                 )
             ],
         )
@@ -781,7 +760,6 @@ def _fallback_coarse_code_plan(
                 ),
                 input_refs=previous_refs,
                 expected_output=f"{area} 的代码实现说明、关键改动和本节点内完成的必要自检结果。",
-                runtime_hints={"access_mode": "write"},
             )
         )
 
@@ -798,7 +776,6 @@ def _fallback_coarse_code_plan(
                 ),
                 input_refs=implementation_refs,
                 expected_output="不同业务代码改动已完成整合，跨业务契约、冲突处理和剩余风险说明清楚。",
-                runtime_hints={"access_mode": "write"},
             )
         )
 
@@ -811,7 +788,6 @@ def _fallback_coarse_code_plan(
             ),
             input_refs=[integration_ref],
             expected_output="代码 review 结论、发现的问题、建议修复项和可交付状态。",
-            runtime_hints={"access_mode": "read"},
         )
     )
 

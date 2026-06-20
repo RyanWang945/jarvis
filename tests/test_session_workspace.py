@@ -81,8 +81,8 @@ def test_coder_nodes_get_independent_node_repos_and_provider_run_dirs(monkeypatc
     plan = ExecutionPlan(
         user_objective="modify independently",
         nodes=[
-            PlanNode(id="modify_a", runtime="coder", objective="Modify A", runtime_hints={"access_mode": "write"}),
-            PlanNode(id="modify_b", runtime="coder", objective="Modify B", runtime_hints={"access_mode": "write"}),
+            PlanNode(id="modify_a", runtime="coder", objective="Modify A"),
+            PlanNode(id="modify_b", runtime="coder", objective="Modify B"),
         ],
     )
     workspace = SessionWorkspaceManager(workdir=tmp_path, session_id_factory=lambda turn_id: "session-code").create_for_plan(
@@ -155,7 +155,7 @@ def test_write_coder_node_auto_commits_node_worktree(monkeypatch, tmp_path: Path
     runtime = CoderNodeExecuteRuntime(provider=_WritingProvider(), git_context_resolver=_noop_git_context)
     plan = ExecutionPlan(
         user_objective="write a file",
-        nodes=[PlanNode(id="write_node", runtime="coder", objective="Write node file", runtime_hints={"access_mode": "write"})],
+        nodes=[PlanNode(id="write_node", runtime="coder", objective="Write node file")],
     )
     workspace = SessionWorkspaceManager(workdir=tmp_path, session_id_factory=lambda turn_id: "session-commit").create_for_plan(
         plan,
@@ -223,7 +223,6 @@ def test_write_coder_node_uses_resolved_target_branch_without_provider_checkout(
                 id="write_quicksort",
                 runtime="coder",
                 objective="Write quicksort",
-                runtime_hints={"access_mode": "write"},
             )
         ],
     )
@@ -279,7 +278,6 @@ def test_write_coder_node_requests_approval_before_merging_to_protected_branch(m
                 id="write_protected",
                 runtime="coder",
                 objective="Write protected",
-                runtime_hints={"access_mode": "write"},
             )
         ],
     )
@@ -327,8 +325,8 @@ def test_later_coder_node_starts_from_latest_target_branch(monkeypatch, tmp_path
     plan = ExecutionPlan(
         user_objective="continue development",
         nodes=[
-            PlanNode(id="write_first", runtime="coder", objective="Write first file", runtime_hints={"access_mode": "write"}),
-            PlanNode(id="read_second", runtime="coder", objective="Read first file", runtime_hints={"access_mode": "write"}),
+            PlanNode(id="write_first", runtime="coder", objective="Write first file"),
+            PlanNode(id="read_second", runtime="coder", objective="Read first file"),
         ],
     )
     workspace = SessionWorkspaceManager(workdir=tmp_path, session_id_factory=lambda turn_id: "session-continue").create_for_plan(
@@ -402,7 +400,7 @@ def test_coder_node_finalizer_loads_node_manifest_artifact(monkeypatch, tmp_path
     runtime = CoderNodeExecuteRuntime(provider=_ManifestWritingProvider(), git_context_resolver=_noop_git_context)
     plan = ExecutionPlan(
         user_objective="write a report",
-        nodes=[PlanNode(id="write_report", runtime="coder", objective="Write report", runtime_hints={"access_mode": "write"})],
+        nodes=[PlanNode(id="write_report", runtime="coder", objective="Write report")],
     )
     workspace = SessionWorkspaceManager(workdir=tmp_path, session_id_factory=lambda turn_id: "session-manifest").create_for_plan(
         plan,
@@ -444,7 +442,7 @@ def test_coder_runtime_does_not_auto_commit_registered_repo_without_node_workspa
 
     result = runtime.run(
         _node_context(
-            node=PlanNode(id="write_node", runtime="coder", objective="Write node file", runtime_hints={"access_mode": "write"}),
+            node=PlanNode(id="write_node", runtime="coder", objective="Write node file"),
             runtime_hints={"active_repo": "jarvis"},
         )
     )

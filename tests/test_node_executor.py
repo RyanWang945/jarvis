@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from app.task_runtime.node_execute_runtime import CodexNodeExecuteRuntime, NodeExecutionContext
+from app.task_runtime.node_execute_runtime import NodeExecutionContext
 from app.task_runtime.node_executor import NodeExecutor
 from app.task_runtime.node_result import NodeResult, ResolvedInput
 from app.task_runtime.planner import ExecutionPlan, PlanNode
-from app.tools.common import ToolExecutionResult
 from app.llm.provider_adapters import NormalizedLLMResponse, NormalizedToolCall
 from app.skills.loader import SkillPackageLoader
 from app.skills.registry import SkillRegistry
+from app.tools.common import ToolExecutionResult
 
 
 class RecordingRuntime:
@@ -176,62 +176,6 @@ def test_node_executor_blocks_downstream_when_dependency_failed() -> None:
     assert report.status == "failed"
     assert [result.status for result in report.node_results] == ["failed", "blocked"]
     assert coder.calls == []
-
-
-def test_codex_node_execute_runtime_builds_tool_request() -> None:
-    captured = {}
-
-    def _runner(request):
-        captured["request"] = request
-        return ToolExecutionResult(
-            ok=True,
-            exit_code=0,
-            stdout="Codex finished.",
-            summary="Codex reviewed planner.",
-            artifacts=["codex_run:data/coder_runs/run1"],
-        )
-
-    runtime = CodexNodeExecuteRuntime(runner=_runner)
-    result = runtime.run(
-        NodeExecutionContext(
-            user_objective="review jarvis",
-            node=PlanNode(
-                id="review",
-                runtime="coder",
-                objective="Review planner",
-                expected_output="Markdown review",
-                input_refs=["node:research"],
-            ),
-            resolved_inputs=[
-                ResolvedInput(
-                    ref="node:research",
-                    kind="node_result",
-                    source_status="completed",
-                    summary="Planner IR should stay lightweight.",
-                )
-            ],
-            runtime_hints={
-                "active_repo": "jarvis",
-                "codex_read_only": True,
-                "current_date": "2026-05-25",
-                "current_time": "2026-05-25T10:30:00+08:00",
-                "timezone": "Asia/Shanghai",
-            },
-        )
-    )
-
-    request = captured["request"]
-    assert request.tool_name == "codex_coder_provider"
-    assert request.args["repo_id"] == "jarvis"
-    assert request.args["_read_only"] is True
-    assert "Review planner" in request.args["instruction"]
-    assert "Planner IR should stay lightweight" in request.args["instruction"]
-    assert "Current date: 2026-05-25" in request.args["instruction"]
-    assert result.status == "completed"
-    assert result.summary == "Codex finished."
-    assert result.artifacts[0].kind == "codex_run"
-    assert result.runtime == "coder"
-    assert result.data["provider"] == "codex"
 
 
 def test_react_node_execute_runtime_runs_tool_loop() -> None:

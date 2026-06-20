@@ -28,7 +28,7 @@ def test_prompt_registry_loads_project_prompt_and_renders_messages() -> None:
 def test_prompt_registry_uses_project_default_versions() -> None:
     bundle = PromptRegistry().load("heavy_plan")
 
-    assert bundle.id == "heavy_plan:v2"
+    assert bundle.id == "heavy_plan:v3"
 
 
 def test_project_prompt_config_defaults_are_loadable() -> None:

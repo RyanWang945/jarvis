@@ -8,7 +8,6 @@ from app.config import get_settings
 from app.task_runtime.approval_types import ApprovalRequest
 from app.task_runtime.coder_provider import (
     CoderApprovalContinuationResult,
-    CoderPolicy,
     CoderRunRequest,
     CoderRunResult,
     CodexCoderProvider,
@@ -72,7 +71,7 @@ def test_coder_provider_factory_rejects_unknown_provider(monkeypatch) -> None:
         get_settings.cache_clear()
 
 
-def test_coder_node_runtime_builds_provider_request_with_policy() -> None:
+def test_coder_node_runtime_builds_provider_request() -> None:
     provider = RecordingProvider()
     runtime = CoderNodeExecuteRuntime(provider=provider, git_context_resolver=_noop_git_context)
 
@@ -83,25 +82,21 @@ def test_coder_node_runtime_builds_provider_request_with_policy() -> None:
                 id="fix",
                 runtime="coder",
                 objective="Fix failing tests",
-                runtime_hints={"access_mode": "write"},
             ),
-            runtime_hints={"active_repo": "jarvis", "allow_commit": True},
+            runtime_hints={"active_repo": "jarvis"},
         )
     )
 
     request = provider.requests[0]
     assert request.repo_id == "jarvis"
     assert request.workdir.name == "jarvis"
-    assert request.policy.access_mode == "write"
-    assert request.policy.allow_commit is True
-    assert request.policy.allow_push is False
     assert "Fix failing tests" in request.instruction
     assert result.runtime == "coder"
     assert result.status == "completed"
     assert result.data["provider"] == "fake"
 
 
-def test_coder_node_runtime_defaults_to_read_policy() -> None:
+def test_coder_node_runtime_ignores_legacy_permission_hints() -> None:
     provider = RecordingProvider()
     runtime = CoderNodeExecuteRuntime(provider=provider, git_context_resolver=_noop_git_context)
 
@@ -114,9 +109,8 @@ def test_coder_node_runtime_defaults_to_read_policy() -> None:
     )
 
     request = provider.requests[0]
-    assert request.policy.access_mode == "read"
-    assert request.policy.allow_commit is False
-    assert request.policy.allow_push is False
+    assert request.repo_id == "jarvis"
+    assert "Review code" in request.instruction
 
 
 def test_codex_provider_surfaces_approval_request_artifact(tmp_path) -> None:
@@ -150,7 +144,6 @@ def test_codex_provider_surfaces_approval_request_artifact(tmp_path) -> None:
             repo_id="jarvis",
             workdir=tmp_path,
             instruction="Push the change.",
-            policy=CoderPolicy(access_mode="write", allow_commit=True, allow_push=True),
         )
     )
 
@@ -181,7 +174,6 @@ def test_claude_code_provider_delegates_to_claude_tool(monkeypatch, tmp_path) ->
             repo_id="jarvis",
             workdir=tmp_path,
             instruction="Review runtime.",
-            policy=CoderPolicy(access_mode="read"),
             timeout_seconds=123,
         )
     )
@@ -192,8 +184,8 @@ def test_claude_code_provider_delegates_to_claude_tool(monkeypatch, tmp_path) ->
     assert request.timeout_seconds == 123
     assert request.args["repo_id"] == "jarvis"
     assert request.args["instruction"] == "Review runtime."
-    assert request.args["_read_only"] is True
-    assert request.args["allow_commit"] is False
+    assert request.args["_read_only"] is False
+    assert request.args["allow_commit"] is True
     assert request.args["allow_push"] is False
     assert result.ok is True
     assert result.stdout == "Claude Code finished."
@@ -202,7 +194,7 @@ def test_claude_code_provider_delegates_to_claude_tool(monkeypatch, tmp_path) ->
     assert result.metadata["provider"] == "claude_code"
 
 
-def test_claude_code_provider_passes_write_permissions(monkeypatch, tmp_path) -> None:
+def test_claude_code_provider_uses_runtime_commit_policy(monkeypatch, tmp_path) -> None:
     captured = {}
 
     def _runner(request):
@@ -216,14 +208,13 @@ def test_claude_code_provider_passes_write_permissions(monkeypatch, tmp_path) ->
             repo_id="jarvis",
             workdir=tmp_path,
             instruction="Commit the change.",
-            policy=CoderPolicy(access_mode="write", allow_commit=True, allow_push=True),
         )
     )
 
     args = captured["request"].args
     assert args["_read_only"] is False
     assert args["allow_commit"] is True
-    assert args["allow_push"] is True
+    assert args["allow_push"] is False
 
 
 def test_claude_code_provider_passes_runtime_branch_context(monkeypatch, tmp_path) -> None:
@@ -240,7 +231,6 @@ def test_claude_code_provider_passes_runtime_branch_context(monkeypatch, tmp_pat
             repo_id="smoke-test",
             workdir=tmp_path,
             instruction="Write quicksort.",
-            policy=CoderPolicy(access_mode="write"),
             metadata={
                 "source_branch": "main",
                 "target_branch": "feat/test",
@@ -278,8 +268,8 @@ def test_coder_node_runtime_blocks_when_approval_required() -> None:
     result = CoderNodeExecuteRuntime(provider=ApprovalProvider(), git_context_resolver=_noop_git_context).run(
         NodeExecutionContext(
             user_objective="commit changes",
-            node=PlanNode(id="commit", runtime="coder", objective="Commit changes", runtime_hints={"access_mode": "write"}),
-            runtime_hints={"active_repo": "jarvis", "allow_commit": True},
+            node=PlanNode(id="commit", runtime="coder", objective="Commit changes"),
+            runtime_hints={"active_repo": "jarvis"},
         )
     )
 

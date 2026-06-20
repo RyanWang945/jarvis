@@ -420,6 +420,9 @@ def commit_node_repo(
         "-m",
         subject,
     )
+    remaining = _git_stdout(repo, "status", "--porcelain", "--untracked-files=all")
+    if remaining.strip():
+        raise RuntimeError(f"Node worktree is dirty after commit: {remaining}")
     commit_hash = _git_stdout(repo, "rev-parse", "HEAD")
     short_hash = _git_stdout(repo, "rev-parse", "--short", "HEAD")
     return NodeRepoCommit(

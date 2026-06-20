@@ -59,12 +59,17 @@ def test_plan_node_normalizes_legacy_tool_runtime_to_react() -> None:
     node = PlanNode(id="remind", runtime="tool", objective="Create reminder", tool_name="scheduled_task")  # type: ignore[arg-type]
 
     assert node.runtime == "react"
-    assert node.tool_name is None
+    assert not hasattr(node, "tool_name")
 
 
 def test_plan_node_rejects_deepresearch_runtime() -> None:
     with pytest.raises(ValidationError):
         PlanNode(id="research", runtime="deepresearch", objective="Run deep research")  # type: ignore[arg-type]
+
+
+def test_plan_node_rejects_legacy_codex_runtime() -> None:
+    with pytest.raises(ValidationError):
+        PlanNode(id="fix", runtime="codex", objective="Fix repo")  # type: ignore[arg-type]
 
 
 def test_build_plan_input_normalizes_artifacts_and_hints() -> None:
@@ -138,7 +143,7 @@ def test_plan_from_payload_normalizes_legacy_tool_node_to_react() -> None:
     )
 
     assert plan.nodes[0].runtime == "react"
-    assert plan.nodes[0].tool_name is None
+    assert not hasattr(plan.nodes[0], "tool_name")
     assert plan.finalization_hint.mode == "llm"
     assert plan.finalization_hint.user_facing is False
 
@@ -152,7 +157,6 @@ def test_plan_from_payload_normalizes_null_node_runtime_hints() -> None:
                     "id": "review",
                     "runtime": "coder",
                     "objective": "Review jarvis",
-                    "runtime_hints": {"access_mode": "read"},
                 },
                 {
                     "id": "remind",
@@ -181,7 +185,7 @@ def test_plan_from_payload_does_not_parse_branch_hints_in_backend() -> None:
                     "id": "write_quicksort",
                     "runtime": "coder",
                     "objective": "实现 quicksort.py",
-                    "runtime_hints": {"access_mode": "write"},
+                    "runtime_hints": {"access_mode": "write", "allow_commit": True, "allow_push": True},
                 }
             ],
         },
@@ -189,7 +193,7 @@ def test_plan_from_payload_does_not_parse_branch_hints_in_backend() -> None:
         runtime_hints={"active_repo": "smoke-test"},
     )
 
-    assert plan.nodes[0].runtime_hints == {"access_mode": "write"}
+    assert plan.nodes[0].runtime_hints == {}
 
 
 def test_plan_from_payload_preserves_llm_branch_hints() -> None:
@@ -202,7 +206,6 @@ def test_plan_from_payload_preserves_llm_branch_hints() -> None:
                     "runtime": "coder",
                     "objective": "继续开发",
                     "runtime_hints": {
-                        "access_mode": "write",
                         "source_branch": "main",
                         "target_branch": "feat/my-skill",
                         "worktree_mode": "node_branch_worktree",
@@ -228,7 +231,7 @@ def test_plan_from_payload_falls_back_to_artifact_delivery_for_empty_nodes() -> 
 
     assert len(plan.nodes) == 1
     assert plan.nodes[0].runtime == "react"
-    assert plan.nodes[0].tool_name is None
+    assert not hasattr(plan.nodes[0], "tool_name")
     assert plan.nodes[0].input_refs == ["artifact:A1"]
     assert plan.finalization_hint.mode == "llm"
 
@@ -241,7 +244,7 @@ def test_plan_from_payload_falls_back_to_repo_then_reminder_dag_for_empty_nodes(
     )
 
     assert [node.runtime for node in plan.nodes] == ["coder", "react"]
-    assert plan.nodes[0].runtime_hints["access_mode"] == "read"
+    assert plan.nodes[0].runtime_hints == {}
     assert plan.nodes[1].input_refs == ["node:repo_report"]
     assert "报告" in plan.nodes[0].objective
     assert "提醒" in plan.nodes[1].objective
@@ -261,8 +264,8 @@ def test_plan_from_payload_falls_back_to_coarse_code_business_dag_for_empty_node
     assert [node.id for node in plan.nodes[-2:]] == ["integrate_business_code", "code_review"]
     assert plan.nodes[-2].input_refs == ["node:implement_area_1", "node:implement_area_2", "node:implement_area_3"]
     assert plan.nodes[-1].input_refs == ["node:integrate_business_code"]
-    assert plan.nodes[0].runtime_hints["access_mode"] == "write"
-    assert plan.nodes[-1].runtime_hints["access_mode"] == "read"
+    assert plan.nodes[0].runtime_hints == {}
+    assert plan.nodes[-1].runtime_hints == {}
     assert any("订单业务" in node.expected_output for node in plan.nodes)
     assert any("支付/退款业务" in node.expected_output for node in plan.nodes)
     assert "合并" in plan.nodes[-2].objective
@@ -278,7 +281,7 @@ real_llm = pytest.mark.skipif(
 @real_llm
 def test_turn_planner_real_llm_creates_artifact_delivery_node() -> None:
     get_settings.cache_clear()
-    plan = TurnPlanner(prompt_version="v2").plan(
+    plan = TurnPlanner(prompt_version="v3").plan(
         content="把刚刚那个报告发我",
         recent_artifacts=[
             {
@@ -296,14 +299,14 @@ def test_turn_planner_real_llm_creates_artifact_delivery_node() -> None:
 
     assert len(plan.nodes) == 1
     assert plan.nodes[0].runtime == "react"
-    assert plan.nodes[0].tool_name is None
+    assert not hasattr(plan.nodes[0], "tool_name")
     assert "artifact:A1" in plan.nodes[0].input_refs
 
 
 @real_llm
 def test_turn_planner_real_llm_reuses_previous_node_result_for_replan() -> None:
     get_settings.cache_clear()
-    plan = TurnPlanner(prompt_version="v2").plan(
+    plan = TurnPlanner(prompt_version="v3").plan(
         content="根据刚才的调研结果，评估 jarvis 是否需要调整。",
         session_state=ConversationSessionState(session_mode="coding", active_repo_id="jarvis"),
         previous_node_results=[

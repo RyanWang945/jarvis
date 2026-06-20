@@ -117,11 +117,9 @@ class PlanningRouter:
                 fast_decision = FastIntentDecision(route="needs_plan", confidence=0.0, reason="fast intent failed")
         try:
             logger.info(
-                "planning router fast intent completed route=%s runtime=%s confidence=%.2f tool_name=%s finalization=%s reply_len=%s reason=%s",
+                "planning router fast intent completed route=%s confidence=%.2f finalization=%s reply_len=%s reason=%s",
                 fast_decision.route,
-                fast_decision.runtime,
                 fast_decision.confidence,
-                fast_decision.tool_name,
                 fast_decision.finalization_hint.mode,
                 len(fast_decision.reply),
                 fast_decision.reason,

@@ -22,11 +22,9 @@ from app.skills.rendering import render_loaded_skill_guidance
 from app.task_runtime.approval_runtime import runtime_git_merge_approval
 from app.task_runtime.approval_types import approval_request_to_dict
 from app.task_runtime.coder_provider import (
-    CoderPolicy,
     CoderProvider,
     CoderRunRequest,
     CoderRunResult,
-    CodexCoderProvider,
     build_coder_provider,
 )
 from app.task_runtime.node_finalizer import CodeNodeFinalizer, LLMCodeNodeFinalizerAgent
@@ -409,15 +407,11 @@ class CoderNodeExecuteRuntime:
         except RepositoryRegistryError as exc:
             logger.info("coder node blocked node_id=%s reason=repository_registry_error error=%s", context.node.id, exc)
             return _blocked(context.node, "repository_not_available", str(exc))
-        policy = _coder_policy(context)
-        if policy.allow_push and not policy.allow_commit:
-            return _failed(context.node, "invalid_coder_policy", "allow_push=true requires allow_commit=true.", retryable=False)
         try:
             context = _context_with_git_workspace_hints(
                 context,
                 registry=registry,
                 resolver=self._git_context_resolver,
-                policy=policy,
             )
         except Exception as exc:
             logger.exception("coder git context resolution failed node_id=%s", context.node.id)
@@ -482,26 +476,22 @@ class CoderNodeExecuteRuntime:
             repo_id=repo.repo_id,
             workdir=workdir,
             instruction=instruction,
-            policy=policy,
             timeout_seconds=int(getattr(get_settings(), "coder_timeout_seconds", 1800)),
             run_dir=run_dir,
             metadata=request_metadata,
         )
         try:
             logger.info(
-                "coder node start node_id=%s repo_id=%s provider=%s workdir=%s run_dir=%s access_mode=%s allow_commit=%s allow_push=%s",
+                "coder node start node_id=%s repo_id=%s provider=%s workdir=%s run_dir=%s",
                 context.node.id,
                 repo_id,
                 self._provider.name,
                 str(workdir),
                 str(run_dir) if run_dir is not None else "",
-                policy.access_mode,
-                policy.allow_commit,
-                policy.allow_push,
             )
             result = self._provider.run(request)
             result = replace(result, metadata={**request.metadata, **result.metadata})
-            if result.ok and policy.access_mode == "write" and repo_workspace is not None:
+            if result.ok and repo_workspace is not None:
                 try:
                     result = _commit_coder_node_worktree(
                         result,
@@ -534,14 +524,6 @@ class CoderNodeExecuteRuntime:
             _truncate(node_result.summary, limit=300),
         )
         return node_result
-
-
-class CodexNodeExecuteRuntime(CoderNodeExecuteRuntime):
-    """Compatibility wrapper for older tests/callers that still name Codex directly."""
-
-    def __init__(self, runner=None) -> None:
-        provider = CodexCoderProvider() if runner is None else CodexCoderProvider(runner=runner)
-        super().__init__(provider=provider)
 
 
 def _default_code_node_finalizer() -> CodeNodeFinalizer:
@@ -1228,7 +1210,6 @@ def _context_with_git_workspace_hints(
     *,
     registry: RepositoryRegistry,
     resolver: Callable[..., dict[str, Any]],
-    policy: CoderPolicy,
 ) -> NodeExecutionContext:
     initial_repo = None
     initial_repo_id = _active_repo(context, registry=registry)
@@ -1237,8 +1218,8 @@ def _context_with_git_workspace_hints(
             initial_repo = registry.resolve_repo(initial_repo_id)
         except RepositoryRegistryError:
             initial_repo = None
-    resolved_context = resolver(context=context, registry=registry, repo=initial_repo, policy=policy)
-    hints = _clean_git_context_hints(resolved_context, access_mode=policy.access_mode)
+    resolved_context = resolver(context=context, registry=registry, repo=initial_repo)
+    hints = _clean_git_context_hints(resolved_context)
     if not hints:
         return context
     logger.info("coder git context node_id=%s hints=%s", context.node.id, json.dumps(hints, ensure_ascii=False, default=str))
@@ -1256,7 +1237,6 @@ def _llm_coder_git_context(
     context: NodeExecutionContext,
     registry: RepositoryRegistry,
     repo: Any | None,
-    policy: CoderPolicy,
 ) -> dict[str, Any]:
     try:
         resolved = ModelRouter().resolve(LLMNode.PLANNER, None)
@@ -1276,11 +1256,6 @@ def _llm_coder_git_context(
             "runtime_hints": context.node.runtime_hints,
         },
         "merged_runtime_hints": context.runtime_hints,
-        "policy": {
-            "access_mode": policy.access_mode,
-            "allow_commit": policy.allow_commit,
-            "allow_push": policy.allow_push,
-        },
         "selected_repo": getattr(repo, "repo_id", None),
         "repositories": _registered_repo_facts(registry),
     }
@@ -1366,7 +1341,7 @@ def _git_stdout_safe(path: Path, *args: str) -> str:
     return result.stdout
 
 
-def _clean_git_context_hints(payload: dict[str, Any] | None, *, access_mode: str) -> dict[str, Any]:
+def _clean_git_context_hints(payload: dict[str, Any] | None) -> dict[str, Any]:
     if not isinstance(payload, dict):
         return {}
     hints: dict[str, Any] = {}
@@ -1379,8 +1354,7 @@ def _clean_git_context_hints(payload: dict[str, Any] | None, *, access_mode: str
     target_branch = _clean_branch_hint(payload.get("target_branch") or payload.get("active_branch") or payload.get("git_branch"))
     if target_branch:
         hints["target_branch"] = target_branch
-        if access_mode == "write":
-            hints["worktree_mode"] = "node_branch_worktree"
+        hints["worktree_mode"] = "node_branch_worktree"
     worktree_mode = _plain_text(payload.get("worktree_mode"))
     if worktree_mode == "node_branch_worktree":
         hints["worktree_mode"] = worktree_mode
@@ -1428,15 +1402,6 @@ def _provider_run_dir(context: NodeExecutionContext) -> Path | None:
         return None
     text = str(value).strip()
     return Path(text) if text else None
-
-
-def _coder_policy(context: NodeExecutionContext) -> CoderPolicy:
-    access_mode = str(context.runtime_hints.get("access_mode") or "").strip().lower()
-    if access_mode not in {"read", "write"}:
-        access_mode = "read"
-    allow_commit = bool(context.runtime_hints.get("allow_commit")) if access_mode == "write" else False
-    allow_push = bool(context.runtime_hints.get("allow_push")) if access_mode == "write" else False
-    return CoderPolicy(access_mode=access_mode, allow_commit=allow_commit, allow_push=allow_push)
 
 
 def _blocked(node: PlanNode, code: str, message: str) -> NodeResult:

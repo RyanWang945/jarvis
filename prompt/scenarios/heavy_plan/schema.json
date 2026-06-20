@@ -40,10 +40,6 @@
             "type": "object",
             "additionalProperties": true,
             "properties": {
-              "access_mode": {
-                "type": "string",
-                "enum": ["read", "write"]
-              },
               "source_branch": {
                 "type": "string"
               },

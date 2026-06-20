@@ -13,22 +13,11 @@ from app.tools.codex_app_server import respond_to_codex_approval
 from app.tools.common import ToolExecutionRequest
 from app.tools.coder import run_coder_tool
 
-CoderAccessMode = Literal["read", "write"]
-
-
-@dataclass(frozen=True)
-class CoderPolicy:
-    access_mode: CoderAccessMode
-    allow_commit: bool = False
-    allow_push: bool = False
-
-
 @dataclass(frozen=True)
 class CoderRunRequest:
     repo_id: str
     workdir: Path
     instruction: str
-    policy: CoderPolicy
     timeout_seconds: int = 1800
     run_dir: Path | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -93,9 +82,9 @@ class CodexCoderProvider:
                     "source_branch": str(request.metadata.get("source_branch") or ""),
                     "target_branch": str(request.metadata.get("target_branch") or ""),
                     "node_branch": str(request.metadata.get("node_branch") or ""),
-                    "allow_commit": request.policy.allow_commit,
-                    "allow_push": request.policy.allow_push,
-                    "_read_only": request.policy.access_mode == "read",
+                    "allow_commit": True,
+                    "allow_push": False,
+                    "_read_only": False,
                 },
                 timeout_seconds=request.timeout_seconds,
             )
@@ -160,9 +149,9 @@ class ClaudeCodeCoderProvider:
                     "source_branch": str(request.metadata.get("source_branch") or ""),
                     "target_branch": str(request.metadata.get("target_branch") or ""),
                     "node_branch": str(request.metadata.get("node_branch") or ""),
-                    "allow_commit": request.policy.allow_commit,
-                    "allow_push": request.policy.allow_push,
-                    "_read_only": request.policy.access_mode == "read",
+                    "allow_commit": True,
+                    "allow_push": False,
+                    "_read_only": False,
                 },
                 timeout_seconds=request.timeout_seconds,
             )

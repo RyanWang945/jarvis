@@ -14,26 +14,17 @@ from app.llm.model_profiles import LLMNode
 from app.llm.model_router import ModelRouter
 from app.prompting import PromptRegistry
 from app.runtime_usage import usage_record_from_response
-from app.task_runtime.planner import FinalizationHint, NodeRuntime
+from app.task_runtime.planner import FinalizationHint
 
 logger = logging.getLogger(__name__)
 
 FastIntentRoute = Literal["fast_reply", "needs_plan"]
-
-_ROUTE_RUNTIMES: dict[str, NodeRuntime | None] = {
-    "fast_reply": None,
-    "needs_plan": None,
-}
-
 
 class FastIntentDecision(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     route: FastIntentRoute
     confidence: float = Field(ge=0.0, le=1.0)
-    runtime: NodeRuntime | None = None
-    tool_name: str | None = None
-    input_refs: list[str] = Field(default_factory=list)
     finalization_hint: FinalizationHint = Field(default_factory=FinalizationHint)
     usage_records: list[dict[str, Any]] = Field(default_factory=list)
     reply: str = ""
@@ -41,11 +32,6 @@ class FastIntentDecision(BaseModel):
 
     @model_validator(mode="after")
     def _normalize_contract(self) -> FastIntentDecision:
-        expected_runtime = _ROUTE_RUNTIMES[self.route]
-        if self.runtime is None:
-            object.__setattr__(self, "runtime", expected_runtime)
-        elif expected_runtime is not None and self.runtime != expected_runtime:
-            object.__setattr__(self, "runtime", expected_runtime)
         if self.route == "fast_reply":
             text = self.reply.strip()
             if not text:
@@ -53,9 +39,6 @@ class FastIntentDecision(BaseModel):
             object.__setattr__(self, "reply", text)
         else:
             object.__setattr__(self, "reply", "")
-        object.__setattr__(self, "runtime", None)
-        object.__setattr__(self, "tool_name", None)
-        object.__setattr__(self, "input_refs", [])
         if self.finalization_hint.mode == "auto" and not self.finalization_hint.reason:
             object.__setattr__(self, "finalization_hint", _default_finalization_hint(self.route))
         return self
@@ -172,9 +155,6 @@ def _decision_from_payload(payload: dict[str, Any]) -> FastIntentDecision:
     runtime = candidate.get("runtime")
     candidate["route"] = _normalize_route(candidate.get("route"), runtime=runtime)
     candidate["confidence"] = _coerce_confidence(candidate.get("confidence"))
-    candidate["runtime"] = None
-    candidate["tool_name"] = None
-    candidate["input_refs"] = []
     candidate["finalization_hint"] = {"mode": "auto"}
     if isinstance(candidate.get("reply"), str):
         candidate["reply"] = candidate["reply"].strip()
@@ -248,7 +228,7 @@ def _decision_from_tool_call(tool_call: NormalizedToolCall) -> FastIntentDecisio
 
 def _normalize_route(value: Any, *, runtime: Any = None) -> FastIntentRoute:
     text = str(value or "").strip()
-    if text in _ROUTE_RUNTIMES:
+    if text in {"fast_reply", "needs_plan"}:
         return text  # type: ignore[return-value]
     if text in {"reply", "fast_reply", "fast"}:
         return "fast_reply"
