@@ -314,11 +314,6 @@ def _aggregation_from_payload(
         normalized["status"] = fallback.status
     normalized.setdefault("reply", fallback.reply)
     normalized.setdefault("artifact_refs", _artifact_refs(report.node_results))
-    data = normalized.get("data")
-    if "approval_requests" not in normalized and isinstance(data, dict):
-        raw_requests = data.get("approval_requests")
-        if isinstance(raw_requests, list):
-            normalized["approval_requests"] = approval_request_dicts(raw_requests)
     normalized.setdefault("data", {})
     try:
         return AggregationResult.model_validate(normalized)
@@ -388,10 +383,6 @@ def _approval_requests(results: list[NodeResult]) -> list[dict[str, Any]]:
     for result in results:
         if result.approval_requests:
             raw_requests.extend(result.approval_requests)
-        raw = result.data.get("approval_requests")
-        if not isinstance(raw, list):
-            continue
-        raw_requests.extend(raw)
     return approval_request_dicts(raw_requests)
 
 

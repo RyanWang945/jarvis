@@ -394,7 +394,7 @@ debug
 | `data` | 拆出 `approval_requests`，剩余改 `debug` | 核心协议不应藏在 dict |
 | `usage_records` | 改名 `usage` | 统一命名 |
 
-已执行迁移：`AggregationResult` 已删除 `needs_replan`、`replan_instructions`、`missing_info_question`，并新增顶层 `approval_requests`。`TaskAgentRuntime` 优先读取 `aggregation.approval_requests`，仅保留从 `data["approval_requests"]` 读取的兼容 fallback。
+已执行迁移：`AggregationResult` 已删除 `needs_replan`、`replan_instructions`、`missing_info_question`，并新增顶层 `approval_requests`。`TaskAgentRuntime` 只读取 `aggregation.approval_requests`；`data["approval_requests"]` 兼容 fallback 已删除。
 
 ### 3.5 `NodeResult`
 
