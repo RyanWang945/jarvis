@@ -70,10 +70,6 @@ class NodeExecutionContext:
     def __post_init__(self) -> None:
         object.__setattr__(self, "runtime_context", RuntimeContext.from_hints(self.legacy_hints))
 
-    @property
-    def runtime_hints(self) -> dict[str, Any]:
-        return self.legacy_hints
-
 
 class NodeExecuteRuntime(Protocol):
     def run(self, context: NodeExecutionContext) -> NodeResult: ...

@@ -111,4 +111,4 @@ def test_node_execution_context_builds_runtime_context_from_legacy_hints() -> No
 
     assert updated.runtime_context.repo.active_repo == "smoke-test"
     assert updated.legacy_hints["target_branch"] == " feat/runtime-context "
-    assert updated.runtime_hints == updated.legacy_hints
+    assert not hasattr(updated, "runtime_hints")
