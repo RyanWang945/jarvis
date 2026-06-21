@@ -553,17 +553,10 @@ def _artifact_records_from_report(
 def _tool_artifact_payloads(result: NodeResult) -> list[dict[str, Any]]:
     payloads: list[dict[str, Any]] = []
     payloads.extend(item for item in result.tool_artifacts if isinstance(item, dict))
-    raw_items = result.data.get("tool_artifacts")
-    if isinstance(raw_items, list):
-        payloads.extend(item for item in raw_items if isinstance(item, dict))
-    raw_calls = result.tool_calls or result.data.get("tool_calls")
-    if isinstance(raw_calls, list):
-        for call in raw_calls:
-            if not isinstance(call, dict):
-                continue
-            call_artifacts = call.get("tool_artifacts")
-            if isinstance(call_artifacts, list):
-                payloads.extend(item for item in call_artifacts if isinstance(item, dict))
+    for call in result.tool_calls:
+        call_artifacts = call.get("tool_artifacts")
+        if isinstance(call_artifacts, list):
+            payloads.extend(item for item in call_artifacts if isinstance(item, dict))
     return payloads
 
 
@@ -626,7 +619,7 @@ def _normalize_tool_artifact(
     if not artifact.tool_call_id:
         updates["tool_call_id"] = f"node:{result.node_id}"
     if not artifact.source_tool:
-        provider = str(result.debug.get("provider") or result.data.get("provider") or "")
+        provider = str(result.debug.get("provider") or "")
         updates["source_tool"] = "coder" if result.runtime in {"coder", "codex"} and provider in {"", "codex"} else result.runtime
     if artifact.node_id is None:
         updates["node_id"] = result.node_id

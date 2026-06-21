@@ -434,7 +434,7 @@ debug
 4. `usage_records` 不再藏在 `data`。
 5. 原始 stdout/stderr 不直接进入用户结果，只进 debug 或 provider log 文件。
 
-已执行迁移：`NodeResult` 已新增顶层 `approval_requests`，coder node 新写入路径不再把 approval request 列表写入 `data["approval_requests"]`。聚合层仍保留读取旧 `data["approval_requests"]` 的兼容 fallback。
+已执行迁移：`NodeResult` 已新增顶层 `approval_requests`，coder node 新写入路径不再把 approval request 列表写入 `data["approval_requests"]`。聚合层已删除读取旧 `data["approval_requests"]` 的兼容 fallback。
 
 已执行迁移：`NodeResult` 已新增顶层 `tool_calls` 和 `usage_records`。LLM/React runtime 新写入路径使用顶层字段；artifact 发布和 usage 汇总保留旧 `data["tool_calls"]` / `data["usage_records"]` 读取兼容。coder finalizer 的 usage 已写入顶层 `usage_records`。
 
@@ -442,7 +442,7 @@ debug
 
 已执行迁移：`NodeResult` 已新增顶层 `debug` 字段。coder finalizer 新写入路径将 `provider`、`stdout`、`stderr`、`exit_code`、`finalizer` 诊断信息写入 `result.debug`，不再写入 `result.data`。
 
-已执行迁移：`NodeResult` 已新增顶层 `tool_artifacts` 字段。React runtime 新写入路径会从 tool call 记录中提取结构化工具产物到顶层；coder finalizer 会从 provider metadata 中弹出 `tool_artifacts` 写入顶层，不再把它并入 `result.data`。artifact 发布器优先读取 `result.tool_artifacts`，仍保留旧 `data["tool_artifacts"]` 和 `tool_calls[].tool_artifacts` 读取 fallback。
+已执行迁移：`NodeResult` 已新增顶层 `tool_artifacts` 字段。React runtime 新写入路径会从 tool call 记录中提取结构化工具产物到顶层；coder finalizer 会从 provider metadata 中弹出 `tool_artifacts` 写入顶层，不再把它并入 `result.data`。artifact 发布器只读取 `result.tool_artifacts` 和顶层 `result.tool_calls[].tool_artifacts`，旧 `data["tool_artifacts"]` / `data["tool_calls"]` fallback 已删除。
 
 已执行迁移：coder blocked approval 结果不再把 `approval_id`、`action_kind`、`command`、`path`、`reason` 这些单个审批字段重复写入 `result.data`。审批详情只通过 `result.approval_requests` 表达，聚合层和 channel 层继续使用顶层 approval request 协议。
 
