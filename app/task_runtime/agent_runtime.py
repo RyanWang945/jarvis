@@ -99,7 +99,6 @@ class TaskAgentRuntime:
                 **_runtime_temporal_hints(),
             }
         )
-        legacy_runtime_hints = runtime_context.to_legacy_hints()
         started = time.perf_counter()
         logger.info(
             "task runtime turn start turn_id=%s conversation_id=%s trigger_type=%s user_input_len=%s recent_artifact_count=%s active_repo=%s",
@@ -129,7 +128,6 @@ class TaskAgentRuntime:
                 recent_artifacts=recent_artifacts,
                 conversation_context=conversation_context,
                 previous_node_results=[],
-                runtime_hints=legacy_runtime_hints,
                 runtime_context=runtime_context,
                 instructions=[],
                 progress=progress,
@@ -248,13 +246,11 @@ class TaskAgentRuntime:
             )
             self._session_workspace_manager.update_status(session_workspace, "running")
             execution_context = runtime_context.with_hints(session_workspace.to_legacy_hints())
-            execution_legacy_hints = execution_context.to_legacy_hints()
             execution_started = time.perf_counter()
             report = self._node_executor.execute(
                 router_result.plan,
                 artifacts=recent_artifacts,
                 previous_node_results=[],
-                runtime_hints=execution_legacy_hints,
                 runtime_context=execution_context,
                 instructions=[],
                 progress=progress,
@@ -295,7 +291,6 @@ class TaskAgentRuntime:
                 route=router_result.route,
                 fast_intent=router_result.fast_intent.model_dump(mode="json"),
                 artifacts=current_artifact_context,
-                runtime_hints=execution_legacy_hints,
                 runtime_context=execution_context,
                 instructions=[],
                 conversation_metadata=conversation.metadata,

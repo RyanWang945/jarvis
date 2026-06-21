@@ -230,9 +230,9 @@ def test_feishu_gateway_can_run_task_runtime_e2e_without_network(tmp_path: Path)
     assert run_result.status == "completed"
     assert run_result.reply == "node result: hello from feishu"
     assert router.calls[0]["content"] == "hello from feishu"
-    assert router.calls[0]["runtime_hints"]["current_date"]
-    assert router.calls[0]["runtime_hints"]["current_time"]
-    assert router.calls[0]["runtime_hints"]["timezone"] == "Asia/Shanghai"
+    assert router.calls[0]["runtime_context"].temporal.current_date
+    assert router.calls[0]["runtime_context"].temporal.current_time
+    assert router.calls[0]["runtime_context"].temporal.timezone == "Asia/Shanghai"
     assert llm_runtime.calls[0].user_objective == "hello from feishu"
 
     messages = store.list_messages(gateway_result.conversation_id)

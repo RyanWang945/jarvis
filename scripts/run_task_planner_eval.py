@@ -15,6 +15,7 @@ from typing import Any
 from app.agent_react.session_state import ConversationSessionState
 from app.task_runtime.planning_router import PlanningRouter
 from app.task_runtime.planner import ExecutionPlan, TurnPlanner
+from app.task_runtime.runtime_context import RuntimeContext
 
 DEFAULT_DATASET = Path("tests/fixtures/task_planner_eval/planner_cases.jsonl")
 DEFAULT_OUTPUT_ROOT = Path("data/eval_runs")
@@ -168,12 +169,13 @@ def run_prompt_matrix(
 
 def run_case(planner: TurnPlanner, case: PlannerEvalCase) -> dict[str, Any]:
     started = time.perf_counter()
+    runtime_context = RuntimeContext.from_hints(case.runtime_hints)
     plan = planner.plan(
         content=case.message,
         session_state=ConversationSessionState(session_mode="coding", active_repo_id=case.runtime_hints.get("active_repo")),
         recent_artifacts=case.artifacts,
         previous_node_results=case.previous_node_results,
-        runtime_hints=case.runtime_hints,
+        runtime_context=runtime_context,
         instructions=case.instructions,
     )
     elapsed_ms = int((time.perf_counter() - started) * 1000)
@@ -185,12 +187,13 @@ def run_case(planner: TurnPlanner, case: PlannerEvalCase) -> dict[str, Any]:
 
 
 def run_router_case(router: PlanningRouter, case: PlannerEvalCase) -> dict[str, Any]:
+    runtime_context = RuntimeContext.from_hints(case.runtime_hints)
     result = router.plan(
         content=case.message,
         session_state=ConversationSessionState(session_mode="coding", active_repo_id=case.runtime_hints.get("active_repo")),
         recent_artifacts=case.artifacts,
         previous_node_results=case.previous_node_results,
-        runtime_hints=case.runtime_hints,
+        runtime_context=runtime_context,
         instructions=case.instructions,
     )
     scored = score_case(case, result.plan, elapsed_ms=result.elapsed_ms)

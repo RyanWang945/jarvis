@@ -7,6 +7,7 @@ from app.agent_react.session_state import ConversationSessionState
 from app.task_runtime.fast_intent import FastIntentDecision
 from app.task_runtime.planning_router import PlanningRouter
 from app.task_runtime.planner import ExecutionPlan, PlanNode, TurnPlannerResult
+from app.task_runtime.runtime_context import RuntimeContext
 
 
 class StaticFastIntent:
@@ -147,7 +148,7 @@ def test_planning_router_emits_planning_started_before_heavy_planner() -> None:
 
     result = router.plan(
         content="查资料",
-        runtime_hints={"turn_id": 42, "conversation_id": 7},
+        runtime_context=RuntimeContext.from_hints({"turn_id": 42, "conversation_id": 7}),
         progress=progress,  # type: ignore[arg-type]
     )
 

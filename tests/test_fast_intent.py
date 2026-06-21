@@ -15,6 +15,7 @@ from app.task_runtime.fast_intent import (
     _decision_from_response,
     _fast_intent_messages,
 )
+from app.task_runtime.runtime_context import RuntimeContext
 
 
 def test_fast_intent_decision_defaults_needs_plan_to_no_runtime() -> None:
@@ -136,11 +137,13 @@ def test_fast_intent_messages_include_temporal_context() -> None:
         "查最近 7 天新闻",
         session_state=ConversationSessionState(),
         recent_artifacts=[],
-        runtime_hints={
-            "current_date": "2026-05-25",
-            "current_time": "2026-05-25T10:30:00+08:00",
-            "timezone": "Asia/Shanghai",
-        },
+        runtime_context=RuntimeContext.from_hints(
+            {
+                "current_date": "2026-05-25",
+                "current_time": "2026-05-25T10:30:00+08:00",
+                "timezone": "Asia/Shanghai",
+            }
+        ),
     )
 
     assert "temporal_context" in messages[1].content

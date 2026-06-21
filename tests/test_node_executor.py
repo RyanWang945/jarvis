@@ -4,6 +4,7 @@ from app.task_runtime.node_execute_runtime import NodeExecutionContext
 from app.task_runtime.node_executor import NodeExecutor
 from app.task_runtime.node_result import NodeResult, ResolvedInput
 from app.task_runtime.planner import ExecutionPlan, PlanNode
+from app.task_runtime.runtime_context import RuntimeContext
 from app.llm.provider_adapters import NormalizedLLMResponse, NormalizedToolCall
 from app.skills.loader import SkillPackageLoader
 from app.skills.registry import SkillRegistry
@@ -73,7 +74,7 @@ def test_node_executor_runs_ready_nodes_and_passes_node_result_inputs() -> None:
         ],
     )
 
-    report = executor.execute(plan, runtime_hints={"active_repo": "jarvis"})
+    report = executor.execute(plan, runtime_context=RuntimeContext.from_hints({"active_repo": "jarvis"}))
 
     assert report.status == "completed"
     assert [result.node_id for result in report.node_results] == ["research", "review"]

@@ -16,8 +16,8 @@ class StaticPlanner:
     def __init__(self, plan: ExecutionPlan) -> None:
         self.plan_result = plan
 
-    def plan(self, *, content, session_state=None, recent_artifacts=None, previous_node_results=None, runtime_hints=None, instructions=None):
-        del content, session_state, recent_artifacts, previous_node_results, runtime_hints, instructions
+    def plan(self, *, content, session_state=None, recent_artifacts=None, previous_node_results=None, runtime_context=None, instructions=None):
+        del content, session_state, recent_artifacts, previous_node_results, runtime_context, instructions
         return self.plan_result
 
     def prompt_metadata(self):
@@ -25,8 +25,8 @@ class StaticPlanner:
 
 
 class StaticRouter:
-    def plan(self, *, content, session_state=None, recent_artifacts=None, previous_node_results=None, runtime_hints=None, instructions=None):
-        del session_state, recent_artifacts, previous_node_results, runtime_hints, instructions
+    def plan(self, *, content, session_state=None, recent_artifacts=None, previous_node_results=None, runtime_context=None, instructions=None):
+        del session_state, recent_artifacts, previous_node_results, runtime_context, instructions
         if "报告发我" in content:
             return PlanningRouterResult(
                 route="planned",

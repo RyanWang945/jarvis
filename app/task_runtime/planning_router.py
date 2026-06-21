@@ -67,13 +67,12 @@ class PlanningRouter:
         recent_artifacts: list[dict[str, Any]] | None = None,
         conversation_context: ConversationContext | None = None,
         previous_node_results: list[dict[str, Any]] | None = None,
-        runtime_hints: dict[str, Any] | None = None,
         runtime_context: RuntimeContext | None = None,
         instructions: list[str] | None = None,
         progress: ProgressReporter | None = None,
     ) -> PlanningRouterResult:
         started = time.perf_counter()
-        resolved_runtime_context = runtime_context or RuntimeContext.from_hints(runtime_hints)
+        resolved_runtime_context = runtime_context or RuntimeContext.from_hints({})
         artifact_plan = _artifact_delivery_plan(content, recent_artifacts or [])
         if artifact_plan is not None:
             fast_decision = FastIntentDecision(
@@ -114,7 +113,6 @@ class PlanningRouter:
                     conversation_metadata=conversation_metadata,
                     recent_artifacts=recent_artifacts,
                     conversation_context=conversation_context,
-                    runtime_hints=runtime_hints,
                     runtime_context=resolved_runtime_context,
                 )
             except Exception:
@@ -173,7 +171,6 @@ class PlanningRouter:
                 recent_artifacts=recent_artifacts,
                 conversation_context=conversation_context,
                 previous_node_results=previous_node_results,
-                runtime_hints=runtime_hints,
                 runtime_context=resolved_runtime_context,
                 instructions=instructions,
             )
@@ -353,7 +350,6 @@ def _timed_planner_call(
     recent_artifacts: list[dict[str, Any]] | None,
     conversation_context: ConversationContext | None,
     previous_node_results: list[dict[str, Any]] | None,
-    runtime_hints: dict[str, Any] | None,
     runtime_context: RuntimeContext | None,
     instructions: list[str] | None,
 ) -> tuple[ExecutionPlan, int, list[dict[str, Any]]]:
@@ -365,7 +361,6 @@ def _timed_planner_call(
         "recent_artifacts": recent_artifacts,
         "conversation_context": conversation_context,
         "previous_node_results": previous_node_results,
-        "runtime_hints": runtime_hints,
         "runtime_context": runtime_context,
         "instructions": instructions,
     }

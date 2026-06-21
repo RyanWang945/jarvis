@@ -76,7 +76,6 @@ class ResultAggregator:
         route: str | None = None,
         fast_intent: dict[str, Any] | None = None,
         artifacts: list[dict[str, Any]] | None = None,
-        runtime_hints: dict[str, Any] | None = None,
         runtime_context: RuntimeContext | None = None,
         instructions: list[str] | None = None,
         conversation_metadata: dict[str, Any] | None = None,
@@ -104,7 +103,7 @@ class ResultAggregator:
 
         prompt = self._prompt_registry.load("result_aggregator", self._prompt_version)
         response_format = prompt.response_format if resolved.profile.supports_json_object else None
-        resolved_runtime_context = runtime_context or RuntimeContext.from_hints(runtime_hints)
+        resolved_runtime_context = runtime_context or RuntimeContext.from_hints({})
         payload = _aggregation_input(
             plan=plan,
             report=report,

@@ -150,7 +150,6 @@ class TurnPlanner:
         recent_artifacts: list[dict[str, Any]] | None = None,
         conversation_context: ConversationContext | None = None,
         previous_node_results: list[dict[str, Any]] | None = None,
-        runtime_hints: dict[str, Any] | None = None,
         runtime_context: RuntimeContext | None = None,
         instructions: list[str] | None = None,
     ) -> ExecutionPlan:
@@ -161,7 +160,6 @@ class TurnPlanner:
             recent_artifacts=recent_artifacts,
             conversation_context=conversation_context,
             previous_node_results=previous_node_results,
-            runtime_hints=runtime_hints,
             runtime_context=runtime_context,
             instructions=instructions,
         ).plan
@@ -175,7 +173,6 @@ class TurnPlanner:
         recent_artifacts: list[dict[str, Any]] | None = None,
         conversation_context: ConversationContext | None = None,
         previous_node_results: list[dict[str, Any]] | None = None,
-        runtime_hints: dict[str, Any] | None = None,
         runtime_context: RuntimeContext | None = None,
         instructions: list[str] | None = None,
     ) -> TurnPlannerResult:
@@ -185,7 +182,6 @@ class TurnPlanner:
             conversation_context=conversation_context,
             artifacts=recent_artifacts or [],
             previous_node_results=previous_node_results or [],
-            runtime_hints=runtime_hints,
             runtime_context=runtime_context,
             session_state=session,
             instructions=instructions or [],
@@ -250,12 +246,11 @@ def build_plan_input(
     conversation_context: ConversationContext | None = None,
     artifacts: list[dict[str, Any]],
     previous_node_results: list[dict[str, Any]],
-    runtime_hints: dict[str, Any] | None,
     runtime_context: RuntimeContext | None = None,
     session_state: ConversationSessionState | None = None,
     instructions: list[str] | None = None,
 ) -> PlanInput:
-    resolved_runtime_context = runtime_context or RuntimeContext.from_hints(runtime_hints)
+    resolved_runtime_context = runtime_context or RuntimeContext.from_hints({})
     if session_state is not None and not resolved_runtime_context.repo.active_repo:
         resolved_runtime_context = resolved_runtime_context.with_hints({"active_repo": session_state.active_repo_id})
     resolved_runtime_context = RuntimeContext.from_hints(_ensure_temporal_hints(resolved_runtime_context.to_legacy_hints()))
@@ -387,11 +382,10 @@ def _plan_from_payload(
     *,
     fallback_objective: str,
     known_artifact_refs: set[str] | None = None,
-    runtime_hints: dict[str, Any] | None = None,
     runtime_context: RuntimeContext | None = None,
     previous_node_results: list[dict[str, Any]] | None = None,
 ) -> ExecutionPlan:
-    resolved_runtime_context = runtime_context or RuntimeContext.from_hints(runtime_hints)
+    resolved_runtime_context = runtime_context or RuntimeContext.from_hints({})
     candidate = payload.get("plan") if isinstance(payload.get("plan"), dict) else payload
     if not isinstance(candidate, dict):
         artifact_delivery = _fallback_artifact_delivery_plan(fallback_objective, known_artifact_refs)
@@ -537,7 +531,6 @@ def _is_valid_input_ref(value: str) -> bool:
 def _fallback_plan_for_objective(
     objective: str,
     *,
-    runtime_hints: dict[str, Any] | None = None,
     runtime_context: RuntimeContext | None = None,
     known_artifact_refs: set[str] | None = None,
     previous_node_results: list[dict[str, Any]] | None = None,
@@ -546,7 +539,7 @@ def _fallback_plan_for_objective(
     if artifact_delivery is not None:
         return artifact_delivery
 
-    active_repo = (runtime_context or RuntimeContext.from_hints(runtime_hints)).repo.active_repo
+    active_repo = (runtime_context or RuntimeContext.from_hints({})).repo.active_repo
     repo_task = bool(active_repo and _looks_like_repo_task(objective, active_repo))
     reminder_task = _looks_like_reminder_task(objective)
     previous_refs = _previous_node_refs(previous_node_results)

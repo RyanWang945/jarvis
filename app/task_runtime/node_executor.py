@@ -30,14 +30,13 @@ class NodeExecutor:
         *,
         artifacts: list[dict[str, Any]] | None = None,
         previous_node_results: list[dict[str, Any] | NodeResult] | None = None,
-        runtime_hints: dict[str, Any] | None = None,
         runtime_context: RuntimeContext | None = None,
         instructions: list[str] | None = None,
         progress: ProgressReporter | None = None,
         session_workspace: SessionWorkspaceRef | None = None,
     ) -> ExecutionReport:
         progress = ensure_progress(progress)
-        base_runtime_context = runtime_context or RuntimeContext.from_hints(runtime_hints)
+        base_runtime_context = runtime_context or RuntimeContext.from_hints({})
         artifact_index = _artifact_index(artifacts or [])
         result_index = _previous_result_index(previous_node_results or [])
         completed_order: list[str] = []

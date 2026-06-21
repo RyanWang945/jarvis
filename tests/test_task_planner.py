@@ -8,6 +8,7 @@ from pydantic import ValidationError
 from app.agent_react.session_state import ConversationSessionState
 from app.config import get_settings
 from app.task_runtime.planner import ExecutionPlan, PlanNode, TurnPlanner, _plan_from_payload, build_plan_input
+from app.task_runtime.runtime_context import RuntimeContext
 
 
 def test_plan_node_uses_input_refs_as_graph_edges() -> None:
@@ -75,7 +76,7 @@ def test_build_plan_input_normalizes_artifacts_and_hints() -> None:
         current_user_input="把刚刚那个报告发我",
         artifacts=[{"id": "report-1", "filename": "rag_eval_report.md", "summary": "RAG report"}],
         previous_node_results=[],
-        runtime_hints={"available_runtimes": ["llm", "react"]},
+        runtime_context=RuntimeContext.from_hints({"available_runtimes": ["llm", "react"]}),
         session_state=ConversationSessionState(active_repo_id="jarvis"),
     )
 
@@ -190,7 +191,7 @@ def test_plan_from_payload_does_not_parse_branch_hints_in_backend() -> None:
             ],
         },
         fallback_objective="在feat/test 里写个快排吧，用python写",
-        runtime_hints={"active_repo": "smoke-test"},
+        runtime_context=RuntimeContext.from_hints({"active_repo": "smoke-test"}),
     )
 
     assert not hasattr(plan.nodes[0], "runtime_hints")
@@ -214,7 +215,7 @@ def test_plan_from_payload_ignores_node_runtime_hints() -> None:
             ],
         },
         fallback_objective="基于 main 创建 feat/my-skill 分支继续开发",
-        runtime_hints={"active_repo": "smoke-test"},
+        runtime_context=RuntimeContext.from_hints({"active_repo": "smoke-test"}),
     )
 
     assert not hasattr(plan.nodes[0], "runtime_hints")
@@ -238,7 +239,7 @@ def test_plan_from_payload_falls_back_to_repo_then_reminder_dag_for_empty_nodes(
     plan = _plan_from_payload(
         {"user_objective": "先 review jarvis 的 agent runtime 重构风险，生成一份 markdown 报告，最后今晚 11 点提醒我看报告。", "nodes": []},
         fallback_objective="先 review jarvis 的 agent runtime 重构风险，生成一份 markdown 报告，最后今晚 11 点提醒我看报告。",
-        runtime_hints={"active_repo": "jarvis"},
+        runtime_context=RuntimeContext.from_hints({"active_repo": "jarvis"}),
     )
 
     assert [node.runtime for node in plan.nodes] == ["coder", "react"]
@@ -254,7 +255,7 @@ def test_plan_from_payload_falls_back_to_coarse_code_business_dag_for_empty_node
     plan = _plan_from_payload(
         {"user_objective": objective, "nodes": []},
         fallback_objective=objective,
-        runtime_hints={"active_repo": "jarvis"},
+        runtime_context=RuntimeContext.from_hints({"active_repo": "jarvis"}),
     )
 
     assert len(plan.nodes) == 5
@@ -292,7 +293,7 @@ def test_turn_planner_real_llm_creates_artifact_delivery_node() -> None:
                 "origin": "assistant_generated",
             }
         ],
-        runtime_hints={"active_repo": None, "available_runtimes": ["llm", "react", "coder"]},
+        runtime_context=RuntimeContext.from_hints({"active_repo": None, "available_runtimes": ["llm", "react", "coder"]}),
     )
 
     assert len(plan.nodes) == 1
@@ -316,7 +317,7 @@ def test_turn_planner_real_llm_reuses_previous_node_result_for_replan() -> None:
                 "artifacts": [],
             }
         ],
-        runtime_hints={"active_repo": "jarvis", "available_runtimes": ["llm", "react", "coder"]},
+        runtime_context=RuntimeContext.from_hints({"active_repo": "jarvis", "available_runtimes": ["llm", "react", "coder"]}),
     )
 
     assert [node.runtime for node in plan.nodes] == ["coder"]

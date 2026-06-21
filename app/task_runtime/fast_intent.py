@@ -59,7 +59,6 @@ class FastIntentNode:
         conversation_metadata: dict[str, Any] | None = None,
         recent_artifacts: list[dict[str, Any]] | None = None,
         conversation_context: ConversationContext | None = None,
-        runtime_hints: dict[str, Any] | None = None,
         runtime_context: RuntimeContext | None = None,
     ) -> FastIntentDecision:
         text = (content or "").strip()
@@ -79,8 +78,7 @@ class FastIntentNode:
                 session_state=session,
                 recent_artifacts=recent_artifacts or [],
                 conversation_context=conversation_context,
-                runtime_hints=runtime_hints,
-                runtime_context=runtime_context,
+                runtime_context=runtime_context or RuntimeContext.from_hints({}),
                 prompt_registry=self._prompt_registry,
                 prompt_version=self._prompt_version,
             ),
@@ -96,14 +94,13 @@ def _fast_intent_messages(
     session_state: ConversationSessionState,
     recent_artifacts: list[dict[str, Any]],
     conversation_context: ConversationContext | None = None,
-    runtime_hints: dict[str, Any] | None = None,
     runtime_context: RuntimeContext | None = None,
     prompt_registry: PromptRegistry | None = None,
     prompt_version: str | None = None,
 ) -> list[LLMMessage]:
     registry = prompt_registry or PromptRegistry()
     prompt = registry.load("fast_intent", prompt_version)
-    resolved_runtime_context = runtime_context or RuntimeContext.from_hints(runtime_hints)
+    resolved_runtime_context = runtime_context or RuntimeContext.from_hints({})
     return prompt.render(
         {
             "input_json": json.dumps(

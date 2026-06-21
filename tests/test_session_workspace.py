@@ -8,6 +8,7 @@ from app.task_runtime.node_execute_runtime import CoderNodeExecuteRuntime
 from app.task_runtime.node_executor import NodeExecutor
 from app.task_runtime.node_result import NodeResult
 from app.task_runtime.planner import ExecutionPlan, PlanNode
+from app.task_runtime.runtime_context import RuntimeContext
 from app.task_runtime.session_workspace import SessionWorkspaceManager, prepare_node_repo, prepare_node_repo_workspace, write_node_result
 from app.task_runtime.coder_provider import CoderRunResult
 
@@ -95,7 +96,7 @@ def test_coder_nodes_get_independent_node_repos_and_provider_run_dirs(monkeypatc
 
     report = NodeExecutor(runtimes={"coder": runtime}).execute(
         plan,
-        runtime_hints={"active_repo": "jarvis"},
+        runtime_context=RuntimeContext.from_hints({"active_repo": "jarvis"}),
         session_workspace=workspace,
     )
 
@@ -167,7 +168,7 @@ def test_write_coder_node_auto_commits_node_worktree(monkeypatch, tmp_path: Path
 
     report = NodeExecutor(runtimes={"coder": runtime}).execute(
         plan,
-        runtime_hints={"active_repo": "jarvis"},
+        runtime_context=RuntimeContext.from_hints({"active_repo": "jarvis"}),
         session_workspace=workspace,
     )
 
@@ -236,7 +237,7 @@ def test_write_coder_node_uses_resolved_target_branch_without_provider_checkout(
 
     report = NodeExecutor(runtimes={"coder": runtime}).execute(
         plan,
-        runtime_hints={"active_repo": "smoke-test"},
+        runtime_context=RuntimeContext.from_hints({"active_repo": "smoke-test"}),
         session_workspace=workspace,
     )
 
@@ -291,7 +292,7 @@ def test_write_coder_node_requests_approval_before_merging_to_protected_branch(m
 
     report = NodeExecutor(runtimes={"coder": runtime}).execute(
         plan,
-        runtime_hints={"active_repo": "smoke-test"},
+        runtime_context=RuntimeContext.from_hints({"active_repo": "smoke-test"}),
         session_workspace=workspace,
     )
 
@@ -339,7 +340,7 @@ def test_later_coder_node_starts_from_latest_target_branch(monkeypatch, tmp_path
 
     report = NodeExecutor(runtimes={"coder": runtime}).execute(
         plan,
-        runtime_hints={"active_repo": "jarvis", "target_branch": "feat-skill"},
+        runtime_context=RuntimeContext.from_hints({"active_repo": "jarvis", "target_branch": "feat-skill"}),
         session_workspace=workspace,
     )
 
@@ -412,7 +413,7 @@ def test_coder_node_finalizer_loads_node_manifest_artifact(monkeypatch, tmp_path
 
     report = NodeExecutor(runtimes={"coder": runtime}).execute(
         plan,
-        runtime_hints={"active_repo": "jarvis"},
+        runtime_context=RuntimeContext.from_hints({"active_repo": "jarvis"}),
         session_workspace=workspace,
     )
 
