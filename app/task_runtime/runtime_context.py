@@ -6,6 +6,19 @@ from typing import Any, Mapping
 
 
 @dataclass(frozen=True)
+class TurnRuntimeContext:
+    turn_id: int | None = None
+    conversation_id: int | None = None
+
+    @classmethod
+    def from_hints(cls, hints: Mapping[str, Any] | None) -> TurnRuntimeContext:
+        return cls(
+            turn_id=_optional_int(_hint(hints, "turn_id")),
+            conversation_id=_optional_int(_hint(hints, "conversation_id")),
+        )
+
+
+@dataclass(frozen=True)
 class TemporalRuntimeContext:
     current_date: str = ""
     current_time: str = ""
@@ -102,6 +115,7 @@ class UsageRuntimeContext:
 @dataclass(frozen=True)
 class RuntimeContext:
     legacy_hints: dict[str, Any]
+    turn: TurnRuntimeContext
     temporal: TemporalRuntimeContext
     branch: BranchRuntimeContext
     node_workspace: NodeWorkspaceRuntimeContext
@@ -114,6 +128,7 @@ class RuntimeContext:
         legacy_hints = dict(hints or {})
         return cls(
             legacy_hints=legacy_hints,
+            turn=TurnRuntimeContext.from_hints(legacy_hints),
             temporal=TemporalRuntimeContext.from_hints(legacy_hints),
             branch=BranchRuntimeContext.from_hints(legacy_hints),
             node_workspace=NodeWorkspaceRuntimeContext.from_hints(legacy_hints),
@@ -140,3 +155,10 @@ def _text(value: Any) -> str:
 def _optional_path(value: Any) -> Path | None:
     text = _text(value)
     return Path(text) if text else None
+
+
+def _optional_int(value: Any) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None

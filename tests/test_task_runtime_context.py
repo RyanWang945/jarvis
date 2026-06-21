@@ -10,6 +10,7 @@ from app.task_runtime.runtime_context import (
     NodeWorkspaceRuntimeContext,
     RepoRuntimeContext,
     TemporalRuntimeContext,
+    TurnRuntimeContext,
     UsageRuntimeContext,
     WorkspaceRuntimeContext,
 )
@@ -26,6 +27,14 @@ def test_temporal_runtime_context_trims_and_drops_empty_values() -> None:
 
     assert context.current_date == "2026-06-21"
     assert context.as_payload() == {"current_date": "2026-06-21", "timezone": "Asia/Shanghai"}
+
+
+def test_turn_runtime_context_coerces_ids() -> None:
+    context = TurnRuntimeContext.from_hints({"turn_id": "42", "conversation_id": 7})
+
+    assert context.turn_id == 42
+    assert context.conversation_id == 7
+    assert TurnRuntimeContext.from_hints({"turn_id": "bad"}).turn_id is None
 
 
 def test_branch_runtime_context_uses_active_branch_as_target_fallback() -> None:

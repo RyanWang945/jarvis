@@ -9,6 +9,7 @@ from app.progress import ProgressReporter, ensure_progress
 from app.task_runtime.node_execute_runtime import NodeExecuteRuntime, NodeExecutionContext
 from app.task_runtime.node_result import ExecutionReport, NodeArtifact, NodeError, NodeResult, ResolvedInput
 from app.task_runtime.planner import ExecutionPlan, NodeRuntime, PlanNode
+from app.task_runtime.runtime_context import RuntimeContext
 from app.task_runtime.session_workspace import (
     SessionWorkspaceRef,
     node_workspace_hints,
@@ -35,6 +36,7 @@ class NodeExecutor:
         session_workspace: SessionWorkspaceRef | None = None,
     ) -> ExecutionReport:
         progress = ensure_progress(progress)
+        base_runtime_context = RuntimeContext.from_hints(runtime_hints)
         artifact_index = _artifact_index(artifacts or [])
         result_index = _previous_result_index(previous_node_results or [])
         completed_order: list[str] = []
@@ -72,8 +74,8 @@ class NodeExecutor:
                 )
                 progress.emit(
                     "node_started",
-                    turn_id=_optional_int((runtime_hints or {}).get("turn_id")),
-                    conversation_id=_optional_int((runtime_hints or {}).get("conversation_id")),
+                    turn_id=base_runtime_context.turn.turn_id,
+                    conversation_id=base_runtime_context.turn.conversation_id,
                     stage="execution",
                     node_id=node.id,
                     status="running",
@@ -84,10 +86,8 @@ class NodeExecutor:
                         "resolved_input_count": len(resolved_inputs),
                     },
                 )
-                merged_runtime_hints = dict(runtime_hints or {})
-                if session_workspace is not None:
-                    merged_runtime_hints.update(session_workspace.runtime_hints())
-                merged_runtime_hints.update(node_workspace_hints(session_workspace, node.id))
+                node_runtime_context = _node_runtime_context(base_runtime_context, session_workspace, node.id)
+                merged_runtime_hints = node_runtime_context.to_legacy_hints()
                 node_workspace = session_workspace.node(node.id) if session_workspace is not None else None
                 if node_workspace is not None:
                     write_node_input_snapshot(
@@ -127,8 +127,8 @@ class NodeExecutor:
                 )
                 progress.emit(
                     "node_failed" if result.status != "completed" else "node_completed",
-                    turn_id=_optional_int((runtime_hints or {}).get("turn_id")),
-                    conversation_id=_optional_int((runtime_hints or {}).get("conversation_id")),
+                    turn_id=base_runtime_context.turn.turn_id,
+                    conversation_id=base_runtime_context.turn.conversation_id,
                     stage="execution",
                     node_id=result.node_id,
                     status=result.status,
@@ -151,9 +151,7 @@ class NodeExecutor:
                     result = _blocked_result(node, "unresolved_input_refs", message)
                     if session_workspace is not None:
                         node_workspace = session_workspace.node(node.id)
-                        merged_runtime_hints = dict(runtime_hints or {})
-                        merged_runtime_hints.update(session_workspace.runtime_hints())
-                        merged_runtime_hints.update(node_workspace_hints(session_workspace, node.id))
+                        merged_runtime_hints = _node_runtime_context(base_runtime_context, session_workspace, node.id).to_legacy_hints()
                         write_node_input_snapshot(
                             node_workspace,
                             user_objective=plan.user_objective,
@@ -175,8 +173,8 @@ class NodeExecutor:
                     )
                     progress.emit(
                         "node_failed",
-                        turn_id=_optional_int((runtime_hints or {}).get("turn_id")),
-                        conversation_id=_optional_int((runtime_hints or {}).get("conversation_id")),
+                        turn_id=base_runtime_context.turn.turn_id,
+                        conversation_id=base_runtime_context.turn.conversation_id,
                         stage="execution",
                         node_id=node.id,
                         status="blocked",
@@ -246,6 +244,18 @@ def _resolve_inputs(
             continue
         missing.append(ref)
     return resolved, missing, blocked
+
+
+def _node_runtime_context(
+    base_context: RuntimeContext,
+    session_workspace: SessionWorkspaceRef | None,
+    node_id: str,
+) -> RuntimeContext:
+    if session_workspace is None:
+        return base_context
+    return base_context.with_hints(session_workspace.runtime_hints()).with_hints(
+        node_workspace_hints(session_workspace, node_id)
+    )
 
 
 def _artifact_index(artifacts: list[dict[str, Any]]) -> dict[str, NodeArtifact]:
