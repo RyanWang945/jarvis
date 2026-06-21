@@ -403,7 +403,7 @@ def _case_from_payload(payload: dict[str, Any], *, path: Path, line_number: int)
             message=str(payload["message"]),
             artifacts=list(payload.get("artifacts", [])),
             previous_node_results=list(payload.get("previous_node_results", [])),
-            runtime_context=dict(payload.get("runtime_context", payload.get("runtime_hints", DEFAULT_RUNTIME_CONTEXT))),
+            runtime_context=dict(payload.get("runtime_context", DEFAULT_RUNTIME_CONTEXT)),
             instructions=list(payload.get("instructions", [])),
             expected_node_count_min=int(payload.get("expected_node_count_min", 1)),
             expected_node_count_max=int(payload.get("expected_node_count_max", 6)),
