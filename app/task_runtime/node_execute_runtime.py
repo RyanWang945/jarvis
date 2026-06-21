@@ -533,7 +533,7 @@ def _llm_messages(context: NodeExecutionContext) -> list[LLMMessage]:
         "node": context.node.model_dump(mode="json"),
         "resolved_inputs": [item.model_dump(mode="json", exclude_none=True) for item in context.resolved_inputs],
         "temporal_context": _temporal_context(context.runtime_context),
-        "runtime_hints": context.legacy_hints,
+        "runtime_context": context.legacy_hints,
         "instructions": context.instructions,
     }
     messages = PromptRegistry().load("llm_node_execute").render(
@@ -551,7 +551,7 @@ def _react_messages(context: NodeExecutionContext) -> list[LLMMessage]:
         "node": context.node.model_dump(mode="json"),
         "resolved_inputs": [item.model_dump(mode="json", exclude_none=True) for item in context.resolved_inputs],
         "temporal_context": _temporal_context(context.runtime_context),
-        "runtime_hints": context.legacy_hints,
+        "runtime_context": context.legacy_hints,
         "instructions": context.instructions,
     }
     messages = PromptRegistry().load("react_node_execute").render(
@@ -1217,7 +1217,7 @@ def _llm_coder_git_context(
             "objective": context.node.objective,
             "output_hint": context.node.output_hint,
         },
-        "merged_runtime_hints": context.legacy_hints,
+        "runtime_context": context.legacy_hints,
         "selected_repo": getattr(repo, "repo_id", None),
         "repositories": _registered_repo_facts(registry),
     }

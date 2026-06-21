@@ -1,0 +1,18 @@
+{
+  "id": "llm_node_execute:v2",
+  "scenario": "llm_node_execute",
+  "version": "v2",
+  "description": "Execute one non-tool Jarvis plan node with runtime_context input.",
+  "response_format": "text",
+  "variables": ["input_json"],
+  "messages": [
+    {
+      "role": "system",
+      "template": "system.md"
+    },
+    {
+      "role": "user",
+      "template": "user.md"
+    }
+  ]
+}

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from pathlib import Path
 
-from app.task_runtime.node_execute_runtime import NodeExecutionContext
+from app.task_runtime.node_execute_runtime import NodeExecutionContext, _llm_messages, _react_messages
 from app.task_runtime.planner import PlanNode
 from app.task_runtime.runtime_context import (
     BranchRuntimeContext,
@@ -112,3 +113,19 @@ def test_node_execution_context_builds_runtime_context_from_legacy_hints() -> No
     assert updated.runtime_context.repo.active_repo == "smoke-test"
     assert updated.legacy_hints["target_branch"] == " feat/runtime-context "
     assert not hasattr(updated, "runtime_hints")
+
+
+def test_node_execute_prompt_payload_uses_runtime_context() -> None:
+    context = NodeExecutionContext(
+        user_objective="explain",
+        node=PlanNode(id="answer", runtime="llm", objective="Explain"),
+        legacy_hints={"active_repo": "jarvis"},
+    )
+
+    llm_payload = json.loads(_llm_messages(context)[1].content)
+    react_payload = json.loads(_react_messages(replace(context, node=PlanNode(id="research", runtime="react", objective="Research")))[1].content)
+
+    assert llm_payload["runtime_context"]["active_repo"] == "jarvis"
+    assert react_payload["runtime_context"]["active_repo"] == "jarvis"
+    assert "runtime_hints" not in llm_payload
+    assert "runtime_hints" not in react_payload
