@@ -34,10 +34,23 @@ class BranchRuntimeContext:
     def from_hints(cls, hints: Mapping[str, Any] | None) -> BranchRuntimeContext:
         return cls(
             source_branch=_text(_hint(hints, "source_branch")),
-            target_branch=_text(_hint(hints, "target_branch")) or _text(_hint(hints, "active_branch")),
+            target_branch=(
+                _text(_hint(hints, "target_branch"))
+                or _text(_hint(hints, "active_branch"))
+                or _text(_hint(hints, "git_branch"))
+            ),
             node_branch=_text(_hint(hints, "node_branch")),
             worktree_mode=_text(_hint(hints, "worktree_mode")),
         )
+
+
+@dataclass(frozen=True)
+class NodeWorkspaceRuntimeContext:
+    repos_dir: Path | None = None
+
+    @classmethod
+    def from_hints(cls, hints: Mapping[str, Any] | None) -> NodeWorkspaceRuntimeContext:
+        return cls(repos_dir=_optional_path(_hint(hints, "node_repos_dir")))
 
 
 @dataclass(frozen=True)

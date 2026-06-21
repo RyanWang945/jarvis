@@ -15,6 +15,7 @@ from uuid import uuid4
 from app.config import get_settings
 from app.task_runtime.node_result import NodeResult, ResolvedInput
 from app.task_runtime.planner import ExecutionPlan, PlanNode
+from app.task_runtime.runtime_context import BranchRuntimeContext, NodeWorkspaceRuntimeContext, WorkspaceRuntimeContext
 
 logger = logging.getLogger(__name__)
 _MERGE_LOCKS: dict[str, threading.RLock] = {}
@@ -282,11 +283,11 @@ def prepare_node_repo(
     project_path: Path,
     runtime_hints: dict[str, Any],
 ) -> Path | None:
-    raw_repos_dir = runtime_hints.get("node_repos_dir")
-    if not raw_repos_dir:
+    node_context = NodeWorkspaceRuntimeContext.from_hints(runtime_hints)
+    if node_context.repos_dir is None:
         return None
 
-    repos_dir = Path(str(raw_repos_dir)).resolve()
+    repos_dir = node_context.repos_dir.resolve()
     node_repo = (repos_dir / _safe_component(repo_id, fallback="repo")).resolve()
     _assert_child(node_repo, repos_dir)
     if node_repo.exists():
@@ -312,21 +313,23 @@ def prepare_node_repo_workspace(
     runtime_hints: dict[str, Any],
     node_id: str,
 ) -> NodeRepoWorkspace | None:
-    raw_repos_dir = runtime_hints.get("node_repos_dir")
-    if not raw_repos_dir:
+    node_context = NodeWorkspaceRuntimeContext.from_hints(runtime_hints)
+    if node_context.repos_dir is None:
         return None
 
-    repos_dir = Path(str(raw_repos_dir)).resolve()
+    repos_dir = node_context.repos_dir.resolve()
     node_repo = (repos_dir / _safe_component(repo_id, fallback="repo")).resolve()
     _assert_child(node_repo, repos_dir)
 
     project = project_path.resolve()
     _assert_git_worktree(project)
-    session_id = _safe_component(runtime_hints.get("session_id") or "session", fallback="session")
-    source_branch = _resolve_source_branch(project, runtime_hints)
-    target_branch = _resolve_target_branch(repo_id=repo_id, session_id=session_id, runtime_hints=runtime_hints)
+    workspace_context = WorkspaceRuntimeContext.from_hints(runtime_hints)
+    branch_context = BranchRuntimeContext.from_hints(runtime_hints)
+    session_id = _safe_component(workspace_context.session_id or "session", fallback="session")
+    source_branch = _resolve_source_branch(project, branch_context)
+    target_branch = _resolve_target_branch(repo_id=repo_id, session_id=session_id, branch_context=branch_context)
     node_branch = _node_branch_name(repo_id=repo_id, session_id=session_id, node_id=node_id)
-    integration_path = _integration_repo_path(repo_id=repo_id, runtime_hints=runtime_hints)
+    integration_path = _integration_repo_path(repo_id=repo_id, workspace_context=workspace_context)
 
     _ensure_target_branch(project, target_branch=target_branch, source_branch=source_branch)
     base_commit = _git_stdout(project, "rev-parse", target_branch)
@@ -500,8 +503,8 @@ def _assert_git_worktree(path: Path) -> None:
         raise RuntimeError(f"Path is not a git worktree: {path}")
 
 
-def _resolve_source_branch(project: Path, runtime_hints: dict[str, Any]) -> str:
-    explicit = _branch_hint(runtime_hints, "source_branch")
+def _resolve_source_branch(project: Path, branch_context: BranchRuntimeContext) -> str:
+    explicit = _validated_branch_hint(branch_context.source_branch)
     if explicit:
         return explicit
     for candidate in ("master", "main"):
@@ -511,22 +514,15 @@ def _resolve_source_branch(project: Path, runtime_hints: dict[str, Any]) -> str:
     return current or "HEAD"
 
 
-def _resolve_target_branch(*, repo_id: str, session_id: str, runtime_hints: dict[str, Any]) -> str:
-    explicit = (
-        _branch_hint(runtime_hints, "target_branch")
-        or _branch_hint(runtime_hints, "active_branch")
-        or _branch_hint(runtime_hints, "git_branch")
-    )
+def _resolve_target_branch(*, repo_id: str, session_id: str, branch_context: BranchRuntimeContext) -> str:
+    explicit = _validated_branch_hint(branch_context.target_branch)
     if explicit:
         return explicit
     return f"jarvis/{_safe_component(repo_id, fallback='repo')}/{_safe_component(session_id, fallback='session')}"
 
 
-def _branch_hint(runtime_hints: dict[str, Any], key: str) -> str | None:
-    value = runtime_hints.get(key)
-    if not isinstance(value, str):
-        return None
-    branch = value.strip()
+def _validated_branch_hint(value: str) -> str | None:
+    branch = str(value or "").strip()
     if not branch:
         return None
     _validate_branch_name(branch)
@@ -546,11 +542,10 @@ def _node_branch_name(*, repo_id: str, session_id: str, node_id: str) -> str:
     return branch
 
 
-def _integration_repo_path(*, repo_id: str, runtime_hints: dict[str, Any]) -> Path | None:
-    raw_session_dir = runtime_hints.get("session_workspace_dir")
-    if not raw_session_dir:
+def _integration_repo_path(*, repo_id: str, workspace_context: WorkspaceRuntimeContext) -> Path | None:
+    if workspace_context.session_root is None:
         return None
-    session_dir = Path(str(raw_session_dir)).resolve()
+    session_dir = workspace_context.session_root.resolve()
     integration_root = (session_dir / "repos").resolve()
     integration_path = (integration_root / _safe_component(repo_id, fallback="repo")).resolve()
     _assert_child(integration_path, integration_root)

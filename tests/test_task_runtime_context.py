@@ -4,6 +4,7 @@ from pathlib import Path
 
 from app.task_runtime.runtime_context import (
     BranchRuntimeContext,
+    NodeWorkspaceRuntimeContext,
     RepoRuntimeContext,
     TemporalRuntimeContext,
     WorkspaceRuntimeContext,
@@ -37,6 +38,18 @@ def test_branch_runtime_context_uses_active_branch_as_target_fallback() -> None:
     assert context.target_branch == "feat/refactor"
     assert context.node_branch == "jarvis-nodes/session/node"
     assert context.worktree_mode == "node_branch_worktree"
+
+
+def test_branch_runtime_context_uses_git_branch_as_last_target_fallback() -> None:
+    context = BranchRuntimeContext.from_hints({"git_branch": " feat/git-branch "})
+
+    assert context.target_branch == "feat/git-branch"
+
+
+def test_node_workspace_runtime_context_normalizes_repo_dir() -> None:
+    context = NodeWorkspaceRuntimeContext.from_hints({"node_repos_dir": "runs/session/nodes/a/repo"})
+
+    assert context.repos_dir == Path("runs/session/nodes/a/repo")
 
 
 def test_workspace_runtime_context_normalizes_paths_and_manifest_default() -> None:

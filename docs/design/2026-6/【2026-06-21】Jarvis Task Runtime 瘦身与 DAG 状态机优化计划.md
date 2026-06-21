@@ -803,7 +803,7 @@ NodeExecutionContext:
 4. `node_workspace_hints()` 改为返回 `NodeWorkspaceContext`。
 5. `SessionWorkspaceRef.runtime_hints()` 标记为 legacy。
 
-已执行迁移：新增 `app/task_runtime/runtime_context.py`，提供 `TemporalRuntimeContext`、`RepoRuntimeContext`、`BranchRuntimeContext`、`WorkspaceRuntimeContext`。`fast_intent.py` 和 `node_execute_runtime.py` 中的 temporal、repo、provider run dir、branch、manifest path、session workspace/node workspace 读取已改为通过这些 typed accessor；`node_execute_runtime.py` 只剩 `git_context_usage` 作为 usage 桥接仍直接读取 hints。
+已执行迁移：新增 `app/task_runtime/runtime_context.py`，提供 `TemporalRuntimeContext`、`RepoRuntimeContext`、`BranchRuntimeContext`、`NodeWorkspaceRuntimeContext`、`WorkspaceRuntimeContext`。`fast_intent.py` 和 `node_execute_runtime.py` 中的 temporal、repo、provider run dir、branch、manifest path、session workspace/node workspace 读取已改为通过这些 typed accessor；`session_workspace.py` 中 repo worktree 准备路径也已改为通过 typed accessor 读取 node repo dir、session id、branch 和 session root；`node_execute_runtime.py` 只剩 `git_context_usage` 作为 usage 桥接仍直接读取 hints。
 
 验收：
 
