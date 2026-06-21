@@ -33,6 +33,7 @@ from app.task_runtime.node_executor import NodeExecutor
 from app.task_runtime.node_result import ExecutionReport, NodeArtifact, NodeResult
 from app.task_runtime.planning_router import PlanningRouter
 from app.task_runtime.result_aggregator import AggregationResult, ResultAggregator
+from app.task_runtime.runtime_context import RuntimeContext
 from app.task_runtime.session_workspace import SessionWorkspaceManager, SessionWorkspaceRef
 from app.tools.common import ToolArtifact
 
@@ -86,16 +87,19 @@ class TaskAgentRuntime:
             session_state=session_state,
             current_user_input=user_input,
         )
-        runtime_hints = {
-            "active_repo": session_state.active_repo_id,
-            "platform": conversation.platform,
-            "conversation_id": turn.conversation_id,
-            "turn_id": turn_id,
-            "external_chat_id": conversation.external_chat_id,
-            "available_runtimes": ["llm", "react", "coder"],
-            "coder_runtime_provider": get_settings().coder_runtime_provider,
-            **_runtime_temporal_hints(),
-        }
+        runtime_context = RuntimeContext.from_hints(
+            {
+                "active_repo": session_state.active_repo_id,
+                "platform": conversation.platform,
+                "conversation_id": turn.conversation_id,
+                "turn_id": turn_id,
+                "external_chat_id": conversation.external_chat_id,
+                "available_runtimes": ["llm", "react", "coder"],
+                "coder_runtime_provider": get_settings().coder_runtime_provider,
+                **_runtime_temporal_hints(),
+            }
+        )
+        runtime_hints = runtime_context.to_legacy_hints()
         started = time.perf_counter()
         logger.info(
             "task runtime turn start turn_id=%s conversation_id=%s trigger_type=%s user_input_len=%s recent_artifact_count=%s active_repo=%s",
@@ -242,10 +246,8 @@ class TaskAgentRuntime:
                 conversation_id=turn.conversation_id,
             )
             self._session_workspace_manager.update_status(session_workspace, "running")
-            execution_runtime_hints = {
-                **runtime_hints,
-                **session_workspace.runtime_hints(),
-            }
+            execution_context = runtime_context.with_hints(session_workspace.runtime_hints())
+            execution_runtime_hints = execution_context.to_legacy_hints()
             execution_started = time.perf_counter()
             report = self._node_executor.execute(
                 router_result.plan,
