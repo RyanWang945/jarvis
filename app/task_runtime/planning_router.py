@@ -11,6 +11,7 @@ from app.progress import ProgressReporter
 from app.prompting import PromptRegistry
 from app.task_runtime.fast_intent import FastIntentDecision, FastIntentNode
 from app.task_runtime.planner import ExecutionPlan, FinalizationHint, PlanNode, TurnPlanner
+from app.task_runtime.runtime_context import RuntimeContext
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +72,7 @@ class PlanningRouter:
         progress: ProgressReporter | None = None,
     ) -> PlanningRouterResult:
         started = time.perf_counter()
+        runtime_context = RuntimeContext.from_hints(runtime_hints)
         artifact_plan = _artifact_delivery_plan(content, recent_artifacts or [])
         if artifact_plan is not None:
             fast_decision = FastIntentDecision(
@@ -92,7 +94,7 @@ class PlanningRouter:
             )
         if _should_skip_fast_intent(
             content,
-            runtime_hints=runtime_hints,
+            runtime_context=runtime_context,
             session_state=session_state,
             previous_node_results=previous_node_results,
             conversation_context=conversation_context,
@@ -150,8 +152,8 @@ class PlanningRouter:
             if progress is not None:
                 progress.emit(
                     "planning_started",
-                    turn_id=_optional_int((runtime_hints or {}).get("turn_id")),
-                    conversation_id=_optional_int((runtime_hints or {}).get("conversation_id")),
+                    turn_id=runtime_context.turn.turn_id,
+                    conversation_id=runtime_context.turn.conversation_id,
                     stage="planning",
                     status="running",
                     summary="正在生成执行计划",
@@ -278,7 +280,7 @@ def _looks_like_artifact_delivery(content: str) -> bool:
 def _should_skip_fast_intent(
     content: str,
     *,
-    runtime_hints: dict[str, Any] | None,
+    runtime_context: RuntimeContext,
     session_state: ConversationSessionState | None,
     previous_node_results: list[dict[str, Any]] | None,
     conversation_context: ConversationContext | None,
@@ -287,7 +289,9 @@ def _should_skip_fast_intent(
         return True
     if conversation_context is not None and conversation_context.context_reference_detected:
         return True
-    active_repo = str((runtime_hints or {}).get("active_repo") or getattr(session_state, "active_repo_id", None) or "").strip().lower()
+    active_repo = (
+        runtime_context.repo.active_repo or str(getattr(session_state, "active_repo_id", None) or "").strip()
+    ).lower()
     if active_repo and _looks_like_repo_or_action_plan(content, active_repo):
         return True
     return False
@@ -365,10 +369,3 @@ def _timed_planner_call(
         return result.plan, int((time.perf_counter() - started) * 1000), result.usage_records
     plan = planner.plan(**kwargs)
     return plan, int((time.perf_counter() - started) * 1000), []
-
-
-def _optional_int(value: Any) -> int | None:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None

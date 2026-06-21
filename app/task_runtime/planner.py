@@ -17,6 +17,7 @@ from app.llm.model_profiles import LLMNode
 from app.llm.model_router import ModelRouter
 from app.prompting import PromptRegistry
 from app.runtime_usage import usage_record_from_response
+from app.task_runtime.runtime_context import RuntimeContext
 
 logger = logging.getLogger(__name__)
 
@@ -535,7 +536,7 @@ def _fallback_plan_for_objective(
     if artifact_delivery is not None:
         return artifact_delivery
 
-    active_repo = str((runtime_hints or {}).get("active_repo") or "").strip()
+    active_repo = RuntimeContext.from_hints(runtime_hints).repo.active_repo
     repo_task = bool(active_repo and _looks_like_repo_task(objective, active_repo))
     reminder_task = _looks_like_reminder_task(objective)
     previous_refs = _previous_node_refs(previous_node_results)
