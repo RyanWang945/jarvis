@@ -620,7 +620,7 @@ def _normalize_tool_artifact(
         updates["tool_call_id"] = f"node:{result.node_id}"
     if not artifact.source_tool:
         provider = str(result.debug.get("provider") or "")
-        updates["source_tool"] = "coder" if result.runtime in {"coder", "codex"} and provider in {"", "codex"} else result.runtime
+        updates["source_tool"] = "coder" if result.runtime == "coder" and provider in {"", "codex"} else result.runtime
     if artifact.node_id is None:
         updates["node_id"] = result.node_id
     path_info = _resolve_session_artifact_path(

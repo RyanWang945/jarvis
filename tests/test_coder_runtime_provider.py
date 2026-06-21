@@ -200,9 +200,9 @@ def test_claude_code_provider_delegates_to_claude_tool(monkeypatch, tmp_path) ->
     assert request.timeout_seconds == 123
     assert request.args["repo_id"] == "jarvis"
     assert request.args["instruction"] == "Review runtime."
-    assert request.args["_read_only"] is False
-    assert request.args["allow_commit"] is True
-    assert request.args["allow_push"] is False
+    assert "_read_only" not in request.args
+    assert "allow_commit" not in request.args
+    assert "allow_push" not in request.args
     assert result.ok is True
     assert result.stdout == "Claude Code finished."
     assert result.summary == "claude done"
@@ -210,7 +210,7 @@ def test_claude_code_provider_delegates_to_claude_tool(monkeypatch, tmp_path) ->
     assert result.metadata["provider"] == "claude_code"
 
 
-def test_claude_code_provider_uses_runtime_commit_policy(monkeypatch, tmp_path) -> None:
+def test_claude_code_provider_omits_legacy_permission_args(monkeypatch, tmp_path) -> None:
     captured = {}
 
     def _runner(request):
@@ -228,9 +228,9 @@ def test_claude_code_provider_uses_runtime_commit_policy(monkeypatch, tmp_path) 
     )
 
     args = captured["request"].args
-    assert args["_read_only"] is False
-    assert args["allow_commit"] is True
-    assert args["allow_push"] is False
+    assert "_read_only" not in args
+    assert "allow_commit" not in args
+    assert "allow_push" not in args
 
 
 def test_claude_code_provider_passes_runtime_branch_context(monkeypatch, tmp_path) -> None:

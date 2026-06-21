@@ -82,9 +82,6 @@ class CodexCoderProvider:
                     "source_branch": str(request.metadata.get("source_branch") or ""),
                     "target_branch": str(request.metadata.get("target_branch") or ""),
                     "node_branch": str(request.metadata.get("node_branch") or ""),
-                    "allow_commit": True,
-                    "allow_push": False,
-                    "_read_only": False,
                 },
                 timeout_seconds=request.timeout_seconds,
             )
@@ -149,9 +146,6 @@ class ClaudeCodeCoderProvider:
                     "source_branch": str(request.metadata.get("source_branch") or ""),
                     "target_branch": str(request.metadata.get("target_branch") or ""),
                     "node_branch": str(request.metadata.get("node_branch") or ""),
-                    "allow_commit": True,
-                    "allow_push": False,
-                    "_read_only": False,
                 },
                 timeout_seconds=request.timeout_seconds,
             )

@@ -18,7 +18,7 @@
 2. `codex` 和 `claude_code` 是 `coder` runtime 下的 provider，不再作为 DAG runtime 暴露。
 3. 删除 DAG 层 `access_mode`、`allow_commit`、`allow_push`，不再设计“写模式节点”。
 4. coder 节点的 Jarvis 管理 worktree 允许 provider 修改并由 runtime 记录 node commit。
-5. provider 底层参数固定为 `allow_commit=true`、`allow_push=false`、`_read_only=false`，push 不在本轮 DAG 路径开放。
+5. task runtime 的 coder provider 不再透传 `allow_commit`、`allow_push`、`_read_only`；commit 策略由 Jarvis 管理的 node worktree 运行时承担，push 不在本轮 DAG 路径开放。
 6. 一个 coder 节点执行完成后，节点 worktree 不允许留下未提交文件；如果 commit 后仍 dirty，节点失败。
 7. 第一轮允许破坏旧 `raw_payload` 结构。
 8. prompt 修改必须新增版本；本轮已从 `heavy_plan:v2` 逐步派生到 `heavy_plan:v5`。
@@ -750,24 +750,19 @@ class RepoExecutionPolicy:
 
 2. `PlanNode.runtime_hints` 已从核心模型移除；旧 payload 中的节点级 `runtime_hints` 由 Pydantic extra ignore 丢弃；planner prompt 不再要求节点输出 `runtime_hints`。
 3. `CoderRunRequest` 不再携带 policy。
-4. `CodexCoderProvider` 和 `ClaudeCodeCoderProvider` 固定传：
-
-```python
-allow_commit=True
-allow_push=False
-_read_only=False
-```
-
+4. `CodexCoderProvider` 和 `ClaudeCodeCoderProvider` 不再传 `allow_commit`、`allow_push`、`_read_only` 这类 DAG 权限字段；provider 只接收 instruction、repo、workdir/run_dir 和 branch context。
 5. Jarvis 只在 `SessionWorkspace` 管理的 node worktree 上自动 commit；直接使用注册 repo 时不自动 commit。
 6. `commit_node_repo()` 在 commit 后再次检查 `git status --porcelain --untracked-files=all`，仍 dirty 则失败。
 7. push 不通过 DAG runtime 开放；未来如需要 push，应作为显式 effect/approval，而不是恢复 `allow_push` 字段。
 
 已执行迁移：新增 `heavy_plan:v5` 并切为默认版本。v5 不再要求节点输出 `runtime_hints`；`PlanNode` 已删除节点级 `runtime_hints` 字段；`NodeExecutor` 和 `CoderNodeExecuteRuntime` 不再合并或读取 `node.runtime_hints`。全局/session/workspace 级 runtime hints 暂时保留，等待 Phase 3 拆成强类型上下文。
 
+已执行迁移：`CodexCoderProvider` 和 `ClaudeCodeCoderProvider` 已停止向底层工具传 `allow_commit`、`allow_push`、`_read_only`。task runtime 的 commit 约束只由 node worktree finalizer / commit 检查表达。
+
 验收：
 
 1. planner 输出旧权限字段或节点级 runtime hints 时会被忽略。
-2. coder provider 请求固定可 commit、不可 push、非 readonly。
+2. coder provider 请求不包含 `allow_commit`、`allow_push`、`_read_only`。
 3. node worktree 有文件变化时产生 node commit。
 4. node worktree commit 后仍 dirty 会导致节点失败。
 5. protected branch merge 仍要求审批。
