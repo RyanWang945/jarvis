@@ -77,6 +77,7 @@ class ResultAggregator:
         fast_intent: dict[str, Any] | None = None,
         artifacts: list[dict[str, Any]] | None = None,
         runtime_hints: dict[str, Any] | None = None,
+        runtime_context: RuntimeContext | None = None,
         instructions: list[str] | None = None,
         conversation_metadata: dict[str, Any] | None = None,
     ) -> AggregationResult:
@@ -103,7 +104,7 @@ class ResultAggregator:
 
         prompt = self._prompt_registry.load("result_aggregator", self._prompt_version)
         response_format = prompt.response_format if resolved.profile.supports_json_object else None
-        runtime_context = RuntimeContext.from_hints(runtime_hints)
+        resolved_runtime_context = runtime_context or RuntimeContext.from_hints(runtime_hints)
         payload = _aggregation_input(
             plan=plan,
             report=report,
@@ -111,7 +112,7 @@ class ResultAggregator:
             route=route,
             fast_intent=fast_intent,
             artifacts=artifacts or [],
-            runtime_hints=runtime_context.to_legacy_hints(),
+            legacy_hints=resolved_runtime_context.to_legacy_hints(),
             instructions=instructions or [],
         )
         try:
@@ -152,7 +153,7 @@ def _aggregation_input(
     route: str | None,
     fast_intent: dict[str, Any] | None,
     artifacts: list[dict[str, Any]],
-    runtime_hints: dict[str, Any],
+    legacy_hints: dict[str, Any],
     instructions: list[str],
 ) -> dict[str, Any]:
     return {
@@ -164,7 +165,7 @@ def _aggregation_input(
         "plan": plan.model_dump(mode="json"),
         "execution_report": report.model_dump(mode="json", exclude_none=True),
         "artifacts": artifacts,
-        "runtime_hints": runtime_hints,
+        "runtime_hints": legacy_hints,
         "instructions": instructions,
     }
 

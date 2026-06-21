@@ -31,12 +31,13 @@ class NodeExecutor:
         artifacts: list[dict[str, Any]] | None = None,
         previous_node_results: list[dict[str, Any] | NodeResult] | None = None,
         runtime_hints: dict[str, Any] | None = None,
+        runtime_context: RuntimeContext | None = None,
         instructions: list[str] | None = None,
         progress: ProgressReporter | None = None,
         session_workspace: SessionWorkspaceRef | None = None,
     ) -> ExecutionReport:
         progress = ensure_progress(progress)
-        base_runtime_context = RuntimeContext.from_hints(runtime_hints)
+        base_runtime_context = runtime_context or RuntimeContext.from_hints(runtime_hints)
         artifact_index = _artifact_index(artifacts or [])
         result_index = _previous_result_index(previous_node_results or [])
         completed_order: list[str] = []
@@ -87,7 +88,7 @@ class NodeExecutor:
                     },
                 )
                 node_runtime_context = _node_runtime_context(base_runtime_context, session_workspace, node.id)
-                merged_runtime_hints = node_runtime_context.to_legacy_hints()
+                merged_legacy_hints = node_runtime_context.to_legacy_hints()
                 node_workspace = session_workspace.node(node.id) if session_workspace is not None else None
                 if node_workspace is not None:
                     write_node_input_snapshot(
@@ -95,7 +96,7 @@ class NodeExecutor:
                         user_objective=plan.user_objective,
                         node=node,
                         resolved_inputs=resolved_inputs,
-                        legacy_hints=merged_runtime_hints,
+                        legacy_hints=merged_legacy_hints,
                         instructions=list(instructions or []),
                     )
                 if runtime is None:
@@ -110,7 +111,7 @@ class NodeExecutor:
                             user_objective=plan.user_objective,
                             node=node,
                             resolved_inputs=resolved_inputs,
-                            legacy_hints=merged_runtime_hints,
+                            legacy_hints=merged_legacy_hints,
                             instructions=list(instructions or []),
                         )
                     )
@@ -151,13 +152,13 @@ class NodeExecutor:
                     result = _blocked_result(node, "unresolved_input_refs", message)
                     if session_workspace is not None:
                         node_workspace = session_workspace.node(node.id)
-                        merged_runtime_hints = _node_runtime_context(base_runtime_context, session_workspace, node.id).to_legacy_hints()
+                        merged_legacy_hints = _node_runtime_context(base_runtime_context, session_workspace, node.id).to_legacy_hints()
                         write_node_input_snapshot(
                             node_workspace,
                             user_objective=plan.user_objective,
                             node=node,
                             resolved_inputs=[],
-                            legacy_hints=merged_runtime_hints,
+                            legacy_hints=merged_legacy_hints,
                             instructions=list(instructions or []),
                             missing_refs=missing_refs,
                             blocked_refs=blocked_refs,

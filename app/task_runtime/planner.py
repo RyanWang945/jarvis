@@ -151,6 +151,7 @@ class TurnPlanner:
         conversation_context: ConversationContext | None = None,
         previous_node_results: list[dict[str, Any]] | None = None,
         runtime_hints: dict[str, Any] | None = None,
+        runtime_context: RuntimeContext | None = None,
         instructions: list[str] | None = None,
     ) -> ExecutionPlan:
         return self.plan_with_usage(
@@ -161,6 +162,7 @@ class TurnPlanner:
             conversation_context=conversation_context,
             previous_node_results=previous_node_results,
             runtime_hints=runtime_hints,
+            runtime_context=runtime_context,
             instructions=instructions,
         ).plan
 
@@ -174,6 +176,7 @@ class TurnPlanner:
         conversation_context: ConversationContext | None = None,
         previous_node_results: list[dict[str, Any]] | None = None,
         runtime_hints: dict[str, Any] | None = None,
+        runtime_context: RuntimeContext | None = None,
         instructions: list[str] | None = None,
     ) -> TurnPlannerResult:
         session = session_state or ConversationSessionState()
@@ -183,6 +186,7 @@ class TurnPlanner:
             artifacts=recent_artifacts or [],
             previous_node_results=previous_node_results or [],
             runtime_hints=runtime_hints,
+            runtime_context=runtime_context,
             session_state=session,
             instructions=instructions or [],
         )
@@ -247,13 +251,14 @@ def build_plan_input(
     artifacts: list[dict[str, Any]],
     previous_node_results: list[dict[str, Any]],
     runtime_hints: dict[str, Any] | None,
+    runtime_context: RuntimeContext | None = None,
     session_state: ConversationSessionState | None = None,
     instructions: list[str] | None = None,
 ) -> PlanInput:
-    runtime_context = RuntimeContext.from_hints(runtime_hints)
-    if session_state is not None and not runtime_context.repo.active_repo:
-        runtime_context = runtime_context.with_hints({"active_repo": session_state.active_repo_id})
-    runtime_context = RuntimeContext.from_hints(_ensure_temporal_hints(runtime_context.to_legacy_hints()))
+    resolved_runtime_context = runtime_context or RuntimeContext.from_hints(runtime_hints)
+    if session_state is not None and not resolved_runtime_context.repo.active_repo:
+        resolved_runtime_context = resolved_runtime_context.with_hints({"active_repo": session_state.active_repo_id})
+    resolved_runtime_context = RuntimeContext.from_hints(_ensure_temporal_hints(resolved_runtime_context.to_legacy_hints()))
     return PlanInput(
         current_user_input=current_user_input,
         conversation_context=(
@@ -268,8 +273,8 @@ def build_plan_input(
         ),
         artifacts=_normalize_artifact_context(artifacts),
         previous_node_results=[item for item in previous_node_results if isinstance(item, dict)],
-        runtime_hints=runtime_context.to_legacy_hints(),
-        runtime_context=runtime_context,
+        runtime_hints=resolved_runtime_context.to_legacy_hints(),
+        runtime_context=resolved_runtime_context,
         instructions=[str(item).strip() for item in (instructions or []) if str(item).strip()],
     )
 

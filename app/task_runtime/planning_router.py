@@ -68,11 +68,12 @@ class PlanningRouter:
         conversation_context: ConversationContext | None = None,
         previous_node_results: list[dict[str, Any]] | None = None,
         runtime_hints: dict[str, Any] | None = None,
+        runtime_context: RuntimeContext | None = None,
         instructions: list[str] | None = None,
         progress: ProgressReporter | None = None,
     ) -> PlanningRouterResult:
         started = time.perf_counter()
-        runtime_context = RuntimeContext.from_hints(runtime_hints)
+        resolved_runtime_context = runtime_context or RuntimeContext.from_hints(runtime_hints)
         artifact_plan = _artifact_delivery_plan(content, recent_artifacts or [])
         if artifact_plan is not None:
             fast_decision = FastIntentDecision(
@@ -94,7 +95,7 @@ class PlanningRouter:
             )
         if _should_skip_fast_intent(
             content,
-            runtime_context=runtime_context,
+            runtime_context=resolved_runtime_context,
             session_state=session_state,
             previous_node_results=previous_node_results,
             conversation_context=conversation_context,
@@ -114,6 +115,7 @@ class PlanningRouter:
                     recent_artifacts=recent_artifacts,
                     conversation_context=conversation_context,
                     runtime_hints=runtime_hints,
+                    runtime_context=resolved_runtime_context,
                 )
             except Exception:
                 logger.exception("fast intent failed; falling back to planner")
@@ -152,8 +154,8 @@ class PlanningRouter:
             if progress is not None:
                 progress.emit(
                     "planning_started",
-                    turn_id=runtime_context.turn.turn_id,
-                    conversation_id=runtime_context.turn.conversation_id,
+                    turn_id=resolved_runtime_context.turn.turn_id,
+                    conversation_id=resolved_runtime_context.turn.conversation_id,
                     stage="planning",
                     status="running",
                     summary="正在生成执行计划",
@@ -172,6 +174,7 @@ class PlanningRouter:
                 conversation_context=conversation_context,
                 previous_node_results=previous_node_results,
                 runtime_hints=runtime_hints,
+                runtime_context=resolved_runtime_context,
                 instructions=instructions,
             )
             logger.info(
@@ -351,6 +354,7 @@ def _timed_planner_call(
     conversation_context: ConversationContext | None,
     previous_node_results: list[dict[str, Any]] | None,
     runtime_hints: dict[str, Any] | None,
+    runtime_context: RuntimeContext | None,
     instructions: list[str] | None,
 ) -> tuple[ExecutionPlan, int, list[dict[str, Any]]]:
     started = time.perf_counter()
@@ -362,6 +366,7 @@ def _timed_planner_call(
         "conversation_context": conversation_context,
         "previous_node_results": previous_node_results,
         "runtime_hints": runtime_hints,
+        "runtime_context": runtime_context,
         "instructions": instructions,
     }
     if hasattr(planner, "plan_with_usage"):
