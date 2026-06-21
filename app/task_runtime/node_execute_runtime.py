@@ -65,6 +65,7 @@ class NodeExecutionContext:
     resolved_inputs: list[ResolvedInput] = field(default_factory=list)
     legacy_hints: dict[str, Any] = field(default_factory=dict)
     instructions: list[str] = field(default_factory=list)
+    usage_records: list[dict[str, Any]] = field(default_factory=list)
     runtime_context: RuntimeContext = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -441,8 +442,8 @@ class CoderNodeExecuteRuntime:
             "project_path": str(repo.canonical_root_path),
             "workdir": str(workdir),
         }
-        if context.runtime_context.usage.git_context_usage is not None:
-            request_metadata["usage_records"] = [context.runtime_context.usage.git_context_usage]
+        if context.usage_records:
+            request_metadata["usage_records"] = list(context.usage_records)
         if repo_workspace is not None:
             request_metadata["repo_workspace"] = repo_workspace.metadata()
             request_metadata["source_branch"] = repo_workspace.source_branch
@@ -1189,10 +1190,16 @@ def _context_with_git_workspace_hints(
             initial_repo = None
     resolved_context = resolver(context=context, registry=registry, repo=initial_repo)
     hints = _clean_git_context_hints(resolved_context)
-    if not hints:
+    usage_record = _git_context_usage_record(resolved_context)
+    if not hints and usage_record is None:
         return context
-    logger.info("coder git context node_id=%s hints=%s", context.node.id, json.dumps(hints, ensure_ascii=False, default=str))
-    return replace(context, legacy_hints=context.runtime_context.with_hints(hints).to_legacy_hints())
+    updated = context
+    if hints:
+        logger.info("coder git context node_id=%s hints=%s", context.node.id, json.dumps(hints, ensure_ascii=False, default=str))
+        updated = replace(updated, legacy_hints=updated.runtime_context.with_hints(hints).to_legacy_hints())
+    if usage_record is not None:
+        updated = replace(updated, usage_records=[*updated.usage_records, usage_record])
+    return updated
 
 
 def _llm_coder_git_context(
@@ -1320,10 +1327,16 @@ def _clean_git_context_hints(payload: dict[str, Any] | None) -> dict[str, Any]:
     worktree_mode = _plain_text(payload.get("worktree_mode"))
     if worktree_mode == "node_branch_worktree":
         hints["worktree_mode"] = worktree_mode
+    return hints
+
+
+def _git_context_usage_record(payload: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
     usage_record = payload.get("usage_record")
     if isinstance(usage_record, dict):
-        hints["git_context_usage"] = usage_record
-    return hints
+        return usage_record
+    return None
 
 
 def _clean_branch_hint(value: Any) -> str:

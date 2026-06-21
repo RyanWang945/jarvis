@@ -103,16 +103,6 @@ class RepoRuntimeContext:
 
 
 @dataclass(frozen=True)
-class UsageRuntimeContext:
-    git_context_usage: dict[str, Any] | None = None
-
-    @classmethod
-    def from_hints(cls, hints: Mapping[str, Any] | None) -> UsageRuntimeContext:
-        value = _hint(hints, "git_context_usage")
-        return cls(git_context_usage=value if isinstance(value, dict) else None)
-
-
-@dataclass(frozen=True)
 class RuntimeContext:
     legacy_hints: dict[str, Any]
     turn: TurnRuntimeContext
@@ -121,7 +111,6 @@ class RuntimeContext:
     node_workspace: NodeWorkspaceRuntimeContext
     workspace: WorkspaceRuntimeContext
     repo: RepoRuntimeContext
-    usage: UsageRuntimeContext
 
     @classmethod
     def from_hints(cls, hints: Mapping[str, Any] | None) -> RuntimeContext:
@@ -134,7 +123,6 @@ class RuntimeContext:
             node_workspace=NodeWorkspaceRuntimeContext.from_hints(legacy_hints),
             workspace=WorkspaceRuntimeContext.from_hints(legacy_hints),
             repo=RepoRuntimeContext.from_hints(legacy_hints),
-            usage=UsageRuntimeContext.from_hints(legacy_hints),
         )
 
     def to_legacy_hints(self) -> dict[str, Any]:

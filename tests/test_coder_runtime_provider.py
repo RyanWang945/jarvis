@@ -112,6 +112,27 @@ def test_coder_node_runtime_builds_provider_request() -> None:
     assert "tool_artifacts" not in result.data
 
 
+def test_coder_node_runtime_keeps_git_context_usage_out_of_runtime_context() -> None:
+    usage = {"source": "llm", "stage": "coder_git_context", "total_tokens": 12}
+    provider = RecordingProvider()
+    runtime = CoderNodeExecuteRuntime(
+        provider=provider,
+        git_context_resolver=lambda **kwargs: {"repo_id": "jarvis", "usage_record": usage},
+    )
+
+    runtime.run(
+        NodeExecutionContext(
+            user_objective="review code",
+            node=PlanNode(id="review", runtime="coder", objective="Review code"),
+            legacy_hints={"active_repo": "jarvis"},
+        )
+    )
+
+    request = provider.requests[0]
+    assert request.metadata["usage_records"] == [usage]
+    assert "git_context_usage" not in request.metadata
+
+
 def test_coder_node_runtime_ignores_legacy_permission_hints() -> None:
     provider = RecordingProvider()
     runtime = CoderNodeExecuteRuntime(provider=provider, git_context_resolver=_noop_git_context)

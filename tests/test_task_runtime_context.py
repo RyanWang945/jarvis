@@ -12,7 +12,6 @@ from app.task_runtime.runtime_context import (
     RepoRuntimeContext,
     TemporalRuntimeContext,
     TurnRuntimeContext,
-    UsageRuntimeContext,
     WorkspaceRuntimeContext,
 )
 
@@ -90,13 +89,6 @@ def test_repo_runtime_context_normalizes_repo_and_provider_run_dir() -> None:
     assert context.provider_run_dir == Path("runs/provider")
 
 
-def test_usage_runtime_context_keeps_only_structured_git_context_usage() -> None:
-    usage = {"provider": "planner", "stage": "git_context"}
-
-    assert UsageRuntimeContext.from_hints({"git_context_usage": usage}).git_context_usage == usage
-    assert UsageRuntimeContext.from_hints({"git_context_usage": "bad"}).git_context_usage is None
-
-
 def test_node_execution_context_builds_runtime_context_from_legacy_hints() -> None:
     context = NodeExecutionContext(
         user_objective="review repo",
@@ -113,6 +105,19 @@ def test_node_execution_context_builds_runtime_context_from_legacy_hints() -> No
     assert updated.runtime_context.repo.active_repo == "smoke-test"
     assert updated.legacy_hints["target_branch"] == " feat/runtime-context "
     assert not hasattr(updated, "runtime_hints")
+
+
+def test_node_execution_context_keeps_usage_records_out_of_runtime_context() -> None:
+    usage = {"provider": "planner", "stage": "git_context"}
+    context = NodeExecutionContext(
+        user_objective="review repo",
+        node=PlanNode(id="review", runtime="coder", objective="Review"),
+        legacy_hints={"active_repo": "jarvis"},
+        usage_records=[usage],
+    )
+
+    assert context.usage_records == [usage]
+    assert "git_context_usage" not in context.runtime_context.to_legacy_hints()
 
 
 def test_node_execute_prompt_payload_uses_runtime_context() -> None:
