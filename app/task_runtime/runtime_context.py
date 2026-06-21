@@ -99,6 +99,36 @@ class UsageRuntimeContext:
         return cls(git_context_usage=value if isinstance(value, dict) else None)
 
 
+@dataclass(frozen=True)
+class RuntimeContext:
+    legacy_hints: dict[str, Any]
+    temporal: TemporalRuntimeContext
+    branch: BranchRuntimeContext
+    node_workspace: NodeWorkspaceRuntimeContext
+    workspace: WorkspaceRuntimeContext
+    repo: RepoRuntimeContext
+    usage: UsageRuntimeContext
+
+    @classmethod
+    def from_hints(cls, hints: Mapping[str, Any] | None) -> RuntimeContext:
+        legacy_hints = dict(hints or {})
+        return cls(
+            legacy_hints=legacy_hints,
+            temporal=TemporalRuntimeContext.from_hints(legacy_hints),
+            branch=BranchRuntimeContext.from_hints(legacy_hints),
+            node_workspace=NodeWorkspaceRuntimeContext.from_hints(legacy_hints),
+            workspace=WorkspaceRuntimeContext.from_hints(legacy_hints),
+            repo=RepoRuntimeContext.from_hints(legacy_hints),
+            usage=UsageRuntimeContext.from_hints(legacy_hints),
+        )
+
+    def to_legacy_hints(self) -> dict[str, Any]:
+        return dict(self.legacy_hints)
+
+    def with_hints(self, updates: Mapping[str, Any]) -> RuntimeContext:
+        return RuntimeContext.from_hints({**self.legacy_hints, **dict(updates)})
+
+
 def _hint(hints: Mapping[str, Any] | None, key: str) -> Any:
     return hints.get(key) if hints is not None else None
 

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
+from app.task_runtime.node_execute_runtime import NodeExecutionContext
+from app.task_runtime.planner import PlanNode
 from app.task_runtime.runtime_context import (
     BranchRuntimeContext,
     NodeWorkspaceRuntimeContext,
@@ -82,3 +85,20 @@ def test_usage_runtime_context_keeps_only_structured_git_context_usage() -> None
 
     assert UsageRuntimeContext.from_hints({"git_context_usage": usage}).git_context_usage == usage
     assert UsageRuntimeContext.from_hints({"git_context_usage": "bad"}).git_context_usage is None
+
+
+def test_node_execution_context_builds_runtime_context_from_legacy_hints() -> None:
+    context = NodeExecutionContext(
+        user_objective="review repo",
+        node=PlanNode(id="review", runtime="coder", objective="Review"),
+        runtime_hints={"active_repo": " jarvis ", "target_branch": " feat/runtime-context "},
+    )
+
+    assert context.runtime_context.repo.active_repo == "jarvis"
+    assert context.runtime_context.branch.target_branch == "feat/runtime-context"
+    assert context.runtime_context.to_legacy_hints()["active_repo"] == " jarvis "
+
+    updated = replace(context, runtime_hints=context.runtime_context.with_hints({"active_repo": "smoke-test"}).to_legacy_hints())
+
+    assert updated.runtime_context.repo.active_repo == "smoke-test"
+    assert updated.runtime_hints["target_branch"] == " feat/runtime-context "

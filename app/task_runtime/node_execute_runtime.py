@@ -31,11 +31,7 @@ from app.task_runtime.node_finalizer import CodeNodeFinalizer, LLMCodeNodeFinali
 from app.task_runtime.node_result import NodeArtifact, NodeError, NodeResult, ResolvedInput
 from app.task_runtime.planner import PlanNode
 from app.task_runtime.runtime_context import (
-    BranchRuntimeContext,
-    RepoRuntimeContext,
-    TemporalRuntimeContext,
-    UsageRuntimeContext,
-    WorkspaceRuntimeContext,
+    RuntimeContext,
 )
 from app.task_runtime.session_workspace import (
     NodeRepoCommit,
@@ -69,6 +65,10 @@ class NodeExecutionContext:
     resolved_inputs: list[ResolvedInput] = field(default_factory=list)
     runtime_hints: dict[str, Any] = field(default_factory=dict)
     instructions: list[str] = field(default_factory=list)
+    runtime_context: RuntimeContext = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "runtime_context", RuntimeContext.from_hints(self.runtime_hints))
 
 
 class NodeExecuteRuntime(Protocol):
@@ -424,8 +424,7 @@ class CoderNodeExecuteRuntime:
         except RepositoryRegistryError as exc:
             logger.info("coder node blocked node_id=%s repo_id=%s reason=repository_error error=%s", context.node.id, repo_id, exc)
             return _blocked(context.node, "repository_not_available", str(exc))
-        repo_context = RepoRuntimeContext.from_hints(context.runtime_hints)
-        run_dir = repo_context.provider_run_dir
+        run_dir = context.runtime_context.repo.provider_run_dir
         try:
             repo_workspace = prepare_node_repo_workspace(
                 repo_id=repo.repo_id,
@@ -442,34 +441,30 @@ class CoderNodeExecuteRuntime:
             "project_path": str(repo.canonical_root_path),
             "workdir": str(workdir),
         }
-        usage_context = UsageRuntimeContext.from_hints(context.runtime_hints)
-        if usage_context.git_context_usage is not None:
-            request_metadata["usage_records"] = [usage_context.git_context_usage]
+        if context.runtime_context.usage.git_context_usage is not None:
+            request_metadata["usage_records"] = [context.runtime_context.usage.git_context_usage]
         if repo_workspace is not None:
             request_metadata["repo_workspace"] = repo_workspace.metadata()
             request_metadata["source_branch"] = repo_workspace.source_branch
             request_metadata["target_branch"] = repo_workspace.target_branch
             request_metadata["node_branch"] = repo_workspace.node_branch
-            context = NodeExecutionContext(
-                user_objective=context.user_objective,
-                node=context.node,
-                resolved_inputs=context.resolved_inputs,
-                runtime_hints={
-                    **context.runtime_hints,
-                    "source_branch": repo_workspace.source_branch,
-                    "target_branch": repo_workspace.target_branch,
-                    "node_branch": repo_workspace.node_branch,
-                    "worktree_mode": BranchRuntimeContext.from_hints(context.runtime_hints).worktree_mode or "node_branch_worktree",
-                },
-                instructions=context.instructions,
+            context = replace(
+                context,
+                runtime_hints=context.runtime_context.with_hints(
+                    {
+                        "source_branch": repo_workspace.source_branch,
+                        "target_branch": repo_workspace.target_branch,
+                        "node_branch": repo_workspace.node_branch,
+                        "worktree_mode": context.runtime_context.branch.worktree_mode or "node_branch_worktree",
+                    }
+                ).to_legacy_hints(),
             )
-        workspace_context = WorkspaceRuntimeContext.from_hints(context.runtime_hints)
-        if workspace_context.manifest_path_text:
-            request_metadata["node_manifest_path"] = workspace_context.manifest_path_text
+        if context.runtime_context.workspace.manifest_path_text:
+            request_metadata["node_manifest_path"] = context.runtime_context.workspace.manifest_path_text
         if run_dir is not None:
             request_metadata["run_dir"] = str(run_dir)
-        if workspace_context.session_id:
-            request_metadata["session_id"] = workspace_context.session_id
+        if context.runtime_context.workspace.session_id:
+            request_metadata["session_id"] = context.runtime_context.workspace.session_id
         instruction = _coder_instruction(context)
         request = CoderRunRequest(
             repo_id=repo.repo_id,
@@ -537,7 +532,7 @@ def _llm_messages(context: NodeExecutionContext) -> list[LLMMessage]:
         "user_objective": context.user_objective,
         "node": context.node.model_dump(mode="json"),
         "resolved_inputs": [item.model_dump(mode="json", exclude_none=True) for item in context.resolved_inputs],
-        "temporal_context": _temporal_context(context.runtime_hints),
+        "temporal_context": _temporal_context(context.runtime_context),
         "runtime_hints": context.runtime_hints,
         "instructions": context.instructions,
     }
@@ -555,7 +550,7 @@ def _react_messages(context: NodeExecutionContext) -> list[LLMMessage]:
         "user_objective": context.user_objective,
         "node": context.node.model_dump(mode="json"),
         "resolved_inputs": [item.model_dump(mode="json", exclude_none=True) for item in context.resolved_inputs],
-        "temporal_context": _temporal_context(context.runtime_hints),
+        "temporal_context": _temporal_context(context.runtime_context),
         "runtime_hints": context.runtime_hints,
         "instructions": context.instructions,
     }
@@ -913,22 +908,22 @@ def _coder_instruction(context: NodeExecutionContext) -> str:
     additional_instructions = "\n".join(f"- {item}" for item in context.instructions)
     return PromptRegistry().load("coder_node_execute").render_text(
         {
-            "temporal_context": _temporal_context_text(context.runtime_hints),
+            "temporal_context": _temporal_context_text(context.runtime_context),
             "user_objective": context.user_objective,
             "node_id": context.node.id,
             "node_objective": context.node.objective,
             "output_hint": context.node.output_hint or "Repository task result.",
-            "node_manifest_path": WorkspaceRuntimeContext.from_hints(context.runtime_hints).manifest_name(),
-            "coder_workspace_section": _coder_workspace_section(context.runtime_hints),
+            "node_manifest_path": context.runtime_context.workspace.manifest_name(),
+            "coder_workspace_section": _coder_workspace_section(context.runtime_context),
             "resolved_inputs_section": "\n".join(resolved_inputs_lines),
             "additional_instructions_section": additional_instructions,
         }
     )
 
 
-def _coder_workspace_section(runtime_hints: dict[str, Any]) -> str:
+def _coder_workspace_section(runtime_context: RuntimeContext) -> str:
     lines: list[str] = []
-    branch_context = BranchRuntimeContext.from_hints(runtime_hints)
+    branch_context = runtime_context.branch
     if branch_context.source_branch:
         lines.append(f"- Source branch: {branch_context.source_branch}")
     if branch_context.target_branch:
@@ -942,12 +937,12 @@ def _coder_workspace_section(runtime_hints: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _temporal_context(runtime_hints: dict[str, Any]) -> dict[str, str]:
-    return TemporalRuntimeContext.from_hints(runtime_hints).as_payload()
+def _temporal_context(runtime_context: RuntimeContext) -> dict[str, str]:
+    return runtime_context.temporal.as_payload()
 
 
-def _temporal_context_text(runtime_hints: dict[str, Any]) -> str:
-    temporal = _temporal_context(runtime_hints)
+def _temporal_context_text(runtime_context: RuntimeContext) -> str:
+    temporal = _temporal_context(runtime_context)
     return PromptRegistry().load("coder_temporal_context").render_text(
         {
             "has_temporal": bool(temporal),
@@ -968,7 +963,6 @@ def _finalize_coder_node_result(
 ) -> NodeResult:
     approval_required = bool(result.approval_requests)
     approval_requests = [approval_request_to_dict(item) for item in result.approval_requests]
-    workspace_context = WorkspaceRuntimeContext.from_hints(context.runtime_hints)
     return finalizer.finalize(
         node=context.node,
         user_objective=context.user_objective,
@@ -983,9 +977,9 @@ def _finalize_coder_node_result(
         metadata=result.metadata,
         approval_required=approval_required,
         approval_requests=approval_requests,
-        session_root=workspace_context.session_root,
-        node_workspace=workspace_context.node_workspace,
-        manifest_path=workspace_context.manifest_path,
+        session_root=context.runtime_context.workspace.session_root,
+        node_workspace=context.runtime_context.workspace.node_workspace,
+        manifest_path=context.runtime_context.workspace.manifest_path,
     )
 
 
@@ -1198,13 +1192,7 @@ def _context_with_git_workspace_hints(
     if not hints:
         return context
     logger.info("coder git context node_id=%s hints=%s", context.node.id, json.dumps(hints, ensure_ascii=False, default=str))
-    return NodeExecutionContext(
-        user_objective=context.user_objective,
-        node=context.node,
-        resolved_inputs=context.resolved_inputs,
-        runtime_hints={**context.runtime_hints, **hints},
-        instructions=context.instructions,
-    )
+    return replace(context, runtime_hints=context.runtime_context.with_hints(hints).to_legacy_hints())
 
 
 def _llm_coder_git_context(
@@ -1356,9 +1344,8 @@ def _plain_text(value: Any) -> str:
 
 
 def _active_repo(context: NodeExecutionContext, *, registry: RepositoryRegistry | None = None) -> str | None:
-    repo_context = RepoRuntimeContext.from_hints(context.runtime_hints)
-    if repo_context.active_repo:
-        return repo_context.active_repo
+    if context.runtime_context.repo.active_repo:
+        return context.runtime_context.repo.active_repo
     if registry is not None:
         active_repos = [repo for repo in registry.list_repositories() if repo.status == "active"]
         if len(active_repos) == 1:
