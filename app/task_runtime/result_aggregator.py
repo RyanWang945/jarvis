@@ -111,7 +111,7 @@ class ResultAggregator:
             route=route,
             fast_intent=fast_intent,
             artifacts=artifacts or [],
-            legacy_hints=resolved_runtime_context.to_legacy_hints(),
+            runtime_context=resolved_runtime_context.to_legacy_hints(),
             instructions=instructions or [],
         )
         try:
@@ -152,7 +152,7 @@ def _aggregation_input(
     route: str | None,
     fast_intent: dict[str, Any] | None,
     artifacts: list[dict[str, Any]],
-    legacy_hints: dict[str, Any],
+    runtime_context: dict[str, Any],
     instructions: list[str],
 ) -> dict[str, Any]:
     return {
@@ -164,7 +164,7 @@ def _aggregation_input(
         "plan": plan.model_dump(mode="json"),
         "execution_report": report.model_dump(mode="json", exclude_none=True),
         "artifacts": artifacts,
-        "runtime_hints": legacy_hints,
+        "runtime_context": runtime_context,
         "instructions": instructions,
     }
 

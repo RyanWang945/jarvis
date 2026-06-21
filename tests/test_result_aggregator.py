@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import json
+
 from app.llm.provider_adapters import NormalizedLLMResponse
 from app.task_runtime.node_result import ExecutionReport, NodeArtifact, NodeError, NodeResult
 from app.task_runtime.planner import ExecutionPlan, FinalizationHint, PlanNode
 from app.task_runtime.result_aggregator import ResultAggregator
+from app.task_runtime.runtime_context import RuntimeContext
 
 
 class FakeProfile:
@@ -81,13 +84,21 @@ def test_result_aggregator_uses_llm_json_result() -> None:
         ],
     )
 
-    result = aggregator.aggregate(plan=_plan(), report=report, current_user_input="帮我 review")
+    result = aggregator.aggregate(
+        plan=_plan(),
+        report=report,
+        current_user_input="帮我 review",
+        runtime_context=RuntimeContext.from_hints({"active_repo": "jarvis"}),
+    )
 
     assert result.status == "completed"
     assert result.reply == "调研和 review 都完成了。"
     assert result.artifact_refs == ["artifact:R1"]
     assert result.data["confidence"] == "high"
     assert chat.calls[0]["response_format"] == {"type": "json_object"}
+    prompt_payload = json.loads(chat.calls[0]["messages"][1].content.split("\n\n", 1)[1])
+    assert prompt_payload["runtime_context"]["active_repo"] == "jarvis"
+    assert "runtime_hints" not in prompt_payload
 
 
 def test_result_aggregator_pass_through_skips_llm() -> None:
