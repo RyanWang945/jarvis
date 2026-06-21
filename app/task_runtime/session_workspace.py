@@ -261,7 +261,7 @@ def write_node_input_snapshot(
         "input_refs": list(node.input_refs),
         "user_objective": user_objective,
         "resolved_inputs": [item.model_dump(mode="json", exclude_none=True) for item in resolved_inputs],
-        "runtime_hints": _jsonable(legacy_hints),
+        "runtime_context": _jsonable(legacy_hints),
         "instructions": list(instructions),
         "missing_refs": list(missing_refs or []),
         "blocked_refs": list(blocked_refs or []),
