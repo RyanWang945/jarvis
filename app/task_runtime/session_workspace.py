@@ -34,7 +34,7 @@ class NodeWorkspaceRef:
     provider_run_dir: Path
     repos_dir: Path
 
-    def runtime_hints(self) -> dict[str, str]:
+    def to_legacy_hints(self) -> dict[str, str]:
         return {
             "node_workspace_dir": str(self.root_path),
             "node_repos_dir": str(self.repos_dir),
@@ -44,6 +44,9 @@ class NodeWorkspaceRef:
             "node_manifest_path": str(self.manifest_path),
             "provider_run_dir": str(self.provider_run_dir),
         }
+
+    def runtime_hints(self) -> dict[str, str]:
+        return self.to_legacy_hints()
 
     def repo_dir(self, repo_id: str) -> Path:
         return self.repos_dir / _safe_component(repo_id, fallback="repo")
@@ -64,7 +67,7 @@ class SessionWorkspaceRef:
     def node(self, node_id: str) -> NodeWorkspaceRef:
         return self.nodes[node_id]
 
-    def runtime_hints(self) -> dict[str, str]:
+    def to_legacy_hints(self) -> dict[str, str]:
         return {
             "session_id": self.session_id,
             "session_workspace_dir": str(self.root_path),
@@ -72,6 +75,9 @@ class SessionWorkspaceRef:
             "session_approvals_dir": str(self.approvals_dir),
             "session_nodes_dir": str(self.nodes_dir),
         }
+
+    def runtime_hints(self) -> dict[str, str]:
+        return self.to_legacy_hints()
 
     def metadata(self) -> dict[str, Any]:
         return {
@@ -436,10 +442,14 @@ def commit_node_repo(
     )
 
 
-def node_workspace_hints(session_workspace: SessionWorkspaceRef | None, node_id: str) -> dict[str, str]:
+def node_workspace_legacy_hints(session_workspace: SessionWorkspaceRef | None, node_id: str) -> dict[str, str]:
     if session_workspace is None:
         return {}
-    return session_workspace.node(node_id).runtime_hints()
+    return session_workspace.node(node_id).to_legacy_hints()
+
+
+def node_workspace_hints(session_workspace: SessionWorkspaceRef | None, node_id: str) -> dict[str, str]:
+    return node_workspace_legacy_hints(session_workspace, node_id)
 
 
 def _node_refs(root: Path, nodes: list[PlanNode]) -> dict[str, NodeWorkspaceRef]:

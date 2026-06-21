@@ -38,6 +38,8 @@ def test_session_workspace_creates_fixed_node_directories_after_plan(tmp_path: P
     assert workspace.node("../modify code").root_path.parent == workspace.nodes_dir
     assert ".." not in workspace.node("../modify code").safe_node_id
     assert workspace.node("inspect/code").repos_dir == workspace.node("inspect/code").root_path / "repo"
+    assert workspace.runtime_hints() == workspace.to_legacy_hints()
+    assert workspace.node("inspect/code").runtime_hints() == workspace.node("inspect/code").to_legacy_hints()
 
 
 def test_write_node_result_preserves_existing_output_file(tmp_path: Path) -> None:
@@ -371,7 +373,7 @@ def test_prepare_node_repo_workspace_creates_node_branch_from_target_branch(tmp_
     node_workspace = prepare_node_repo_workspace(
         repo_id="jarvis",
         project_path=project,
-        runtime_hints={**workspace.node("modify").runtime_hints(), **workspace.runtime_hints(), "target_branch": "feat-skill"},
+        runtime_hints={**workspace.node("modify").to_legacy_hints(), **workspace.to_legacy_hints(), "target_branch": "feat-skill"},
         node_id="modify",
     )
 
@@ -468,7 +470,7 @@ def test_prepare_node_repo_works_when_project_is_jarvis_workdir(tmp_path: Path) 
     node_repo = prepare_node_repo(
         repo_id="jarvis",
         project_path=project,
-        runtime_hints=workspace.node("modify").runtime_hints(),
+        runtime_hints=workspace.node("modify").to_legacy_hints(),
     )
 
     assert node_repo == workspace.node("modify").repo_dir("jarvis").resolve()

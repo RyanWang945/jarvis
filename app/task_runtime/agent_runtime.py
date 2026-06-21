@@ -246,7 +246,7 @@ class TaskAgentRuntime:
                 conversation_id=turn.conversation_id,
             )
             self._session_workspace_manager.update_status(session_workspace, "running")
-            execution_context = runtime_context.with_hints(session_workspace.runtime_hints())
+            execution_context = runtime_context.with_hints(session_workspace.to_legacy_hints())
             execution_runtime_hints = execution_context.to_legacy_hints()
             execution_started = time.perf_counter()
             report = self._node_executor.execute(

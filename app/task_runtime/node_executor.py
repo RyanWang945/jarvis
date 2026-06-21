@@ -12,7 +12,7 @@ from app.task_runtime.planner import ExecutionPlan, NodeRuntime, PlanNode
 from app.task_runtime.runtime_context import RuntimeContext
 from app.task_runtime.session_workspace import (
     SessionWorkspaceRef,
-    node_workspace_hints,
+    node_workspace_legacy_hints,
     write_node_input_snapshot,
     write_node_result,
 )
@@ -253,8 +253,8 @@ def _node_runtime_context(
 ) -> RuntimeContext:
     if session_workspace is None:
         return base_context
-    return base_context.with_hints(session_workspace.runtime_hints()).with_hints(
-        node_workspace_hints(session_workspace, node_id)
+    return base_context.with_hints(session_workspace.to_legacy_hints()).with_hints(
+        node_workspace_legacy_hints(session_workspace, node_id)
     )
 
 
