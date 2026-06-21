@@ -55,11 +55,9 @@ def test_execution_plan_rejects_cycles() -> None:
         )
 
 
-def test_plan_node_normalizes_legacy_tool_runtime_to_react() -> None:
-    node = PlanNode(id="remind", runtime="tool", objective="Create reminder", tool_name="scheduled_task")  # type: ignore[arg-type]
-
-    assert node.runtime == "react"
-    assert not hasattr(node, "tool_name")
+def test_plan_node_rejects_legacy_tool_runtime() -> None:
+    with pytest.raises(ValidationError):
+        PlanNode(id="remind", runtime="tool", objective="Create reminder", tool_name="scheduled_task")  # type: ignore[arg-type]
 
 
 def test_plan_node_rejects_deepresearch_runtime() -> None:
@@ -124,7 +122,7 @@ def test_plan_from_payload_keeps_pass_through_for_single_llm_node() -> None:
     assert plan.finalization_hint.mode == "pass_through"
 
 
-def test_plan_from_payload_normalizes_legacy_tool_node_to_react() -> None:
+def test_plan_from_payload_falls_back_for_legacy_tool_node() -> None:
     plan = _plan_from_payload(
         {
             "user_objective": "设置提醒",
@@ -141,6 +139,7 @@ def test_plan_from_payload_normalizes_legacy_tool_node_to_react() -> None:
         fallback_objective="设置提醒",
     )
 
+    assert plan.nodes[0].id == "set_reminder"
     assert plan.nodes[0].runtime == "react"
     assert not hasattr(plan.nodes[0], "tool_name")
     assert plan.finalization_hint.mode == "llm"
@@ -159,7 +158,7 @@ def test_plan_from_payload_ignores_null_node_runtime_hints() -> None:
                 },
                 {
                     "id": "remind",
-                    "runtime": "tool",
+                    "runtime": "react",
                     "objective": "Create reminder",
                     "tool_name": "scheduled_task",
                     "input_refs": ["node:review"],

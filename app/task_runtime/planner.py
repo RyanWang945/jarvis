@@ -494,8 +494,6 @@ def _normalize_node_payload(
 
 def _normalize_runtime(value: Any) -> NodeRuntime:
     text = str(value or "").strip().lower()
-    if text == "tool":
-        return "react"
     if text in _RUNTIMES:
         return text  # type: ignore[return-value]
     return text  # type: ignore[return-value]
