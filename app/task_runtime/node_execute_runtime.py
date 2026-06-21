@@ -63,12 +63,16 @@ class NodeExecutionContext:
     user_objective: str
     node: PlanNode
     resolved_inputs: list[ResolvedInput] = field(default_factory=list)
-    runtime_hints: dict[str, Any] = field(default_factory=dict)
+    legacy_hints: dict[str, Any] = field(default_factory=dict)
     instructions: list[str] = field(default_factory=list)
     runtime_context: RuntimeContext = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "runtime_context", RuntimeContext.from_hints(self.runtime_hints))
+        object.__setattr__(self, "runtime_context", RuntimeContext.from_hints(self.legacy_hints))
+
+    @property
+    def runtime_hints(self) -> dict[str, Any]:
+        return self.legacy_hints
 
 
 class NodeExecuteRuntime(Protocol):
@@ -429,7 +433,7 @@ class CoderNodeExecuteRuntime:
             repo_workspace = prepare_node_repo_workspace(
                 repo_id=repo.repo_id,
                 project_path=repo.canonical_root_path,
-                legacy_hints=context.runtime_hints,
+                legacy_hints=context.legacy_hints,
                 node_id=context.node.id,
             )
             workdir = repo_workspace.repo_path if repo_workspace is not None else repo.canonical_root_path
@@ -450,7 +454,7 @@ class CoderNodeExecuteRuntime:
             request_metadata["node_branch"] = repo_workspace.node_branch
             context = replace(
                 context,
-                runtime_hints=context.runtime_context.with_hints(
+                legacy_hints=context.runtime_context.with_hints(
                     {
                         "source_branch": repo_workspace.source_branch,
                         "target_branch": repo_workspace.target_branch,
@@ -533,7 +537,7 @@ def _llm_messages(context: NodeExecutionContext) -> list[LLMMessage]:
         "node": context.node.model_dump(mode="json"),
         "resolved_inputs": [item.model_dump(mode="json", exclude_none=True) for item in context.resolved_inputs],
         "temporal_context": _temporal_context(context.runtime_context),
-        "runtime_hints": context.runtime_hints,
+        "runtime_hints": context.legacy_hints,
         "instructions": context.instructions,
     }
     messages = PromptRegistry().load("llm_node_execute").render(
@@ -551,7 +555,7 @@ def _react_messages(context: NodeExecutionContext) -> list[LLMMessage]:
         "node": context.node.model_dump(mode="json"),
         "resolved_inputs": [item.model_dump(mode="json", exclude_none=True) for item in context.resolved_inputs],
         "temporal_context": _temporal_context(context.runtime_context),
-        "runtime_hints": context.runtime_hints,
+        "runtime_hints": context.legacy_hints,
         "instructions": context.instructions,
     }
     messages = PromptRegistry().load("react_node_execute").render(
@@ -1192,7 +1196,7 @@ def _context_with_git_workspace_hints(
     if not hints:
         return context
     logger.info("coder git context node_id=%s hints=%s", context.node.id, json.dumps(hints, ensure_ascii=False, default=str))
-    return replace(context, runtime_hints=context.runtime_context.with_hints(hints).to_legacy_hints())
+    return replace(context, legacy_hints=context.runtime_context.with_hints(hints).to_legacy_hints())
 
 
 def _llm_coder_git_context(
@@ -1217,7 +1221,7 @@ def _llm_coder_git_context(
             "objective": context.node.objective,
             "output_hint": context.node.output_hint,
         },
-        "merged_runtime_hints": context.runtime_hints,
+        "merged_runtime_hints": context.legacy_hints,
         "selected_repo": getattr(repo, "repo_id", None),
         "repositories": _registered_repo_facts(registry),
     }

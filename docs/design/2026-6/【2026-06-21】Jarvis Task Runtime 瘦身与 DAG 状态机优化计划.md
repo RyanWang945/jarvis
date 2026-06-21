@@ -796,14 +796,15 @@ NodeExecutionContext:
     user_objective
     node
     resolved_inputs
-    context: RuntimeContext
+    runtime_context: RuntimeContext
+    legacy_hints: dict  # only for old prompt/provider payloads
 ```
 
 3. 保留 `RuntimeContext.to_legacy_hints()`，只给旧 prompt 和 provider 使用。
 4. `node_workspace_hints()` 改为返回 `NodeWorkspaceContext`。
 5. `SessionWorkspaceRef` / `NodeWorkspaceRef` 只保留 `to_legacy_hints()` 作为旧 payload 输出 API。
 
-已执行迁移：新增 `app/task_runtime/runtime_context.py`，提供 `TurnRuntimeContext`、`TemporalRuntimeContext`、`RepoRuntimeContext`、`BranchRuntimeContext`、`NodeWorkspaceRuntimeContext`、`WorkspaceRuntimeContext`、`UsageRuntimeContext` 和聚合 `RuntimeContext`。`agent_runtime.py` 已在 turn 入口构建 `RuntimeContext`，session workspace 合并通过 `RuntimeContext.with_hints()` 完成；`NodeExecutionContext` 已在初始化时从 legacy hints 构建 `runtime_context`；`PlanInput` 已拆出不进入 prompt JSON 的 `runtime_context`，`runtime_hints` 暂时保留为旧 prompt/provider 的输出格式。`NodeExecutor` 的 progress turn/conversation id 读取和 session/node workspace hints 合并已改为通过 `RuntimeContext`；`PlanningRouter` 的 progress id 与 active repo 路由判断、`planner.py` 的 fallback repo 判断也已改为通过 `RuntimeContext`。`fast_intent.py` 和 `node_execute_runtime.py` 中的 temporal、repo、provider run dir、branch、manifest path、session workspace/node workspace、git context usage 读取已改为通过 typed accessor；`fast_intent.py` 和 `result_aggregator.py` 的 prompt payload 边界已改为显式从 `RuntimeContext` 导出 legacy hints；`SessionWorkspaceRef` / `NodeWorkspaceRef` 已只保留 `to_legacy_hints()` 作为旧 payload 输出 API，旧 `runtime_hints()` 别名已删除；`session_workspace.py` 中 repo worktree 准备路径也已改为通过 typed accessor 读取 node repo dir、session id、branch 和 session root，内部参数命名使用 `legacy_hints` 表达旧 payload 边界。当前仍保留 `git_context_usage` 写入 legacy hints 的桥接，等待 usage 管道从 hints 中迁出。
+已执行迁移：新增 `app/task_runtime/runtime_context.py`，提供 `TurnRuntimeContext`、`TemporalRuntimeContext`、`RepoRuntimeContext`、`BranchRuntimeContext`、`NodeWorkspaceRuntimeContext`、`WorkspaceRuntimeContext`、`UsageRuntimeContext` 和聚合 `RuntimeContext`。`agent_runtime.py` 已在 turn 入口构建 `RuntimeContext`，session workspace 合并通过 `RuntimeContext.with_hints()` 完成；`NodeExecutionContext` 主字段已改为 `legacy_hints`，并在初始化时从 legacy hints 构建 `runtime_context`；`runtime_hints` 仅保留为只读兼容 property。`PlanInput` 已拆出不进入 prompt JSON 的 `runtime_context`，`runtime_hints` 暂时保留为旧 prompt/provider 的输出格式。`NodeExecutor` 的 progress turn/conversation id 读取和 session/node workspace hints 合并已改为通过 `RuntimeContext`；`PlanningRouter` 的 progress id 与 active repo 路由判断、`planner.py` 的 fallback repo 判断也已改为通过 `RuntimeContext`。`fast_intent.py` 和 `node_execute_runtime.py` 中的 temporal、repo、provider run dir、branch、manifest path、session workspace/node workspace、git context usage 读取已改为通过 typed accessor；`fast_intent.py` 和 `result_aggregator.py` 的 prompt payload 边界已改为显式从 `RuntimeContext` 导出 legacy hints；`SessionWorkspaceRef` / `NodeWorkspaceRef` 已只保留 `to_legacy_hints()` 作为旧 payload 输出 API，旧 `runtime_hints()` 别名已删除；`session_workspace.py` 中 repo worktree 准备路径也已改为通过 typed accessor 读取 node repo dir、session id、branch 和 session root，内部参数命名使用 `legacy_hints` 表达旧 payload 边界。当前仍保留 `git_context_usage` 写入 legacy hints 的桥接，等待 usage 管道从 hints 中迁出。
 
 验收：
 

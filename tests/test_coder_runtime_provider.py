@@ -97,7 +97,7 @@ def test_coder_node_runtime_builds_provider_request() -> None:
                 runtime="coder",
                 objective="Fix failing tests",
             ),
-            runtime_hints={"active_repo": "jarvis"},
+            legacy_hints={"active_repo": "jarvis"},
         )
     )
 
@@ -120,7 +120,7 @@ def test_coder_node_runtime_ignores_legacy_permission_hints() -> None:
         NodeExecutionContext(
             user_objective="review code",
             node=PlanNode(id="review", runtime="coder", objective="Review code"),
-            runtime_hints={"active_repo": "jarvis", "allow_commit": True, "allow_push": True},
+            legacy_hints={"active_repo": "jarvis", "allow_commit": True, "allow_push": True},
         )
     )
 
@@ -285,7 +285,7 @@ def test_coder_node_runtime_blocks_when_approval_required() -> None:
         NodeExecutionContext(
             user_objective="commit changes",
             node=PlanNode(id="commit", runtime="coder", objective="Commit changes"),
-            runtime_hints={"active_repo": "jarvis"},
+            legacy_hints={"active_repo": "jarvis"},
         )
     )
 

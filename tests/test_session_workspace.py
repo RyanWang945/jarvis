@@ -132,7 +132,7 @@ def test_coder_node_uses_only_registered_repo_when_active_repo_missing(monkeypat
     result = runtime.run(
         _node_context(
             node=PlanNode(id="inspect", runtime="coder", objective="Inspect repo"),
-            runtime_hints={},
+            legacy_hints={},
         )
     )
 
@@ -445,7 +445,7 @@ def test_coder_runtime_does_not_auto_commit_registered_repo_without_node_workspa
     result = runtime.run(
         _node_context(
             node=PlanNode(id="write_node", runtime="coder", objective="Write node file"),
-            runtime_hints={"active_repo": "jarvis"},
+            legacy_hints={"active_repo": "jarvis"},
         )
     )
 
@@ -556,13 +556,13 @@ class _ContinuingProvider:
         raise NotImplementedError
 
 
-def _node_context(*, node: PlanNode, runtime_hints: dict[str, object]):
+def _node_context(*, node: PlanNode, legacy_hints: dict[str, object]):
     from app.task_runtime.node_execute_runtime import NodeExecutionContext
 
     return NodeExecutionContext(
         user_objective="write a file",
         node=node,
-        runtime_hints=runtime_hints,
+        legacy_hints=legacy_hints,
     )
 
 

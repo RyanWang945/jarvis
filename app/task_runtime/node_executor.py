@@ -110,7 +110,7 @@ class NodeExecutor:
                             user_objective=plan.user_objective,
                             node=node,
                             resolved_inputs=resolved_inputs,
-                            runtime_hints=merged_runtime_hints,
+                            legacy_hints=merged_runtime_hints,
                             instructions=list(instructions or []),
                         )
                     )

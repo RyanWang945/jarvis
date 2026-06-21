@@ -162,8 +162,8 @@ class NodeManifestArtifactRuntime:
         self.absolute = absolute
 
     def run(self, context):
-        session_root = Path(context.runtime_hints["session_workspace_dir"])
-        node_dir = Path(context.runtime_hints["node_workspace_dir"])
+        session_root = Path(context.legacy_hints["session_workspace_dir"])
+        node_dir = Path(context.legacy_hints["node_workspace_dir"])
         report_path = node_dir / "report.md"
         report_path.write_text("# Report\n\nbody", encoding="utf-8")
         relative_path = report_path.relative_to(session_root).as_posix()

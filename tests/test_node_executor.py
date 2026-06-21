@@ -213,7 +213,7 @@ def test_react_node_execute_runtime_runs_tool_loop() -> None:
         NodeExecutionContext(
             user_objective="research agent tests",
             node=PlanNode(id="research", runtime="react", objective="Research agent testing"),
-            runtime_hints={
+            legacy_hints={
                 "current_date": "2026-05-25",
                 "current_time": "2026-05-25T10:30:00+08:00",
                 "timezone": "Asia/Shanghai",
