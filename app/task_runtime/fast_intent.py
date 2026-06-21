@@ -148,8 +148,7 @@ def _fast_intent_model_metadata(model_profile: str | None) -> dict[str, Any]:
 def _decision_from_payload(payload: dict[str, Any]) -> FastIntentDecision:
     nested = payload.get("decision") if isinstance(payload.get("decision"), dict) else payload.get("fast_intent")
     candidate = dict(nested if isinstance(nested, dict) else payload)
-    runtime = candidate.get("runtime")
-    candidate["route"] = _normalize_route(candidate.get("route"), runtime=runtime)
+    candidate["route"] = _normalize_route(candidate.get("route"))
     candidate["confidence"] = _coerce_confidence(candidate.get("confidence"))
     if isinstance(candidate.get("reply"), str):
         candidate["reply"] = candidate["reply"].strip()
@@ -221,7 +220,7 @@ def _decision_from_tool_call(tool_call: NormalizedToolCall) -> FastIntentDecisio
     )
 
 
-def _normalize_route(value: Any, *, runtime: Any = None) -> FastIntentRoute:
+def _normalize_route(value: Any) -> FastIntentRoute:
     text = str(value or "").strip()
     if text in {"fast_reply", "needs_plan"}:
         return text  # type: ignore[return-value]

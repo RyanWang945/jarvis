@@ -31,7 +31,7 @@ def test_fast_intent_decision_ignores_legacy_planning_fields() -> None:
     decision = FastIntentDecision(
         route="needs_plan",
         confidence=0.9,
-        runtime="codex",
+        runtime="legacy_runtime",
         tool_name="deliver_file",
         input_refs=["artifact:A1"],
         reply="should be ignored",
@@ -56,12 +56,12 @@ def test_fast_intent_decision_accepts_fast_reply() -> None:
     assert not hasattr(decision, "finalization_hint")
 
 
-def test_fast_intent_payload_maps_legacy_direct_route_to_needs_plan() -> None:
+def test_fast_intent_payload_maps_unknown_legacy_route_to_needs_plan() -> None:
     decision = _decision_from_payload(
         {
-            "route": "direct_codex",
-            "runtime": "codex",
-            "tool_name": "delegate_to_codex",
+            "route": "legacy_direct",
+            "runtime": "legacy_runtime",
+            "tool_name": "legacy_tool",
             "confidence": 0.95,
             "reason": "single repo task",
         }
