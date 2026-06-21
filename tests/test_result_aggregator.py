@@ -188,7 +188,7 @@ def test_result_aggregator_blocked_missing_repo_needs_user_input() -> None:
                 node_id="review",
                 runtime="coder",
                 status="blocked",
-                summary="Codex runtime requires runtime_hints.active_repo.",
+                summary="Coder runtime requires an active repository in runtime context.",
                 error=NodeError(code="missing_active_repo", message="active_repo missing"),
             )
         ],

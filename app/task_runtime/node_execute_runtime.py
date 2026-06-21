@@ -422,7 +422,7 @@ class CoderNodeExecuteRuntime:
         repo_id = _active_repo(context, registry=registry)
         if not repo_id:
             logger.info("coder node blocked node_id=%s reason=missing_active_repo", context.node.id)
-            return _blocked(context.node, "missing_active_repo", "Coder runtime requires runtime_hints.active_repo.")
+            return _blocked(context.node, "missing_active_repo", "Coder runtime requires an active repository in runtime context.")
         try:
             repo = registry.resolve_repo(repo_id)
         except RepositoryRegistryError as exc:
