@@ -34,6 +34,7 @@ from app.task_runtime.runtime_context import (
     BranchRuntimeContext,
     RepoRuntimeContext,
     TemporalRuntimeContext,
+    UsageRuntimeContext,
     WorkspaceRuntimeContext,
 )
 from app.task_runtime.session_workspace import (
@@ -441,9 +442,9 @@ class CoderNodeExecuteRuntime:
             "project_path": str(repo.canonical_root_path),
             "workdir": str(workdir),
         }
-        git_context_usage = context.runtime_hints.get("git_context_usage")
-        if isinstance(git_context_usage, dict):
-            request_metadata["usage_records"] = [git_context_usage]
+        usage_context = UsageRuntimeContext.from_hints(context.runtime_hints)
+        if usage_context.git_context_usage is not None:
+            request_metadata["usage_records"] = [usage_context.git_context_usage]
         if repo_workspace is not None:
             request_metadata["repo_workspace"] = repo_workspace.metadata()
             request_metadata["source_branch"] = repo_workspace.source_branch

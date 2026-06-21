@@ -89,6 +89,16 @@ class RepoRuntimeContext:
         )
 
 
+@dataclass(frozen=True)
+class UsageRuntimeContext:
+    git_context_usage: dict[str, Any] | None = None
+
+    @classmethod
+    def from_hints(cls, hints: Mapping[str, Any] | None) -> UsageRuntimeContext:
+        value = _hint(hints, "git_context_usage")
+        return cls(git_context_usage=value if isinstance(value, dict) else None)
+
+
 def _hint(hints: Mapping[str, Any] | None, key: str) -> Any:
     return hints.get(key) if hints is not None else None
 

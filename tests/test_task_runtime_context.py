@@ -7,6 +7,7 @@ from app.task_runtime.runtime_context import (
     NodeWorkspaceRuntimeContext,
     RepoRuntimeContext,
     TemporalRuntimeContext,
+    UsageRuntimeContext,
     WorkspaceRuntimeContext,
 )
 
@@ -74,3 +75,10 @@ def test_repo_runtime_context_normalizes_repo_and_provider_run_dir() -> None:
 
     assert context.active_repo == "jarvis"
     assert context.provider_run_dir == Path("runs/provider")
+
+
+def test_usage_runtime_context_keeps_only_structured_git_context_usage() -> None:
+    usage = {"provider": "planner", "stage": "git_context"}
+
+    assert UsageRuntimeContext.from_hints({"git_context_usage": usage}).git_context_usage == usage
+    assert UsageRuntimeContext.from_hints({"git_context_usage": "bad"}).git_context_usage is None
