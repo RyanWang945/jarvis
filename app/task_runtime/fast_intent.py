@@ -14,7 +14,7 @@ from app.llm.model_profiles import LLMNode
 from app.llm.model_router import ModelRouter
 from app.prompting import PromptRegistry
 from app.runtime_usage import usage_record_from_response
-from app.task_runtime.runtime_context import TemporalRuntimeContext
+from app.task_runtime.runtime_context import RuntimeContext
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +100,7 @@ def _fast_intent_messages(
 ) -> list[LLMMessage]:
     registry = prompt_registry or PromptRegistry()
     prompt = registry.load("fast_intent", prompt_version)
+    runtime_context = RuntimeContext.from_hints(runtime_hints)
     return prompt.render(
         {
             "input_json": json.dumps(
@@ -108,7 +109,7 @@ def _fast_intent_messages(
                     "active_repo_id": session_state.active_repo_id,
                     "session_goal": session_state.session_goal,
                     "working_summary": session_state.working_summary,
-                    "temporal_context": _temporal_context(runtime_hints or {}),
+                    "temporal_context": _temporal_context(runtime_context),
                     "conversation_context": (
                         conversation_context.fast_payload()
                         if conversation_context is not None
@@ -128,8 +129,8 @@ def _fast_intent_messages(
     )
 
 
-def _temporal_context(runtime_hints: dict[str, Any]) -> dict[str, str]:
-    return TemporalRuntimeContext.from_hints(runtime_hints).as_payload()
+def _temporal_context(runtime_context: RuntimeContext) -> dict[str, str]:
+    return runtime_context.temporal.as_payload()
 
 
 def _fast_intent_model_metadata(model_profile: str | None) -> dict[str, Any]:

@@ -15,6 +15,7 @@ from app.runtime_usage import usage_record_from_response
 from app.task_runtime.approval_types import approval_request_dicts
 from app.task_runtime.node_result import ExecutionReport, NodeResult
 from app.task_runtime.planner import ExecutionPlan
+from app.task_runtime.runtime_context import RuntimeContext
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +103,7 @@ class ResultAggregator:
 
         prompt = self._prompt_registry.load("result_aggregator", self._prompt_version)
         response_format = prompt.response_format if resolved.profile.supports_json_object else None
+        runtime_context = RuntimeContext.from_hints(runtime_hints)
         payload = _aggregation_input(
             plan=plan,
             report=report,
@@ -109,7 +111,7 @@ class ResultAggregator:
             route=route,
             fast_intent=fast_intent,
             artifacts=artifacts or [],
-            runtime_hints=runtime_hints or {},
+            runtime_hints=runtime_context.to_legacy_hints(),
             instructions=instructions or [],
         )
         try:
