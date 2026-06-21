@@ -1,0 +1,18 @@
+{
+  "id": "heavy_plan:v6",
+  "scenario": "heavy_plan",
+  "version": "v6",
+  "description": "Compile one user turn into a lightweight Jarvis execution plan with runtime_context input.",
+  "response_format": "json_object",
+  "variables": ["input_json"],
+  "messages": [
+    {
+      "role": "system",
+      "template": "system.md"
+    },
+    {
+      "role": "user",
+      "template": "user.md"
+    }
+  ]
+}

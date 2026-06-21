@@ -118,8 +118,8 @@ class PlanInput(BaseModel):
     conversation_context: dict[str, Any] = Field(default_factory=dict)
     artifacts: list[dict[str, Any]] = Field(default_factory=list)
     previous_node_results: list[dict[str, Any]] = Field(default_factory=list)
-    runtime_hints: dict[str, Any] = Field(default_factory=dict)
-    runtime_context: RuntimeContext = Field(default_factory=lambda: RuntimeContext.from_hints({}), exclude=True)
+    runtime_context: dict[str, Any] = Field(default_factory=dict)
+    typed_runtime_context: RuntimeContext = Field(default_factory=lambda: RuntimeContext.from_hints({}), exclude=True)
     instructions: list[str] = Field(default_factory=list)
 
     @field_validator("current_user_input")
@@ -192,7 +192,7 @@ class TurnPlanner:
             return TurnPlannerResult(
                 plan=_fallback_plan_for_objective(
                     plan_input.current_user_input,
-                    runtime_context=plan_input.runtime_context,
+                    runtime_context=plan_input.typed_runtime_context,
                     known_artifact_refs=_known_artifact_refs(plan_input.artifacts),
                     previous_node_results=plan_input.previous_node_results,
                 )
@@ -232,7 +232,7 @@ class TurnPlanner:
             payload,
             fallback_objective=plan_input.current_user_input,
             known_artifact_refs=_known_artifact_refs(plan_input.artifacts),
-            runtime_context=plan_input.runtime_context,
+            runtime_context=plan_input.typed_runtime_context,
             previous_node_results=plan_input.previous_node_results,
         )
         usage_record = usage_record_from_response(response, stage="planner")
@@ -268,8 +268,8 @@ def build_plan_input(
         ),
         artifacts=_normalize_artifact_context(artifacts),
         previous_node_results=[item for item in previous_node_results if isinstance(item, dict)],
-        runtime_hints=resolved_runtime_context.to_legacy_hints(),
-        runtime_context=resolved_runtime_context,
+        runtime_context=resolved_runtime_context.to_legacy_hints(),
+        typed_runtime_context=resolved_runtime_context,
         instructions=[str(item).strip() for item in (instructions or []) if str(item).strip()],
     )
 

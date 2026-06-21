@@ -83,12 +83,14 @@ def test_build_plan_input_normalizes_artifacts_and_hints() -> None:
     assert plan_input.current_user_input == "把刚刚那个报告发我"
     assert plan_input.artifacts[0]["ref"] == "report-1"
     assert plan_input.artifacts[0]["name"] == "rag_eval_report.md"
-    assert plan_input.runtime_hints["active_repo"] == "jarvis"
-    assert plan_input.runtime_hints["current_date"]
-    assert plan_input.runtime_hints["current_time"]
-    assert plan_input.runtime_hints["timezone"] == "Asia/Shanghai"
-    assert plan_input.runtime_context.repo.active_repo == "jarvis"
-    assert "runtime_context" not in plan_input.model_dump(mode="json")
+    assert plan_input.runtime_context["active_repo"] == "jarvis"
+    assert plan_input.runtime_context["current_date"]
+    assert plan_input.runtime_context["current_time"]
+    assert plan_input.runtime_context["timezone"] == "Asia/Shanghai"
+    assert plan_input.typed_runtime_context.repo.active_repo == "jarvis"
+    dumped = plan_input.model_dump(mode="json")
+    assert "runtime_hints" not in dumped
+    assert "typed_runtime_context" not in dumped
 
 
 def test_plan_from_payload_derives_llm_finalization_for_non_llm_nodes() -> None:
@@ -280,7 +282,7 @@ real_llm = pytest.mark.skipif(
 @real_llm
 def test_turn_planner_real_llm_creates_artifact_delivery_node() -> None:
     get_settings.cache_clear()
-    plan = TurnPlanner(prompt_version="v5").plan(
+    plan = TurnPlanner(prompt_version="v6").plan(
         content="把刚刚那个报告发我",
         recent_artifacts=[
             {
@@ -305,7 +307,7 @@ def test_turn_planner_real_llm_creates_artifact_delivery_node() -> None:
 @real_llm
 def test_turn_planner_real_llm_reuses_previous_node_result_for_replan() -> None:
     get_settings.cache_clear()
-    plan = TurnPlanner(prompt_version="v5").plan(
+    plan = TurnPlanner(prompt_version="v6").plan(
         content="根据刚才的调研结果，评估 jarvis 是否需要调整。",
         session_state=ConversationSessionState(session_mode="coding", active_repo_id="jarvis"),
         previous_node_results=[
