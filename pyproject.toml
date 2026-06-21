@@ -42,6 +42,9 @@ packages = ["app"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "slow: slow test (e.g. real LLM calls, opt-in only)",
+]
 norecursedirs = [
     ".git",
     ".mypy_cache",

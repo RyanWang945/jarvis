@@ -39,7 +39,7 @@ def test_context_contract_keeps_current_turn_contract_under_tight_budget() -> No
             SimpleNamespace(id=1, status="completed", started_at="2026-05-01T00:00:00Z"),
             SimpleNamespace(id=2, status="running", started_at="2026-05-01T00:01:00Z"),
         ],
-        session_state=ConversationSessionState(session_mode="coding", active_repo_id="jarvis"),
+        session_state=ConversationSessionState(session_mode="coding"),
         task_plan={
             "objective": "修改 jarvis-architecture-v3.png 的路由关系",
         },
@@ -61,7 +61,7 @@ def test_context_contract_keeps_current_turn_contract_under_tight_budget() -> No
 
     assert model_messages[0].role == "system"
     assert "Conversation session state:" in system
-    assert "Active repository: jarvis" in system
+    assert "jarvis:" in system
     assert "Current turn objective:" in system
     assert "修改 jarvis-architecture-v3.png 的路由关系" in system
     assert "Recent artifacts:" in system

@@ -413,9 +413,10 @@ def test_task_runtime_injects_history_context_only_into_planning(tmp_path: Path)
     fast_payload = context.fast_payload()
     assert planner_payload["context_reference_detected"] is True
     assert fast_payload["context_reference_detected"] is True
+    # History context is now embedded as messages (some compressed as role:system)
     assert any("ContextManager" in item["content"] for item in planner_payload["messages"])
-    assert planner_payload["summary_node"]["kind"] == "compressed_history"
-    assert "ContextManager" in planner_payload["summary_node"]["content"]
+    # No separate summary_node field — compression is baked into messages
+    assert "summary_node" not in planner_payload
     assert not hasattr(llm_runtime.calls[-1], "conversation_context")
 
 

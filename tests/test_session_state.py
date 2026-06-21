@@ -17,7 +17,6 @@ def test_load_session_state_defaults_from_empty_metadata() -> None:
 def test_session_state_round_trips_under_metadata_namespace() -> None:
     state = ConversationSessionState(
         session_mode="research",
-        active_repo_id="jarvis",
         session_goal="compare runtime designs",
         working_summary="Keep the session state lightweight.",
         waiting_for="approval",
@@ -36,7 +35,6 @@ def test_session_state_round_trips_under_metadata_namespace() -> None:
     loaded = load_session_state({"unrelated": True, **metadata})
 
     assert metadata["session"]["session_mode"] == "research"
-    assert metadata["session"]["active_repo_id"] == "jarvis"
     assert metadata["session"]["pending_user_question"] == "Which repository should I use?"
     assert loaded == state
 
@@ -62,7 +60,6 @@ def test_render_session_state_is_status_friendly() -> None:
 
     assert "Session State" in rendered
     assert "Mode: coding" in rendered
-    assert "Active repo: -" in rendered
     assert "Goal: -" in rendered
 
 
@@ -70,7 +67,6 @@ def test_render_session_state_for_model_omits_debug_only_fields() -> None:
     rendered = render_session_state_for_model(
         ConversationSessionState(
             session_mode="research",
-            active_repo_id="jarvis",
             session_goal="compare runtime designs",
             working_summary="Keep the context lightweight.",
             waiting_for="user",
@@ -86,7 +82,6 @@ def test_render_session_state_for_model_omits_debug_only_fields() -> None:
     assert rendered is not None
     assert "Conversation session state:" in rendered
     assert "Mode: research" in rendered
-    assert "Active repository: jarvis" in rendered
     assert "Goal: compare runtime designs" in rendered
     assert "Working summary: Keep the context lightweight." in rendered
     assert "Pending user clarification:" in rendered
@@ -104,7 +99,6 @@ def test_build_session_state_after_turn_preserves_working_summary() -> None:
     state = build_session_state_after_turn(
         ConversationSessionState(
             session_mode="research",
-            active_repo_id="jarvis",
             session_goal="compare runtime designs",
             working_summary="Do not overwrite this conservatively maintained summary.",
             waiting_for="tool",
@@ -115,7 +109,6 @@ def test_build_session_state_after_turn_preserves_working_summary() -> None:
     )
 
     assert state.session_mode == "research"
-    assert state.active_repo_id == "jarvis"
     assert state.session_goal == "compare runtime designs"
     assert state.working_summary == "Do not overwrite this conservatively maintained summary."
     assert state.waiting_for is None

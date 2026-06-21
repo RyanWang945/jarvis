@@ -98,7 +98,7 @@ def test_obsidian_wiki_tools_run_inside_react_runtime() -> None:
         assert result.status == "completed"
         assert result.summary == "wiki-applied"
 
-        tool_calls = result.data["tool_calls"]
+        tool_calls = result.tool_calls
         assert [tool_call["tool_name"] for tool_call in tool_calls] == ["obsidian_wiki_draft", "obsidian_wiki_apply"]
         assert all(tool_call["status"] == "completed" for tool_call in tool_calls)
         assert (vault_path / "vault" / "projects" / "jarvis" / "designs" / "runtime-draft.md").exists()

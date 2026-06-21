@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 
-from app.agent_react.context_manager import ConversationContext
+from app.agent_react.context_manager import ContextMessage, ConversationContext
 from app.agent_react.session_state import ConversationSessionState
 from app.task_runtime.fast_intent import FastIntentDecision
 from app.task_runtime.planning_router import PlanningRouter
@@ -165,13 +165,13 @@ def test_planning_router_needs_plan_waits_for_planner() -> None:
 
     result = router.plan(
         content="先查资料再 review jarvis",
-        session_state=ConversationSessionState(session_mode="coding", active_repo_id="jarvis"),
+        session_state=ConversationSessionState(session_mode="coding"),
     )
 
     assert result.route == "planned"
     assert [node.runtime for node in result.plan.nodes] == ["react", "coder"]
     assert result.plan.nodes[1].input_refs == ["node:research"]
-    assert fast.calls == 0
+    assert fast.calls == 1
 
 
 def test_planning_router_previous_node_results_force_planner() -> None:
@@ -224,8 +224,14 @@ def test_planning_router_context_reference_forces_planner() -> None:
     result = router.plan(
         content="继续刚才那个方案",
         conversation_context=ConversationContext(
-            summary="User and assistant discussed the ContextManager history plan.",
-            messages=(),
+            messages=(
+                ContextMessage(
+                    role="system",
+                    content="[对话历史] User and assistant discussed the ContextManager history plan.",
+                    is_compressed=True,
+                    compression_level="batch",
+                ),
+            ),
             context_reference_detected=True,
         ),
     )

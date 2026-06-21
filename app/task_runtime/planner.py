@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Any, Literal
@@ -17,6 +18,7 @@ from app.llm.model_profiles import LLMNode
 from app.llm.model_router import ModelRouter
 from app.prompting import PromptRegistry
 from app.runtime_usage import usage_record_from_response
+from app.repositories import get_repository_registry
 from app.task_runtime.runtime_context import RuntimeContext
 
 logger = logging.getLogger(__name__)
@@ -32,6 +34,7 @@ class PlanNode(BaseModel):
     id: str
     runtime: NodeRuntime
     objective: str
+    repo_id: str | None = None
     input_refs: list[str] = Field(default_factory=list)
     output_hint: str = ""
 
@@ -112,15 +115,19 @@ class TurnPlannerResult:
 
 
 class PlanInput(BaseModel):
-    model_config = ConfigDict(extra="ignore", arbitrary_types_allowed=True)
+    model_config = ConfigDict(extra="ignore")
 
     current_user_input: str
     conversation_context: dict[str, Any] = Field(default_factory=dict)
     artifacts: list[dict[str, Any]] = Field(default_factory=list)
     previous_node_results: list[dict[str, Any]] = Field(default_factory=list)
     runtime_context: dict[str, Any] = Field(default_factory=dict)
-    typed_runtime_context: RuntimeContext = Field(default_factory=lambda: RuntimeContext.from_hints({}), exclude=True)
     instructions: list[str] = Field(default_factory=list)
+    registered_repositories: list[dict[str, str]] = Field(default_factory=list)
+
+    @property
+    def typed_runtime_context(self) -> RuntimeContext:
+        return RuntimeContext.from_hints(self.runtime_context)
 
     @field_validator("current_user_input")
     @classmethod
@@ -192,7 +199,6 @@ class TurnPlanner:
             return TurnPlannerResult(
                 plan=_fallback_plan_for_objective(
                     plan_input.current_user_input,
-                    runtime_context=plan_input.typed_runtime_context,
                     known_artifact_refs=_known_artifact_refs(plan_input.artifacts),
                     previous_node_results=plan_input.previous_node_results,
                 )
@@ -232,7 +238,6 @@ class TurnPlanner:
             payload,
             fallback_objective=plan_input.current_user_input,
             known_artifact_refs=_known_artifact_refs(plan_input.artifacts),
-            runtime_context=plan_input.typed_runtime_context,
             previous_node_results=plan_input.previous_node_results,
         )
         usage_record = usage_record_from_response(response, stage="planner")
@@ -251,8 +256,6 @@ def build_plan_input(
     instructions: list[str] | None = None,
 ) -> PlanInput:
     resolved_runtime_context = runtime_context or RuntimeContext.from_hints({})
-    if session_state is not None and not resolved_runtime_context.repo.active_repo:
-        resolved_runtime_context = resolved_runtime_context.with_hints({"active_repo": session_state.active_repo_id})
     resolved_runtime_context = RuntimeContext.from_hints(_ensure_temporal_hints(resolved_runtime_context.to_legacy_hints()))
     return PlanInput(
         current_user_input=current_user_input,
@@ -262,16 +265,23 @@ def build_plan_input(
             else {
                 "has_history": False,
                 "context_reference_detected": False,
-                "summary_node": None,
                 "messages": [],
             }
         ),
         artifacts=_normalize_artifact_context(artifacts),
         previous_node_results=[item for item in previous_node_results if isinstance(item, dict)],
         runtime_context=resolved_runtime_context.to_legacy_hints(),
-        typed_runtime_context=resolved_runtime_context,
         instructions=[str(item).strip() for item in (instructions or []) if str(item).strip()],
+        registered_repositories=_registered_repo_list(),
     )
+
+
+def _registered_repo_list() -> list[dict[str, str]]:
+    try:
+        repos = get_repository_registry().list_repositories()
+    except Exception:
+        return []
+    return [{"repo_id": repo.repo_id, "name": repo.name} for repo in repos]
 
 
 def _planner_messages(
@@ -382,10 +392,8 @@ def _plan_from_payload(
     *,
     fallback_objective: str,
     known_artifact_refs: set[str] | None = None,
-    runtime_context: RuntimeContext | None = None,
     previous_node_results: list[dict[str, Any]] | None = None,
 ) -> ExecutionPlan:
-    resolved_runtime_context = runtime_context or RuntimeContext.from_hints({})
     candidate = payload.get("plan") if isinstance(payload.get("plan"), dict) else payload
     if not isinstance(candidate, dict):
         artifact_delivery = _fallback_artifact_delivery_plan(fallback_objective, known_artifact_refs)
@@ -393,7 +401,6 @@ def _plan_from_payload(
             return artifact_delivery
         intent_fallback = _fallback_plan_for_objective(
             fallback_objective,
-            runtime_context=resolved_runtime_context,
             known_artifact_refs=known_artifact_refs,
             previous_node_results=previous_node_results,
         )
@@ -415,7 +422,6 @@ def _plan_from_payload(
             return artifact_delivery
         intent_fallback = _fallback_plan_for_objective(
             fallback_objective,
-            runtime_context=resolved_runtime_context,
             known_artifact_refs=known_artifact_refs,
             previous_node_results=previous_node_results,
         )
@@ -531,7 +537,6 @@ def _is_valid_input_ref(value: str) -> bool:
 def _fallback_plan_for_objective(
     objective: str,
     *,
-    runtime_context: RuntimeContext | None = None,
     known_artifact_refs: set[str] | None = None,
     previous_node_results: list[dict[str, Any]] | None = None,
 ) -> ExecutionPlan | None:
@@ -539,10 +544,12 @@ def _fallback_plan_for_objective(
     if artifact_delivery is not None:
         return artifact_delivery
 
-    active_repo = (runtime_context or RuntimeContext.from_hints({})).repo.active_repo
-    repo_task = bool(active_repo and _looks_like_repo_task(objective, active_repo))
+    registered = _registered_repo_list()
+    matched_repo = _match_registered_repo(objective, registered)
+    repo_task = matched_repo is not None or _looks_like_repo_task(objective)
     reminder_task = _looks_like_reminder_task(objective)
     previous_refs = _previous_node_refs(previous_node_results)
+    repo_id = matched_repo or (registered[0]["repo_id"] if registered else None)
 
     if repo_task and reminder_task:
         return ExecutionPlan(
@@ -555,7 +562,8 @@ def _fallback_plan_for_objective(
                 PlanNode(
                     id="repo_report",
                     runtime="coder",
-                    objective=f"Review the {active_repo} repository for the user request and produce the requested markdown report / 报告: {objective}",
+                    repo_id=repo_id,
+                    objective=f"Review the {repo_id or 'registered'} repository for the user request and produce the requested markdown report / 报告: {objective}",
                     input_refs=previous_refs,
                     output_hint="Markdown report / 报告 covering the repository findings.",
                 ),
@@ -573,7 +581,7 @@ def _fallback_plan_for_objective(
         areas = _code_business_areas(objective)
         return _fallback_coarse_code_plan(
             objective=objective,
-            active_repo=active_repo,
+            repo_id=repo_id or "",
             areas=areas,
             previous_refs=previous_refs,
         )
@@ -589,7 +597,8 @@ def _fallback_plan_for_objective(
                 PlanNode(
                     id="repo_task",
                     runtime="coder",
-                    objective=f"Use the {active_repo} repository to complete the user request: {objective}",
+                    repo_id=repo_id,
+                    objective=f"Use the {repo_id or 'registered'} repository to complete the user request: {objective}",
                     input_refs=previous_refs,
                     output_hint="Repository-grounded result for the user request.",
                 )
@@ -662,12 +671,23 @@ def _looks_like_artifact_delivery(objective: str) -> bool:
     return any(term in text for term in delivery_terms) and any(term in text for term in artifact_terms)
 
 
-def _looks_like_repo_task(objective: str, active_repo: str) -> bool:
+def _match_registered_repo(objective: str, registered: list[dict[str, str]]) -> str | None:
+    text = str(objective or "").strip().lower()
+    if not text:
+        return None
+    for repo in registered:
+        repo_id = repo["repo_id"].lower()
+        name = repo.get("name", "").lower()
+        if _contains_token(text, repo_id) or (name and _contains_token(text, name)):
+            return repo["repo_id"]
+    return None
+
+
+def _looks_like_repo_task(objective: str) -> bool:
     text = str(objective or "").strip().lower()
     if not text:
         return False
     repo_markers = (
-        active_repo.lower(),
         "repo",
         "repository",
         "project",
@@ -684,6 +704,14 @@ def _looks_like_repo_task(objective: str, active_repo: str) -> bool:
         "markdown",
     )
     return any(marker and marker in text for marker in repo_markers)
+
+
+def _contains_token(text: str, token: str) -> bool:
+    if not token:
+        return False
+    if token.isascii():
+        return re.search(rf"(?<![A-Za-z0-9_-]){re.escape(token)}(?![A-Za-z0-9_-])", text) is not None
+    return token in text
 
 
 def _looks_like_coarse_code_decomposition_task(objective: str) -> bool:
@@ -749,7 +777,7 @@ def _code_business_areas(objective: str) -> list[str]:
 def _fallback_coarse_code_plan(
     *,
     objective: str,
-    active_repo: str,
+    repo_id: str,
     areas: list[str],
     previous_refs: list[str],
 ) -> ExecutionPlan:
@@ -763,8 +791,9 @@ def _fallback_coarse_code_plan(
             PlanNode(
                 id=node_id,
                 runtime="coder",
+                repo_id=repo_id,
                 objective=(
-                    f"在 {active_repo} 仓库按粗粒度业务板块实现 {area} 相关代码改动，"
+                    f"在 {repo_id} 仓库按粗粒度业务板块实现 {area} 相关代码改动，"
                     f"保持任务边界在业务能力层，不拆成低层文件操作或单个测试步骤：{objective}"
                 ),
                 input_refs=previous_refs,
@@ -779,8 +808,9 @@ def _fallback_coarse_code_plan(
             PlanNode(
                 id="integrate_business_code",
                 runtime="coder",
+                repo_id=repo_id,
                 objective=(
-                    f"合并 / integrate {active_repo} 仓库中不同业务实现节点的代码结果，处理跨业务接口、数据流和冲突，"
+                    f"合并 / integrate {repo_id} 仓库中不同业务实现节点的代码结果，处理跨业务接口、数据流和冲突，"
                     f"不要拆成低层文件操作：{objective}"
                 ),
                 input_refs=implementation_refs,
@@ -793,9 +823,10 @@ def _fallback_coarse_code_plan(
             id="code_review",
             runtime="coder",
             objective=(
-                f"Review / 代码审查 {active_repo} 仓库的粗粒度代码改动，聚焦业务正确性、集成风险、回归风险和是否满足用户要求：{objective}"
+                f"Review / 代码审查 {repo_id} 仓库的粗粒度代码改动，聚焦业务正确性、集成风险、回归风险和是否满足用户要求：{objective}"
             ),
             input_refs=[integration_ref],
+            repo_id=repo_id,
             output_hint="代码 review 结论、发现的问题、建议修复项和可交付状态。",
         )
     )

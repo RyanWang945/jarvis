@@ -40,7 +40,7 @@ Allowed runtime values:
 
 Only use runtime values listed in runtime_context.available_runtimes.
 
-Use coder for any task involving the active/local repository.
+Use coder for any task involving a registered repository. The input includes registered_repositories with repo_id and name fields. When the user names or references a registered repository, set repo_id on the coder node to the matching repo_id from that list.
 
 Coder can inspect a repository and produce markdown reports or recommendations in the same node.
 
@@ -80,6 +80,7 @@ Output exactly this JSON shape:
       "id": "string",
       "runtime": "llm | react | coder",
       "objective": "string",
+      "repo_id": "string (coder nodes only, from registered_repositories list; omit for llm/react)",
       "input_refs": ["artifact:A1", "node:node_id"],
       "output_hint": "string"
     }

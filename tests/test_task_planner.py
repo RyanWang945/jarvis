@@ -77,17 +77,14 @@ def test_build_plan_input_normalizes_artifacts_and_hints() -> None:
         artifacts=[{"id": "report-1", "filename": "rag_eval_report.md", "summary": "RAG report"}],
         previous_node_results=[],
         runtime_context=RuntimeContext.from_hints({"available_runtimes": ["llm", "react"]}),
-        session_state=ConversationSessionState(active_repo_id="jarvis"),
     )
 
     assert plan_input.current_user_input == "把刚刚那个报告发我"
     assert plan_input.artifacts[0]["ref"] == "report-1"
     assert plan_input.artifacts[0]["name"] == "rag_eval_report.md"
-    assert plan_input.runtime_context["active_repo"] == "jarvis"
     assert plan_input.runtime_context["current_date"]
     assert plan_input.runtime_context["current_time"]
     assert plan_input.runtime_context["timezone"] == "Asia/Shanghai"
-    assert plan_input.typed_runtime_context.repo.active_repo == "jarvis"
     dumped = plan_input.model_dump(mode="json")
     assert "runtime_hints" not in dumped
     assert "typed_runtime_context" not in dumped
@@ -193,7 +190,6 @@ def test_plan_from_payload_does_not_parse_branch_hints_in_backend() -> None:
             ],
         },
         fallback_objective="在feat/test 里写个快排吧，用python写",
-        runtime_context=RuntimeContext.from_hints({"active_repo": "smoke-test"}),
     )
 
     assert not hasattr(plan.nodes[0], "runtime_hints")
@@ -217,7 +213,6 @@ def test_plan_from_payload_ignores_node_runtime_hints() -> None:
             ],
         },
         fallback_objective="基于 main 创建 feat/my-skill 分支继续开发",
-        runtime_context=RuntimeContext.from_hints({"active_repo": "smoke-test"}),
     )
 
     assert not hasattr(plan.nodes[0], "runtime_hints")
@@ -241,7 +236,6 @@ def test_plan_from_payload_falls_back_to_repo_then_reminder_dag_for_empty_nodes(
     plan = _plan_from_payload(
         {"user_objective": "先 review jarvis 的 agent runtime 重构风险，生成一份 markdown 报告，最后今晚 11 点提醒我看报告。", "nodes": []},
         fallback_objective="先 review jarvis 的 agent runtime 重构风险，生成一份 markdown 报告，最后今晚 11 点提醒我看报告。",
-        runtime_context=RuntimeContext.from_hints({"active_repo": "jarvis"}),
     )
 
     assert [node.runtime for node in plan.nodes] == ["coder", "react"]
@@ -257,7 +251,6 @@ def test_plan_from_payload_falls_back_to_coarse_code_business_dag_for_empty_node
     plan = _plan_from_payload(
         {"user_objective": objective, "nodes": []},
         fallback_objective=objective,
-        runtime_context=RuntimeContext.from_hints({"active_repo": "jarvis"}),
     )
 
     assert len(plan.nodes) == 5
@@ -309,7 +302,7 @@ def test_turn_planner_real_llm_reuses_previous_node_result_for_replan() -> None:
     get_settings.cache_clear()
     plan = TurnPlanner(prompt_version="v6").plan(
         content="根据刚才的调研结果，评估 jarvis 是否需要调整。",
-        session_state=ConversationSessionState(session_mode="coding", active_repo_id="jarvis"),
+        session_state=ConversationSessionState(session_mode="coding"),
         previous_node_results=[
             {
                 "node_id": "research_agent_sdk",

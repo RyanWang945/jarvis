@@ -32,6 +32,7 @@ from app.task_runtime.node_result import NodeArtifact, NodeError, NodeResult, Re
 from app.task_runtime.planner import PlanNode
 from app.task_runtime.runtime_context import (
     RuntimeContext,
+    truncate,
 )
 from app.task_runtime.session_workspace import (
     NodeRepoCommit,
@@ -66,10 +67,10 @@ class NodeExecutionContext:
     legacy_hints: dict[str, Any] = field(default_factory=dict)
     instructions: list[str] = field(default_factory=list)
     usage_records: list[dict[str, Any]] = field(default_factory=list)
-    runtime_context: RuntimeContext = field(init=False, repr=False, compare=False)
 
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "runtime_context", RuntimeContext.from_hints(self.legacy_hints))
+    @property
+    def runtime_context(self) -> RuntimeContext:
+        return RuntimeContext.from_hints(self.legacy_hints)
 
 
 class NodeExecuteRuntime(Protocol):
@@ -202,8 +203,8 @@ class LLMNodeExecuteRuntime:
             "status": status,
             "tool_name": tool.name,
             "summary": result.summary,
-            "stdout": _truncate(_tool_observation_stdout(tool.name, result.stdout)),
-            "stderr": _truncate(result.stderr),
+            "stdout": truncate(_tool_observation_stdout(tool.name, result.stdout)),
+            "stderr": truncate(result.stderr),
         }
         return observation, record
 
@@ -360,7 +361,7 @@ class ReactNodeExecuteRuntime:
             result.exit_code,
             len(result.tool_artifacts) + len(result.artifacts),
             int((time.perf_counter() - started) * 1000),
-            _truncate(result.summary, limit=300),
+            truncate(result.summary, limit=300),
         )
         record.update(
             {
@@ -379,8 +380,8 @@ class ReactNodeExecuteRuntime:
             "status": status,
             "tool_name": tool.name,
             "summary": result.summary,
-            "stdout": _truncate(_tool_observation_stdout(tool.name, result.stdout)),
-            "stderr": _truncate(result.stderr),
+            "stdout": truncate(_tool_observation_stdout(tool.name, result.stdout)),
+            "stderr": truncate(result.stderr),
             "artifacts": list(result.artifacts),
             "tool_artifacts": [_tool_artifact_dict(item) for item in result.tool_artifacts],
         }
@@ -516,7 +517,7 @@ class CoderNodeExecuteRuntime:
             result.exit_code,
             len(result.artifacts),
             int((time.perf_counter() - started) * 1000),
-            _truncate(node_result.summary, limit=300),
+            truncate(node_result.summary, limit=300),
         )
         return node_result
 
@@ -827,7 +828,7 @@ def _react_summary_from_tool_calls(tool_calls: list[dict[str, Any]]) -> str:
         tool_name = str(record.get("tool_name") or "tool").strip()
         summary = str(record.get("summary") or "").strip()
         if summary:
-            lines.append(f"- {tool_name}: {_truncate(summary, limit=500)}")
+            lines.append(f"- {tool_name}: {truncate(summary, limit=500)}")
         if len(lines) >= 5:
             break
     return "\n".join(lines)
@@ -856,7 +857,7 @@ def _summary_from_mapping(value: dict[str, Any]) -> str:
                 return summary
     if not value:
         return ""
-    return _truncate(json.dumps(value, ensure_ascii=False), limit=1200)
+    return truncate(json.dumps(value, ensure_ascii=False), limit=1200)
 
 
 def _summary_from_list(items: list[Any]) -> str:
@@ -885,7 +886,7 @@ def _summary_from_item(item: dict[str, Any]) -> str:
         if isinstance(value, str) and value.strip():
             return value.strip()
     compact = {key: value for key, value in item.items() if key not in {"url", "source_url"}}
-    return _truncate(json.dumps(compact or item, ensure_ascii=False), limit=400)
+    return truncate(json.dumps(compact or item, ensure_ascii=False), limit=400)
 
 
 def _first_item_text(item: dict[str, Any], keys: tuple[str, ...]) -> str:
@@ -1130,13 +1131,6 @@ def _tool_artifact_dict(artifact: Any) -> dict[str, Any]:
     }
 
 
-def _truncate(value: str, *, limit: int = 4000) -> str:
-    text = str(value or "")
-    if len(text) <= limit:
-        return text
-    return text[:limit] + "\n...[truncated]"
-
-
 def _optional_text(value: Any) -> str | None:
     if value is None:
         return None
@@ -1223,9 +1217,10 @@ def _llm_coder_git_context(
             "id": context.node.id,
             "objective": context.node.objective,
             "output_hint": context.node.output_hint,
+            "repo_id": context.node.repo_id,
         },
         "runtime_context": context.legacy_hints,
-        "selected_repo": getattr(repo, "repo_id", None),
+        "selected_repo": context.node.repo_id or getattr(repo, "repo_id", None),
         "repositories": _registered_repo_facts(registry),
     }
     messages = [
@@ -1357,6 +1352,8 @@ def _plain_text(value: Any) -> str:
 
 
 def _active_repo(context: NodeExecutionContext, *, registry: RepositoryRegistry | None = None) -> str | None:
+    if context.node.repo_id:
+        return context.node.repo_id
     if context.runtime_context.repo.active_repo:
         return context.runtime_context.repo.active_repo
     if registry is not None:

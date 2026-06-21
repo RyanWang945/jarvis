@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
@@ -34,7 +33,7 @@ from app.persistence.models import (
     TurnRecord,
     UserRecord,
 )
-from app.repositories import RepositoryRegistryError, get_repository_registry, render_repository_report
+from app.repositories import render_repository_report
 
 logger = logging.getLogger(__name__)
 
@@ -112,50 +111,21 @@ def _turn_type(content: str) -> str:
 
 def _task_runtime_ingest_classification(content: str, session_state: ConversationSessionState) -> tuple[str, dict[str, Any], ConversationSessionState]:
     turn_type = _turn_type(content)
-    repo_id = _detect_registered_repo_reference(content)
-    updated_session = session_state
-    target_resources: list[dict[str, str]] = []
-    if repo_id:
-        target_resources.append({"type": "repository", "id": repo_id})
-        updated_session = replace(updated_session, session_mode="coding", active_repo_id=repo_id)
     metadata = {
         "source": "task_runtime_ingest",
-        "scene": "project" if repo_id else "chat",
+        "scene": "chat",
         "access": "read",
         "deliver": False,
         "confidence": 1.0,
         "reason": "Legacy turn classifier skipped for task runtime; PlanningRouter owns routing.",
-        "session_mode_update": updated_session.session_mode if updated_session != session_state else None,
-        "active_repo_id_update": repo_id,
-        "target_resources": target_resources,
+        "session_mode_update": None,
+        "active_repo_id_update": None,
+        "target_resources": [],
         "task_plan": {},
         "routing_basis": "task_runtime",
     }
-    return turn_type, metadata, updated_session
+    return turn_type, metadata, session_state
 
-
-def _detect_registered_repo_reference(content: str) -> str | None:
-    text = str(content or "").lower()
-    if not text.strip():
-        return None
-    try:
-        repositories = get_repository_registry().list_repositories()
-    except (RepositoryRegistryError, OSError):
-        return None
-    for repo in repositories:
-        repo_id = repo.repo_id.lower()
-        name = repo.name.lower()
-        if _contains_token(text, repo_id) or (name and _contains_token(text, name)):
-            return repo.repo_id
-    return None
-
-
-def _contains_token(text: str, token: str) -> bool:
-    if not token:
-        return False
-    if token.isascii():
-        return re.search(rf"(?<![A-Za-z0-9_-]){re.escape(token)}(?![A-Za-z0-9_-])", text) is not None
-    return token in text
 
 
 class MySQLConversationStore:

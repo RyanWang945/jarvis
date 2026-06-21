@@ -13,6 +13,7 @@ from app.llm.provider_adapters import NormalizedLLMResponse, NormalizedToolCall
 from app.llm.model_profiles import LLMNode
 from app.llm.model_router import ModelRouter
 from app.prompting import PromptRegistry
+from app.repositories import get_repository_registry
 from app.runtime_usage import usage_record_from_response
 from app.task_runtime.runtime_context import RuntimeContext
 
@@ -106,7 +107,6 @@ def _fast_intent_messages(
             "input_json": json.dumps(
                 {
                     "session_mode": session_state.session_mode,
-                    "active_repo_id": session_state.active_repo_id,
                     "session_goal": session_state.session_goal,
                     "working_summary": session_state.working_summary,
                     "temporal_context": _temporal_context(resolved_runtime_context),
@@ -116,11 +116,11 @@ def _fast_intent_messages(
                         else {
                             "has_history": False,
                             "context_reference_detected": False,
-                            "summary": None,
                             "recent_messages": [],
                         }
                     ),
                     "recent_artifacts": recent_artifacts,
+                    "registered_repositories": _registered_repo_list(),
                     "message": text,
                 },
                 ensure_ascii=False,
@@ -131,6 +131,14 @@ def _fast_intent_messages(
 
 def _temporal_context(runtime_context: RuntimeContext) -> dict[str, str]:
     return runtime_context.temporal.as_payload()
+
+
+def _registered_repo_list() -> list[dict[str, str]]:
+    try:
+        repos = get_repository_registry().list_repositories()
+    except Exception:
+        return []
+    return [{"repo_id": repo.repo_id, "name": repo.name} for repo in repos]
 
 
 def _fast_intent_model_metadata(model_profile: str | None) -> dict[str, Any]:

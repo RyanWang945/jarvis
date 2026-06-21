@@ -289,38 +289,7 @@ def _should_skip_fast_intent(
         return True
     if conversation_context is not None and conversation_context.context_reference_detected:
         return True
-    active_repo = (
-        runtime_context.repo.active_repo or str(getattr(session_state, "active_repo_id", None) or "").strip()
-    ).lower()
-    if active_repo and _looks_like_repo_or_action_plan(content, active_repo):
-        return True
     return False
-
-
-def _looks_like_repo_or_action_plan(content: str, active_repo: str) -> bool:
-    text = str(content or "").strip().lower()
-    if not text:
-        return False
-    markers = (
-        active_repo,
-        "repo",
-        "repository",
-        "项目",
-        "仓库",
-        "代码",
-        "review",
-        "重构",
-        "风险",
-        "评估",
-        "调整",
-        "报告",
-        "markdown",
-        "提醒",
-        "remind",
-        "agent runtime",
-        "task graph",
-    )
-    return any(marker and marker in text for marker in markers)
 
 
 def _can_use_fast_reply(

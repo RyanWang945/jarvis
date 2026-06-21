@@ -16,6 +16,7 @@ from app.prompting import PromptRegistry
 from app.runtime_usage import usage_record_from_response
 from app.task_runtime.node_result import NodeArtifact, NodeError, NodeResult, NodeStatus
 from app.task_runtime.planner import PlanNode
+from app.task_runtime.runtime_context import truncate
 
 logger = logging.getLogger(__name__)
 
@@ -59,8 +60,8 @@ class LLMCodeNodeFinalizerAgent:
             "provider_ok": request.provider_ok,
             "provider_summary": request.provider_summary,
             "exit_code": request.exit_code,
-            "stdout": _truncate(request.stdout, limit=self.max_stdout_chars),
-            "stderr": _truncate(request.stderr, limit=self.max_stderr_chars),
+            "stdout": truncate(request.stdout, limit=self.max_stdout_chars),
+            "stderr": truncate(request.stderr, limit=self.max_stderr_chars),
             "manifest": request.manifest or {},
             "metadata": _jsonable(request.metadata),
         }
@@ -442,13 +443,6 @@ def _optional_text(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
-
-
-def _truncate(value: Any, *, limit: int) -> str:
-    text = str(value or "")
-    if len(text) <= limit:
-        return text
-    return text[: max(0, limit - 3)].rstrip() + "..."
 
 
 def _jsonable(value: Any) -> Any:

@@ -15,7 +15,6 @@ _WAITING_FOR = {"user", "approval", "tool", "external"}
 class ConversationSessionState:
     version: int = 1
     session_mode: SessionMode = "chat"
-    active_repo_id: str | None = None
     session_goal: str | None = None
     working_summary: str | None = None
     waiting_for: WaitingFor = None
@@ -40,7 +39,6 @@ def load_session_state(metadata: dict[str, Any] | None) -> ConversationSessionSt
     return ConversationSessionState(
         version=_coerce_int(raw.get("version"), default=1) or 1,
         session_mode=_coerce_session_mode(raw.get("session_mode")),
-        active_repo_id=_coerce_optional_str(raw.get("active_repo_id")),
         session_goal=_coerce_optional_str(raw.get("session_goal")),
         working_summary=_coerce_optional_str(raw.get("working_summary")),
         waiting_for=_coerce_waiting_for(raw.get("waiting_for")),
@@ -64,7 +62,6 @@ def render_session_state(state: ConversationSessionState) -> str:
     return (
         "Session State\n"
         f"Mode: {state.session_mode}\n"
-        f"Active repo: {_display_value(state.active_repo_id)}\n"
         f"Goal: {_display_value(state.session_goal)}\n"
         f"Waiting: {_display_value(state.waiting_for)}\n"
         f"Pending question: {_display_value(state.pending_user_question)}\n"
@@ -76,8 +73,6 @@ def render_session_state(state: ConversationSessionState) -> str:
 
 def render_session_state_for_model(state: ConversationSessionState) -> str | None:
     lines = [f"Mode: {state.session_mode}"]
-    if state.active_repo_id:
-        lines.append(f"Active repository: {state.active_repo_id}")
     if state.session_goal:
         lines.append(f"Goal: {state.session_goal}")
     if state.working_summary:

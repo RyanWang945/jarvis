@@ -172,7 +172,7 @@ def run_case(planner: TurnPlanner, case: PlannerEvalCase) -> dict[str, Any]:
     runtime_context = RuntimeContext.from_hints(case.runtime_context)
     plan = planner.plan(
         content=case.message,
-        session_state=ConversationSessionState(session_mode="coding", active_repo_id=case.runtime_context.get("active_repo")),
+        session_state=ConversationSessionState(session_mode="coding"),
         recent_artifacts=case.artifacts,
         previous_node_results=case.previous_node_results,
         runtime_context=runtime_context,
@@ -190,7 +190,7 @@ def run_router_case(router: PlanningRouter, case: PlannerEvalCase) -> dict[str, 
     runtime_context = RuntimeContext.from_hints(case.runtime_context)
     result = router.plan(
         content=case.message,
-        session_state=ConversationSessionState(session_mode="coding", active_repo_id=case.runtime_context.get("active_repo")),
+        session_state=ConversationSessionState(session_mode="coding"),
         recent_artifacts=case.artifacts,
         previous_node_results=case.previous_node_results,
         runtime_context=runtime_context,

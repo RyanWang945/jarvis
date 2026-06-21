@@ -50,6 +50,7 @@ class Settings(BaseSettings):
     coder_runtime_provider: str = "codex"
     coder_timeout_seconds: int = 1800
     coder_node_finalizer_llm_enabled: bool = False
+    react_runtime_backend: str = "builtin"  # builtin | claude_agent_sdk
     repositories_config_path: Path | None = Field(default=Path("data/repositories.json"))
     deepseek_api_key: str | None = None
     deepseek_base_url: str = "https://api.deepseek.com"

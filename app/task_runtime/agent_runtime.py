@@ -1,19 +1,14 @@
 from __future__ import annotations
 
-import hashlib
 import logging
-import mimetypes
-import re
-import shutil
 import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.agent_react.artifact_context import artifact_records_to_context
-from app.agent_react.artifacts import artifact_from_payload, artifact_to_payload, resolve_channel_attachments
+from app.agent_react.artifacts import artifact_to_payload, resolve_channel_attachments
 from app.agent_react.context_manager import ContextManager
 from app.agent_react.session_state import (
     build_session_state_after_turn,
@@ -24,20 +19,55 @@ from app.progress import ProgressReporter, ensure_progress
 from app.runtime_usage import append_usage_footer, collect_usage_records, usage_totals
 from app.runtime_types import ChannelMessage, ConversationStore, TurnResult
 from app.task_runtime.approval_types import approval_request_dicts
+from app.task_runtime.artifacts import ArtifactPublisher
+from app.task_runtime.claude_react_runtime import ClaudeReactNodeExecuteRuntime, is_claude_agent_sdk_available
 from app.task_runtime.node_execute_runtime import (
     CoderNodeExecuteRuntime,
     LLMNodeExecuteRuntime,
     ReactNodeExecuteRuntime,
 )
 from app.task_runtime.node_executor import NodeExecutor
-from app.task_runtime.node_result import ExecutionReport, NodeArtifact, NodeResult
+from app.task_runtime.node_result import ExecutionReport, NodeResult
 from app.task_runtime.planning_router import PlanningRouter
 from app.task_runtime.result_aggregator import AggregationResult, ResultAggregator
 from app.task_runtime.runtime_context import RuntimeContext
 from app.task_runtime.session_workspace import SessionWorkspaceManager, SessionWorkspaceRef
-from app.tools.common import ToolArtifact
 
 logger = logging.getLogger(__name__)
+
+
+def _build_default_runtimes() -> dict:
+    """Build the default runtime dict.
+
+    The ``react`` runtime backend is controlled by ``JARVIS_REACT_RUNTIME_BACKEND``:
+    - ``builtin`` (default) – the hand-rolled ReAct loop
+    - ``claude_agent_sdk`` – Claude Agent SDK, if installed
+    """
+    settings = get_settings()
+    backend = (settings.react_runtime_backend or "builtin").strip().lower()
+
+    runtimes: dict = {
+        "llm": LLMNodeExecuteRuntime(),
+        "coder": CoderNodeExecuteRuntime(),
+    }
+
+    if backend == "claude_agent_sdk":
+        if is_claude_agent_sdk_available():
+            runtimes["react"] = ClaudeReactNodeExecuteRuntime()
+        else:
+            logger.warning(
+                "react_runtime_backend=claude_agent_sdk but SDK is not installed; falling back to builtin"
+            )
+            runtimes["react"] = ReactNodeExecuteRuntime()
+    else:
+        runtimes["react"] = ReactNodeExecuteRuntime()
+
+    return runtimes
+
+
+def _default_available_runtimes() -> list[str]:
+    """List of runtime names the planner may assign. Always returns standard names."""
+    return ["llm", "react", "coder"]
 
 
 class TaskAgentRuntime:
@@ -57,11 +87,7 @@ class TaskAgentRuntime:
         self._context_manager = context_manager or ContextManager()
         self._planning_router = planning_router or PlanningRouter()
         self._node_executor = node_executor or NodeExecutor(
-            runtimes={
-                "llm": LLMNodeExecuteRuntime(),
-                "react": ReactNodeExecuteRuntime(),
-                "coder": CoderNodeExecuteRuntime(),
-            }
+            runtimes=_build_default_runtimes(),
         )
         self._result_aggregator = result_aggregator or ResultAggregator()
         self._session_workspace_manager = session_workspace_manager or SessionWorkspaceManager()
@@ -89,25 +115,23 @@ class TaskAgentRuntime:
         )
         runtime_context = RuntimeContext.from_hints(
             {
-                "active_repo": session_state.active_repo_id,
                 "platform": conversation.platform,
                 "conversation_id": turn.conversation_id,
                 "turn_id": turn_id,
                 "external_chat_id": conversation.external_chat_id,
-                "available_runtimes": ["llm", "react", "coder"],
+                "available_runtimes": _default_available_runtimes(),
                 "coder_runtime_provider": get_settings().coder_runtime_provider,
                 **_runtime_temporal_hints(),
             }
         )
         started = time.perf_counter()
         logger.info(
-            "task runtime turn start turn_id=%s conversation_id=%s trigger_type=%s user_input_len=%s recent_artifact_count=%s active_repo=%s",
+            "task runtime turn start turn_id=%s conversation_id=%s trigger_type=%s user_input_len=%s recent_artifact_count=%s",
             turn_id,
             turn.conversation_id,
             getattr(turn, "trigger_type", None),
             len(user_input),
             len(recent_artifacts),
-            session_state.active_repo_id,
         )
         progress.emit(
             "turn_started",
@@ -264,12 +288,9 @@ class TaskAgentRuntime:
                 report.data.get("completed_order"),
                 int((time.perf_counter() - execution_started) * 1000),
             )
-            artifact_records = _publish_artifacts_from_report(
-                report,
-                turn_id=turn_id,
-                session_workspace=session_workspace,
+            artifact_records = ArtifactPublisher(self._store, session_workspace).publish(
+                report, turn_id=turn_id, conversation_id=turn.conversation_id,
             )
-            _persist_artifacts(self._store, turn.conversation_id, artifact_records)
             current_artifact_context = [
                 *recent_artifacts,
                 *[artifact_to_payload(item) for item in artifact_records],
@@ -399,7 +420,7 @@ class TaskAgentRuntime:
                 conversation_id=turn.conversation_id,
                 status=status,
                 message=ChannelMessage(
-                    content=reply if status == "completed" else "",
+                    content=reply,
                     content_type="markdown",
                     summary=reply,
                     attachments=artifact_resolution.attachments,
@@ -436,14 +457,15 @@ class TaskAgentRuntime:
                 reply=None,
                 current_user_input=user_input,
             )
+            error_text = str(exc)
             return TurnResult(
                 turn_id=turn_id,
                 conversation_id=turn.conversation_id,
                 status="failed",
                 message=ChannelMessage(
-                    content="",
+                    content=f"任务执行异常: {error_text}",
                     content_type="markdown",
-                    summary=str(exc),
+                    summary=error_text,
                     metadata={"conversation_id": turn.conversation_id, "turn_id": turn_id},
                 ),
             )
@@ -501,317 +523,6 @@ def _recent_artifacts(store: ConversationStore, conversation_id: int) -> list[di
     except Exception:
         logger.warning("task runtime failed to load recent artifacts conversation_id=%s", conversation_id, exc_info=True)
         return []
-
-
-def _publish_artifacts_from_report(
-    report: ExecutionReport,
-    *,
-    turn_id: int,
-    session_workspace: SessionWorkspaceRef,
-) -> list[ToolArtifact]:
-    artifacts = _artifact_records_from_report(report, turn_id=turn_id, session_workspace=session_workspace)
-    return _promote_tool_artifacts_to_session(artifacts, session_workspace)
-
-
-def _artifact_records_from_report(
-    report: ExecutionReport,
-    *,
-    turn_id: int,
-    session_workspace: SessionWorkspaceRef,
-) -> list[ToolArtifact]:
-    artifacts: list[ToolArtifact] = []
-    seen: set[str] = set()
-    for result in report.node_results:
-        for node_artifact in result.artifacts:
-            artifact = _artifact_record_from_node_artifact(
-                node_artifact,
-                result=result,
-                turn_id=turn_id,
-                session_workspace=session_workspace,
-            )
-            if artifact is None:
-                continue
-            if artifact.artifact_id not in seen:
-                seen.add(artifact.artifact_id)
-                artifacts.append(artifact)
-        for raw in _tool_artifact_payloads(result):
-            artifact = artifact_from_payload(raw)
-            if artifact is None:
-                continue
-            artifact = _normalize_tool_artifact(
-                artifact,
-                result=result,
-                turn_id=turn_id,
-                session_workspace=session_workspace,
-            )
-            if artifact is not None and artifact.artifact_id not in seen:
-                seen.add(artifact.artifact_id)
-                artifacts.append(artifact)
-    return artifacts
-
-
-def _tool_artifact_payloads(result: NodeResult) -> list[dict[str, Any]]:
-    payloads: list[dict[str, Any]] = []
-    payloads.extend(item for item in result.tool_artifacts if isinstance(item, dict))
-    for call in result.tool_calls:
-        call_artifacts = call.get("tool_artifacts")
-        if isinstance(call_artifacts, list):
-            payloads.extend(item for item in call_artifacts if isinstance(item, dict))
-    return payloads
-
-
-def _artifact_record_from_node_artifact(
-    node_artifact: NodeArtifact,
-    *,
-    result: NodeResult,
-    turn_id: int,
-    session_workspace: SessionWorkspaceRef,
-) -> ToolArtifact | None:
-    if not node_artifact.publish:
-        return None
-    path_info = _resolve_session_artifact_path(
-        node_artifact.session_relative_path or node_artifact.path,
-        session_workspace=session_workspace,
-        allow_absolute=False,
-    )
-    if path_info is None and node_artifact.kind in {"file", "image", "log", "directory"}:
-        logger.warning(
-            "node artifact skipped node_id=%s ref=%s reason=invalid_session_relative_path path=%s",
-            result.node_id,
-            node_artifact.ref,
-            node_artifact.path,
-        )
-        return None
-    absolute_path, relative_path = path_info if path_info is not None else (None, None)
-    stat = _stat_file(absolute_path)
-    metadata = dict(node_artifact.metadata)
-    if relative_path:
-        metadata.setdefault("session_relative_path", relative_path)
-    metadata.setdefault("node_artifact_ref", node_artifact.ref)
-    return ToolArtifact(
-        artifact_id=node_artifact.artifact_id
-        or _stable_session_artifact_id(session_workspace.session_id, result.node_id, node_artifact.ref, relative_path),
-        kind=_artifact_kind(node_artifact.kind, absolute_path),
-        turn_id=turn_id,
-        tool_call_id=f"node:{result.node_id}",
-        path=str(absolute_path) if absolute_path is not None else node_artifact.path,
-        session_relative_path=relative_path,
-        mime_type=node_artifact.mime_type or (_guess_mime(absolute_path) if absolute_path is not None else None),
-        filename=node_artifact.filename or node_artifact.name or (absolute_path.name if absolute_path is not None else None),
-        size_bytes=node_artifact.size_bytes or (stat.st_size if stat is not None else None),
-        source_tool=node_artifact.source_tool or result.runtime,
-        node_id=result.node_id,
-        publish=node_artifact.publish,
-        metadata=metadata,
-    )
-
-
-def _normalize_tool_artifact(
-    artifact: ToolArtifact,
-    *,
-    result: NodeResult,
-    turn_id: int,
-    session_workspace: SessionWorkspaceRef,
-) -> ToolArtifact | None:
-    updates: dict[str, Any] = {}
-    if artifact.turn_id is None:
-        updates["turn_id"] = turn_id
-    if not artifact.tool_call_id:
-        updates["tool_call_id"] = f"node:{result.node_id}"
-    if not artifact.source_tool:
-        provider = str(result.debug.get("provider") or "")
-        updates["source_tool"] = "coder" if result.runtime == "coder" and provider in {"", "codex"} else result.runtime
-    if artifact.node_id is None:
-        updates["node_id"] = result.node_id
-    path_info = _resolve_session_artifact_path(
-        artifact.session_relative_path or artifact.path,
-        session_workspace=session_workspace,
-        allow_absolute=True,
-    )
-    if path_info is not None:
-        absolute_path, relative_path = path_info
-        updates["path"] = str(absolute_path)
-        updates["session_relative_path"] = relative_path
-        metadata = dict(artifact.metadata)
-        metadata.setdefault("session_relative_path", relative_path)
-        updates["metadata"] = metadata
-        stat = _stat_file(absolute_path)
-        if artifact.size_bytes is None and stat is not None:
-            updates["size_bytes"] = stat.st_size
-        if not artifact.filename:
-            updates["filename"] = absolute_path.name
-        if not artifact.mime_type:
-            updates["mime_type"] = _guess_mime(absolute_path)
-    return replace(artifact, **updates) if updates else artifact
-
-
-def _promote_tool_artifacts_to_session(
-    artifacts: list[ToolArtifact],
-    session_workspace: SessionWorkspaceRef,
-) -> list[ToolArtifact]:
-    return [_promote_tool_artifact_to_session(artifact, session_workspace) for artifact in artifacts]
-
-
-def _promote_tool_artifact_to_session(
-    artifact: ToolArtifact,
-    session_workspace: SessionWorkspaceRef,
-) -> ToolArtifact:
-    if not artifact.publish:
-        return artifact
-    if artifact.kind not in {"image", "file"} or not artifact.path:
-        return artifact
-    try:
-        source = Path(artifact.path).expanduser().resolve(strict=True)
-    except OSError:
-        return artifact
-    if not source.is_file():
-        return artifact
-    artifacts_dir = session_workspace.artifacts_dir.resolve()
-    try:
-        source.relative_to(artifacts_dir)
-        return _with_session_relative_path(artifact, source, session_workspace)
-    except ValueError:
-        pass
-
-    target = (artifacts_dir / _session_artifact_filename(artifact, source)).resolve()
-    try:
-        target.relative_to(artifacts_dir)
-    except ValueError:
-        logger.warning("session artifact promotion target escaped artifacts dir artifact_id=%s", artifact.artifact_id)
-        return artifact
-
-    try:
-        artifacts_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, target)
-        stat = target.stat()
-    except OSError:
-        logger.warning("session artifact promotion failed artifact_id=%s source=%s", artifact.artifact_id, source, exc_info=True)
-        return artifact
-
-    metadata = dict(artifact.metadata)
-    metadata.update(
-        {
-            "session_id": session_workspace.session_id,
-            "session_artifacts_dir": str(session_workspace.artifacts_dir),
-            "source_path": str(source),
-            "source_session_relative_path": artifact.session_relative_path,
-            "promoted_to_session_artifacts": True,
-        }
-    )
-    session_relative_path = _session_relative(target, session_workspace.root_path)
-    return replace(
-        artifact,
-        path=str(target),
-        session_relative_path=session_relative_path,
-        filename=target.name,
-        size_bytes=stat.st_size,
-        metadata=metadata,
-    )
-
-
-def _session_artifact_filename(artifact: ToolArtifact, source: Path) -> str:
-    raw_name = artifact.filename or source.name or "artifact"
-    raw_path = Path(raw_name)
-    suffix = raw_path.suffix or source.suffix
-    suffix = re.sub(r"[^A-Za-z0-9.]+", "", suffix)[:16]
-    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", raw_path.stem).strip("._-")[:80] or "artifact"
-    digest_source = f"{artifact.artifact_id}|{source}"
-    digest = hashlib.sha256(digest_source.encode("utf-8", errors="replace")).hexdigest()[:12]
-    return f"{stem}-{digest}{suffix}"
-
-
-def _with_session_relative_path(
-    artifact: ToolArtifact,
-    path: Path,
-    session_workspace: SessionWorkspaceRef,
-) -> ToolArtifact:
-    relative = _session_relative(path, session_workspace.root_path)
-    if artifact.session_relative_path == relative:
-        return artifact
-    metadata = dict(artifact.metadata)
-    metadata.setdefault("session_relative_path", relative)
-    return replace(artifact, session_relative_path=relative, metadata=metadata)
-
-
-def _resolve_session_artifact_path(
-    path_text: str | None,
-    *,
-    session_workspace: SessionWorkspaceRef,
-    allow_absolute: bool,
-) -> tuple[Path, str] | None:
-    text = str(path_text or "").strip()
-    if not text:
-        return None
-    path = Path(text)
-    session_root = session_workspace.root_path.resolve()
-    try:
-        if path.is_absolute():
-            if not allow_absolute:
-                return None
-            resolved = path.expanduser().resolve(strict=True)
-        else:
-            if any(part == ".." for part in path.parts):
-                return None
-            resolved = (session_root / path).resolve(strict=True)
-        relative = resolved.relative_to(session_root)
-    except (OSError, ValueError):
-        return None
-    return resolved, relative.as_posix()
-
-
-def _session_relative(path: Path, session_root: Path) -> str | None:
-    try:
-        return path.resolve().relative_to(session_root.resolve()).as_posix()
-    except (OSError, ValueError):
-        return None
-
-
-def _stat_file(path: Path | None):
-    if path is None:
-        return None
-    try:
-        return path.stat() if path.is_file() else None
-    except OSError:
-        return None
-
-
-def _guess_mime(path: Path | None) -> str | None:
-    if path is None:
-        return None
-    return mimetypes.guess_type(str(path))[0]
-
-
-def _artifact_kind(kind: str, path: Path | None) -> Any:
-    normalized = str(kind or "").strip().lower()
-    if normalized in {"image", "file", "directory", "log", "git_ref"}:
-        return normalized
-    if path is not None and path.is_dir():
-        return "directory"
-    if path is not None and _guess_mime(path or None) in {"image/png", "image/jpeg", "image/webp", "image/gif", "image/svg+xml"}:
-        return "image"
-    return "file" if path is not None else "git_ref"
-
-
-def _stable_session_artifact_id(session_id: str, node_id: str, ref: str, relative_path: str | None) -> str:
-    identity = relative_path or ref
-    digest = hashlib.sha256(f"{session_id}|{node_id}|{identity}".encode("utf-8", errors="replace")).hexdigest()[:16]
-    safe_ref = re.sub(r"[^A-Za-z0-9._:-]+", "_", ref).strip("._:-")[:48] or "artifact"
-    return f"{session_id}:{node_id}:{safe_ref}:{digest}"
-
-
-def _persist_artifacts(store: ConversationStore, conversation_id: int, artifacts: list[Any]) -> None:
-    upsert = getattr(store, "upsert_artifact", None)
-    if not callable(upsert):
-        return
-    for artifact in artifacts:
-        try:
-            upsert(artifact, conversation_id=conversation_id)
-        except Exception:
-            logger.exception(
-                "task runtime artifact persistence failed conversation_id=%s artifact_id=%s",
-                conversation_id,
-                getattr(artifact, "artifact_id", ""),
-            )
 
 
 def _runtime_temporal_hints(now: datetime | None = None) -> dict[str, str]:

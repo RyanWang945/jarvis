@@ -88,7 +88,7 @@ def test_code_node_finalizer_rejects_absolute_manifest_artifact(tmp_path: Path) 
     )
 
     assert result.artifacts == []
-    assert "artifact_candidate_rejected:external:invalid_session_relative_path" in result.data["finalizer"]["warnings"]
+    assert "artifact_candidate_rejected:external:invalid_session_relative_path" in result.debug["finalizer"]["warnings"]
 
 
 def test_code_node_finalizer_validates_llm_artifact_candidates(tmp_path: Path) -> None:
@@ -126,4 +126,4 @@ def test_code_node_finalizer_validates_llm_artifact_candidates(tmp_path: Path) -
 
     assert result.summary == "llm summary"
     assert [artifact.ref for artifact in result.artifacts] == ["output"]
-    assert "artifact_candidate_rejected:missing:missing_file" in result.data["finalizer"]["warnings"]
+    assert "artifact_candidate_rejected:missing:missing_file" in result.debug["finalizer"]["warnings"]

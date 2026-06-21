@@ -55,6 +55,11 @@ _CONTEXT_REFERENCE_MARKERS = (
     "前一个",
     "上一版",
     "这版",
+    "不够细",
+    "不够详细",
+    "详细点",
+    "展开",
+    "再详细",
     "it",
     "that",
     "this",
@@ -65,26 +70,50 @@ _CONTEXT_REFERENCE_MARKERS = (
 
 
 @dataclass(frozen=True)
-class ConversationContextMessage:
+class ContextMessage:
+    """A single message in the conversation context, with optional compression metadata.
+
+    AI-facing format is always plain ``{"role": role, "content": content}``.
+    Metadata fields are for internal tracking only.
+    """
+
     role: str
     content: str
+    original_index: int | None = None  # index in the original (pre-compression) message list
+    is_compressed: bool = False        # this message is a compressed version of something
+    compression_level: str = "none"    # "none" | "single" | "batch"
+    compressed_from_indices: tuple[int, ...] = ()  # indices of original messages this replaces
+    original_token_count: int = 0      # estimated tokens before compression
+
+
+# Alias kept for backward compatibility during migration.
+ConversationContextMessage = ContextMessage  # noqa: F811
+
+
+# Number of most recent user+assistant rounds to always keep in full.
+_PRESERVE_RECENT_ROUNDS = 2
 
 
 @dataclass(frozen=True)
 class ConversationContext:
-    summary: str | None
-    messages: tuple[ConversationContextMessage, ...]
+    """Model-facing conversation history.
+
+    Contains a flat message array with optional compression baked in.
+    The ``summary`` field and ``summary_node`` in planner_payload are removed —
+    old messages are compressed directly into the messages array as ``role: system`` entries.
+    """
+
+    messages: tuple[ContextMessage, ...]
     context_reference_detected: bool = False
 
     @property
     def has_history(self) -> bool:
-        return bool(self.summary or self.messages)
+        return bool(self.messages)
 
     def fast_payload(self) -> dict[str, Any]:
         return {
             "has_history": self.has_history,
             "context_reference_detected": self.context_reference_detected,
-            "summary": self.summary,
             "recent_messages": [
                 {"role": message.role, "content": message.content}
                 for message in self.messages[-_MAX_FAST_HISTORY_MESSAGES:]
@@ -92,17 +121,9 @@ class ConversationContext:
         }
 
     def planner_payload(self) -> dict[str, Any]:
-        summary_node = None
-        if self.summary:
-            summary_node = {
-                "id": "conversation_summary",
-                "kind": "compressed_history",
-                "content": self.summary,
-            }
         return {
             "has_history": self.has_history,
             "context_reference_detected": self.context_reference_detected,
-            "summary_node": summary_node,
             "messages": [
                 {"role": message.role, "content": message.content}
                 for message in self.messages
@@ -384,12 +405,17 @@ class ContextManager:
             if getattr(record, "id", None) != trigger_message_id
             and (current_turn_id is None or getattr(record, "turn_id", None) != current_turn_id)
         ]
-        messages = self._records_to_conversation_context_messages(history_records)
-        messages = self._fit_context_messages(messages, max_tokens=_MAX_PLANNER_HISTORY_TOKENS)
-        summary = session_state.working_summary if session_state is not None else None
+        # Step 1: records → ContextMessage with per-message token truncation
+        context_messages = self._records_to_context_messages(history_records)
+
+        # Step 2: two-layer compression — single-big then batch-old
+        compressed = self._compress_context_messages(context_messages)
+
+        # Step 3: enforce message count cap
+        compressed = compressed[-_MAX_PLANNER_HISTORY_MESSAGES:]
+
         return ConversationContext(
-            summary=summary,
-            messages=tuple(messages[-_MAX_PLANNER_HISTORY_MESSAGES:]),
+            messages=tuple(compressed),
             context_reference_detected=_has_context_reference(current_user_input),
         )
 
@@ -523,17 +549,12 @@ class ContextManager:
         if not repositories:
             return None
 
-        active_repo_id = session_state.active_repo_id if session_state is not None else None
-        active_repo_line = ""
-        if active_repo_id:
-            active_repo_line = f"Active repository: {active_repo_id}"
         repository_lines: list[str] = []
         for repo in repositories:
-            active_marker = " (active)" if repo.repo_id == active_repo_id else ""
-            repository_lines.append(f"- {repo.repo_id}{active_marker}: {repo.canonical_root_path}")
+            repository_lines.append(f"- {repo.repo_id}: {repo.canonical_root_path}")
         return self._prompt_registry.load("repository_context").render_text(
             {
-                "active_repo_line": active_repo_line,
+                "active_repo_line": "",
                 "repository_lines": "\n".join(repository_lines),
             }
         )
@@ -588,9 +609,10 @@ class ContextManager:
             {"artifact_lines": "\n".join(lines)}
         )
 
-    def _records_to_conversation_context_messages(self, records: list) -> list[ConversationContextMessage]:
-        messages: list[ConversationContextMessage] = []
-        for record in records:
+    def _records_to_context_messages(self, records: list) -> list[ContextMessage]:
+        """Convert raw records to ContextMessage, applying per-message token truncation."""
+        messages: list[ContextMessage] = []
+        for idx, record in enumerate(records):
             role = getattr(record, "role", None)
             if role not in {"user", "assistant"}:
                 continue
@@ -599,25 +621,76 @@ class ContextManager:
                 continue
             if role == "assistant":
                 content = strip_token_usage_footer(content)
+            original_tokens = self.estimate_text_tokens(content)
             content = self._truncate_text_by_tokens(content, _MAX_HISTORY_MESSAGE_TOKENS)
-            messages.append(ConversationContextMessage(role=role, content=content))
+            messages.append(
+                ContextMessage(
+                    role=role,
+                    content=content,
+                    original_index=idx,
+                    original_token_count=original_tokens,
+                )
+            )
         return messages
 
-    def _fit_context_messages(
+    def _compress_context_messages(
         self,
-        messages: list[ConversationContextMessage],
-        *,
-        max_tokens: int,
-    ) -> list[ConversationContextMessage]:
-        kept_reversed: list[ConversationContextMessage] = []
-        used = 0
-        for message in reversed(messages):
-            tokens = self.estimate_text_tokens(message.content) + 4
-            if kept_reversed and used + tokens > max_tokens:
-                break
-            kept_reversed.append(message)
-            used += tokens
-        return list(reversed(kept_reversed))
+        messages: list[ContextMessage],
+    ) -> list[ContextMessage]:
+        """Two-layer compression for context messages.
+
+        Layer 1 (single): truncate each message to ``_MAX_HISTORY_MESSAGE_TOKENS``
+        — already done in ``_records_to_context_messages``.
+
+        Layer 2 (batch): when total tokens exceed the budget, compress the oldest
+        messages into one ``role: system`` summary, preserving the most recent
+        ``_PRESERVE_RECENT_ROUNDS`` user+assistant pairs in full.
+        """
+        total_tokens = sum(self.estimate_text_tokens(m.content) + 4 for m in messages)
+        if total_tokens <= _MAX_PLANNER_HISTORY_TOKENS:
+            return messages
+
+        if len(messages) <= _PRESERVE_RECENT_ROUNDS * 2:
+            return messages
+
+        # Identify the cut point: keep last N rounds, compress the rest.
+        # A "round" = one user + one assistant message (may not always be paired).
+        recent_count = _PRESERVE_RECENT_ROUNDS * 2
+        to_keep = messages[-recent_count:]
+        to_compress = messages[:-recent_count]
+
+        if not to_compress:
+            return messages
+
+        # Build a condensed summary of the older messages.
+        # Sum of user content is the most signal-dense representation.
+        user_texts: list[str] = []
+        for msg in to_compress:
+            if msg.role == "user":
+                text = msg.content.strip()
+                if text and len(text) > 2:
+                    user_texts.append(text)
+
+        # Clear error messages or empty summaries don't help.
+        if not user_texts:
+            return to_keep
+
+        # Build batch compression summary
+        batch_summary = _build_batch_summary(user_texts, _MAX_PLANNER_HISTORY_TOKENS)
+        compressed_indices = tuple(
+            i for m in to_compress if m.original_index is not None
+            for i in (m.original_index,)
+        )
+        batch_msg = ContextMessage(
+            role="system",
+            content=batch_summary,
+            original_index=None,
+            is_compressed=True,
+            compression_level="batch",
+            compressed_from_indices=compressed_indices,
+            original_token_count=sum(self.estimate_text_tokens(m.content) for m in to_compress),
+        )
+        return [batch_msg, *to_keep]
 
     def _summarize_exchange(
         self,
@@ -814,3 +887,53 @@ def _truncate_chars(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
     return text[: max(0, max_chars - 1)].rstrip() + "…"
+
+
+def _build_batch_summary(user_texts: list[str], max_tokens: int) -> str:
+    """Build a compressed summary of older conversation turns.
+
+    Each entry is a user message (the intent signal). The output is a single
+    ``role: system`` message placed in the messages array, replacing the
+    compressed entries.
+
+    Token budget: aim for ~15% of ``_MAX_PLANNER_HISTORY_TOKENS`` so the
+    summary doesn't compete with the recent full-text messages.
+    """
+    budget = max(120, int(max_tokens * 0.15))
+    lines: list[str] = []
+    used = 0
+    for text in user_texts:
+        if used >= budget:
+            break
+        # use first sentence-ish chunk (up to 120 chars)
+        chunk = _first_sentence(text, max_chars=120)
+        chunk_tokens = count_text_tokens(chunk) + 4
+        if lines and used + chunk_tokens > budget:
+            break
+        lines.append(chunk)
+        used += chunk_tokens
+
+    if not lines:
+        return ""
+
+    # Join: use arrows between turns for readability
+    if len(lines) == 1:
+        body = lines[0]
+    else:
+        body = " → ".join(lines)
+
+    return f"[对话历史] {body}"
+
+
+def _first_sentence(text: str, *, max_chars: int = 120) -> str:
+    """Extract the first sentence-ish chunk of text, up to max_chars."""
+    if len(text) <= max_chars:
+        return text.strip()
+    # Try to break at first sentence-ending punctuation
+    for i, ch in enumerate(text):
+        if i >= max_chars:
+            break
+        if ch in "。！？\n" and i > 4:
+            return text[: i + 1].strip()
+    # Fallback: hard truncate at max_chars
+    return text[:max_chars].rstrip() + "…"
