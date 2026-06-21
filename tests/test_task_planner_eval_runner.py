@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from app.task_runtime.fast_intent import FastIntentDecision
 from app.task_runtime.planning_router import PlanningRouterResult
 from app.task_runtime.planner import ExecutionPlan, PlanNode
@@ -68,9 +70,31 @@ def test_task_planner_eval_dataset_loads_simple_and_complex_cases() -> None:
 
     assert len(cases) >= 7
     assert any(case.required_runtimes == ["llm"] for case in cases)
+    assert cases[0].runtime_context["available_runtimes"] == ["llm", "react", "coder"]
     assert any("coder" in case.required_runtimes and "react" in case.required_runtimes for case in cases)
     assert any(case.required_input_refs == ["artifact:A1"] for case in cases)
     assert any(case.required_node_objective_contains for case in cases)
+
+
+def test_task_planner_eval_loader_accepts_legacy_runtime_hints(tmp_path) -> None:
+    dataset = tmp_path / "cases.jsonl"
+    dataset.write_text(
+        json.dumps(
+            {
+                "id": "legacy_context",
+                "category": "simple",
+                "message": "解释一下",
+                "runtime_hints": {"active_repo": "jarvis", "available_runtimes": ["llm", "react", "coder"]},
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    case = load_cases(dataset)[0]
+
+    assert case.runtime_context["active_repo"] == "jarvis"
 
 
 def test_task_planner_eval_score_checks_latency_and_plan_accuracy() -> None:

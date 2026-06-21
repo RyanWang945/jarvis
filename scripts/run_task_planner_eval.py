@@ -19,7 +19,7 @@ from app.task_runtime.runtime_context import RuntimeContext
 
 DEFAULT_DATASET = Path("tests/fixtures/task_planner_eval/planner_cases.jsonl")
 DEFAULT_OUTPUT_ROOT = Path("data/eval_runs")
-DEFAULT_RUNTIME_HINTS = {
+DEFAULT_RUNTIME_CONTEXT = {
     "active_repo": "jarvis",
     "available_runtimes": ["llm", "react", "coder"],
 }
@@ -32,7 +32,7 @@ class PlannerEvalCase:
     message: str
     artifacts: list[dict[str, Any]]
     previous_node_results: list[dict[str, Any]]
-    runtime_hints: dict[str, Any]
+    runtime_context: dict[str, Any]
     instructions: list[str]
     expected_node_count_min: int
     expected_node_count_max: int
@@ -169,10 +169,10 @@ def run_prompt_matrix(
 
 def run_case(planner: TurnPlanner, case: PlannerEvalCase) -> dict[str, Any]:
     started = time.perf_counter()
-    runtime_context = RuntimeContext.from_hints(case.runtime_hints)
+    runtime_context = RuntimeContext.from_hints(case.runtime_context)
     plan = planner.plan(
         content=case.message,
-        session_state=ConversationSessionState(session_mode="coding", active_repo_id=case.runtime_hints.get("active_repo")),
+        session_state=ConversationSessionState(session_mode="coding", active_repo_id=case.runtime_context.get("active_repo")),
         recent_artifacts=case.artifacts,
         previous_node_results=case.previous_node_results,
         runtime_context=runtime_context,
@@ -187,10 +187,10 @@ def run_case(planner: TurnPlanner, case: PlannerEvalCase) -> dict[str, Any]:
 
 
 def run_router_case(router: PlanningRouter, case: PlannerEvalCase) -> dict[str, Any]:
-    runtime_context = RuntimeContext.from_hints(case.runtime_hints)
+    runtime_context = RuntimeContext.from_hints(case.runtime_context)
     result = router.plan(
         content=case.message,
-        session_state=ConversationSessionState(session_mode="coding", active_repo_id=case.runtime_hints.get("active_repo")),
+        session_state=ConversationSessionState(session_mode="coding", active_repo_id=case.runtime_context.get("active_repo")),
         recent_artifacts=case.artifacts,
         previous_node_results=case.previous_node_results,
         runtime_context=runtime_context,
@@ -403,7 +403,7 @@ def _case_from_payload(payload: dict[str, Any], *, path: Path, line_number: int)
             message=str(payload["message"]),
             artifacts=list(payload.get("artifacts", [])),
             previous_node_results=list(payload.get("previous_node_results", [])),
-            runtime_hints=dict(payload.get("runtime_hints", DEFAULT_RUNTIME_HINTS)),
+            runtime_context=dict(payload.get("runtime_context", payload.get("runtime_hints", DEFAULT_RUNTIME_CONTEXT))),
             instructions=list(payload.get("instructions", [])),
             expected_node_count_min=int(payload.get("expected_node_count_min", 1)),
             expected_node_count_max=int(payload.get("expected_node_count_max", 6)),
