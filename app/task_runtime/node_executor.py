@@ -95,7 +95,7 @@ class NodeExecutor:
                         user_objective=plan.user_objective,
                         node=node,
                         resolved_inputs=resolved_inputs,
-                        runtime_hints=merged_runtime_hints,
+                        legacy_hints=merged_runtime_hints,
                         instructions=list(instructions or []),
                     )
                 if runtime is None:
@@ -157,7 +157,7 @@ class NodeExecutor:
                             user_objective=plan.user_objective,
                             node=node,
                             resolved_inputs=[],
-                            runtime_hints=merged_runtime_hints,
+                            legacy_hints=merged_runtime_hints,
                             instructions=list(instructions or []),
                             missing_refs=missing_refs,
                             blocked_refs=blocked_refs,

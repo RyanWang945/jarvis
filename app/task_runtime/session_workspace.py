@@ -254,7 +254,7 @@ def write_node_input_snapshot(
     user_objective: str,
     node: PlanNode,
     resolved_inputs: list[ResolvedInput],
-    runtime_hints: dict[str, Any],
+    legacy_hints: dict[str, Any],
     instructions: list[str],
     missing_refs: list[str] | None = None,
     blocked_refs: list[str] | None = None,
@@ -267,7 +267,7 @@ def write_node_input_snapshot(
         "input_refs": list(node.input_refs),
         "user_objective": user_objective,
         "resolved_inputs": [item.model_dump(mode="json", exclude_none=True) for item in resolved_inputs],
-        "runtime_hints": _jsonable(runtime_hints),
+        "runtime_hints": _jsonable(legacy_hints),
         "instructions": list(instructions),
         "missing_refs": list(missing_refs or []),
         "blocked_refs": list(blocked_refs or []),
@@ -287,9 +287,9 @@ def prepare_node_repo(
     *,
     repo_id: str,
     project_path: Path,
-    runtime_hints: dict[str, Any],
+    legacy_hints: dict[str, Any],
 ) -> Path | None:
-    node_context = NodeWorkspaceRuntimeContext.from_hints(runtime_hints)
+    node_context = NodeWorkspaceRuntimeContext.from_hints(legacy_hints)
     if node_context.repos_dir is None:
         return None
 
@@ -316,10 +316,10 @@ def prepare_node_repo_workspace(
     *,
     repo_id: str,
     project_path: Path,
-    runtime_hints: dict[str, Any],
+    legacy_hints: dict[str, Any],
     node_id: str,
 ) -> NodeRepoWorkspace | None:
-    node_context = NodeWorkspaceRuntimeContext.from_hints(runtime_hints)
+    node_context = NodeWorkspaceRuntimeContext.from_hints(legacy_hints)
     if node_context.repos_dir is None:
         return None
 
@@ -329,8 +329,8 @@ def prepare_node_repo_workspace(
 
     project = project_path.resolve()
     _assert_git_worktree(project)
-    workspace_context = WorkspaceRuntimeContext.from_hints(runtime_hints)
-    branch_context = BranchRuntimeContext.from_hints(runtime_hints)
+    workspace_context = WorkspaceRuntimeContext.from_hints(legacy_hints)
+    branch_context = BranchRuntimeContext.from_hints(legacy_hints)
     session_id = _safe_component(workspace_context.session_id or "session", fallback="session")
     source_branch = _resolve_source_branch(project, branch_context)
     target_branch = _resolve_target_branch(repo_id=repo_id, session_id=session_id, branch_context=branch_context)

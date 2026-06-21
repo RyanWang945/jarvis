@@ -429,7 +429,7 @@ class CoderNodeExecuteRuntime:
             repo_workspace = prepare_node_repo_workspace(
                 repo_id=repo.repo_id,
                 project_path=repo.canonical_root_path,
-                runtime_hints=context.runtime_hints,
+                legacy_hints=context.runtime_hints,
                 node_id=context.node.id,
             )
             workdir = repo_workspace.repo_path if repo_workspace is not None else repo.canonical_root_path
