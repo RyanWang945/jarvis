@@ -14,6 +14,7 @@ from app.llm.model_profiles import LLMNode
 from app.llm.model_router import ModelRouter
 from app.prompting import PromptRegistry
 from app.runtime_usage import usage_record_from_response
+from app.task_runtime.runtime_context import TemporalRuntimeContext
 
 logger = logging.getLogger(__name__)
 
@@ -128,15 +129,7 @@ def _fast_intent_messages(
 
 
 def _temporal_context(runtime_hints: dict[str, Any]) -> dict[str, str]:
-    return {
-        key: value
-        for key, value in {
-            "current_date": str(runtime_hints.get("current_date") or "").strip(),
-            "current_time": str(runtime_hints.get("current_time") or "").strip(),
-            "timezone": str(runtime_hints.get("timezone") or "").strip(),
-        }.items()
-        if value
-    }
+    return TemporalRuntimeContext.from_hints(runtime_hints).as_payload()
 
 
 def _fast_intent_model_metadata(model_profile: str | None) -> dict[str, Any]:

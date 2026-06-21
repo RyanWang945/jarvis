@@ -775,7 +775,7 @@ class RepoExecutionPolicy:
 
 任务：
 
-1. 新增 `context.py`：
+1. 新增 typed runtime context 适配层：
 
 ```python
 TurnContext
@@ -786,6 +786,8 @@ RepoContext
 RepoExecutionPolicy
 RuntimeContext
 ```
+
+短期文件名为 `runtime_context.py`，先提供小型 dataclass 访问器，逐步替换直接读取 `runtime_hints["..."]` / `runtime_hints.get("...")` 的代码；等调用面收敛后再合并成完整 `RuntimeContext`。
 
 2. `NodeExecutionContext` 改成：
 
@@ -800,6 +802,8 @@ NodeExecutionContext:
 3. 保留 `RuntimeContext.to_legacy_hints()`，只给旧 prompt 和 provider 使用。
 4. `node_workspace_hints()` 改为返回 `NodeWorkspaceContext`。
 5. `SessionWorkspaceRef.runtime_hints()` 标记为 legacy。
+
+已执行迁移：新增 `app/task_runtime/runtime_context.py`，提供 `TemporalRuntimeContext`、`RepoRuntimeContext`、`BranchRuntimeContext`、`WorkspaceRuntimeContext`。`fast_intent.py` 和 `node_execute_runtime.py` 中的 temporal、repo、provider run dir、branch、manifest path、session workspace/node workspace 读取已改为通过这些 typed accessor；`node_execute_runtime.py` 只剩 `git_context_usage` 作为 usage 桥接仍直接读取 hints。
 
 验收：
 

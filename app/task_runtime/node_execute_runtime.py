@@ -30,6 +30,12 @@ from app.task_runtime.coder_provider import (
 from app.task_runtime.node_finalizer import CodeNodeFinalizer, LLMCodeNodeFinalizerAgent
 from app.task_runtime.node_result import NodeArtifact, NodeError, NodeResult, ResolvedInput
 from app.task_runtime.planner import PlanNode
+from app.task_runtime.runtime_context import (
+    BranchRuntimeContext,
+    RepoRuntimeContext,
+    TemporalRuntimeContext,
+    WorkspaceRuntimeContext,
+)
 from app.task_runtime.session_workspace import (
     NodeRepoCommit,
     NodeRepoMerge,
@@ -417,7 +423,8 @@ class CoderNodeExecuteRuntime:
         except RepositoryRegistryError as exc:
             logger.info("coder node blocked node_id=%s repo_id=%s reason=repository_error error=%s", context.node.id, repo_id, exc)
             return _blocked(context.node, "repository_not_available", str(exc))
-        run_dir = _provider_run_dir(context)
+        repo_context = RepoRuntimeContext.from_hints(context.runtime_hints)
+        run_dir = repo_context.provider_run_dir
         try:
             repo_workspace = prepare_node_repo_workspace(
                 repo_id=repo.repo_id,
@@ -451,18 +458,17 @@ class CoderNodeExecuteRuntime:
                     "source_branch": repo_workspace.source_branch,
                     "target_branch": repo_workspace.target_branch,
                     "node_branch": repo_workspace.node_branch,
-                    "worktree_mode": context.runtime_hints.get("worktree_mode") or "node_branch_worktree",
+                    "worktree_mode": BranchRuntimeContext.from_hints(context.runtime_hints).worktree_mode or "node_branch_worktree",
                 },
                 instructions=context.instructions,
             )
-        raw_manifest_path = str(context.runtime_hints.get("node_manifest_path") or "").strip()
-        if raw_manifest_path:
-            request_metadata["node_manifest_path"] = raw_manifest_path
+        workspace_context = WorkspaceRuntimeContext.from_hints(context.runtime_hints)
+        if workspace_context.manifest_path_text:
+            request_metadata["node_manifest_path"] = workspace_context.manifest_path_text
         if run_dir is not None:
             request_metadata["run_dir"] = str(run_dir)
-        session_id = str(context.runtime_hints.get("session_id") or "").strip()
-        if session_id:
-            request_metadata["session_id"] = session_id
+        if workspace_context.session_id:
+            request_metadata["session_id"] = workspace_context.session_id
         instruction = _coder_instruction(context)
         request = CoderRunRequest(
             repo_id=repo.repo_id,
@@ -911,7 +917,7 @@ def _coder_instruction(context: NodeExecutionContext) -> str:
             "node_id": context.node.id,
             "node_objective": context.node.objective,
             "output_hint": context.node.output_hint or "Repository task result.",
-            "node_manifest_path": str(context.runtime_hints.get("node_manifest_path") or "node_manifest.json"),
+            "node_manifest_path": WorkspaceRuntimeContext.from_hints(context.runtime_hints).manifest_name(),
             "coder_workspace_section": _coder_workspace_section(context.runtime_hints),
             "resolved_inputs_section": "\n".join(resolved_inputs_lines),
             "additional_instructions_section": additional_instructions,
@@ -921,36 +927,22 @@ def _coder_instruction(context: NodeExecutionContext) -> str:
 
 def _coder_workspace_section(runtime_hints: dict[str, Any]) -> str:
     lines: list[str] = []
-    source_branch = _optional_text(runtime_hints.get("source_branch"))
-    target_branch = _optional_text(runtime_hints.get("target_branch") or runtime_hints.get("active_branch"))
-    node_branch = _optional_text(runtime_hints.get("node_branch"))
-    worktree_mode = _optional_text(runtime_hints.get("worktree_mode"))
-    if source_branch:
-        lines.append(f"- Source branch: {source_branch}")
-    if target_branch:
-        lines.append(f"- Target branch: {target_branch}")
-    if node_branch:
-        lines.append(f"- Node branch: {node_branch}")
-    if worktree_mode:
-        lines.append(f"- Worktree mode: {worktree_mode}")
-    if target_branch:
+    branch_context = BranchRuntimeContext.from_hints(runtime_hints)
+    if branch_context.source_branch:
+        lines.append(f"- Source branch: {branch_context.source_branch}")
+    if branch_context.target_branch:
+        lines.append(f"- Target branch: {branch_context.target_branch}")
+    if branch_context.node_branch:
+        lines.append(f"- Node branch: {branch_context.node_branch}")
+    if branch_context.worktree_mode:
+        lines.append(f"- Worktree mode: {branch_context.worktree_mode}")
+    if branch_context.target_branch:
         lines.append("- Branch checkout is managed by Jarvis runtime before provider execution.")
     return "\n".join(lines)
 
 
 def _temporal_context(runtime_hints: dict[str, Any]) -> dict[str, str]:
-    current_date = str(runtime_hints.get("current_date") or "").strip()
-    current_time = str(runtime_hints.get("current_time") or "").strip()
-    timezone = str(runtime_hints.get("timezone") or "").strip()
-    return {
-        key: value
-        for key, value in {
-            "current_date": current_date,
-            "current_time": current_time,
-            "timezone": timezone,
-        }.items()
-        if value
-    }
+    return TemporalRuntimeContext.from_hints(runtime_hints).as_payload()
 
 
 def _temporal_context_text(runtime_hints: dict[str, Any]) -> str:
@@ -975,6 +967,7 @@ def _finalize_coder_node_result(
 ) -> NodeResult:
     approval_required = bool(result.approval_requests)
     approval_requests = [approval_request_to_dict(item) for item in result.approval_requests]
+    workspace_context = WorkspaceRuntimeContext.from_hints(context.runtime_hints)
     return finalizer.finalize(
         node=context.node,
         user_objective=context.user_objective,
@@ -989,9 +982,9 @@ def _finalize_coder_node_result(
         metadata=result.metadata,
         approval_required=approval_required,
         approval_requests=approval_requests,
-        session_root=_optional_path(context.runtime_hints.get("session_workspace_dir")),
-        node_workspace=_optional_path(context.runtime_hints.get("node_workspace_dir")),
-        manifest_path=_optional_path(context.runtime_hints.get("node_manifest_path")),
+        session_root=workspace_context.session_root,
+        node_workspace=workspace_context.node_workspace,
+        manifest_path=workspace_context.manifest_path,
     )
 
 
@@ -1153,11 +1146,6 @@ def _optional_text(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
-
-
-def _optional_path(value: Any) -> Path | None:
-    text = _optional_text(value)
-    return Path(text) if text else None
 
 
 def _optional_int(value: Any) -> int | None:
@@ -1367,9 +1355,9 @@ def _plain_text(value: Any) -> str:
 
 
 def _active_repo(context: NodeExecutionContext, *, registry: RepositoryRegistry | None = None) -> str | None:
-    value = context.runtime_hints.get("active_repo")
-    if isinstance(value, str) and value.strip():
-        return value.strip()
+    repo_context = RepoRuntimeContext.from_hints(context.runtime_hints)
+    if repo_context.active_repo:
+        return repo_context.active_repo
     if registry is not None:
         active_repos = [repo for repo in registry.list_repositories() if repo.status == "active"]
         if len(active_repos) == 1:
@@ -1379,14 +1367,6 @@ def _active_repo(context: NodeExecutionContext, *, registry: RepositoryRegistry 
 
 def _is_protected_target_branch(branch: str) -> bool:
     return str(branch or "").strip().lower() in {"main", "master"}
-
-
-def _provider_run_dir(context: NodeExecutionContext) -> Path | None:
-    value = context.runtime_hints.get("provider_run_dir")
-    if value is None:
-        return None
-    text = str(value).strip()
-    return Path(text) if text else None
 
 
 def _blocked(node: PlanNode, code: str, message: str) -> NodeResult:
