@@ -86,6 +86,8 @@ def test_build_plan_input_normalizes_artifacts_and_hints() -> None:
     assert plan_input.runtime_hints["current_date"]
     assert plan_input.runtime_hints["current_time"]
     assert plan_input.runtime_hints["timezone"] == "Asia/Shanghai"
+    assert plan_input.runtime_context.repo.active_repo == "jarvis"
+    assert "runtime_context" not in plan_input.model_dump(mode="json")
 
 
 def test_plan_from_payload_derives_llm_finalization_for_non_llm_nodes() -> None:

@@ -112,13 +112,14 @@ class TurnPlannerResult:
 
 
 class PlanInput(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", arbitrary_types_allowed=True)
 
     current_user_input: str
     conversation_context: dict[str, Any] = Field(default_factory=dict)
     artifacts: list[dict[str, Any]] = Field(default_factory=list)
     previous_node_results: list[dict[str, Any]] = Field(default_factory=list)
     runtime_hints: dict[str, Any] = Field(default_factory=dict)
+    runtime_context: RuntimeContext = Field(default_factory=lambda: RuntimeContext.from_hints({}), exclude=True)
     instructions: list[str] = Field(default_factory=list)
 
     @field_validator("current_user_input")
@@ -191,7 +192,7 @@ class TurnPlanner:
             return TurnPlannerResult(
                 plan=_fallback_plan_for_objective(
                     plan_input.current_user_input,
-                    runtime_hints=plan_input.runtime_hints,
+                    runtime_context=plan_input.runtime_context,
                     known_artifact_refs=_known_artifact_refs(plan_input.artifacts),
                     previous_node_results=plan_input.previous_node_results,
                 )
@@ -231,7 +232,7 @@ class TurnPlanner:
             payload,
             fallback_objective=plan_input.current_user_input,
             known_artifact_refs=_known_artifact_refs(plan_input.artifacts),
-            runtime_hints=plan_input.runtime_hints,
+            runtime_context=plan_input.runtime_context,
             previous_node_results=plan_input.previous_node_results,
         )
         usage_record = usage_record_from_response(response, stage="planner")
@@ -249,10 +250,10 @@ def build_plan_input(
     session_state: ConversationSessionState | None = None,
     instructions: list[str] | None = None,
 ) -> PlanInput:
-    hints = dict(runtime_hints or {})
-    if session_state is not None and "active_repo" not in hints:
-        hints["active_repo"] = session_state.active_repo_id
-    hints = _ensure_temporal_hints(hints)
+    runtime_context = RuntimeContext.from_hints(runtime_hints)
+    if session_state is not None and not runtime_context.repo.active_repo:
+        runtime_context = runtime_context.with_hints({"active_repo": session_state.active_repo_id})
+    runtime_context = RuntimeContext.from_hints(_ensure_temporal_hints(runtime_context.to_legacy_hints()))
     return PlanInput(
         current_user_input=current_user_input,
         conversation_context=(
@@ -267,7 +268,8 @@ def build_plan_input(
         ),
         artifacts=_normalize_artifact_context(artifacts),
         previous_node_results=[item for item in previous_node_results if isinstance(item, dict)],
-        runtime_hints=hints,
+        runtime_hints=runtime_context.to_legacy_hints(),
+        runtime_context=runtime_context,
         instructions=[str(item).strip() for item in (instructions or []) if str(item).strip()],
     )
 
@@ -381,8 +383,10 @@ def _plan_from_payload(
     fallback_objective: str,
     known_artifact_refs: set[str] | None = None,
     runtime_hints: dict[str, Any] | None = None,
+    runtime_context: RuntimeContext | None = None,
     previous_node_results: list[dict[str, Any]] | None = None,
 ) -> ExecutionPlan:
+    resolved_runtime_context = runtime_context or RuntimeContext.from_hints(runtime_hints)
     candidate = payload.get("plan") if isinstance(payload.get("plan"), dict) else payload
     if not isinstance(candidate, dict):
         artifact_delivery = _fallback_artifact_delivery_plan(fallback_objective, known_artifact_refs)
@@ -390,7 +394,7 @@ def _plan_from_payload(
             return artifact_delivery
         intent_fallback = _fallback_plan_for_objective(
             fallback_objective,
-            runtime_hints=runtime_hints,
+            runtime_context=resolved_runtime_context,
             known_artifact_refs=known_artifact_refs,
             previous_node_results=previous_node_results,
         )
@@ -412,7 +416,7 @@ def _plan_from_payload(
             return artifact_delivery
         intent_fallback = _fallback_plan_for_objective(
             fallback_objective,
-            runtime_hints=runtime_hints,
+            runtime_context=resolved_runtime_context,
             known_artifact_refs=known_artifact_refs,
             previous_node_results=previous_node_results,
         )
@@ -529,6 +533,7 @@ def _fallback_plan_for_objective(
     objective: str,
     *,
     runtime_hints: dict[str, Any] | None = None,
+    runtime_context: RuntimeContext | None = None,
     known_artifact_refs: set[str] | None = None,
     previous_node_results: list[dict[str, Any]] | None = None,
 ) -> ExecutionPlan | None:
@@ -536,7 +541,7 @@ def _fallback_plan_for_objective(
     if artifact_delivery is not None:
         return artifact_delivery
 
-    active_repo = RuntimeContext.from_hints(runtime_hints).repo.active_repo
+    active_repo = (runtime_context or RuntimeContext.from_hints(runtime_hints)).repo.active_repo
     repo_task = bool(active_repo and _looks_like_repo_task(objective, active_repo))
     reminder_task = _looks_like_reminder_task(objective)
     previous_refs = _previous_node_refs(previous_node_results)
