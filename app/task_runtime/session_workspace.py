@@ -45,9 +45,6 @@ class NodeWorkspaceRef:
             "provider_run_dir": str(self.provider_run_dir),
         }
 
-    def runtime_hints(self) -> dict[str, str]:
-        return self.to_legacy_hints()
-
     def repo_dir(self, repo_id: str) -> Path:
         return self.repos_dir / _safe_component(repo_id, fallback="repo")
 
@@ -75,9 +72,6 @@ class SessionWorkspaceRef:
             "session_approvals_dir": str(self.approvals_dir),
             "session_nodes_dir": str(self.nodes_dir),
         }
-
-    def runtime_hints(self) -> dict[str, str]:
-        return self.to_legacy_hints()
 
     def metadata(self) -> dict[str, Any]:
         return {

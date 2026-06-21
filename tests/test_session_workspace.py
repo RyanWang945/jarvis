@@ -38,8 +38,8 @@ def test_session_workspace_creates_fixed_node_directories_after_plan(tmp_path: P
     assert workspace.node("../modify code").root_path.parent == workspace.nodes_dir
     assert ".." not in workspace.node("../modify code").safe_node_id
     assert workspace.node("inspect/code").repos_dir == workspace.node("inspect/code").root_path / "repo"
-    assert workspace.runtime_hints() == workspace.to_legacy_hints()
-    assert workspace.node("inspect/code").runtime_hints() == workspace.node("inspect/code").to_legacy_hints()
+    assert workspace.to_legacy_hints()["session_id"] == "session-test"
+    assert workspace.node("inspect/code").to_legacy_hints()["node_workspace_dir"] == str(workspace.node("inspect/code").root_path)
 
 
 def test_write_node_result_preserves_existing_output_file(tmp_path: Path) -> None:
