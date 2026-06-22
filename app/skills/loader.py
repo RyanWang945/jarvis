@@ -62,7 +62,6 @@ class SkillPackageLoader:
         effective_description = _effective_description(manifest, content_path)
         skill = Skill(
             skill_id=skill_id,
-            name=skill_id,
             description=manifest.description,
             effective_description=effective_description,
             path=path,

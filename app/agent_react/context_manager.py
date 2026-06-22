@@ -18,7 +18,6 @@ from app.llm.client import LLMMessage
 from app.prompting import PromptRegistry
 from app.repositories import RepositoryRegistryError, get_repository_registry
 from app.skills.bootstrap import get_skill_registry
-from app.skills.rendering import render_loaded_skill_guidance
 from utils.token_counter import count_text_tokens
 
 def load_agent_system_prompt(
@@ -30,9 +29,6 @@ def load_agent_system_prompt(
 
 SYSTEM_PROMPT = _SYSTEM_PROMPT = load_agent_system_prompt()
 
-_MAX_SELECTED_SKILLS = 3
-_MAX_SKILL_BODY_TOKENS = 800
-_MAX_TOTAL_SKILL_TOKENS = 1800
 _MAX_SKILL_LISTING_TOKENS = 900
 _MAX_SKILL_LISTING_ITEM_CHARS = 250
 _MAX_HISTORY_MESSAGE_TOKENS = 180
@@ -335,17 +331,6 @@ class ContextManager:
             stripped.append(message)
         return stripped
 
-    def inject_selected_skills(self, messages: list[BaseMessage], skill_names: list[str]) -> list[BaseMessage]:
-        if not skill_names:
-            return messages
-
-        skill_message = self._build_skill_reminder_message(skill_names)
-        if skill_message is None:
-            return messages
-
-        insert_at = 1 if messages and isinstance(messages[0], SystemMessage) else 0
-        return [*messages[:insert_at], skill_message, *messages[insert_at:]]
-
     def inject_skill_listing(self, messages: list[BaseMessage]) -> list[BaseMessage]:
         skill_message = self.build_skill_listing_message()
         if skill_message is None:
@@ -357,7 +342,6 @@ class ContextManager:
         self,
         *,
         session_state: ConversationSessionState | None,
-        skill_names: list[str],
         task_plan: dict[str, Any] | None = None,
         recent_artifacts: list[dict[str, Any]] | None = None,
     ) -> SystemMessage:
@@ -442,52 +426,11 @@ class ContextManager:
             tail = tail[first_line_break + 1 :].lstrip()
         return "Earlier conversation was compressed. Recent working summary:\n" + tail
 
-    def build_skill_reminder_message(self, skill_names: list[str]) -> HumanMessage | None:
-        rendered = self._render_selected_skills(skill_names)
-        if rendered is None:
-            return None
-        return HumanMessage(content=rendered)
-
     def build_skill_listing_message(self) -> HumanMessage | None:
         rendered = self._render_skill_listing()
         if rendered is None:
             return None
         return HumanMessage(content=f"<system-reminder>\n{rendered}\n</system-reminder>")
-
-    def _build_skill_reminder_message(self, skill_names: list[str]) -> HumanMessage | None:
-        return self.build_skill_reminder_message(skill_names)
-
-    def _render_selected_skills(self, skill_names: list[str]) -> str | None:
-        if not skill_names:
-            return None
-
-        registry = get_skill_registry()
-        sections: list[str] = []
-        total_tokens = 0
-        for skill_name in skill_names[:_MAX_SELECTED_SKILLS]:
-            try:
-                skill = registry.get(skill_name)
-            except ValueError:
-                continue
-            body = self._bounded_skill_body(render_loaded_skill_guidance(skill).strip())
-            if not body:
-                continue
-            section = f"[Skill: {skill.skill_id}]\n{body}"
-            section_tokens = self.estimate_text_tokens(section)
-            if total_tokens and total_tokens + section_tokens > _MAX_TOTAL_SKILL_TOKENS:
-                break
-            if section_tokens > _MAX_TOTAL_SKILL_TOKENS:
-                section = self._truncate_text_by_tokens(section, _MAX_TOTAL_SKILL_TOKENS)
-                section_tokens = self.estimate_text_tokens(section)
-            sections.append(section)
-            total_tokens += section_tokens
-
-        if not sections:
-            return None
-
-        return self._prompt_registry.load("loaded_skill_guidance").render_text(
-            {"skill_sections": "\n\n".join(sections)}
-        )
 
     def _render_skill_listing(self) -> str | None:
         try:
@@ -527,16 +470,11 @@ class ContextManager:
             {"skill_lines": "\n".join(skill_lines)}
         )
 
-    def _bounded_skill_body(self, body: str) -> str:
-        if not body:
-            return ""
-        return self._truncate_text_by_tokens(body, _MAX_SKILL_BODY_TOKENS)
-
     def _truncate_text_by_tokens(self, text: str, max_tokens: int) -> str:
         if self.estimate_text_tokens(text) <= max_tokens:
             return text
         max_chars = max(0, max_tokens * 4)
-        return text[:max_chars].rstrip() + "\n\n[Skill content truncated by Jarvis token budget.]"
+        return text[:max_chars].rstrip() + "\n\n[Content truncated by Jarvis token budget.]"
 
     def _render_repository_context(
         self,
@@ -750,7 +688,7 @@ class ContextManager:
         session_state: ConversationSessionState | None = None,
         task_plan: dict[str, Any] | None = None,
         recent_artifacts: list[dict[str, Any]] | None = None,
-    ) -> tuple[list[BaseMessage], list[str]]:
+    ) -> list[BaseMessage]:
         bounded_records = select_records_for_turn(
             records,
             turn_records or [],
@@ -759,16 +697,13 @@ class ContextManager:
         )
         lc_messages = self.records_to_lc_messages(bounded_records)
         lc_messages = self.strip_historical_tool_protocol(lc_messages)
-        skill_names: list[str] = []
         header = self.build_context_header(
             session_state=session_state,
-            skill_names=skill_names,
             task_plan=task_plan,
             recent_artifacts=recent_artifacts,
         )
         messages = self.inject_skill_listing([header, *lc_messages])
-        messages = self.inject_selected_skills(messages, skill_names)
-        return messages, skill_names
+        return messages
 
     def estimate_text_tokens(self, text: str) -> int:
         return count_text_tokens(text)

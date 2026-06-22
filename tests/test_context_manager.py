@@ -24,7 +24,7 @@ def test_context_header_keeps_session_state_in_protected_system_message() -> Non
         )
     ]
 
-    messages, _ = manager.build_initial_messages(
+    messages = manager.build_initial_messages(
         records,
         trigger_message_id=1,
         session_state=ConversationSessionState(
@@ -48,7 +48,7 @@ def test_context_header_keeps_session_state_in_protected_system_message() -> Non
 
 
 def test_context_header_includes_runtime_temporal_context() -> None:
-    messages, _ = ContextManager().build_initial_messages(
+    messages = ContextManager().build_initial_messages(
         [
             SimpleNamespace(
                 id=1,
@@ -70,7 +70,7 @@ def test_context_header_includes_runtime_temporal_context() -> None:
 
 
 def test_context_header_includes_task_plan_and_recent_artifacts() -> None:
-    messages, _ = ContextManager().build_initial_messages(
+    messages = ContextManager().build_initial_messages(
         [
             SimpleNamespace(
                 id=1,
@@ -121,7 +121,7 @@ def test_coding_context_includes_active_registered_repository(monkeypatch, tmp_p
     )
     monkeypatch.setattr("app.agent_react.context_manager.get_repository_registry", lambda: registry)
 
-    messages, _ = ContextManager().build_initial_messages(
+    messages = ContextManager().build_initial_messages(
         [
             SimpleNamespace(
                 id=1,
@@ -155,7 +155,7 @@ def test_workspace_context_includes_active_registered_repository(monkeypatch, tm
     )
     monkeypatch.setattr("app.agent_react.context_manager.get_repository_registry", lambda: registry)
 
-    messages, _ = ContextManager().build_initial_messages(
+    messages = ContextManager().build_initial_messages(
         [
             SimpleNamespace(
                 id=1,
@@ -198,7 +198,7 @@ def test_initial_context_strips_persisted_tool_protocol() -> None:
         SimpleNamespace(id=5, role="user", content="next request", raw_payload={}),
     ]
 
-    messages, _ = ContextManager().build_initial_messages(records, trigger_message_id=5)
+    messages = ContextManager().build_initial_messages(records, trigger_message_id=5)
 
     assert not any(isinstance(message, ToolMessage) for message in messages)
     assert not any(isinstance(message, AIMessage) and message.tool_calls for message in messages)
@@ -217,7 +217,7 @@ def test_initial_context_hides_clear_command_audit_message() -> None:
         SimpleNamespace(id=2, role="user", content="用codex给我个jarvis项目当前架构的svg图", raw_payload={}),
     ]
 
-    messages, _ = ContextManager().build_initial_messages(records, trigger_message_id=2)
+    messages = ContextManager().build_initial_messages(records, trigger_message_id=2)
 
     assert len([message for message in messages if isinstance(message, SystemMessage)]) == 1
     assert not any("Conversation cleared from" in str(message.content) for message in messages)

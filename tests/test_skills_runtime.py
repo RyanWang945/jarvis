@@ -1,7 +1,6 @@
 import json
 from pathlib import Path
 from types import SimpleNamespace
-from uuid import uuid4
 
 from langchain_core.messages import HumanMessage
 
@@ -43,39 +42,13 @@ def test_skill_body_strips_frontmatter_and_manifest_supports_guide_fields(tmp_pa
     assert "when_to_use:" not in body
 
 
-def test_context_manager_bounds_selected_skill_body(monkeypatch, tmp_path: Path) -> None:
-    skill_dir = tmp_path / "long-guide"
+def test_skill_registry_get_uses_skill_id_not_display_name(tmp_path: Path) -> None:
+    skill_dir = tmp_path / "release-checklist"
     skill_dir.mkdir()
     (skill_dir / "SKILL.md").write_text(
         "---\n"
-        "name: long-guide\n"
-        "description: Long guide.\n"
-        "---\n\n"
-        + ("Long procedural guidance. " * 1000),
-        encoding="utf-8",
-    )
-    package = SkillPackageLoader([]).load_package(skill_dir)
-    registry = SkillRegistry([package.skill])
-    monkeypatch.setattr("app.agent_react.context_manager.get_skill_registry", lambda: registry)
-
-    rendered = ContextManager()._render_selected_skills(["long-guide"])
-
-    assert rendered is not None
-    assert "[Skill: long-guide]" in rendered
-    assert "name: long-guide" not in rendered
-    assert "[Skill content truncated by Jarvis token budget.]" in rendered
-
-
-def test_skill_registry_select_matches_returns_reason_and_confidence() -> None:
-    skill_dir = Path("sandbox") / f"test-skill-registry-{uuid4().hex}" / "release-checklist"
-    skill_dir.mkdir(parents=True)
-    (skill_dir / "SKILL.md").write_text(
-        "---\n"
-        "name: release-checklist\n"
+        "name: Release Checklist\n"
         "description: Release workflow guidance.\n"
-        "when_to_use: User asks for release workflow.\n"
-        "capabilities:\n"
-        "  - release\n"
         "---\n\n"
         "Follow release steps.\n",
         encoding="utf-8",
@@ -83,22 +56,22 @@ def test_skill_registry_select_matches_returns_reason_and_confidence() -> None:
     package = SkillPackageLoader([]).load_package(skill_dir)
     registry = SkillRegistry([package.skill])
 
-    matches = registry.select_matches("please run the release workflow")
+    assert registry.get("release-checklist").skill_id == "release-checklist"
+    try:
+        registry.get("Release Checklist")
+    except ValueError as exc:
+        assert "unknown skill" in str(exc)
+    else:
+        raise AssertionError("display name must not resolve as a skill id")
 
-    assert len(matches) == 1
-    assert matches[0].skill.skill_id == "release-checklist"
-    assert matches[0].confidence in {"high", "medium"}
-    assert matches[0].reason
 
-
-def test_weather_skill_is_selected_for_chinese_weather_requests(monkeypatch) -> None:
+def test_weather_skill_is_listed_without_body(monkeypatch) -> None:
     skill_dir = Path("skills/weather-1.0.0")
     package = SkillPackageLoader([]).load_package(skill_dir)
     registry = SkillRegistry([package.skill])
     monkeypatch.setattr("app.agent_react.context_manager.get_skill_registry", lambda: registry)
 
-    matches = registry.select_matches("查一下上海天气")
-    messages, skill_names = ContextManager().build_initial_messages(
+    messages = ContextManager().build_initial_messages(
         [
             SimpleNamespace(
                 id=1,
@@ -113,8 +86,6 @@ def test_weather_skill_is_selected_for_chinese_weather_requests(monkeypatch) -> 
         current_turn_id=None,
     )
 
-    assert matches[0].skill.skill_id == "weather-1.0.0"
-    assert skill_names == []
     reminder_content = str(messages[1].content)
     assert "The following skills are available for use with the Skill tool:" in reminder_content
     assert "- weather-1.0.0:" in reminder_content
@@ -138,7 +109,7 @@ def test_skill_listing_shows_menu_without_body(monkeypatch, tmp_path: Path) -> N
     registry = SkillRegistry([package.skill])
     monkeypatch.setattr("app.agent_react.context_manager.get_skill_registry", lambda: registry)
 
-    messages, skill_names = ContextManager().build_initial_messages(
+    messages = ContextManager().build_initial_messages(
         [
             SimpleNamespace(
                 id=1,
@@ -153,7 +124,6 @@ def test_skill_listing_shows_menu_without_body(monkeypatch, tmp_path: Path) -> N
         current_turn_id=None,
     )
 
-    assert skill_names == []
     assert isinstance(messages[1], HumanMessage)
     reminder_content = str(messages[1].content)
     assert reminder_content.startswith("<system-reminder>")
@@ -177,17 +147,16 @@ def test_load_skill_loads_exact_skill_id_and_injects_body(monkeypatch, tmp_path:
     package = SkillPackageLoader([]).load_package(skill_dir)
     registry = SkillRegistry([package.skill])
     monkeypatch.setattr("app.tools.skill_guidance.get_skill_registry", lambda: registry)
-    monkeypatch.setattr("app.agent_react.context_manager.get_skill_registry", lambda: registry)
 
     result = run_load_skill(ToolExecutionRequest(tool_name="Skill", workdir=None, args={"skill": "external-review"}))
     payload = json.loads(result.stdout)
-    rendered = ContextManager().build_skill_reminder_message([payload["skills"][0]["name"]])
 
     assert payload["status"] == "loaded"
     assert payload["skill"]["skill_id"] == "external-review"
     assert payload["skills"][0]["name"] == "external-review"
     assert "Base directory for this skill:" in payload["content"]
-    assert rendered is not None
-    assert not str(rendered.content).startswith("<system-reminder>")
-    assert "[Skill: external-review]" in str(rendered.content)
-    assert "Follow the external skill review checklist." in str(rendered.content)
+    assert "Follow the external skill review checklist." in payload["content"]
+
+    alias_result = run_load_skill(ToolExecutionRequest(tool_name="Skill", workdir=None, args={"skill": "Fancy Display Name"}))
+    alias_payload = json.loads(alias_result.stdout)
+    assert alias_payload["status"] == "unknown_skill"

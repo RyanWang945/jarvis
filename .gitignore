@@ -36,8 +36,3 @@ projects/
 *.spec
 nul
 data/*
-!data/skills/
-!data/skills/**
-data/skills/**/.DS_Store
-data/skills/**/__pycache__/
-data/skills/**/*.py[oc]

@@ -27,7 +27,7 @@ def _record(
 
 def test_context_contract_keeps_current_turn_contract_under_tight_budget() -> None:
     manager = ContextManager()
-    messages, _skills = manager.build_initial_messages(
+    messages = manager.build_initial_messages(
         [
             _record(1, "user", "old context " * 200, turn_id=1),
             _record(2, "assistant", "old answer " * 200, turn_id=1),
@@ -72,7 +72,7 @@ def test_context_contract_keeps_current_turn_contract_under_tight_budget() -> No
 
 def test_context_contract_strips_historical_tool_protocol_and_usage_footer() -> None:
     manager = ContextManager()
-    messages, _skills = manager.build_initial_messages(
+    messages = manager.build_initial_messages(
         [
             _record(1, "user", "review repo", turn_id=1),
             _record(
@@ -115,7 +115,7 @@ def test_context_contract_omits_policy_specific_sections() -> None:
     manager = ContextManager()
     records = [_record(1, "user", "hello")]
 
-    messages, _ = manager.build_initial_messages(
+    messages = manager.build_initial_messages(
         records,
         trigger_message_id=1,
     )
@@ -127,7 +127,7 @@ def test_context_contract_omits_policy_specific_sections() -> None:
 
 def test_context_contract_excludes_incomplete_prior_turns_when_building_current_context() -> None:
     manager = ContextManager()
-    messages, _skills = manager.build_initial_messages(
+    messages = manager.build_initial_messages(
         [
             _record(1, "user", "completed user", turn_id=1),
             _record(2, "assistant", "completed assistant", turn_id=1),

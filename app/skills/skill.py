@@ -9,7 +9,6 @@ from app.skills.manifest import SkillManifest
 @dataclass(frozen=True)
 class Skill:
     skill_id: str
-    name: str
     description: str
     effective_description: str
     path: Path

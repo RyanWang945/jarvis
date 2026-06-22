@@ -370,7 +370,7 @@ def _build_system_prompt(context) -> str:
         )
     except Exception:
         logger.warning("claude react runtime failed to load react_node_execute prompt, using fallback", exc_info=True)
-        return _fallback_system_prompt()
+        return _fallback_system_prompt(context)
 
     # Extract the system message content
     system_text = ""
@@ -382,15 +382,20 @@ def _build_system_prompt(context) -> str:
             break
 
     if not system_text:
-        return _fallback_system_prompt()
+        return _fallback_system_prompt(context)
+
+    # Build temporal context line so the Claude Code CLI subprocess
+    # (claude.exe) knows the actual current date/time instead of falling
+    # back to its baked-in knowledge cutoff.
+    temporal_line = _build_temporal_context_line(context)
 
     # Adapt the prompt for Claude Agent SDK environment.
     # Appended instruction guides the agent toward a final structured answer.
-    adapted = (
-        system_text.strip()
-        + "\n\n"
-        + _FINAL_RESPONSE_GUIDANCE
-    )
+    parts = [system_text.strip()]
+    if temporal_line:
+        parts.append(temporal_line)
+    parts.append(_FINAL_RESPONSE_GUIDANCE)
+    adapted = "\n\n".join(parts)
     return adapted
 
 
@@ -415,6 +420,33 @@ def _build_user_prompt(context) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
+def _build_temporal_context_line(context) -> str:
+    """Return a single-line temporal context snippet for the system prompt.
+
+    This ensures the Claude Code CLI subprocess (claude.exe) sees the actual
+    current date and time rather than relying on its baked-in knowledge cutoff.
+    """
+    from app.task_runtime.node_execute_runtime import _temporal_context
+
+    temporal = _temporal_context(
+        getattr(context, "runtime_context", None)
+        or RuntimeContext.from_hints(context.legacy_hints)
+    )
+    if not temporal:
+        return ""
+    date = temporal.get("current_date", "")
+    time_ = temporal.get("current_time", "")
+    tz = temporal.get("timezone", "")
+    if not date:
+        return ""
+    parts = [f"Current date: {date}"]
+    if time_:
+        parts.append(f"Current time: {time_}")
+    if tz:
+        parts.append(f"Timezone: {tz}")
+    return " | ".join(parts)
+
+
 _FINAL_RESPONSE_GUIDANCE = """
 Use whatever tools you need to complete the task (WebSearch, WebFetch, etc.).
 When you have gathered enough information, provide your final response.
@@ -427,14 +459,19 @@ rather than making additional tool calls.
 """.strip()
 
 
-def _fallback_system_prompt() -> str:
-    return (
+def _fallback_system_prompt(context=None) -> str:
+    parts = [
         "You are Jarvis ClaudeReactNodeExecuteRuntime. "
         "Execute one non-repository plan node using available tools. "
         "Do not perform code edits, shell commands, or repository workflows "
-        "(code and shell work belongs to coder runtime nodes). "
-        + _FINAL_RESPONSE_GUIDANCE
-    )
+        "(code and shell work belongs to coder runtime nodes).",
+    ]
+    if context is not None:
+        temporal_line = _build_temporal_context_line(context)
+        if temporal_line:
+            parts.append(temporal_line)
+    parts.append(_FINAL_RESPONSE_GUIDANCE)
+    return "\n\n".join(parts)
 
 
 # ---------------------------------------------------------------------------

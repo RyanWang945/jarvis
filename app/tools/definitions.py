@@ -20,7 +20,7 @@ from app.tools.obsidian_wiki import (
 )
 from app.tools.shell import run_shell_command, run_shell_inspect
 from app.tools.scheduled_task import run_scheduled_task
-from app.tools.skill_guidance import run_load_skill, run_load_skill_guidance
+from app.tools.skill_guidance import run_load_skill
 from app.tools.tavily import run_tavily_search
 from app.tools.tool_search import run_tool_search
 from app.tools.write_file import run_write_file
@@ -233,52 +233,6 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
             },
             handler=run_load_skill,
             risk_level="low",
-        ),
-        ToolDefinition(
-            name="load_skill",
-            description=_tool_description("load_skill"),
-            args_schema={
-                "type": "object",
-                "properties": {
-                    "skill": {
-                        "type": "string",
-                        "description": _property_description("load_skill", "skill"),
-                    },
-                    "args": {
-                        "description": _property_description("load_skill", "args"),
-                    },
-                },
-                "required": ["skill"],
-            },
-            handler=run_load_skill,
-            risk_level="low",
-            exposed_to_llm=False,
-        ),
-        ToolDefinition(
-            name="load_skill_guidance",
-            description=_tool_description("load_skill_guidance"),
-            args_schema={
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": _property_description("load_skill_guidance", "query"),
-                    },
-                    "intent": {
-                        "type": "string",
-                        "description": _property_description("load_skill_guidance", "intent"),
-                    },
-                    "max_results": {
-                        "type": "integer",
-                        "description": _property_description("load_skill_guidance", "max_results"),
-                        "default": 3,
-                    },
-                },
-                "required": ["query"],
-            },
-            handler=run_load_skill_guidance,
-            risk_level="low",
-            exposed_to_llm=False,
         ),
         ToolDefinition(
             name="obsidian_wiki_query",

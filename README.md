@@ -82,7 +82,7 @@ Invoke-RestMethod http://127.0.0.1:8000/agent/run `
 
 `JARVIS_WORKER_MODE=thread` enables the experimental threaded worker client and starts the in-process dispatcher that resumes agent threads when workers finish.
 
-`JARVIS_TAVILY_API_KEY` enables the external `tavily_search` skill when installed under `data/skills/`.
+`JARVIS_TAVILY_API_KEY` enables the external `tavily_search` tool.
 
 `JARVIS_OBSIDIAN_WORKSPACE_PATH` controls the Obsidian wiki workspace. The default is `data/obsidian_wiki`; open `data/obsidian_wiki/vault/` in Obsidian. `JARVIS_OBSIDIAN_VAULT_PATH` is kept as a deprecated compatibility alias for older local configs.
 
