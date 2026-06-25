@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from dataclasses import asdict
 from typing import Any
 
 from app.tools.common import ToolExecutionRequest, ToolExecutionResult
@@ -150,6 +151,7 @@ def adapt_jarvis_tool_to_sdk_tool(
                             "stdout": text,
                             "stderr": _truncate(result.stderr),
                             "artifacts": list(result.artifacts),
+                            "tool_artifacts": [asdict(item) for item in result.tool_artifacts],
                         },
                         ensure_ascii=False,
                     ),

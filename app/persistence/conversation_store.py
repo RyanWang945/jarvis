@@ -24,6 +24,7 @@ from app.api.schemas import (
 )
 from app.config import get_settings
 from app.llm.model_profiles import model_command_response, render_model_status, runtime_preferences_metadata
+from app.observability import instrument_sqlalchemy_engine
 from app.persistence.models import (
     ArtifactRecord,
     ConversationRecord,
@@ -139,6 +140,7 @@ class MySQLConversationStore:
             f"?charset=utf8mb4"
         )
         self._engine = create_engine(url, pool_pre_ping=True, pool_recycle=3600)
+        instrument_sqlalchemy_engine(self._engine, settings)
         logger.info("mysql store initialized host=%s db=%s", settings.mysql_host, settings.mysql_database)
         self._ensure_extension_schema()
         self._reset_stale_turns()

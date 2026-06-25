@@ -238,7 +238,7 @@ def test_react_node_execute_runtime_runs_tool_loop() -> None:
     assert "trace evidence" in chat.calls[1]["messages"][-1].content
 
 
-def test_react_node_execute_runtime_exposes_all_llm_tools() -> None:
+def test_react_node_execute_runtime_hides_write_file_for_read_nodes() -> None:
     from app.task_runtime.node_execute_runtime import ReactNodeExecuteRuntime
 
     chat = ScriptedNodeChat([llm_response('{"summary":"done"}')])
@@ -257,8 +257,60 @@ def test_react_node_execute_runtime_exposes_all_llm_tools() -> None:
 
     tool_names = {tool["function"]["name"] for tool in chat.calls[0]["tools"]}
     assert result.status == "completed"
-    assert {"read_file", "shell_run_command", "scheduled_task", "deliver_file", "tavily_search"} <= tool_names
+    assert {"read_file", "scheduled_task", "deliver_file", "tavily_search"} <= tool_names
+    assert "write_file" not in tool_names
+    assert "shell_run_command" not in tool_names
     assert "delegate_to_codex" not in tool_names
+
+
+def test_react_node_execute_runtime_exposes_write_file_for_write_nodes() -> None:
+    from app.task_runtime.node_execute_runtime import ReactNodeExecuteRuntime
+
+    chat = ScriptedNodeChat([llm_response('{"summary":"done"}')])
+    runtime = ReactNodeExecuteRuntime(
+        model_resolver=lambda context: FakeResolvedModel(chat),
+        tool_runner=lambda tool, tool_args, *, timeout_seconds=60: (_ for _ in ()).throw(AssertionError("should not run")),
+        max_steps=2,
+    )
+
+    result = runtime.run(
+        NodeExecutionContext(
+            user_objective="写一份报告",
+            node=PlanNode(id="write_report", runtime="react", mode="write", objective="Write report"),
+        )
+    )
+
+    tool_names = {tool["function"]["name"] for tool in chat.calls[0]["tools"]}
+    assert result.status == "completed"
+    assert "write_file" in tool_names
+    assert "shell_run_command" not in tool_names
+
+
+def test_react_node_execute_runtime_rejects_write_file_for_read_nodes() -> None:
+    from app.task_runtime.node_execute_runtime import ReactNodeExecuteRuntime
+
+    chat = ScriptedNodeChat(
+        [
+            llm_response(tool_calls=(NormalizedToolCall(id="call_1", name="write_file", args={"relative_path": "report.md", "content": "x"}),)),
+            llm_response('{"summary":"used inline result","findings":[],"sources":[]}'),
+        ]
+    )
+    runtime = ReactNodeExecuteRuntime(
+        model_resolver=lambda context: FakeResolvedModel(chat),
+        tool_runner=lambda tool, tool_args, *, timeout_seconds=60: (_ for _ in ()).throw(AssertionError("should not run")),
+        max_steps=4,
+    )
+
+    result = runtime.run(
+        NodeExecutionContext(
+            user_objective="研究一下",
+            node=PlanNode(id="research", runtime="react", objective="Research"),
+        )
+    )
+
+    assert result.status == "completed"
+    assert result.tool_calls[0]["status"] == "rejected"
+    assert "mode=read" in result.tool_calls[0]["summary"]
 
 
 def test_react_node_execute_runtime_rejects_coder_only_tool_calls_before_runner() -> None:

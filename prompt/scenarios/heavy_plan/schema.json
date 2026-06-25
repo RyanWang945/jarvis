@@ -14,14 +14,18 @@
       "items": {
         "type": "object",
         "additionalProperties": true,
-        "required": ["id", "runtime", "objective", "input_refs", "output_hint"],
+        "required": ["id", "runtime", "mode", "objective", "input_refs", "output_hint"],
         "properties": {
           "id": {
             "type": "string"
           },
           "runtime": {
             "type": "string",
-            "enum": ["llm", "react", "coder"]
+            "enum": ["react", "coder"]
+          },
+          "mode": {
+            "type": "string",
+            "enum": ["read", "write"]
           },
           "objective": {
             "type": "string"

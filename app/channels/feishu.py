@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import http
 import inspect
 import json
@@ -12,6 +13,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -45,9 +47,10 @@ from app.channels.feishu_progress import FeishuCardKitProgressSink, FeishuProgre
 from app.channels.feishu_renderer import FeishuDelivery, FeishuRenderer
 from app.config import get_settings
 from app.gateway import InboundEvent, get_gateway_service
+from app.observability import span_context
 from app.progress import NoopProgressReporter, ProgressEvent, ProgressReporter
 from app.persistence.models import DeliveryRecord
-from app.runtime_usage import append_usage_footer, collect_usage_records, usage_totals
+from app.runtime_usage import collect_usage_records, usage_totals
 from app.task_runtime.approval_types import approval_request_from_mapping
 from app.task_runtime.approval_runtime import continue_approval
 from app.tools.codex_app_server import approval_command_prefix
@@ -534,11 +537,14 @@ class FeishuChannel:
                     decided_by=approval_source or "approval_runtime",
                 )
                 token_usage = usage_totals(collect_usage_records(result.metadata))
-                reply = append_usage_footer(
-                    result.final_text.strip() or "Approval continuation completed.",
-                    token_usage,
+                self._send_channel_message(
+                    chat_id,
+                    ChannelMessage(
+                        content=result.final_text.strip() or "Approval continuation completed.",
+                        content_type="markdown",
+                        metadata={"usage": token_usage} if token_usage is not None else {},
+                    ),
                 )
-                self._send_channel_message(chat_id, ChannelMessage(content=reply, content_type="markdown"))
                 return
 
             if result.status == "approval_requested":
@@ -608,6 +614,37 @@ class FeishuChannel:
         conversation_id: int,
         turn_id: int | None,
     ) -> None:
+        with span_context(
+            "feishu.agent_run",
+            **{
+                "messaging.system": "feishu",
+                "jarvis.platform": "feishu",
+                "jarvis.chat_id": chat_id,
+                "jarvis.chat_type": chat_type,
+                "jarvis.conversation_id": conversation_id,
+                "jarvis.turn_id": turn_id,
+                "jarvis.sender_open_id": sender_open_id,
+            },
+        ):
+            self._handle_agent_run_inner(
+                sender_open_id=sender_open_id,
+                chat_id=chat_id,
+                chat_type=chat_type,
+                text=text,
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+            )
+
+    def _handle_agent_run_inner(
+        self,
+        *,
+        sender_open_id: str,
+        chat_id: str,
+        chat_type: str,
+        text: str,
+        conversation_id: int,
+        turn_id: int | None,
+    ) -> None:
         thinking_message_id: str | None = None
         progress: ProgressReporter | None = None
         drain_after = True
@@ -645,10 +682,7 @@ class FeishuChannel:
                     error_message="agent run failed",
                 )
             if thinking_message_id:
-                self._update_card_message(
-                    thinking_message_id,
-                    self._renderer.render_error_card("Sorry, something went wrong. Please try again later."),
-                )
+                self._update_error_message(thinking_message_id, "Sorry, something went wrong. Please try again later.")
             else:
                 self._send_text_message(
                     chat_id,
@@ -667,10 +701,7 @@ class FeishuChannel:
         if result.status == "failed":
             error_text = result.reply.strip() or "抱歉，调用模型时出错了，请稍后再试。"
             if thinking_message_id:
-                self._update_card_message(
-                    thinking_message_id,
-                    self._renderer.render_error_card(error_text),
-                )
+                self._update_error_message(thinking_message_id, error_text)
             else:
                 self._send_text_message(chat_id, error_text)
             if drain_after:
@@ -715,7 +746,14 @@ class FeishuChannel:
 
         message = self._format_result(result)
         if thinking_message_id:
-            self._update_channel_message(thinking_message_id, message)
+            try:
+                self._update_channel_message(thinking_message_id, message)
+            except Exception:
+                logger.exception(
+                    "failed to update final feishu message_id=%s; sending fallback message",
+                    thinking_message_id,
+                )
+                self._send_channel_message(chat_id, message)
             self._send_message_attachments(chat_id, message)
         else:
             self._send_channel_message(chat_id, message)
@@ -836,7 +874,12 @@ class FeishuChannel:
         if message_id in self._cardkit_progress_message_ids:
             sink = self._progress_sinks.get(message_id)
             snapshot = sink.snapshot if sink is not None else _initial_progress_snapshot()
-            delivery = self._renderer.render_cardkit_progress_card(snapshot, output_markdown=message.content)
+            usage = message.metadata.get("usage") if isinstance(message.metadata, dict) else None
+            delivery = self._renderer.render_cardkit_progress_card(
+                snapshot,
+                output_markdown=message.content,
+                usage=usage if isinstance(usage, dict) else None,
+            )
         else:
             delivery = self._renderer.render(message)
         if delivery.msg_type != "interactive":
@@ -844,6 +887,13 @@ class FeishuChannel:
         self._update_card_message(message_id, delivery)
         # Thinking-card updates do not carry chat_id. The caller sends attachments
         # after update when it has the receive_id available.
+
+    def _update_error_message(self, message_id: str, error_text: str) -> None:
+        if message_id in self._cardkit_progress_message_ids:
+            message = ChannelMessage(content=error_text, content_type="markdown")
+            self._update_channel_message(message_id, message)
+            return
+        self._update_card_message(message_id, self._renderer.render_error_card(error_text))
 
     def _send_thinking_card(self, receive_id: str, prompt: str) -> str | None:
         try:
@@ -871,24 +921,82 @@ class FeishuChannel:
 
     def _send_delivery(self, receive_id: str, delivery: FeishuDelivery) -> dict[str, Any]:
         token = self._ensure_token()
+        request_payload = {
+            "receive_id": receive_id,
+            "msg_type": delivery.msg_type,
+            "content": delivery.content,
+        }
+        request_meta = _feishu_payload_meta(
+            operation="send",
+            msg_type=delivery.msg_type,
+            content=delivery.content,
+            receive_id=receive_id,
+        )
+        logger.info(
+            "feishu message send starting receive_id=%s msg_type=%s content_bytes=%s content_sha1=%s",
+            receive_id,
+            delivery.msg_type,
+            request_meta["content_bytes"],
+            request_meta["content_sha1"],
+        )
         resp = self._http.post(
             "https://open.feishu.cn/open-apis/im/v1/messages",
             params={"receive_id_type": "chat_id"},
             headers={"Authorization": f"Bearer {token}"},
-            json={
-                "receive_id": receive_id,
-                "msg_type": delivery.msg_type,
-                "content": delivery.content,
-            },
+            json=request_payload,
         )
-        resp.raise_for_status()
-        payload = resp.json()
+        log_id = _feishu_log_id(resp)
+        payload = _response_payload(resp)
+        if resp.status_code >= 400:
+            capture_path = _capture_feishu_payload(
+                "send",
+                request_meta=request_meta,
+                request_payload=request_payload,
+                response_status=resp.status_code,
+                response_payload=payload,
+                response_headers=_selected_feishu_headers(resp),
+                force_error=True,
+            )
+            logger.error(
+                "feishu send message http_error status=%s log_id=%s receive_id=%s msg_type=%s content_bytes=%s content_sha1=%s capture_path=%s payload=%s",
+                resp.status_code,
+                log_id,
+                receive_id,
+                delivery.msg_type,
+                request_meta["content_bytes"],
+                request_meta["content_sha1"],
+                capture_path,
+                payload,
+            )
+            raise RuntimeError(f"feishu send message http_error status={resp.status_code} log_id={log_id} capture_path={capture_path} payload={payload}")
         if payload.get("code") != 0:
-            raise RuntimeError(f"feishu send message failed: {payload}")
+            capture_path = _capture_feishu_payload(
+                "send",
+                request_meta=request_meta,
+                request_payload=request_payload,
+                response_status=resp.status_code,
+                response_payload=payload,
+                response_headers=_selected_feishu_headers(resp),
+                force_error=True,
+            )
+            raise RuntimeError(f"feishu send message failed log_id={log_id} capture_path={capture_path} payload={payload}")
+        _capture_feishu_payload(
+            "send",
+            request_meta=request_meta,
+            request_payload=request_payload,
+            response_status=resp.status_code,
+            response_payload=payload,
+            response_headers=_selected_feishu_headers(resp),
+        )
+        message_id = _extract_message_id(payload) or ""
         logger.info(
-            "feishu message sent receive_id=%s msg_type=%s",
+            "feishu message sent receive_id=%s msg_type=%s message_id=%s content_bytes=%s content_sha1=%s log_id=%s",
             receive_id,
             delivery.msg_type,
+            message_id,
+            request_meta["content_bytes"],
+            request_meta["content_sha1"],
+            log_id,
         )
         return payload
 
@@ -1123,16 +1231,74 @@ class FeishuChannel:
         if delivery.msg_type != "interactive":
             raise RuntimeError("Only interactive card messages can be updated.")
         token = self._ensure_token()
+        request_payload = {"content": delivery.content}
+        request_meta = _feishu_payload_meta(
+            operation="patch",
+            msg_type=delivery.msg_type,
+            content=delivery.content,
+            message_id=message_id,
+        )
+        logger.info(
+            "feishu message update starting message_id=%s msg_type=%s content_bytes=%s content_sha1=%s",
+            message_id,
+            delivery.msg_type,
+            request_meta["content_bytes"],
+            request_meta["content_sha1"],
+        )
         resp = self._http.patch(
             f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}",
             headers={"Authorization": f"Bearer {token}"},
-            json={"content": delivery.content},
+            json=request_payload,
         )
-        resp.raise_for_status()
-        payload = resp.json()
+        log_id = _feishu_log_id(resp)
+        payload = _response_payload(resp)
+        if resp.status_code >= 400:
+            capture_path = _capture_feishu_payload(
+                "patch",
+                request_meta=request_meta,
+                request_payload=request_payload,
+                response_status=resp.status_code,
+                response_payload=payload,
+                response_headers=_selected_feishu_headers(resp),
+                force_error=True,
+            )
+            logger.error(
+                "feishu update message http_error status=%s log_id=%s message_id=%s content_bytes=%s content_sha1=%s capture_path=%s payload=%s",
+                resp.status_code,
+                log_id,
+                message_id,
+                request_meta["content_bytes"],
+                request_meta["content_sha1"],
+                capture_path,
+                payload,
+            )
+            raise RuntimeError(f"feishu update message http_error status={resp.status_code} log_id={log_id} capture_path={capture_path} payload={payload}")
         if payload.get("code") != 0:
-            raise RuntimeError(f"feishu update message failed: {payload}")
-        logger.info("feishu message updated message_id=%s", message_id)
+            capture_path = _capture_feishu_payload(
+                "patch",
+                request_meta=request_meta,
+                request_payload=request_payload,
+                response_status=resp.status_code,
+                response_payload=payload,
+                response_headers=_selected_feishu_headers(resp),
+                force_error=True,
+            )
+            raise RuntimeError(f"feishu update message failed log_id={log_id} capture_path={capture_path} payload={payload}")
+        _capture_feishu_payload(
+            "patch",
+            request_meta=request_meta,
+            request_payload=request_payload,
+            response_status=resp.status_code,
+            response_payload=payload,
+            response_headers=_selected_feishu_headers(resp),
+        )
+        logger.info(
+            "feishu message updated message_id=%s content_bytes=%s content_sha1=%s log_id=%s",
+            message_id,
+            request_meta["content_bytes"],
+            request_meta["content_sha1"],
+            log_id,
+        )
 
     def send_message(self, receive_id: str, text: str) -> bool:
         try:
@@ -1501,6 +1667,187 @@ def _safe_preview(value: str, *, limit: int = 120) -> str:
     if len(normalized) <= limit:
         return normalized
     return normalized[:limit] + "...[truncated]"
+
+
+def _feishu_payload_meta(
+    *,
+    operation: str,
+    msg_type: str,
+    content: str,
+    receive_id: str | None = None,
+    message_id: str | None = None,
+) -> dict[str, Any]:
+    content_bytes = content.encode("utf-8")
+    meta: dict[str, Any] = {
+        "operation": operation,
+        "msg_type": msg_type,
+        "content_chars": len(content),
+        "content_bytes": len(content_bytes),
+        "content_sha1": hashlib.sha1(content_bytes).hexdigest(),
+    }
+    if receive_id:
+        meta["receive_id"] = receive_id
+    if message_id:
+        meta["message_id"] = message_id
+    card = _json_object_or_none(content)
+    if card is not None:
+        meta.update(_feishu_card_meta(card))
+    return meta
+
+
+def _feishu_card_meta(card: dict[str, Any]) -> dict[str, Any]:
+    schema = card.get("schema")
+    result: dict[str, Any] = {
+        "card_schema": schema if isinstance(schema, str) else "legacy",
+        "element_count": 0,
+        "markdown_blocks": [],
+    }
+    if schema == "2.0":
+        body = card.get("body")
+        elements = body.get("elements") if isinstance(body, dict) else []
+    else:
+        elements = card.get("elements")
+    if not isinstance(elements, list):
+        elements = []
+    result["element_count"] = len(elements)
+    result["markdown_blocks"] = _feishu_markdown_block_meta(card)
+    return result
+
+
+def _feishu_markdown_block_meta(card: dict[str, Any]) -> list[dict[str, Any]]:
+    blocks: list[dict[str, Any]] = []
+
+    def visit(value: Any, path: str) -> None:
+        if isinstance(value, dict):
+            if value.get("tag") in {"markdown", "lark_md"} and isinstance(value.get("content"), str):
+                content = value["content"]
+                blocks.append(
+                    {
+                        "path": path,
+                        "element_id": value.get("element_id"),
+                        "tag": value.get("tag"),
+                        "chars": len(content),
+                        "bytes": len(content.encode("utf-8")),
+                    }
+                )
+            text = value.get("text")
+            if isinstance(text, dict) and text.get("tag") in {"markdown", "lark_md"} and isinstance(text.get("content"), str):
+                content = text["content"]
+                blocks.append(
+                    {
+                        "path": f"{path}.text",
+                        "element_id": value.get("element_id"),
+                        "tag": text.get("tag"),
+                        "chars": len(content),
+                        "bytes": len(content.encode("utf-8")),
+                    }
+                )
+            for key, item in value.items():
+                visit(item, f"{path}.{key}" if path else str(key))
+        elif isinstance(value, list):
+            for index, item in enumerate(value):
+                visit(item, f"{path}[{index}]")
+
+    visit(card, "")
+    return blocks
+
+
+def _capture_feishu_payload(
+    operation: str,
+    *,
+    request_meta: dict[str, Any],
+    request_payload: dict[str, Any],
+    response_status: int,
+    response_payload: dict[str, Any],
+    response_headers: dict[str, str],
+    force_error: bool = False,
+) -> str | None:
+    try:
+        settings = get_settings()
+        should_capture = bool(settings.feishu_capture_payload_always or (force_error and settings.feishu_capture_payload_on_error))
+        if not should_capture:
+            return None
+        log_dir = settings.feishu_payload_log_dir
+        log_dir.mkdir(parents=True, exist_ok=True)
+        sha1 = str(request_meta.get("content_sha1") or "unknown")
+        target_id = str(request_meta.get("message_id") or request_meta.get("receive_id") or "unknown")
+        safe_target_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", target_id)[:96]
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        path = log_dir / f"{timestamp}-{operation}-{safe_target_id}-{sha1[:12]}.json"
+        record = {
+            "request_meta": request_meta,
+            "request_payload": request_payload,
+            "response": {
+                "status_code": response_status,
+                "headers": response_headers,
+                "payload": response_payload,
+            },
+        }
+        text = json.dumps(record, ensure_ascii=False, indent=2)
+        max_bytes = max(0, int(settings.feishu_payload_log_max_bytes or 0))
+        encoded = text.encode("utf-8")
+        if max_bytes and len(encoded) > max_bytes:
+            record["request_payload"] = {
+                **request_payload,
+                "content": _truncate_utf8(str(request_payload.get("content") or ""), max_bytes=max(1024, max_bytes // 2)),
+                "content_truncated": True,
+            }
+            record["response"]["payload"] = _truncate_nested_strings(response_payload, max_bytes=max(1024, max_bytes // 4))
+            record["truncated"] = True
+            text = json.dumps(record, ensure_ascii=False, indent=2)
+        path.write_text(text, encoding="utf-8")
+        return str(path)
+    except Exception:
+        logger.exception("failed to capture feishu payload operation=%s", operation)
+        return None
+
+
+def _truncate_nested_strings(value: Any, *, max_bytes: int) -> Any:
+    if isinstance(value, str):
+        return _truncate_utf8(value, max_bytes=max_bytes)
+    if isinstance(value, dict):
+        return {key: _truncate_nested_strings(item, max_bytes=max_bytes) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_truncate_nested_strings(item, max_bytes=max_bytes) for item in value]
+    return value
+
+
+def _truncate_utf8(value: str, *, max_bytes: int) -> str:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value
+    suffix = "\n...[truncated]"
+    budget = max(0, max_bytes - len(suffix.encode("utf-8")))
+    return encoded[:budget].decode("utf-8", errors="ignore") + suffix
+
+
+def _response_payload(resp: httpx.Response) -> dict[str, Any]:
+    try:
+        payload = resp.json()
+    except ValueError:
+        return {"status_code": resp.status_code, "body": resp.text}
+    return payload if isinstance(payload, dict) else {"payload": payload}
+
+
+def _selected_feishu_headers(resp: httpx.Response) -> dict[str, str]:
+    selected: dict[str, str] = {}
+    for key in ("x-tt-logid", "X-Tt-Logid", "x-request-id", "X-Request-Id"):
+        value = resp.headers.get(key)
+        if value:
+            selected[key] = value
+    return selected
+
+
+def _feishu_log_id(resp: httpx.Response) -> str | None:
+    return resp.headers.get("x-tt-logid") or resp.headers.get("X-Tt-Logid")
+
+
+def _json_object_or_none(value: str) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 def _extract_message_id(payload: dict[str, Any]) -> str | None:

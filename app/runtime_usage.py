@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.agent_react.model_usage import strip_token_usage_footer
 from app.llm.provider_adapters import NormalizedLLMResponse, TokenUsage
 
 
@@ -87,20 +86,6 @@ def usage_totals(records: list[dict[str, Any]]) -> dict[str, Any] | None:
         "total_tokens": total,
         "records": breakdown,
     }
-
-
-def append_usage_footer(markdown: str, totals: dict[str, Any] | None) -> str:
-    if not totals:
-        return markdown
-    body = strip_token_usage_footer(str(markdown or "")).rstrip()
-    prompt = _int_value(totals.get("prompt_tokens"))
-    completion = _int_value(totals.get("completion_tokens"))
-    total = _int_value(totals.get("total_tokens"))
-    footer = (
-        "---\n"
-        f"- Token：输入 `{prompt}` / 输出 `{completion}` / 合计 `{total}`"
-    )
-    return f"{body}\n\n{footer}" if body else footer
 
 
 def _collect_usage_records(value: Any, records: list[dict[str, Any]]) -> None:

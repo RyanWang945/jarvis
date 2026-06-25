@@ -11,6 +11,14 @@ from app.progress import ProgressEvent
 
 logger = logging.getLogger(__name__)
 
+_FORCE_FLUSH_EVENT_TYPES = {
+    "node_started",
+    "aggregation_started",
+    "turn_failed",
+    "node_failed",
+    "turn_completed",
+}
+
 
 @dataclass
 class ProgressSnapshot:
@@ -61,7 +69,7 @@ class FeishuProgressSink:
     def on_progress(self, event: ProgressEvent) -> None:
         if self._closed:
             return
-        force = event.event_type in {"turn_failed", "node_failed", "turn_completed"}
+        force = event.event_type in _FORCE_FLUSH_EVENT_TYPES
         self._merge(event)
         self.flush(force=force)
 
@@ -117,7 +125,7 @@ class FeishuProgressSink:
             return
         if event_type == "node_started":
             self._snapshot.current_stage = "执行节点"
-            self._snapshot.current_action = event.summary or _node_label(event, prefix="开始执行")
+            self._snapshot.current_action = _node_started_action(event)
             self._append_recent(self._snapshot.current_action)
             return
         if event_type in {"node_completed", "node_failed"}:
@@ -200,6 +208,13 @@ def _node_label(event: ProgressEvent, *, prefix: str) -> str:
     if event.node_id:
         return f"{prefix} {event.node_id}"
     return prefix
+
+
+def _node_started_action(event: ProgressEvent) -> str:
+    node_name = _clean(event.node_id or str(event.data.get("node_id") or ""), limit=80)
+    if node_name:
+        return f"正在执行 {node_name} 节点"
+    return event.summary or _node_label(event, prefix="开始执行")
 
 
 def _node_info(item: dict) -> dict[str, str]:

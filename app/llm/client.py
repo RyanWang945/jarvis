@@ -5,6 +5,7 @@ from typing import Any, Literal
 import httpx
 from pydantic import BaseModel
 
+from app.observability import record_exception, set_attributes
 from app.llm.provider_adapters import NormalizedLLMResponse, normalize_response
 
 logger = logging.getLogger(__name__)
@@ -81,9 +82,17 @@ class ChatClient:
             json=payload,
             timeout=self._timeout_seconds,
         )
+        set_attributes(
+            **{
+                "jarvis.provider": self._provider,
+                "jarvis.model": self._model,
+                "http.response.status_code": getattr(response, "status_code", 0),
+            }
+        )
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
+            record_exception(exc, **{"jarvis.provider": self._provider, "jarvis.model": self._model})
             logger.error("llm request failed status=%s body=%s", exc.response.status_code, exc.response.text)
             raise
         body = response.json()

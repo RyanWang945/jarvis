@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import re
 import time
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from app.config import get_settings
 from app.llm.client import parse_json_content
 from app.llm.model_profiles import LLMNode
 from app.llm.model_router import ModelRouter
+from app.observability import add_event, record_exception, set_attributes
 from app.prompting import PromptRegistry
 from app.runtime_usage import usage_record_from_response
 from app.task_runtime.approval_types import approval_request_dicts
@@ -20,6 +24,22 @@ from app.task_runtime.runtime_context import RuntimeContext
 logger = logging.getLogger(__name__)
 
 AggregationStatus = Literal["completed", "needs_user_input", "failed"]
+_CLAUDE_AGGREGATOR_TIMEOUT_SECONDS = 180
+_CLAUDE_AGGREGATOR_MAX_TURNS = 1
+
+_AGGREGATION_OUTPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["status", "reply", "artifact_refs", "approval_requests", "data"],
+    "properties": {
+        "status": {"type": "string", "enum": ["completed", "needs_user_input", "failed"]},
+        "reply": {"type": "string"},
+        "artifact_refs": {"type": "array", "items": {"type": "string"}},
+        "approval_requests": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
+        "data": {"type": "object", "additionalProperties": True},
+    },
+}
+
 
 class AggregationResult(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -59,10 +79,12 @@ class ResultAggregator:
         prompt_registry: PromptRegistry | None = None,
         prompt_version: str | None = None,
         model_resolver=None,
+        backend: str | None = None,
     ) -> None:
         self._prompt_registry = prompt_registry or PromptRegistry()
         self._prompt_version = prompt_version
         self._model_resolver = model_resolver or (lambda metadata: ModelRouter().resolve(LLMNode.SUMMARY, metadata))
+        self._backend = (backend or get_settings().result_aggregator_backend or "llm").strip().lower()
 
     def prompt_metadata(self) -> dict[str, Any]:
         return self._prompt_registry.load("result_aggregator", self._prompt_version).metadata()
@@ -82,8 +104,21 @@ class ResultAggregator:
     ) -> AggregationResult:
         started = time.perf_counter()
         fallback = _fallback_aggregation(plan=plan, report=report)
+        add_event(
+            "aggregation.started",
+            **{
+                "jarvis.report_status": report.status,
+                "jarvis.node_count": len(report.node_results),
+                "jarvis.finalization_mode": plan.finalization_hint.mode,
+            },
+        )
         local_result = _local_aggregation_result(plan=plan, report=report, fallback=fallback)
         if local_result is not None:
+            _trace_aggregation_result(
+                local_result,
+                elapsed_ms=int((time.perf_counter() - started) * 1000),
+                mode="local",
+            )
             logger.info(
                 "result aggregator llm skipped reason=local_finalization mode=%s report_status=%s result_status=%s elapsed_ms=%s",
                 plan.finalization_hint.mode,
@@ -96,13 +131,19 @@ class ResultAggregator:
             resolved = self._model_resolver(conversation_metadata)
         except Exception:
             logger.exception("result aggregator model resolution failed")
+            add_event("aggregation.fallback", **{"jarvis.reason": "model_resolution_failed"})
             return fallback
         if not resolved.profile.api_key:
             logger.info("result aggregator llm skipped reason=missing_api_key profile=%s", getattr(resolved.profile, "id", None))
+            add_event(
+                "aggregation.fallback",
+                **{
+                    "jarvis.reason": "missing_api_key",
+                    "jarvis.profile": getattr(resolved.profile, "id", None),
+                },
+            )
             return fallback
 
-        prompt = self._prompt_registry.load("result_aggregator", self._prompt_version)
-        response_format = prompt.response_format if resolved.profile.supports_json_object else None
         resolved_runtime_context = runtime_context or RuntimeContext.from_hints({})
         payload = _aggregation_input(
             plan=plan,
@@ -114,6 +155,41 @@ class ResultAggregator:
             runtime_context=resolved_runtime_context.to_legacy_hints(),
             instructions=instructions or [],
         )
+
+        if self._backend == "claude_agent_sdk":
+            sdk_result = self._aggregate_with_claude_agent_sdk(
+                plan=plan,
+                report=report,
+                payload=payload,
+                fallback=fallback,
+                resolved=resolved,
+                started=started,
+            )
+            if sdk_result is not None:
+                return sdk_result
+            logger.info("result aggregator claude sdk failed or unavailable; falling back to llm backend")
+
+        return self._aggregate_with_llm(
+            plan=plan,
+            report=report,
+            payload=payload,
+            fallback=fallback,
+            resolved=resolved,
+            started=started,
+        )
+
+    def _aggregate_with_llm(
+        self,
+        *,
+        plan: ExecutionPlan,
+        report: ExecutionReport,
+        payload: dict[str, Any],
+        fallback: AggregationResult,
+        resolved,
+        started: float,
+    ) -> AggregationResult:
+        prompt = self._prompt_registry.load("result_aggregator", self._prompt_version)
+        response_format = prompt.response_format if resolved.profile.supports_json_object else None
         try:
             logger.info(
                 "result aggregator llm request report_status=%s node_count=%s finalization=%s response_format=%s",
@@ -121,6 +197,15 @@ class ResultAggregator:
                 len(report.node_results),
                 plan.finalization_hint.mode,
                 response_format,
+            )
+            add_event(
+                "aggregation.llm.request",
+                **{
+                    "jarvis.report_status": report.status,
+                    "jarvis.node_count": len(report.node_results),
+                    "jarvis.finalization_mode": plan.finalization_hint.mode,
+                    "jarvis.response_format": bool(response_format),
+                },
             )
             response = resolved.client.chat_normalized(
                 prompt.render({"input_json": json.dumps(payload, ensure_ascii=False)}),
@@ -138,10 +223,86 @@ class ResultAggregator:
                 result.artifact_refs,
                 int((time.perf_counter() - started) * 1000),
             )
+            _trace_aggregation_result(
+                result,
+                elapsed_ms=int((time.perf_counter() - started) * 1000),
+                mode="llm",
+            )
             return result
-        except Exception:
+        except Exception as exc:
             logger.exception("result aggregator llm failed")
+            record_exception(exc, **{"jarvis.stage": "result_aggregator"})
+            add_event("aggregation.fallback", **{"jarvis.reason": "llm_failed"})
             return fallback
+
+    def _aggregate_with_claude_agent_sdk(
+        self,
+        *,
+        plan: ExecutionPlan,
+        report: ExecutionReport,
+        payload: dict[str, Any],
+        fallback: AggregationResult,
+        resolved,
+        started: float,
+    ) -> AggregationResult | None:
+        if not _is_claude_agent_sdk_available():
+            add_event("aggregation.fallback", **{"jarvis.reason": "claude_agent_sdk_unavailable"})
+            return None
+        try:
+            logger.info(
+                "result aggregator claude sdk request report_status=%s node_count=%s finalization=%s",
+                report.status,
+                len(report.node_results),
+                plan.finalization_hint.mode,
+            )
+            add_event(
+                "aggregation.claude_sdk.request",
+                **{
+                    "jarvis.report_status": report.status,
+                    "jarvis.node_count": len(report.node_results),
+                    "jarvis.finalization_mode": plan.finalization_hint.mode,
+                },
+            )
+            result_payload = asyncio.run(
+                asyncio.wait_for(
+                    _run_claude_agent_aggregation(payload=payload, resolved=resolved),
+                    timeout=_CLAUDE_AGGREGATOR_TIMEOUT_SECONDS,
+                )
+            )
+            parsed = result_payload.get("payload")
+            result = _aggregation_from_payload(parsed, fallback=fallback, report=report)
+            usage_records = result_payload.get("usage_records")
+            if isinstance(usage_records, list):
+                result.usage_records.extend(item for item in usage_records if isinstance(item, dict))
+            result.data = {
+                **result.data,
+                "aggregator_backend": "claude_agent_sdk",
+                **({"agent_session_id": result_payload.get("session_id")} if result_payload.get("session_id") else {}),
+            }
+            logger.info(
+                "result aggregator claude sdk completed status=%s reply_len=%s artifact_refs=%s elapsed_ms=%s",
+                result.status,
+                len(result.reply),
+                result.artifact_refs,
+                int((time.perf_counter() - started) * 1000),
+            )
+            _trace_aggregation_result(
+                result,
+                elapsed_ms=int((time.perf_counter() - started) * 1000),
+                mode="claude_agent_sdk",
+            )
+            return result
+        except Exception as exc:
+            logger.exception("result aggregator claude sdk failed")
+            record_exception(exc, **{"jarvis.stage": "result_aggregator_claude_sdk"})
+            add_event(
+                "aggregation.fallback",
+                **{
+                    "jarvis.reason": "claude_agent_sdk_failed",
+                    "jarvis.error": str(exc),
+                },
+            )
+            return None
 
 
 def _aggregation_input(
@@ -166,6 +327,165 @@ def _aggregation_input(
         "artifacts": artifacts,
         "runtime_context": runtime_context,
         "instructions": instructions,
+    }
+
+
+async def _run_claude_agent_aggregation(*, payload: dict[str, Any], resolved) -> dict[str, Any]:
+    from claude_agent_sdk import ClaudeAgentOptions, query
+
+    settings = get_settings()
+    endpoint = _resolve_claude_endpoint(settings, resolved)
+    api_key = getattr(resolved.profile, "api_key", "")
+    model = _resolved_model_name(resolved)
+    options = ClaudeAgentOptions(
+        system_prompt=_claude_aggregator_system_prompt(),
+        model=model,
+        permission_mode="dontAsk",
+        tools=[],
+        allowed_tools=[],
+        disallowed_tools=[
+            "Bash",
+            "WebFetch",
+            "WebSearch",
+            "Read",
+            "Write",
+            "Edit",
+            "MultiEdit",
+            "NotebookEdit",
+            "Glob",
+            "Grep",
+            "LS",
+        ],
+        mcp_servers={},
+        strict_mcp_config=True,
+        output_format={"type": "json_schema", "schema": _AGGREGATION_OUTPUT_SCHEMA},
+        max_turns=_CLAUDE_AGGREGATOR_MAX_TURNS,
+        env={
+            "ANTHROPIC_BASE_URL": endpoint,
+            "ANTHROPIC_AUTH_TOKEN": api_key,
+        },
+    )
+    prompt = _claude_aggregator_user_prompt(payload)
+    final_text = ""
+    parsed_payload: dict[str, Any] | None = None
+    usage_records: list[dict[str, Any]] = []
+    session_id = ""
+
+    async for msg in query(prompt=prompt, options=options):
+        msg_type = type(msg).__name__
+        session_id = _message_session_id(msg) or session_id
+        if msg_type == "AssistantMessage":
+            msg_usage = getattr(msg, "usage", None) or getattr(msg, "model_usage", None)
+            if isinstance(msg_usage, dict) and msg_usage:
+                usage_records.append(_normalize_claude_usage(msg_usage, "result_aggregator_claude_sdk_step"))
+            if hasattr(msg, "content") and isinstance(msg.content, list):
+                for block in msg.content:
+                    if type(block).__name__ == "TextBlock":
+                        final_text = getattr(block, "text", "") or final_text
+        elif msg_type == "ResultMessage":
+            result_usage = getattr(msg, "usage", None) or getattr(msg, "model_usage", None)
+            if isinstance(result_usage, dict) and result_usage:
+                usage_records.append(_normalize_claude_usage(result_usage, "result_aggregator_claude_sdk"))
+            structured = getattr(msg, "structured_output", None)
+            if isinstance(structured, dict):
+                parsed_payload = structured
+            result = getattr(msg, "result", None)
+            if isinstance(result, dict):
+                parsed_payload = result
+            elif isinstance(result, str) and result.strip():
+                final_text = result.strip()
+
+    if parsed_payload is None:
+        parsed_payload = parse_json_content({"content": final_text})
+    return {
+        "payload": parsed_payload,
+        "usage_records": usage_records,
+        "session_id": session_id,
+    }
+
+
+def _claude_aggregator_system_prompt() -> str:
+    return """
+You are Jarvis ResultAggregator. Convert execution results into the final user-facing answer.
+Output must be a JSON object matching the configured schema.
+The reply field must be clean Markdown, not plain pseudo-table text.
+For comparison tasks, prefer a valid Markdown table with headers such as | 维度 | Claude Tag | YouMind |.
+If Markdown table evidence is too long, use concise Markdown sections and bullet lists.
+Do not claim that an attachment, report, or artifact exists unless artifact_refs is non-empty and references it.
+Do not invent facts missing from execution_report. Mark uncertain or time-sensitive facts explicitly.
+If execution_report indicates failed or blocked work, explain the concrete failure or missing input without generic apologies.
+Do not call tools. Use only the JSON payload supplied by the user message.
+""".strip()
+
+
+def _claude_aggregator_user_prompt(payload: dict[str, Any]) -> str:
+    return json.dumps(
+        {
+            "task": "Produce the final AggregationResult for this turn.",
+            "requirements": [
+                "reply must be Markdown.",
+                "Use real Markdown tables for comparisons, never pseudo tables.",
+                "Only mention attachments/artifacts that appear in artifact_refs.",
+                "Preserve approval_requests from blocked node results when needed.",
+            ],
+            "input": payload,
+        },
+        ensure_ascii=False,
+        default=str,
+    )
+
+
+def _is_claude_agent_sdk_available() -> bool:
+    try:
+        import claude_agent_sdk  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _resolve_claude_endpoint(settings, resolved) -> str:
+    provider = getattr(resolved, "provider", "") or getattr(getattr(resolved, "profile", None), "provider", "")
+    provider = str(provider or getattr(settings, "llm_provider", "deepseek")).strip().lower()
+    if provider == "deepseek":
+        return "https://api.deepseek.com/anthropic"
+    if provider in {"google", "gemini"}:
+        return "https://generativelanguage.googleapis.com/v1beta/anthropic"
+    base_url = getattr(resolved, "base_url", "") or getattr(getattr(resolved, "profile", None), "base_url", "")
+    if base_url:
+        return str(base_url).rstrip("/") + "/anthropic"
+    return "https://api.deepseek.com/anthropic"
+
+
+def _resolved_model_name(resolved) -> str:
+    for owner in (resolved, getattr(resolved, "profile", None)):
+        value = getattr(owner, "model", None)
+        if value:
+            return str(value)
+    return "deepseek-v4-pro"
+
+
+def _message_session_id(msg: Any) -> str:
+    value = getattr(msg, "session_id", None)
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _normalize_claude_usage(usage: dict[str, Any], stage: str) -> dict[str, Any]:
+    input_tokens = _int_value(usage.get("input_tokens"), usage.get("prompt_tokens"))
+    output_tokens = _int_value(usage.get("output_tokens"), usage.get("completion_tokens"))
+    total_tokens = _int_value(usage.get("total_tokens"))
+    if total_tokens <= 0 and (input_tokens > 0 or output_tokens > 0):
+        total_tokens = input_tokens + output_tokens
+    return {
+        "source": "claude_agent_sdk",
+        "provider": "deepseek",
+        "model": str(usage.get("model") or ""),
+        "stage": stage,
+        "prompt_tokens": input_tokens,
+        "completion_tokens": output_tokens,
+        "total_tokens": total_tokens,
+        "_raw": usage,
     }
 
 
@@ -314,9 +634,17 @@ def _aggregation_from_payload(
     status = normalized.get("status")
     if status not in {"completed", "needs_user_input", "failed"}:
         normalized["status"] = fallback.status
+    elif report.status == "completed" and status == "failed":
+        normalized["status"] = "completed"
     normalized.setdefault("reply", fallback.reply)
-    normalized.setdefault("artifact_refs", _artifact_refs(report.node_results))
-    normalized.setdefault("data", {})
+    if not isinstance(normalized.get("artifact_refs"), list):
+        normalized["artifact_refs"] = _artifact_refs(report.node_results)
+    if not isinstance(normalized.get("approval_requests"), list):
+        normalized["approval_requests"] = fallback.approval_requests
+    if not isinstance(normalized.get("data"), dict):
+        normalized["data"] = {}
+    if not normalized.get("artifact_refs"):
+        normalized["reply"] = _strip_unbacked_artifact_claims(str(normalized.get("reply") or ""))
     try:
         return AggregationResult.model_validate(normalized)
     except ValidationError as exc:
@@ -404,6 +732,20 @@ def _artifact_refs(results: list[NodeResult]) -> list[str]:
     return refs
 
 
+def _strip_unbacked_artifact_claims(reply: str) -> str:
+    lines = []
+    artifact_claim = re.compile(
+        r"(查看附件|见附件|附件中|附件里|附件已|报告已生成.*附件|attached|attachment)",
+        flags=re.IGNORECASE,
+    )
+    for line in str(reply or "").splitlines():
+        if artifact_claim.search(line):
+            continue
+        lines.append(line)
+    stripped = "\n".join(lines).strip()
+    return stripped or reply
+
+
 def _preview_json(value: Any, *, limit: int = 2000) -> str:
     try:
         text = json.dumps(value, ensure_ascii=False, default=str)
@@ -412,3 +754,34 @@ def _preview_json(value: Any, *, limit: int = 2000) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + "...[truncated]"
+
+
+def _int_value(*values: Any) -> int:
+    for value in values:
+        if value is None:
+            continue
+        try:
+            return max(int(value), 0)
+        except (TypeError, ValueError):
+            continue
+    return 0
+
+
+def _trace_aggregation_result(result: AggregationResult, *, elapsed_ms: int, mode: str) -> None:
+    set_attributes(
+        **{
+            "jarvis.aggregation_status": result.status,
+            "jarvis.reply_len": len(result.reply),
+            "jarvis.aggregation_mode": mode,
+        }
+    )
+    add_event(
+        "aggregation.completed",
+        **{
+            "jarvis.aggregation_status": result.status,
+            "jarvis.reply_len": len(result.reply),
+            "jarvis.artifact_refs": result.artifact_refs,
+            "jarvis.elapsed_ms": elapsed_ms,
+            "jarvis.aggregation_mode": mode,
+        },
+    )

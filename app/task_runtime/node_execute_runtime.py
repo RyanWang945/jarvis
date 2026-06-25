@@ -11,6 +11,7 @@ from typing import Any, Callable, Protocol
 from app.agent_react.context_manager import ContextManager
 from app.config import get_settings
 from app.llm.client import LLMMessage, parse_json_content
+from app.observability import add_event, record_exception, set_attributes, span_context
 from app.llm.provider_adapters import NormalizedLLMResponse, NormalizedToolCall
 from app.llm.model_profiles import LLMNode
 from app.llm.model_router import ModelRouter
@@ -54,6 +55,7 @@ _REACT_CODER_ONLY_TOOLS = {
     "shell_inspect",
     "shell_run_command",
 }
+_REACT_WRITE_TOOLS = {"write_file"}
 _SKILL_TOOL_NAMES = {"Skill"}
 _MAX_REACT_SELECTED_SKILLS = 3
 _MAX_REACT_SKILL_GUIDANCE_CHARS = 12000
@@ -119,12 +121,30 @@ class LLMNodeExecuteRuntime:
                     len(tool_calls),
                     force_final,
                 )
-                response = resolved.client.chat_normalized(
-                    messages,
-                    tools=None if force_final else tools,
-                    tool_choice=None if force_final else "auto",
-                    response_format=response_format,
-                )
+                with span_context(
+                    "llm.call",
+                    **{
+                        "jarvis.turn_id": context.runtime_context.turn.turn_id,
+                        "jarvis.conversation_id": context.runtime_context.turn.conversation_id,
+                        "jarvis.node_id": context.node.id,
+                        "jarvis.provider": getattr(resolved.profile, "provider", ""),
+                        "jarvis.model": getattr(resolved.profile, "id", ""),
+                    },
+                ):
+                    response = resolved.client.chat_normalized(
+                        messages,
+                        tools=None if force_final else tools,
+                        tool_choice=None if force_final else "auto",
+                        response_format=response_format,
+                    )
+                    set_attributes(
+                        **{
+                            "jarvis.model": response.model,
+                            "jarvis.usage.prompt_tokens": response.usage.prompt_tokens if response.usage is not None else None,
+                            "jarvis.usage.completion_tokens": response.usage.completion_tokens if response.usage is not None else None,
+                            "jarvis.usage.total_tokens": response.usage.total_tokens if response.usage is not None else None,
+                        }
+                    )
                 usage_record = usage_record_from_response(response, stage="llm_node")
                 if usage_record is not None:
                     usage_records.append(usage_record)
@@ -176,18 +196,27 @@ class LLMNodeExecuteRuntime:
             return {"ok": False, "status": "rejected", "error": message}, record
         try:
             tool = get_tool_definition(tool_call.name)
-            result = self._skill_tool_runner(
-                tool,
-                tool_call.args,
-                timeout_seconds=self._skill_tool_timeout_seconds,
-            )
+            with span_context(
+                "tool.call",
+                **{
+                    "jarvis.tool_name": tool.name,
+                    "jarvis.tool_call_id": tool_call.id,
+                },
+            ):
+                result = self._skill_tool_runner(
+                    tool,
+                    tool_call.args,
+                    timeout_seconds=self._skill_tool_timeout_seconds,
+                )
         except Exception as exc:
             message = str(exc)
             record.update({"status": "failed", "summary": message})
+            record_exception(exc, **{"jarvis.tool_name": tool_call.name, "jarvis.tool_call_id": tool_call.id})
             logger.exception("llm node skill tool failed tool_call_id=%s elapsed_ms=%s", tool_call.id, int((time.perf_counter() - started) * 1000))
             return {"ok": False, "status": "failed", "error": message}, record
 
         status = "completed" if result.ok else "failed"
+        set_attributes(**{"jarvis.status": status})
         record.update(
             {
                 "status": status,
@@ -232,7 +261,7 @@ class ReactNodeExecuteRuntime:
             logger.info("react node skipped node_id=%s reason=missing_api_key profile=%s", context.node.id, getattr(resolved.profile, "id", None))
             return _blocked(context.node, "missing_api_key", "React runtime LLM API key is not configured.")
         messages = _react_messages(context)
-        tools = build_llm_tools()
+        tools = build_llm_tools(allowed_tools=_react_allowed_tool_names(context))
         tool_calls: list[dict[str, Any]] = []
         loaded_skill_names: set[str] = set()
         response: NormalizedLLMResponse | None = None
@@ -249,12 +278,30 @@ class ReactNodeExecuteRuntime:
                     len(tools),
                     len(tool_calls),
                 )
-                response = resolved.client.chat_normalized(
-                    messages,
-                    tools=None if force_final else tools,
-                    tool_choice=None if force_final else "auto",
-                    response_format=response_format,
-                )
+                with span_context(
+                    "llm.call",
+                    **{
+                        "jarvis.turn_id": context.runtime_context.turn.turn_id,
+                        "jarvis.conversation_id": context.runtime_context.turn.conversation_id,
+                        "jarvis.node_id": context.node.id,
+                        "jarvis.provider": getattr(resolved.profile, "provider", ""),
+                        "jarvis.model": getattr(resolved.profile, "id", ""),
+                    },
+                ):
+                    response = resolved.client.chat_normalized(
+                        messages,
+                        tools=None if force_final else tools,
+                        tool_choice=None if force_final else "auto",
+                        response_format=response_format,
+                    )
+                    set_attributes(
+                        **{
+                            "jarvis.model": response.model,
+                            "jarvis.usage.prompt_tokens": response.usage.prompt_tokens if response.usage is not None else None,
+                            "jarvis.usage.completion_tokens": response.usage.completion_tokens if response.usage is not None else None,
+                            "jarvis.usage.total_tokens": response.usage.total_tokens if response.usage is not None else None,
+                        }
+                    )
                 usage_record = usage_record_from_response(response, stage="react_node")
                 if usage_record is not None:
                     usage_records.append(usage_record)
@@ -345,14 +392,26 @@ class ReactNodeExecuteRuntime:
             return {"ok": False, "status": "rejected", "error": rejection}, record
         try:
             logger.info("react node tool start tool=%s tool_call_id=%s args=%s", tool_call.name, tool_call.id, tool_call.args)
-            result = self._tool_runner(tool, tool_call.args, timeout_seconds=self._tool_timeout_seconds)
+            with span_context(
+                "tool.call",
+                **{
+                    "jarvis.turn_id": context.runtime_context.turn.turn_id,
+                    "jarvis.conversation_id": context.runtime_context.turn.conversation_id,
+                    "jarvis.node_id": context.node.id,
+                    "jarvis.tool_name": tool.name,
+                    "jarvis.tool_call_id": tool_call.id,
+                },
+            ):
+                result = self._tool_runner(tool, tool_call.args, timeout_seconds=self._tool_timeout_seconds)
         except Exception as exc:
             message = str(exc)
             record.update({"status": "failed", "summary": message})
+            record_exception(exc, **{"jarvis.tool_name": tool_call.name, "jarvis.tool_call_id": tool_call.id})
             logger.exception("react node tool failed tool=%s tool_call_id=%s elapsed_ms=%s", tool_call.name, tool_call.id, int((time.perf_counter() - started) * 1000))
             return {"ok": False, "status": "failed", "error": message}, record
 
         status = "completed" if result.ok else "failed"
+        set_attributes(**{"jarvis.status": status})
         logger.info(
             "react node tool finished tool=%s tool_call_id=%s status=%s exit_code=%s artifact_count=%s elapsed_ms=%s summary=%s",
             tool_call.name,
@@ -485,21 +544,38 @@ class CoderNodeExecuteRuntime:
                 str(workdir),
                 str(run_dir) if run_dir is not None else "",
             )
-            result = self._provider.run(request)
-            result = replace(result, metadata={**request.metadata, **result.metadata})
-            if result.ok and repo_workspace is not None:
-                try:
-                    result = _commit_coder_node_worktree(
-                        result,
-                        workdir=workdir,
-                        node_id=context.node.id,
-                        objective=context.node.objective,
-                        repo_workspace=repo_workspace,
-                    )
-                except (RuntimeError, OSError) as exc:
-                    logger.exception("coder node worktree commit/merge failed node_id=%s workdir=%s", context.node.id, workdir)
-                    return _failed(context.node, "node_repo_commit_failed", str(exc), retryable=True)
+            with span_context(
+                "coder.run",
+                **{
+                    "jarvis.turn_id": context.runtime_context.turn.turn_id,
+                    "jarvis.conversation_id": context.runtime_context.turn.conversation_id,
+                    "jarvis.node_id": context.node.id,
+                    "jarvis.runtime": "coder",
+                    "jarvis.provider": self._provider.name,
+                    "jarvis.repo_id": repo_id,
+                    "jarvis.approval_required": False,
+                },
+            ):
+                result = self._provider.run(request)
+                result = replace(result, metadata={**request.metadata, **result.metadata})
+                if result.approval_requests:
+                    set_attributes(**{"jarvis.approval_required": True})
+                    add_event("approval_requested", count=len(result.approval_requests))
+                if result.ok and repo_workspace is not None:
+                    try:
+                        result = _commit_coder_node_worktree(
+                            result,
+                            workdir=workdir,
+                            node_id=context.node.id,
+                            objective=context.node.objective,
+                            repo_workspace=repo_workspace,
+                        )
+                    except (RuntimeError, OSError) as exc:
+                        record_exception(exc, **{"jarvis.node_id": context.node.id, "jarvis.provider": self._provider.name})
+                        logger.exception("coder node worktree commit/merge failed node_id=%s workdir=%s", context.node.id, workdir)
+                        return _failed(context.node, "node_repo_commit_failed", str(exc), retryable=True)
         except Exception as exc:
+            record_exception(exc, **{"jarvis.node_id": context.node.id, "jarvis.provider": self._provider.name})
             logger.exception("coder node failed node_id=%s elapsed_ms=%s", context.node.id, int((time.perf_counter() - started) * 1000))
             return _failed(context.node, "coder_runtime_error", str(exc), retryable=True)
         node_result = _finalize_coder_node_result(
@@ -509,6 +585,7 @@ class CoderNodeExecuteRuntime:
             result=result,
             provider=self._provider.name,
         )
+        set_attributes(**{"jarvis.status": node_result.status})
         logger.info(
             "coder node finished node_id=%s provider=%s status=%s exit_code=%s artifact_count=%s elapsed_ms=%s summary=%s",
             context.node.id,
@@ -774,13 +851,31 @@ def _react_result_from_response(
 
 
 def _check_react_action_permission(context: NodeExecutionContext, tool_name: str) -> str | None:
-    if tool_name not in _REACT_CODER_ONLY_TOOLS:
-        return None
     node_id = context.node.id
-    return (
-        f"Rejected: React runtime node {node_id} cannot execute coder-only actions. "
-        "Use a coder node for shell commands, repository workflows, and code-agent delegation."
-    )
+    if tool_name in _REACT_CODER_ONLY_TOOLS:
+        return (
+            f"Rejected: React runtime node {node_id} cannot execute coder-only actions. "
+            "Use a coder node for shell commands, repository workflows, and code-agent delegation."
+        )
+    if tool_name in _REACT_WRITE_TOOLS and getattr(context.node, "mode", "read") != "write":
+        return (
+            f"Rejected: React runtime node {node_id} is mode=read and cannot create or modify files/artifacts. "
+            "Planner must set mode=write for artifact-producing nodes."
+        )
+    return None
+
+
+def _react_allowed_tool_names(context: NodeExecutionContext) -> set[str]:
+    from app.tools.runtime import list_tool_definitions
+
+    blocked = set(_REACT_CODER_ONLY_TOOLS)
+    if getattr(context.node, "mode", "read") != "write":
+        blocked.update(_REACT_WRITE_TOOLS)
+    return {
+        tool.name
+        for tool in list_tool_definitions(exposed_to_llm=True)
+        if tool.name not in blocked
+    }
 
 
 def _react_summary(payload: dict[str, Any], response_content: str) -> str:

@@ -67,6 +67,10 @@ JARVIS_GEMINI_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai
 JARVIS_GEMINI_MODEL=gemini-2.5-flash
 JARVIS_TAVILY_API_KEY=tvly-...
 JARVIS_OBSIDIAN_WORKSPACE_PATH=data/obsidian_wiki
+JARVIS_OTEL_ENABLED=false
+JARVIS_OTEL_SERVICE_NAME=jarvis-api
+JARVIS_OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
+JARVIS_OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
 ```
 
 Run a local agent task:
@@ -91,3 +95,39 @@ Invoke-RestMethod http://127.0.0.1:8000/agent/run `
 `JARVIS_ALIYUN_OPENSEARCH_*` settings are reserved for SEC PDF document parsing through Alibaba Cloud AI Search Open Platform. The current implementation targets the async document analyze API with `ops-document-analyze-002`.
 
 `JARVIS_OPENSEARCH_*` settings are reserved for the knowledge base index and search pipeline. The default OpenSearch endpoint is `http://127.0.0.1:9200`.
+
+## Local Observability
+
+Start the local OpenTelemetry Collector and Jaeger UI:
+
+```powershell
+docker compose -f docker-compose.observability.yml up -d
+```
+
+Enable tracing in `.env`:
+
+```text
+JARVIS_OTEL_ENABLED=true
+JARVIS_OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
+JARVIS_OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+```
+
+Jaeger UI:
+
+```text
+http://127.0.0.1:16686
+```
+
+Collector health:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:13133
+```
+
+The first tracing pass records:
+
+- `turn.run`
+- `node.execute`
+- `llm.call`
+- `tool.call`
+- `coder.run`

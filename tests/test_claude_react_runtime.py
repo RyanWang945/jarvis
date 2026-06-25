@@ -226,6 +226,8 @@ class TestClaudeReactRuntimeExecution:
         import sys as _sys
 
         async def _failing_query(**kwargs):
+            if False:
+                yield None
             raise RuntimeError("Simulated SDK failure")
 
         mock_sdk = MagicMock()
@@ -247,6 +249,272 @@ class TestClaudeReactRuntimeExecution:
         assert result.status == "failed"
         assert result.runtime == "react"
         assert result.error is not None
+
+    def test_sdk_options_use_json_schema_and_disable_native_write_tools_for_read_mode(self):
+        import sys as _sys
+
+        captured = {}
+
+        async def _fake_query(**kwargs):
+            captured["options"] = kwargs["options"]
+            text_block = type(
+                "TextBlock",
+                (),
+                {"text": json.dumps({"status": "completed", "summary": "structured", "findings": [], "sources": [], "data": {}, "artifacts": []})},
+            )()
+            yield type("AssistantMessage", (), {"content": [text_block]})()
+            yield type("ResultMessage", (), {"status": "completed"})()
+
+        def _options(**kwargs):
+            captured["option_kwargs"] = kwargs
+            return MagicMock()
+
+        mock_sdk = MagicMock()
+        mock_sdk.ClaudeAgentOptions = _options
+        mock_sdk.query = _fake_query
+        mock_sdk.create_sdk_mcp_server = MagicMock(return_value=MagicMock())
+        mock_sdk.tool = lambda **kw: (lambda fn: fn)
+
+        with patch.dict("sys.modules", {"claude_agent_sdk": mock_sdk}):
+            from app.task_runtime.claude_react_runtime import ClaudeReactNodeExecuteRuntime
+
+            runtime = ClaudeReactNodeExecuteRuntime(
+                model_resolver=lambda ctx: MagicMock(
+                    profile=MagicMock(api_key="test-key", model="deepseek-v4-flash"),
+                ),
+                max_turns=3,
+            )
+            result = runtime.run(_context())
+
+        kwargs = captured["option_kwargs"]
+        assert result.status == "completed"
+        assert result.summary == "structured"
+        assert kwargs["output_format"]["type"] == "json_schema"
+        assert "summary" in kwargs["output_format"]["schema"]["required"]
+        assert "Write" in kwargs["disallowed_tools"]
+        assert "Edit" in kwargs["disallowed_tools"]
+        assert "Bash" in kwargs["disallowed_tools"]
+        assert kwargs["max_turns"] == 3
+
+    def test_sdk_options_allow_native_write_tools_for_write_mode(self):
+        captured = {}
+
+        async def _fake_query(**kwargs):
+            text_block = type(
+                "TextBlock",
+                (),
+                {"text": json.dumps({"status": "completed", "summary": "written", "findings": [], "sources": [], "data": {}, "artifacts": []})},
+            )()
+            yield type("AssistantMessage", (), {"content": [text_block]})()
+            yield type("ResultMessage", (), {"status": "completed"})()
+
+        def _options(**kwargs):
+            captured["option_kwargs"] = kwargs
+            return MagicMock()
+
+        mock_sdk = MagicMock()
+        mock_sdk.ClaudeAgentOptions = _options
+        mock_sdk.query = _fake_query
+        mock_sdk.create_sdk_mcp_server = MagicMock(return_value=MagicMock())
+        mock_sdk.tool = lambda **kw: (lambda fn: fn)
+
+        with patch.dict("sys.modules", {"claude_agent_sdk": mock_sdk}):
+            from app.task_runtime.claude_react_runtime import ClaudeReactNodeExecuteRuntime
+
+            runtime = ClaudeReactNodeExecuteRuntime(
+                model_resolver=lambda ctx: MagicMock(
+                    profile=MagicMock(api_key="test-key", model="deepseek-v4-flash"),
+                ),
+            )
+            result = runtime.run(_context(node=_plan_node(mode="write")))
+
+        disallowed = captured["option_kwargs"]["disallowed_tools"]
+        assert result.status == "completed"
+        assert "Write" not in disallowed
+        assert "Edit" not in disallowed
+        assert "MultiEdit" not in disallowed
+        assert "NotebookEdit" not in disallowed
+        assert "Bash" in disallowed
+
+    def test_sdk_options_use_node_workspace_as_cwd(self, tmp_path):
+        captured = {}
+
+        async def _fake_query(**kwargs):
+            yield type(
+                "AssistantMessage",
+                (),
+                {"content": [type("TextBlock", (), {"text": json.dumps({"status": "completed", "summary": "ok", "findings": [], "sources": [], "data": {}, "artifacts": []})})()]},
+            )()
+            yield type("ResultMessage", (), {"status": "completed"})()
+
+        def _options(**kwargs):
+            captured["option_kwargs"] = kwargs
+            return MagicMock()
+
+        mock_sdk = MagicMock()
+        mock_sdk.ClaudeAgentOptions = _options
+        mock_sdk.query = _fake_query
+        mock_sdk.create_sdk_mcp_server = MagicMock(return_value=MagicMock())
+        mock_sdk.tool = lambda **kw: (lambda fn: fn)
+
+        with patch.dict("sys.modules", {"claude_agent_sdk": mock_sdk}):
+            from app.task_runtime.claude_react_runtime import ClaudeReactNodeExecuteRuntime
+
+            runtime = ClaudeReactNodeExecuteRuntime(
+                model_resolver=lambda ctx: MagicMock(
+                    profile=MagicMock(api_key="test-key", model="deepseek-v4-flash"),
+                ),
+            )
+            runtime.run(
+                _context(
+                    legacy_hints={
+                        "session_workspace_dir": str(tmp_path / "session"),
+                        "node_workspace_dir": str(tmp_path / "session" / "nodes" / "write_report"),
+                    }
+                )
+            )
+
+        assert captured["option_kwargs"]["cwd"] == str(tmp_path / "session" / "nodes" / "write_report")
+
+    def test_claude_react_mcp_tools_exclude_jarvis_write_file(self):
+        from app.tools.definitions import ToolDefinition
+        from app.task_runtime.claude_react_runtime import _claude_react_tool_definitions
+
+        def _noop_handler(req):
+            from app.tools.common import ToolExecutionResult
+
+            return ToolExecutionResult(ok=True, exit_code=0)
+
+        tool_defs = [
+            ToolDefinition(
+                name="read_file",
+                description="Read",
+                args_schema={"type": "object", "properties": {}},
+                handler=_noop_handler,
+            ),
+            ToolDefinition(
+                name="write_file",
+                description="Write",
+                args_schema={"type": "object", "properties": {}},
+                handler=_noop_handler,
+            ),
+        ]
+
+        with patch("app.task_runtime.claude_react_runtime.list_tool_definitions", return_value=tool_defs):
+            read_names = {tool.name for tool in _claude_react_tool_definitions(_context())}
+            write_names = {
+                tool.name
+                for tool in _claude_react_tool_definitions(
+                    _context(node=_plan_node(mode="write"))
+                )
+            }
+
+        assert read_names == {"read_file"}
+        assert write_names == {"read_file"}
+
+    def test_max_turns_without_final_output_forks_finalize_session(self):
+        captured_options: list[dict] = []
+
+        async def _fake_query(**kwargs):
+            options = kwargs["options"]
+            if options.get("fork_session"):
+                text = json.dumps(
+                    {
+                        "status": "completed",
+                        "summary": "finalized report",
+                        "findings": [{"title": "done"}],
+                        "sources": [],
+                        "data": {},
+                        "artifacts": [],
+                    }
+                )
+                yield type("AssistantMessage", (), {"content": [type("TextBlock", (), {"text": text})()], "session_id": "fork-session"})()
+                yield type("ResultMessage", (), {"status": "completed", "session_id": "fork-session"})()
+                return
+
+            tool_use = type(
+                "ToolUseBlock",
+                (),
+                {"id": "tool-1", "name": "WebFetch", "input": {"url": "https://example.com"}},
+            )()
+            yield type("AssistantMessage", (), {"content": [tool_use], "session_id": "primary-session"})()
+            tool_result = type(
+                "ToolResultBlock",
+                (),
+                {"tool_use_id": "tool-1", "content": "useful evidence", "is_error": False},
+            )()
+            yield type("UserMessage", (), {"content": [tool_result], "session_id": "primary-session"})()
+            yield type("ResultMessage", (), {"status": "completed", "session_id": "primary-session"})()
+            raise RuntimeError("maximum number of turns reached")
+
+        def _options(**kwargs):
+            captured_options.append(kwargs)
+            return kwargs
+
+        mock_sdk = MagicMock()
+        mock_sdk.ClaudeAgentOptions = _options
+        mock_sdk.query = _fake_query
+        mock_sdk.create_sdk_mcp_server = MagicMock(return_value=MagicMock())
+        mock_sdk.tool = lambda **kw: (lambda fn: fn)
+
+        with patch.dict("sys.modules", {"claude_agent_sdk": mock_sdk}):
+            from app.task_runtime.claude_react_runtime import ClaudeReactNodeExecuteRuntime
+
+            runtime = ClaudeReactNodeExecuteRuntime(
+                model_resolver=lambda ctx: MagicMock(
+                    profile=MagicMock(api_key="test-key", model="deepseek-v4-flash"),
+                ),
+                max_turns=3,
+            )
+            result = runtime.run(_context())
+
+        assert result.status == "completed"
+        assert result.summary == "finalized report"
+        assert result.data["max_turns_reached"] is True
+        assert result.data["recovered_from"] == "max_turns_finalize_fork"
+        assert result.data["primary_agent_session_id"] == "primary-session"
+        assert result.data["finalize_agent_session_id"] == "fork-session"
+
+        finalize_options = next(item for item in captured_options if item.get("fork_session"))
+        assert finalize_options["resume"] == "primary-session"
+        assert finalize_options["max_turns"] == 1
+        assert finalize_options["tools"] == []
+        assert finalize_options["mcp_servers"] == {}
+        assert finalize_options["strict_mcp_config"] is True
+        assert finalize_options["permission_mode"] == "dontAsk"
+
+    def test_max_turns_without_session_id_fails_instead_of_empty_completed(self):
+        async def _fake_query(**kwargs):
+            tool_use = type(
+                "ToolUseBlock",
+                (),
+                {"id": "tool-1", "name": "WebFetch", "input": {"url": "https://example.com"}},
+            )()
+            yield type("AssistantMessage", (), {"content": [tool_use]})()
+            raise RuntimeError("maximum number of turns reached")
+
+        mock_sdk = MagicMock()
+        mock_sdk.ClaudeAgentOptions = lambda **kwargs: kwargs
+        mock_sdk.query = _fake_query
+        mock_sdk.create_sdk_mcp_server = MagicMock(return_value=MagicMock())
+        mock_sdk.tool = lambda **kw: (lambda fn: fn)
+
+        with patch.dict("sys.modules", {"claude_agent_sdk": mock_sdk}):
+            from app.task_runtime.claude_react_runtime import ClaudeReactNodeExecuteRuntime
+
+            runtime = ClaudeReactNodeExecuteRuntime(
+                model_resolver=lambda ctx: MagicMock(
+                    profile=MagicMock(api_key="test-key", model="deepseek-v4-flash"),
+                ),
+                max_turns=3,
+            )
+            result = runtime.run(_context())
+
+        assert result.status == "failed"
+        assert result.error is not None
+        assert result.error.code == "react_max_turns_no_final_output"
+        assert result.data["max_turns_reached"] is True
+        assert result.data["final_text_len"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -345,12 +613,13 @@ class TestMutualExclusivity:
                     assert "claude_react" not in runtimes
                     assert len([k for k in runtimes if "react" in k]) == 1
 
-    def test_available_runtimes_always_standard_names(self):
-        """available_runtimes is always ['llm', 'react', 'coder']."""
+    def test_available_runtimes_excludes_llm_candidate(self):
+        """Planner candidates exclude llm; fast replies still bypass planner."""
         from app.task_runtime.agent_runtime import _default_available_runtimes
 
         names = _default_available_runtimes()
-        assert names == ["llm", "react", "coder"]
+        assert names == ["react", "coder"]
+        assert "llm" not in names
         assert "claude_react" not in names
 
 

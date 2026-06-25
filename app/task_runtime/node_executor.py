@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.observability import add_event, content_capture_enabled, record_exception, set_attributes, span_context, trace_preview
 from app.progress import ProgressReporter, ensure_progress
 from app.task_runtime.node_execute_runtime import NodeExecuteRuntime, NodeExecutionContext
 from app.task_runtime.node_result import ExecutionReport, NodeArtifact, NodeError, NodeResult, ResolvedInput
@@ -65,80 +66,113 @@ class NodeExecutor:
                     continue
                 runtime = self.runtimes.get(node.runtime)
                 node_started = time.perf_counter()
-                logger.info(
-                    "node executor node start node_id=%s runtime=%s input_refs=%s resolved_input_count=%s",
-                    node.id,
-                    node.runtime,
-                    node.input_refs,
-                    len(resolved_inputs),
-                )
-                progress.emit(
-                    "node_started",
-                    turn_id=base_runtime_context.turn.turn_id,
-                    conversation_id=base_runtime_context.turn.conversation_id,
-                    stage="execution",
-                    node_id=node.id,
-                    status="running",
-                    summary=f"开始执行 {node.runtime} 节点：{node.objective}",
-                    data={
-                        "runtime": node.runtime,
-                        "input_refs": list(node.input_refs),
-                        "resolved_input_count": len(resolved_inputs),
+                with span_context(
+                    "node.execute",
+                    **{
+                        "jarvis.conversation_id": base_runtime_context.turn.conversation_id,
+                        "jarvis.turn_id": base_runtime_context.turn.turn_id,
+                        "jarvis.node_id": node.id,
+                        "jarvis.runtime": node.runtime,
                     },
-                )
-                node_runtime_context = _node_runtime_context(base_runtime_context, session_workspace, node.id)
-                merged_legacy_hints = node_runtime_context.to_legacy_hints()
-                node_workspace = session_workspace.node(node.id) if session_workspace is not None else None
-                if node_workspace is not None:
-                    write_node_input_snapshot(
-                        node_workspace,
-                        user_objective=plan.user_objective,
-                        node=node,
-                        resolved_inputs=resolved_inputs,
-                        legacy_hints=merged_legacy_hints,
-                        instructions=list(instructions or []),
+                ):
+                    logger.info(
+                        "node executor node start node_id=%s runtime=%s input_refs=%s resolved_input_count=%s",
+                        node.id,
+                        node.runtime,
+                        node.input_refs,
+                        len(resolved_inputs),
                     )
-                if runtime is None:
-                    result = _blocked_result(
-                        node,
-                        "runtime_not_available",
-                        f"No NodeExecuteRuntime registered for runtime: {node.runtime}",
+                    progress.emit(
+                        "node_started",
+                        turn_id=base_runtime_context.turn.turn_id,
+                        conversation_id=base_runtime_context.turn.conversation_id,
+                        stage="execution",
+                        node_id=node.id,
+                        status="running",
+                        summary=f"开始执行 {node.runtime} 节点：{node.objective}",
+                        data={
+                            "runtime": node.runtime,
+                            "input_refs": list(node.input_refs),
+                            "resolved_input_count": len(resolved_inputs),
+                        },
                     )
-                else:
-                    result = runtime.run(
-                        NodeExecutionContext(
+                    node_runtime_context = _node_runtime_context(base_runtime_context, session_workspace, node.id)
+                    merged_legacy_hints = node_runtime_context.to_legacy_hints()
+                    node_workspace = session_workspace.node(node.id) if session_workspace is not None else None
+                    node_attributes: dict[str, Any] = {
+                        "jarvis.input_ref_count": len(node.input_refs),
+                        "jarvis.resolved_input_count": len(resolved_inputs),
+                    }
+                    if content_capture_enabled():
+                        node_attributes["jarvis.node_objective_preview"] = trace_preview(node.objective, limit=240)
+                        node_attributes["jarvis.node_output_hint_preview"] = trace_preview(node.output_hint, limit=240)
+                    if node_workspace is not None:
+                        node_attributes.update(
+                            {
+                                "jarvis.node_workspace_dir": str(node_workspace.root_path),
+                                "jarvis.node_input_path": str(node_workspace.input_snapshot_path),
+                                "jarvis.node_output_path": str(node_workspace.output_path),
+                                "jarvis.node_result_path": str(node_workspace.result_path),
+                            }
+                        )
+                    set_attributes(**node_attributes)
+                    if node_workspace is not None:
+                        write_node_input_snapshot(
+                            node_workspace,
                             user_objective=plan.user_objective,
                             node=node,
                             resolved_inputs=resolved_inputs,
                             legacy_hints=merged_legacy_hints,
                             instructions=list(instructions or []),
                         )
+                    try:
+                        if runtime is None:
+                            result = _blocked_result(
+                                node,
+                                "runtime_not_available",
+                                f"No NodeExecuteRuntime registered for runtime: {node.runtime}",
+                            )
+                        else:
+                            result = runtime.run(
+                                NodeExecutionContext(
+                                    user_objective=plan.user_objective,
+                                    node=node,
+                                    resolved_inputs=resolved_inputs,
+                                    legacy_hints=merged_legacy_hints,
+                                    instructions=list(instructions or []),
+                                )
+                            )
+                    except Exception as exc:
+                        record_exception(exc, **{"jarvis.node_id": node.id, "jarvis.runtime": node.runtime})
+                        raise
+                    if node_workspace is not None:
+                        write_node_result(node_workspace, result)
+                    result_attributes = _node_result_trace_attributes(result)
+                    set_attributes(**result_attributes)
+                    add_event("node.completed", **result_attributes)
+                    logger.info(
+                        "node executor node finished node_id=%s runtime=%s status=%s artifact_count=%s elapsed_ms=%s summary_preview=%s",
+                        result.node_id,
+                        result.runtime,
+                        result.status,
+                        len(result.artifacts),
+                        int((time.perf_counter() - node_started) * 1000),
+                        _preview(result.summary),
                     )
-                if node_workspace is not None:
-                    write_node_result(node_workspace, result)
-                logger.info(
-                    "node executor node finished node_id=%s runtime=%s status=%s artifact_count=%s elapsed_ms=%s summary_preview=%s",
-                    result.node_id,
-                    result.runtime,
-                    result.status,
-                    len(result.artifacts),
-                    int((time.perf_counter() - node_started) * 1000),
-                    _preview(result.summary),
-                )
-                progress.emit(
-                    "node_failed" if result.status != "completed" else "node_completed",
-                    turn_id=base_runtime_context.turn.turn_id,
-                    conversation_id=base_runtime_context.turn.conversation_id,
-                    stage="execution",
-                    node_id=result.node_id,
-                    status=result.status,
-                    summary=f"{node.runtime} 节点 {result.status}: {_preview(result.summary, limit=120)}",
-                    data={
-                        "runtime": result.runtime,
-                        "artifact_count": len(result.artifacts),
-                        "elapsed_ms": int((time.perf_counter() - node_started) * 1000),
-                    },
-                )
+                    progress.emit(
+                        "node_failed" if result.status != "completed" else "node_completed",
+                        turn_id=base_runtime_context.turn.turn_id,
+                        conversation_id=base_runtime_context.turn.conversation_id,
+                        stage="execution",
+                        node_id=result.node_id,
+                        status=result.status,
+                        summary=f"{node.runtime} 节点 {result.status}: {_preview(result.summary, limit=120)}",
+                        data={
+                            "runtime": result.runtime,
+                            "artifact_count": len(result.artifacts),
+                            "elapsed_ms": int((time.perf_counter() - node_started) * 1000),
+                        },
+                    )
                 results.append(result)
                 result_index[f"node:{node.id}"] = result
                 completed_order.append(node.id)
@@ -382,6 +416,29 @@ def _execution_status(results: list[NodeResult]) -> str:
     if any(result.status == "blocked" for result in results):
         return "blocked"
     return "completed"
+
+
+def _node_result_trace_attributes(result: NodeResult) -> dict[str, Any]:
+    attributes: dict[str, Any] = {
+        "jarvis.status": result.status,
+        "jarvis.node_summary_len": len(result.summary or ""),
+        "jarvis.artifact_count": len(result.artifacts),
+        "jarvis.tool_count": len(result.tool_calls),
+        "jarvis.tool_artifact_count": len(result.tool_artifacts),
+    }
+    data = result.data if isinstance(result.data, dict) else {}
+    for source_key, attr_key in (
+        ("tool_count", "jarvis.runtime.tool_count"),
+        ("final_text_len", "jarvis.runtime.final_text_len"),
+        ("max_turns_reached", "jarvis.runtime.max_turns_reached"),
+        ("runtime_backend", "jarvis.runtime_backend"),
+    ):
+        if source_key in data:
+            attributes[attr_key] = data[source_key]
+    if result.error is not None:
+        attributes["jarvis.error_code"] = result.error.code
+        attributes["jarvis.retryable"] = result.error.retryable
+    return attributes
 
 
 def _optional_str(value: Any) -> str | None:

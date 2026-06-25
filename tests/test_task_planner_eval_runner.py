@@ -67,8 +67,8 @@ def test_task_planner_eval_dataset_loads_simple_and_complex_cases() -> None:
     cases = load_cases("tests/fixtures/task_planner_eval/planner_cases.jsonl")
 
     assert len(cases) >= 7
-    assert any(case.required_runtimes == ["llm"] for case in cases)
-    assert cases[0].runtime_context["available_runtimes"] == ["llm", "react", "coder"]
+    assert any(case.required_runtimes == ["react"] for case in cases)
+    assert cases[0].runtime_context["available_runtimes"] == ["react", "coder"]
     assert any("coder" in case.required_runtimes and "react" in case.required_runtimes for case in cases)
     assert any(case.required_input_refs == ["artifact:A1"] for case in cases)
     assert any(case.required_node_objective_contains for case in cases)
@@ -142,7 +142,7 @@ def test_task_planner_eval_report_includes_latency_summary() -> None:
     case = next(case for case in load_cases("tests/fixtures/task_planner_eval/planner_cases.jsonl") if case.id == "simple_llm_explain")
     plan = ExecutionPlan(
         user_objective="解释 Plan IR 和 ReActLoop",
-        nodes=[PlanNode(id="main", objective="解释 Plan IR 和 ReActLoop 的区别", runtime="llm")],
+        nodes=[PlanNode(id="main", objective="解释 Plan IR 和 ReActLoop 的区别", runtime="react")],
     )
     result = score_case(case, plan, elapsed_ms=321)
     result["mode"] = "planner"
@@ -170,7 +170,7 @@ def test_task_planner_eval_both_report_compares_latency() -> None:
     case = next(case for case in load_cases("tests/fixtures/task_planner_eval/planner_cases.jsonl") if case.id == "simple_llm_explain")
     plan = ExecutionPlan(
         user_objective="解释 Plan IR 和 ReActLoop",
-        nodes=[PlanNode(id="main", objective="解释 Plan IR 和 ReActLoop 的区别", runtime="llm")],
+        nodes=[PlanNode(id="main", objective="解释 Plan IR 和 ReActLoop 的区别", runtime="react")],
     )
     planner_result = score_case(case, plan, elapsed_ms=1000)
     planner_result["mode"] = "planner"

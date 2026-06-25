@@ -15,8 +15,17 @@ from app.agent_react.session_state import (
     load_session_state,
 )
 from app.config import get_settings
+from app.observability import (
+    add_event,
+    content_capture_enabled,
+    current_trace_ids,
+    record_exception,
+    set_attributes,
+    span_context,
+    trace_preview,
+)
 from app.progress import ProgressReporter, ensure_progress
-from app.runtime_usage import append_usage_footer, collect_usage_records, usage_totals
+from app.runtime_usage import collect_usage_records, usage_totals
 from app.runtime_types import ChannelMessage, ConversationStore, TurnResult
 from app.task_runtime.approval_types import approval_request_dicts
 from app.task_runtime.artifacts import ArtifactPublisher
@@ -67,7 +76,7 @@ def _build_default_runtimes() -> dict:
 
 def _default_available_runtimes() -> list[str]:
     """List of runtime names the planner may assign. Always returns standard names."""
-    return ["llm", "react", "coder"]
+    return ["react", "coder"]
 
 
 class TaskAgentRuntime:
@@ -125,6 +134,41 @@ class TaskAgentRuntime:
             }
         )
         started = time.perf_counter()
+        with span_context(
+            "turn.run",
+            **{
+                "jarvis.platform": conversation.platform,
+                "jarvis.conversation_id": turn.conversation_id,
+                "jarvis.turn_id": turn_id,
+            },
+        ):
+            return self._run_turn_inner(
+                turn=turn,
+                conversation=conversation,
+                turn_id=turn_id,
+                user_input=user_input,
+                session_state=session_state,
+                recent_artifacts=recent_artifacts,
+                conversation_context=conversation_context,
+                runtime_context=runtime_context,
+                progress=progress,
+                started=started,
+            )
+
+    def _run_turn_inner(
+        self,
+        *,
+        turn: Any,
+        conversation: Any,
+        turn_id: int,
+        user_input: str,
+        session_state: Any,
+        recent_artifacts: list[dict[str, Any]],
+        conversation_context: Any,
+        runtime_context: RuntimeContext,
+        progress: ProgressReporter,
+        started: float,
+    ) -> TurnResult:
         logger.info(
             "task runtime turn start turn_id=%s conversation_id=%s trigger_type=%s user_input_len=%s recent_artifact_count=%s",
             turn_id,
@@ -133,6 +177,13 @@ class TaskAgentRuntime:
             len(user_input),
             len(recent_artifacts),
         )
+        turn_attributes: dict[str, Any] = {
+            "jarvis.trigger_type": getattr(turn, "trigger_type", None),
+            "jarvis.user_input_len": len(user_input),
+            "jarvis.user_input_preview": trace_preview(user_input),
+            "jarvis.recent_artifact_count": len(recent_artifacts),
+        }
+        set_attributes(**turn_attributes)
         progress.emit(
             "turn_started",
             turn_id=turn_id,
@@ -156,6 +207,26 @@ class TaskAgentRuntime:
                 instructions=[],
                 progress=progress,
             )
+            set_attributes(**{"jarvis.route": router_result.route})
+            planner_attributes: dict[str, Any] = {
+                "jarvis.route": router_result.route,
+                "jarvis.fast_route": router_result.fast_intent.route,
+                "jarvis.fast_confidence": router_result.fast_intent.confidence,
+                "jarvis.node_count": len(router_result.plan.nodes),
+                "jarvis.finalization_mode": router_result.plan.finalization_hint.mode,
+                "jarvis.planner_elapsed_ms": router_result.planner_elapsed_ms,
+            }
+            set_attributes(**planner_attributes)
+            planner_event: dict[str, Any] = {
+                **planner_attributes,
+                "jarvis.node_ids": [node.id for node in router_result.plan.nodes],
+                "jarvis.node_runtimes": [node.runtime for node in router_result.plan.nodes],
+            }
+            if content_capture_enabled():
+                planner_event["jarvis.node_objective_previews"] = [
+                    trace_preview(node.objective, limit=180) for node in router_result.plan.nodes
+                ]
+            add_event("planner.completed", **planner_event)
             logger.info(
                 "task runtime planning completed turn_id=%s route=%s fast_route=%s fast_confidence=%.2f node_count=%s runtimes=%s finalization=%s elapsed_ms=%s planner_elapsed_ms=%s",
                 turn_id,
@@ -176,25 +247,28 @@ class TaskAgentRuntime:
                     report.node_results,
                 )
                 token_usage = usage_totals(usage_records)
-                reply = append_usage_footer(router_result.fast_intent.reply, token_usage)
+                reply = router_result.fast_intent.reply
                 aggregation = AggregationResult(
                     status="completed",
                     reply=reply,
                     data={"finalization": "fast_reply"},
                     usage_records=usage_records,
                 )
-                raw_payload = {
-                    "source": "task_runtime",
-                    "route": router_result.route,
-                    "fast_intent": router_result.fast_intent.model_dump(mode="json"),
-                    "plan": router_result.plan.model_dump(mode="json"),
-                    "execution_report": report.model_dump(mode="json", exclude_none=True),
-                    "aggregation": aggregation.model_dump(mode="json", exclude_none=True),
-                }
+                raw_payload = _trace_enriched_payload(
+                    {
+                        "source": "task_runtime",
+                        "route": router_result.route,
+                        "fast_intent": router_result.fast_intent.model_dump(mode="json"),
+                        "plan": router_result.plan.model_dump(mode="json"),
+                        "execution_report": report.model_dump(mode="json", exclude_none=True),
+                        "aggregation": aggregation.model_dump(mode="json", exclude_none=True),
+                    }
+                )
                 if usage_records:
                     raw_payload["usage_records"] = usage_records
                 if token_usage is not None:
                     raw_payload["usage"] = token_usage
+                    _set_usage_attributes(token_usage)
                 self._store.finalize_turn_success(
                     turn_id=turn_id,
                     conversation_id=turn.conversation_id,
@@ -202,6 +276,7 @@ class TaskAgentRuntime:
                     content_type="markdown",
                     raw_payload=raw_payload,
                 )
+                set_attributes(**{"jarvis.status": "completed"})
                 logger.info(
                     "task runtime fast reply finished turn_id=%s reply_len=%s elapsed_ms=%s",
                     turn_id,
@@ -236,6 +311,8 @@ class TaskAgentRuntime:
                             "turn_id": turn_id,
                             "aggregation_status": aggregation.status,
                             "route": router_result.route,
+                            **({"usage_records": usage_records} if usage_records else {}),
+                            **({"usage": token_usage} if token_usage is not None else {}),
                         },
                     ),
                 )
@@ -267,6 +344,23 @@ class TaskAgentRuntime:
                 router_result.plan,
                 turn_id=turn_id,
                 conversation_id=turn.conversation_id,
+            )
+            set_attributes(
+                **{
+                    "jarvis.session_id": session_workspace.session_id,
+                    "jarvis.session_path": str(session_workspace.session_path),
+                    "jarvis.dag_path": str(session_workspace.dag_path),
+                    "jarvis.session_workspace_dir": str(session_workspace.root_path),
+                }
+            )
+            add_event(
+                "session_workspace.created",
+                **{
+                    "jarvis.session_id": session_workspace.session_id,
+                    "jarvis.session_path": str(session_workspace.session_path),
+                    "jarvis.dag_path": str(session_workspace.dag_path),
+                    "jarvis.node_count": len(session_workspace.nodes),
+                },
             )
             self._session_workspace_manager.update_status(session_workspace, "running")
             execution_context = runtime_context.with_hints(session_workspace.to_legacy_hints())
@@ -330,6 +424,12 @@ class TaskAgentRuntime:
                 aggregation.artifact_refs,
                 int((time.perf_counter() - aggregation_started) * 1000),
             )
+            set_attributes(
+                **{
+                    "jarvis.aggregation_status": aggregation.status,
+                    "jarvis.reply_len": len(aggregation.reply),
+                }
+            )
             progress.emit(
                 "aggregation_completed",
                 turn_id=turn_id,
@@ -350,15 +450,17 @@ class TaskAgentRuntime:
                 len(artifact_resolution.attachments),
                 len(artifact_resolution.rejected),
             )
-            raw_payload = {
-                "source": "task_runtime",
-                "route": router_result.route,
-                "fast_intent": router_result.fast_intent.model_dump(mode="json"),
-                "plan": router_result.plan.model_dump(mode="json"),
-                "execution_report": report.model_dump(mode="json", exclude_none=True),
-                "aggregation": aggregation.model_dump(mode="json", exclude_none=True),
-                "session_workspace": session_workspace.metadata(),
-            }
+            raw_payload = _trace_enriched_payload(
+                {
+                    "source": "task_runtime",
+                    "route": router_result.route,
+                    "fast_intent": router_result.fast_intent.model_dump(mode="json"),
+                    "plan": router_result.plan.model_dump(mode="json"),
+                    "execution_report": report.model_dump(mode="json", exclude_none=True),
+                    "aggregation": aggregation.model_dump(mode="json", exclude_none=True),
+                    "session_workspace": session_workspace.metadata(),
+                }
+            )
             if artifact_records:
                 raw_payload["artifacts"] = [artifact_to_payload(item) for item in artifact_records]
             if artifact_resolution.attachments:
@@ -375,11 +477,12 @@ class TaskAgentRuntime:
                 aggregation,
             )
             token_usage = usage_totals(usage_records)
-            reply = append_usage_footer(aggregation.reply, token_usage)
+            reply = aggregation.reply
             if usage_records:
                 raw_payload["usage_records"] = usage_records
             if token_usage is not None:
                 raw_payload["usage"] = token_usage
+                _set_usage_attributes(token_usage)
             if aggregation.status == "failed":
                 self._store.finalize_turn_failure(turn_id, error_message=reply)
                 status = "failed"
@@ -392,6 +495,7 @@ class TaskAgentRuntime:
                     raw_payload=raw_payload,
                 )
                 status = "completed"
+            set_attributes(**{"jarvis.status": status})
             self._session_workspace_manager.update_status(session_workspace, status)
             logger.info(
                 "task runtime turn finished turn_id=%s status=%s elapsed_ms=%s",
@@ -428,11 +532,15 @@ class TaskAgentRuntime:
                         "conversation_id": turn.conversation_id,
                         "turn_id": turn_id,
                         "aggregation_status": aggregation.status,
+                        **({"usage_records": usage_records} if usage_records else {}),
+                        **({"usage": token_usage} if token_usage is not None else {}),
                         **({"approval_requests": approval_requests} if approval_requests else {}),
                     },
                 ),
             )
         except Exception as exc:
+            set_attributes(**{"jarvis.status": "failed"})
+            record_exception(exc, **{"jarvis.turn_id": turn_id, "jarvis.conversation_id": turn.conversation_id})
             logger.exception(
                 "task runtime failed turn_id=%s elapsed_ms=%s",
                 turn_id,
@@ -564,3 +672,23 @@ def _approval_requests_from_aggregation(aggregation: AggregationResult) -> list[
     if aggregation.approval_requests:
         return approval_request_dicts(aggregation.approval_requests)
     return []
+
+
+def _trace_enriched_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    trace_id, span_id = current_trace_ids()
+    if not trace_id and not span_id:
+        return payload
+    enriched = dict(payload)
+    enriched["trace"] = {"trace_id": trace_id, "span_id": span_id}
+    return enriched
+
+
+def _set_usage_attributes(token_usage: dict[str, Any]) -> None:
+    set_attributes(
+        **{
+            "jarvis.usage.model": token_usage.get("model"),
+            "jarvis.usage.prompt_tokens": token_usage.get("prompt_tokens"),
+            "jarvis.usage.completion_tokens": token_usage.get("completion_tokens"),
+            "jarvis.usage.total_tokens": token_usage.get("total_tokens"),
+        }
+    )

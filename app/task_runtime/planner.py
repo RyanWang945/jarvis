@@ -24,8 +24,10 @@ from app.task_runtime.runtime_context import RuntimeContext
 logger = logging.getLogger(__name__)
 
 NodeRuntime = Literal["llm", "react", "coder"]
+NodeMode = Literal["read", "write"]
 FinalizationMode = Literal["pass_through", "llm"]
 _RUNTIMES = {"llm", "react", "coder"}
+_NODE_MODES = {"read", "write"}
 
 
 class PlanNode(BaseModel):
@@ -33,6 +35,7 @@ class PlanNode(BaseModel):
 
     id: str
     runtime: NodeRuntime
+    mode: NodeMode = "read"
     objective: str
     repo_id: str | None = None
     input_refs: list[str] = Field(default_factory=list)
@@ -42,6 +45,11 @@ class PlanNode(BaseModel):
     @classmethod
     def _runtime_text(cls, value: Any) -> NodeRuntime:
         return _normalize_runtime(value)
+
+    @field_validator("mode", mode="before")
+    @classmethod
+    def _mode_text(cls, value: Any) -> NodeMode:
+        return _normalize_node_mode(value)
 
     @field_validator("id", "objective")
     @classmethod
@@ -202,7 +210,10 @@ class TurnPlanner:
                     known_artifact_refs=_known_artifact_refs(plan_input.artifacts),
                     previous_node_results=plan_input.previous_node_results,
                 )
-                or _fallback_single_node_plan(plan_input.current_user_input)
+                or _fallback_single_node_plan(
+                    plan_input.current_user_input,
+                    allowed_runtimes=_allowed_runtimes(plan_input.runtime_context),
+                )
             )
 
         prompt = self._prompt_registry.load("heavy_plan", self._prompt_version)
@@ -239,6 +250,7 @@ class TurnPlanner:
             fallback_objective=plan_input.current_user_input,
             known_artifact_refs=_known_artifact_refs(plan_input.artifacts),
             previous_node_results=plan_input.previous_node_results,
+            allowed_runtimes=_allowed_runtimes(plan_input.runtime_context),
         )
         usage_record = usage_record_from_response(response, stage="planner")
         logger.info("turn planner plan output=%s", _json_for_log(plan.model_dump(mode="json")))
@@ -348,6 +360,14 @@ def _known_artifact_refs(artifacts: list[dict[str, Any]]) -> set[str]:
     return refs
 
 
+def _allowed_runtimes(runtime_context: dict[str, Any]) -> set[str] | None:
+    raw = runtime_context.get("available_runtimes")
+    if not isinstance(raw, list):
+        return None
+    allowed = {str(item).strip().lower() for item in raw if str(item).strip().lower() in _RUNTIMES}
+    return allowed or None
+
+
 def _ensure_temporal_hints(hints: dict[str, Any]) -> dict[str, Any]:
     if hints.get("current_date") and hints.get("current_time") and hints.get("timezone"):
         return hints
@@ -393,6 +413,7 @@ def _plan_from_payload(
     fallback_objective: str,
     known_artifact_refs: set[str] | None = None,
     previous_node_results: list[dict[str, Any]] | None = None,
+    allowed_runtimes: set[str] | None = None,
 ) -> ExecutionPlan:
     candidate = payload.get("plan") if isinstance(payload.get("plan"), dict) else payload
     if not isinstance(candidate, dict):
@@ -406,10 +427,11 @@ def _plan_from_payload(
         )
         if intent_fallback is not None:
             return intent_fallback
-        return _fallback_single_node_plan(fallback_objective)
+        return _fallback_single_node_plan(fallback_objective, allowed_runtimes=allowed_runtimes)
     normalized = _normalize_plan_payload(
         candidate,
         known_artifact_refs=known_artifact_refs,
+        allowed_runtimes=allowed_runtimes,
     )
     normalized.setdefault("user_objective", fallback_objective)
     normalized.setdefault("nodes", [])
@@ -427,13 +449,14 @@ def _plan_from_payload(
         )
         if intent_fallback is not None:
             return intent_fallback
-        return _fallback_single_node_plan(fallback_objective)
+        return _fallback_single_node_plan(fallback_objective, allowed_runtimes=allowed_runtimes)
 
 
 def _normalize_plan_payload(
     payload: dict[str, Any],
     *,
     known_artifact_refs: set[str] | None = None,
+    allowed_runtimes: set[str] | None = None,
 ) -> dict[str, Any]:
     normalized = dict(payload)
     raw_finalization_hint = normalized.get("finalization_hint")
@@ -445,6 +468,7 @@ def _normalize_plan_payload(
             _normalize_node_payload(
                 node,
                 known_artifact_refs=known_artifact_refs,
+                allowed_runtimes=allowed_runtimes,
             )
             for node in raw_nodes
             if isinstance(node, dict)
@@ -467,7 +491,7 @@ def _derive_finalization_hint(nodes: Any, raw_hint: Any) -> dict[str, Any]:
             }
     return {
         "mode": "llm",
-        "user_facing": user_facing,
+        "user_facing": False,
     }
 
 
@@ -486,10 +510,14 @@ def _normalize_node_payload(
     payload: dict[str, Any],
     *,
     known_artifact_refs: set[str] | None = None,
+    allowed_runtimes: set[str] | None = None,
 ) -> dict[str, Any]:
     node = dict(payload)
     runtime = _normalize_runtime(node.get("runtime"))
+    if allowed_runtimes is not None and runtime not in allowed_runtimes and runtime == "llm" and "react" in allowed_runtimes:
+        runtime = "react"
     node["runtime"] = runtime
+    node["mode"] = _normalize_node_mode(node.get("mode"))
 
     output_hint = node.get("output_hint")
     if isinstance(output_hint, dict):
@@ -507,6 +535,13 @@ def _normalize_runtime(value: Any) -> NodeRuntime:
     if text in _RUNTIMES:
         return text  # type: ignore[return-value]
     return text  # type: ignore[return-value]
+
+
+def _normalize_node_mode(value: Any) -> NodeMode:
+    text = str(value or "").strip().lower()
+    if text in _NODE_MODES:
+        return text  # type: ignore[return-value]
+    return "read"
 
 
 def _normalize_input_refs(value: Any, *, known_artifact_refs: set[str] | None = None) -> list[str]:
@@ -625,15 +660,19 @@ def _fallback_plan_for_objective(
     return None
 
 
-def _fallback_single_node_plan(objective: str) -> ExecutionPlan:
+def _fallback_single_node_plan(objective: str, *, allowed_runtimes: set[str] | None = None) -> ExecutionPlan:
+    runtime = "react" if allowed_runtimes is not None and "llm" not in allowed_runtimes and "react" in allowed_runtimes else "llm"
     return ExecutionPlan(
         user_objective=objective,
-        finalization_hint=FinalizationHint(mode="pass_through", user_facing=True),
+        finalization_hint=FinalizationHint(
+            mode="pass_through" if runtime == "llm" else "llm",
+            user_facing=runtime == "llm",
+        ),
         nodes=[
             PlanNode(
                 id="main",
                 objective=objective,
-                runtime="llm",
+                runtime=runtime,
                 output_hint="User-facing result.",
             )
         ],

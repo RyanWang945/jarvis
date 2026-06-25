@@ -243,7 +243,7 @@ def test_feishu_gateway_can_run_task_runtime_e2e_without_network(tmp_path: Path)
     assert messages[-1].raw_payload["aggregation"]["status"] == "completed"
 
 
-def test_task_runtime_appends_combined_usage_footer(tmp_path: Path) -> None:
+def test_task_runtime_returns_combined_usage_metadata(tmp_path: Path) -> None:
     store = InMemoryConversationStore()
     gateway = GatewayService(conversation_store=store)
     plan = ExecutionPlan(
@@ -273,7 +273,9 @@ def test_task_runtime_appends_combined_usage_footer(tmp_path: Path) -> None:
 
     assert "node result with usage" in run_result.reply
     assert "- 模型：" not in run_result.reply
-    assert "- Token：输入 `300` / 输出 `75` / 合计 `375`" in run_result.reply
+    assert "- Token：" not in run_result.reply
+    assert run_result.message.metadata["usage"]["prompt_tokens"] == 300
+    assert len(run_result.message.metadata["usage_records"]) == 2
     messages = store.list_messages(gateway_result.conversation_id)
     assert messages[-1].raw_payload["usage"]["prompt_tokens"] == 300
     assert len(messages[-1].raw_payload["usage_records"]) == 2

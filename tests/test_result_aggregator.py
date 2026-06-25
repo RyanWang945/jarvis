@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from unittest.mock import MagicMock, patch
 
 from app.llm.provider_adapters import NormalizedLLMResponse
 from app.task_runtime.node_result import ExecutionReport, NodeArtifact, NodeError, NodeResult
@@ -99,6 +100,112 @@ def test_result_aggregator_uses_llm_json_result() -> None:
     prompt_payload = json.loads(chat.calls[0]["messages"][1].content.split("\n\n", 1)[1])
     assert prompt_payload["runtime_context"]["active_repo"] == "jarvis"
     assert "runtime_hints" not in prompt_payload
+
+
+def test_result_aggregator_does_not_downgrade_completed_report_to_failed() -> None:
+    chat = ScriptedSummaryChat('{"status":"failed","reply":"没有生成完整报告。"}')
+    aggregator = ResultAggregator(model_resolver=lambda metadata: FakeResolvedModel(chat))
+    report = ExecutionReport(
+        status="completed",
+        node_results=[
+            NodeResult(node_id="research", runtime="react", status="completed", summary="Found enough source material.")
+        ],
+    )
+
+    result = aggregator.aggregate(plan=_plan(), report=report)
+
+    assert result.status == "completed"
+    assert result.reply == "没有生成完整报告。"
+
+
+def test_result_aggregator_strips_unbacked_attachment_claims() -> None:
+    chat = ScriptedSummaryChat(
+        '{"status":"completed","reply":"核心结论如下。\\n\\n详细对比报告已生成，可查看附件。","artifact_refs":[],"data":{}}'
+    )
+    aggregator = ResultAggregator(model_resolver=lambda metadata: FakeResolvedModel(chat))
+    report = ExecutionReport(
+        status="completed",
+        node_results=[
+            NodeResult(node_id="research", runtime="react", status="completed", summary="Found enough source material.")
+        ],
+    )
+
+    result = aggregator.aggregate(plan=_plan(), report=report)
+
+    assert result.status == "completed"
+    assert "核心结论如下" in result.reply
+    assert "附件" not in result.reply
+
+
+def test_result_aggregator_normalizes_nullable_collection_fields() -> None:
+    chat = ScriptedSummaryChat(
+        '{"status":"completed","reply":"已完成。","artifact_refs":null,"approval_requests":null,"data":null}'
+    )
+    aggregator = ResultAggregator(model_resolver=lambda metadata: FakeResolvedModel(chat))
+    report = ExecutionReport(
+        status="completed",
+        node_results=[
+            NodeResult(
+                node_id="research",
+                runtime="react",
+                status="completed",
+                summary="Found enough source material.",
+                artifacts=[NodeArtifact(ref="A1")],
+            )
+        ],
+    )
+
+    result = aggregator.aggregate(plan=_plan(), report=report)
+
+    assert result.status == "completed"
+    assert result.artifact_refs == ["artifact:A1"]
+    assert result.approval_requests == []
+    assert result.data == {}
+
+
+def test_result_aggregator_uses_claude_agent_sdk_backend_with_no_tools() -> None:
+    captured_options: list[dict] = []
+
+    async def _fake_query(**kwargs):
+        captured_options.append(kwargs["options"])
+        payload = {
+            "status": "completed",
+            "reply": "| 维度 | Claude Tag | YouMind |\n| --- | --- | --- |\n| 产品类型 | Slack AI teammate | AI 创作工作室 |",
+            "artifact_refs": [],
+            "approval_requests": [],
+            "data": {"confidence": "medium"},
+        }
+        yield type("AssistantMessage", (), {"content": [], "session_id": "agg-session"})()
+        yield type("ResultMessage", (), {"status": "completed", "structured_output": payload, "session_id": "agg-session"})()
+
+    mock_sdk = MagicMock()
+    mock_sdk.ClaudeAgentOptions = lambda **kwargs: kwargs
+    mock_sdk.query = _fake_query
+
+    with patch.dict("sys.modules", {"claude_agent_sdk": mock_sdk}):
+        aggregator = ResultAggregator(
+            model_resolver=lambda metadata: FakeResolvedModel(ScriptedSummaryChat("{}")),
+            backend="claude_agent_sdk",
+        )
+        report = ExecutionReport(
+            status="completed",
+            node_results=[
+                NodeResult(node_id="research", runtime="react", status="completed", summary="Found source material.")
+            ],
+        )
+
+        result = aggregator.aggregate(plan=_plan(), report=report)
+
+    assert result.status == "completed"
+    assert "| 维度 | Claude Tag | YouMind |" in result.reply
+    assert result.data["aggregator_backend"] == "claude_agent_sdk"
+    assert result.data["agent_session_id"] == "agg-session"
+    options = captured_options[0]
+    assert options["max_turns"] == 1
+    assert options["tools"] == []
+    assert options["mcp_servers"] == {}
+    assert options["strict_mcp_config"] is True
+    assert options["permission_mode"] == "dontAsk"
 
 
 def test_result_aggregator_pass_through_skips_llm() -> None:

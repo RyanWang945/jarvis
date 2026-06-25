@@ -154,8 +154,33 @@ def test_feishu_renderer_adapts_commonmark_and_table() -> None:
     assert "**Story Outline**" in all_content
     assert "**Quote**" in all_content
     assert "A well-blended story" in all_content
-    assert "**Fan Xian | Lead**" in all_content
-    assert "**Skill**: Strategy" in all_content
+    assert "**Fan Xian**" in all_content
+    assert "- **Role**：Lead" in all_content
+    assert "- **Skill**：Strategy" in all_content
+
+
+def test_feishu_renderer_renders_comparison_table_as_dimension_blocks() -> None:
+    renderer = FeishuRenderer(title="Jarvis")
+
+    delivery = renderer.render(
+        ChannelMessage(
+            content=(
+                "| 维度 | Claude Tag | YouMind |\n"
+                "| --- | --- | --- |\n"
+                "| 产品类型 | Slack 内嵌 AI 团队协作者 | AI 创作工作室 + 知识管理平台 |\n"
+                "| 主要平台 | Slack | Web + Chrome 扩展 + iOS |\n"
+            ),
+            content_type="markdown",
+        )
+    )
+
+    all_content = "\n".join(element["text"]["content"] for element in json.loads(delivery.content)["elements"])
+    assert "**产品类型**" in all_content
+    assert "- **Claude Tag**：Slack 内嵌 AI 团队协作者" in all_content
+    assert "- **YouMind**：AI 创作工作室 + 知识管理平台" in all_content
+    assert "**主要平台**" in all_content
+    assert "- **Claude Tag**：Slack" in all_content
+    assert "- **YouMind**：Web + Chrome 扩展 + iOS" in all_content
 
 
 def test_feishu_renderer_repairs_quad_asterisk_labels() -> None:
@@ -184,7 +209,7 @@ def test_feishu_renderer_repairs_quad_asterisk_labels() -> None:
     assert "**资产属性** | 避险资产" in all_content
 
 
-def test_feishu_renderer_moves_usage_footer_to_note() -> None:
+def test_feishu_renderer_moves_usage_footer_to_usage_block() -> None:
     renderer = FeishuRenderer(title="Jarvis")
 
     delivery = renderer.render(
@@ -207,13 +232,32 @@ def test_feishu_renderer_moves_usage_footer_to_note() -> None:
     assert "- 模型：" not in body_content
     assert "- Token：" not in body_content
     assert card["elements"][-2] == {"tag": "hr"}
+    assert card["elements"][-1] == {
+        "tag": "note",
+        "elements": [
+            {
+                "tag": "lark_md",
+                "content": "**用量：** 5.2k tokens · 输入 4.6k / 输出 618",
+            }
+        ],
+    }
+
+
+def test_feishu_renderer_renders_usage_from_metadata() -> None:
+    renderer = FeishuRenderer(title="Jarvis")
+
+    delivery = renderer.render(
+        ChannelMessage(
+            content="这是最终回复。",
+            content_type="markdown",
+            metadata={"usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}},
+        )
+    )
+
+    card = json.loads(delivery.content)
+    assert card["elements"][-2] == {"tag": "hr"}
     assert card["elements"][-1]["tag"] == "note"
-    assert card["elements"][-1]["elements"] == [
-        {
-            "tag": "plain_text",
-            "content": "Token：输入 4553 / 输出 618 / 合计 5171",
-        }
-    ]
+    assert card["elements"][-1]["elements"][0]["content"] == "**用量：** 15 tokens · 输入 10 / 输出 5"
 
 
 def test_feishu_channel_retries_text_fallback_when_interactive_fails(monkeypatch) -> None:
@@ -294,6 +338,46 @@ def test_feishu_channel_updates_error_card_for_failed_turn_result(monkeypatch) -
     assert "**❌ Request Failed**" in updated[0][2]
     assert "调用模型时出错" in updated[0][2]
     assert drained == [(7, "chat_1")]
+
+
+def test_feishu_channel_updates_cardkit_error_with_schema_v2(monkeypatch) -> None:
+    monkeypatch.setenv("JARVIS_FEISHU_PROGRESS_UPDATES_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_FEISHU_PROGRESS_MODE", "cardkit")
+    monkeypatch.setenv("JARVIS_FEISHU_PROGRESS_MIN_INTERVAL_SECONDS", "0")
+    get_settings.cache_clear()
+    channel = FeishuChannel(app_id="app", app_secret="secret")
+    updated: list[dict] = []
+
+    class FakeRuntime:
+        def run_turn(self, turn_id: int, *, progress) -> TurnResult:
+            progress.emit("planning_started", turn_id=turn_id, summary="正在生成执行计划")
+            return TurnResult(
+                turn_id=turn_id,
+                conversation_id=7,
+                status="failed",
+                message=ChannelMessage(content="生成完整报告失败。", content_type="markdown"),
+            )
+
+    def fake_send(receive_id: str, delivery) -> dict:
+        return {"code": 0, "data": {"message_id": "om_cardkit"}}
+
+    def fake_update(message_id: str, delivery) -> None:
+        updated.append(json.loads(delivery.content))
+
+    monkeypatch.setattr("app.channels.feishu.get_agent_runtime", lambda: FakeRuntime())
+    monkeypatch.setattr(channel, "_send_delivery", fake_send)
+    monkeypatch.setattr(channel, "_update_card_message", fake_update)
+    monkeypatch.setattr(channel, "_submit_next_queued_turn", lambda conversation_id, chat_id: None)
+
+    try:
+        channel._handle_agent_run("ou_1", "chat_1", "dm", "查资料", 7, 42)
+    finally:
+        get_settings.cache_clear()
+
+    assert updated[-1]["schema"] == "2.0"
+    content = json.dumps(updated[-1], ensure_ascii=False)
+    assert "生成完整报告失败" in content
+    assert "elements" not in updated[-1]
 
 
 def test_feishu_channel_injects_progress_when_enabled(monkeypatch) -> None:
@@ -418,6 +502,49 @@ def test_feishu_channel_uses_cardkit_progress_mode(monkeypatch) -> None:
     final_content = json.dumps(updated[-1][1], ensure_ascii=False)
     assert "Final" in final_content
     assert "Done" in final_content
+
+
+def test_feishu_channel_sends_fallback_when_final_card_update_fails(monkeypatch) -> None:
+    monkeypatch.setenv("JARVIS_FEISHU_PROGRESS_UPDATES_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_FEISHU_PROGRESS_MODE", "cardkit")
+    monkeypatch.setenv("JARVIS_FEISHU_PROGRESS_MIN_INTERVAL_SECONDS", "0")
+    get_settings.cache_clear()
+    channel = FeishuChannel(app_id="app", app_secret="secret")
+    sent: list[tuple[str, str, str]] = []
+    update_count = 0
+
+    class FakeRuntime:
+        def run_turn(self, turn_id: int, *, progress) -> TurnResult:
+            progress.emit("planning_started", turn_id=turn_id, summary="正在生成执行计划")
+            return TurnResult(
+                turn_id=turn_id,
+                conversation_id=7,
+                status="completed",
+                message=ChannelMessage(content="# Final\n\nDone", content_type="markdown"),
+            )
+
+    def fake_send(receive_id: str, delivery) -> dict:
+        sent.append((receive_id, delivery.msg_type, delivery.content))
+        return {"code": 0, "data": {"message_id": "om_cardkit"}}
+
+    def fake_update(message_id: str, delivery) -> None:
+        nonlocal update_count
+        update_count += 1
+        if "Final" in delivery.content:
+            raise RuntimeError("bad request")
+
+    monkeypatch.setattr("app.channels.feishu.get_agent_runtime", lambda: FakeRuntime())
+    monkeypatch.setattr(channel, "_send_delivery", fake_send)
+    monkeypatch.setattr(channel, "_update_card_message", fake_update)
+    monkeypatch.setattr(channel, "_submit_next_queued_turn", lambda conversation_id, chat_id: None)
+
+    try:
+        channel._handle_agent_run("ou_1", "chat_1", "dm", "查资料", 7, 42)
+    finally:
+        get_settings.cache_clear()
+
+    assert update_count >= 2
+    assert any(receive_id == "chat_1" and msg_type == "interactive" and "Final" in content for receive_id, msg_type, content in sent)
 
 
 def test_feishu_channel_cardkit_progress_send_falls_back_to_thinking_card(monkeypatch) -> None:
@@ -689,6 +816,65 @@ def test_feishu_image_upload_error_includes_response_payload(monkeypatch) -> Non
     assert "log_1" in message
     assert "99991672" in message
     assert "Access denied" in message
+
+
+def test_feishu_update_error_captures_request_and_response_payload(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("JARVIS_FEISHU_CAPTURE_PAYLOAD_ON_ERROR", "true")
+    monkeypatch.setenv("JARVIS_FEISHU_CAPTURE_PAYLOAD_ALWAYS", "false")
+    monkeypatch.setenv("JARVIS_FEISHU_PAYLOAD_LOG_DIR", str(tmp_path))
+    get_settings.cache_clear()
+    channel = FeishuChannel(app_id="app", app_secret="secret")
+
+    class FakeResponse:
+        status_code = 400
+        text = '{"code":99991672,"msg":"Bad card."}'
+        headers = {"x-tt-logid": "log_card_1"}
+
+        def json(self):
+            return {"code": 99991672, "msg": "Bad card."}
+
+    class FakeHttp:
+        def patch(self, *args, **kwargs):
+            return FakeResponse()
+
+    monkeypatch.setattr(channel, "_ensure_token", lambda: "token")
+    channel._http = FakeHttp()
+    delivery = FeishuRenderer(title="Jarvis").render_cardkit_progress_card(
+        SimpleNamespace(
+            current_stage="完成",
+            current_action="任务已完成",
+            completed_items=["生成执行计划"],
+            recent_events=[],
+            planned_nodes=[],
+            completed_node_ids=[],
+            node_total=0,
+            node_completed=0,
+            output_started=True,
+            status="completed",
+        ),
+        output_markdown="可接受 @Claude 委派任务。\n\n---\n- Token：输入 `1` / 输出 `2` / 合计 `3`",
+    )
+
+    try:
+        channel._update_card_message("om_bad", delivery)
+    except RuntimeError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("expected update failure")
+    finally:
+        get_settings.cache_clear()
+
+    captures = list(tmp_path.glob("*.json"))
+    assert len(captures) == 1
+    captured = json.loads(captures[0].read_text(encoding="utf-8"))
+    assert "capture_path=" in message
+    assert captured["request_meta"]["operation"] == "patch"
+    assert captured["request_meta"]["message_id"] == "om_bad"
+    assert captured["request_meta"]["content_bytes"] > 0
+    assert captured["request_payload"]["content"] == delivery.content
+    assert captured["response"]["status_code"] == 400
+    assert captured["response"]["headers"]["x-tt-logid"] == "log_card_1"
+    assert captured["response"]["payload"]["code"] == 99991672
 
 
 def test_feishu_card_action_updates_approval_card(monkeypatch) -> None:

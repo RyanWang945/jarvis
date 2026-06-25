@@ -71,6 +71,12 @@ def test_plan_node_rejects_legacy_codex_runtime() -> None:
         PlanNode(id="fix", runtime="codex", objective="Fix repo")  # type: ignore[arg-type]
 
 
+def test_plan_node_normalizes_mode() -> None:
+    assert PlanNode(id="read", runtime="react", objective="Research").mode == "read"
+    assert PlanNode(id="write", runtime="react", mode="write", objective="Write report").mode == "write"
+    assert PlanNode(id="bad", runtime="react", mode="deliver", objective="Deliver report").mode == "read"
+
+
 def test_build_plan_input_normalizes_artifacts_and_hints() -> None:
     plan_input = build_plan_input(
         current_user_input="把刚刚那个报告发我",
@@ -108,7 +114,32 @@ def test_plan_from_payload_derives_llm_finalization_for_non_llm_nodes() -> None:
     )
 
     assert plan.finalization_hint.mode == "llm"
-    assert plan.finalization_hint.user_facing is True
+    assert plan.finalization_hint.user_facing is False
+    assert plan.nodes[0].mode == "read"
+
+
+def test_plan_from_payload_coerces_llm_when_not_available() -> None:
+    plan = _plan_from_payload(
+        {
+            "user_objective": "仔细对比claudetag和youmind",
+            "finalization_hint": {"user_facing": True},
+            "nodes": [
+                {
+                    "id": "compare",
+                    "runtime": "llm",
+                    "mode": "read",
+                    "objective": "仔细对比claudetag和youmind",
+                    "output_hint": "详细对比分析",
+                }
+            ],
+        },
+        fallback_objective="仔细对比claudetag和youmind",
+        allowed_runtimes={"react", "coder"},
+    )
+
+    assert plan.nodes[0].runtime == "react"
+    assert plan.finalization_hint.mode == "llm"
+    assert plan.finalization_hint.user_facing is False
 
 
 def test_plan_from_payload_keeps_pass_through_for_single_llm_node() -> None:
@@ -288,7 +319,7 @@ def test_turn_planner_real_llm_creates_artifact_delivery_node() -> None:
                 "origin": "assistant_generated",
             }
         ],
-        runtime_context=RuntimeContext.from_hints({"active_repo": None, "available_runtimes": ["llm", "react", "coder"]}),
+        runtime_context=RuntimeContext.from_hints({"active_repo": None, "available_runtimes": ["react", "coder"]}),
     )
 
     assert len(plan.nodes) == 1
@@ -312,7 +343,7 @@ def test_turn_planner_real_llm_reuses_previous_node_result_for_replan() -> None:
                 "artifacts": [],
             }
         ],
-        runtime_context=RuntimeContext.from_hints({"active_repo": "jarvis", "available_runtimes": ["llm", "react", "coder"]}),
+        runtime_context=RuntimeContext.from_hints({"active_repo": "jarvis", "available_runtimes": ["react", "coder"]}),
     )
 
     assert [node.runtime for node in plan.nodes] == ["coder"]
