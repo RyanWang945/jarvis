@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import os
 import queue
@@ -11,6 +13,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
+
+from app.llm.provider_adapters import TokenUsage
+from app.tools.common import ToolArtifact
 
 
 APPROVAL_REQUEST_METHODS = {
@@ -28,6 +33,8 @@ class CodexAppServerRunResult:
     exit_code: int | None = None
     final_text: str = ""
     approval_requests: list[dict[str, Any]] = field(default_factory=list)
+    tool_artifacts: list[ToolArtifact] = field(default_factory=list)
+    usage: TokenUsage | None = None
     error: str = ""
 
 
@@ -39,6 +46,8 @@ class CodexApprovalContinuationResult:
     exit_code: int | None = None
     final_text: str = ""
     approval_requests: list[dict[str, Any]] = field(default_factory=list)
+    tool_artifacts: list[ToolArtifact] = field(default_factory=list)
+    usage: TokenUsage | None = None
     error: str = ""
 
 
@@ -50,10 +59,18 @@ class CodexAppServerSession:
         workdir: Path,
         run_dir: Path,
         trusted_command_prefixes: list[str] | None = None,
+        allowed_write_roots: list[Path] | None = None,
     ) -> None:
         self._provider_command = provider_command
         self._workdir = workdir
         self._run_dir = run_dir
+        self._allowed_write_roots = _unique_resolved_paths(
+            [
+                self._workdir,
+                self._run_dir.parent,
+                *(allowed_write_roots or []),
+            ]
+        )
         self._trusted_command_prefixes = tuple(
             prefix for prefix in (_normalize_command_prefix(value) for value in trusted_command_prefixes or []) if prefix
         )
@@ -71,6 +88,9 @@ class CodexAppServerSession:
         self._pending_server_request_id: int | str | None = None
         self._pending_approval_payload: dict[str, Any] | None = None
         self._closed = False
+        self._tool_artifacts: list[ToolArtifact] = []
+        self._artifact_ids: set[str] = set()
+        self._latest_thread_usage: TokenUsage | None = None
 
     @property
     def run_dir(self) -> Path:
@@ -134,6 +154,8 @@ class CodexAppServerSession:
                     exit_code=run_result.exit_code,
                     final_text=run_result.final_text,
                     approval_requests=run_result.approval_requests,
+                    tool_artifacts=run_result.tool_artifacts,
+                    usage=run_result.usage,
                 )
             return CodexApprovalContinuationResult(
                 status=run_result.status if run_result.status in {"completed", "failed", "timeout"} else "failed",
@@ -141,6 +163,8 @@ class CodexAppServerSession:
                 raw_stderr=run_result.raw_stderr,
                 exit_code=run_result.exit_code,
                 final_text=run_result.final_text,
+                tool_artifacts=run_result.tool_artifacts,
+                usage=run_result.usage,
                 error=run_result.error,
             )
 
@@ -163,9 +187,10 @@ class CodexAppServerSession:
         self._events_path.write_text("", encoding="utf-8")
         self._stderr_path.write_text("", encoding="utf-8")
         env = os.environ.copy()
-        env["GIT_CONFIG_COUNT"] = "1"
-        env["GIT_CONFIG_KEY_0"] = "safe.directory"
-        env["GIT_CONFIG_VALUE_0"] = str(self._workdir)
+        for index, safe_directory in enumerate(self._allowed_write_roots):
+            env[f"GIT_CONFIG_KEY_{index}"] = "safe.directory"
+            env[f"GIT_CONFIG_VALUE_{index}"] = safe_directory.as_posix()
+        env["GIT_CONFIG_COUNT"] = str(len(self._allowed_write_roots))
         self._proc = subprocess.Popen(
             [*self._provider_command, "app-server"],
             cwd=str(self._workdir),
@@ -278,11 +303,10 @@ class CodexAppServerSession:
             text = _final_text_from_app_server_event(event)
             if text:
                 final_text = text
+            self._collect_tool_artifact(event)
             if method in APPROVAL_REQUEST_METHODS:
                 approval = self._build_approval_payload(event)
-                if self._matches_trusted_command_prefix(approval) or (
-                    auto_approve_routine_approvals and _is_routine_repo_git_approval(approval)
-                ):
+                if self._should_auto_approve(approval, auto_approve_routine_approvals=auto_approve_routine_approvals):
                     self._send({"id": event.get("id"), "result": {"decision": _approval_decision(approval, approved=True)}})
                     continue
                 self._pending_approval_id = str(approval["id"])
@@ -296,7 +320,14 @@ class CodexAppServerSession:
                     exit_code=None,
                     final_text=final_text,
                     approval_requests=[approval],
+                    tool_artifacts=list(self._tool_artifacts),
+                    usage=self._latest_thread_usage,
                 )
+            if method == "thread/tokenUsage/updated":
+                usage = _thread_token_usage_from_event(event)
+                if usage is not None:
+                    self._latest_thread_usage = usage
+                continue
             if method == "turn/completed":
                 completion_status = _turn_completion_status(event)
                 if completion_status and completion_status != "completed":
@@ -308,6 +339,8 @@ class CodexAppServerSession:
                         raw_stderr=self.raw_stderr(),
                         exit_code=None,
                         final_text=final_text or last_agent_text,
+                        tool_artifacts=list(self._tool_artifacts),
+                        usage=self._latest_thread_usage,
                         error=error,
                     )
                 self.close()
@@ -317,6 +350,8 @@ class CodexAppServerSession:
                     raw_stderr=self.raw_stderr(),
                     exit_code=0,
                     final_text=final_text,
+                    tool_artifacts=list(self._tool_artifacts),
+                    usage=self._latest_thread_usage,
                 )
 
         self.close()
@@ -326,6 +361,8 @@ class CodexAppServerSession:
             raw_stderr=self.raw_stderr(),
             exit_code=None,
             final_text=final_text,
+            tool_artifacts=list(self._tool_artifacts),
+            usage=self._latest_thread_usage,
             error="Codex app-server timed out.",
         )
 
@@ -338,8 +375,17 @@ class CodexAppServerSession:
             raw_stderr=self.raw_stderr(),
             exit_code=exit_code,
             final_text=final_text,
+            tool_artifacts=list(self._tool_artifacts),
+            usage=self._latest_thread_usage,
             error=error,
         )
+
+    def _collect_tool_artifact(self, event: dict[str, Any]) -> None:
+        artifact = _image_generation_artifact(event, run_dir=self._run_dir)
+        if artifact is None or artifact.artifact_id in self._artifact_ids:
+            return
+        self._artifact_ids.add(artifact.artifact_id)
+        self._tool_artifacts.append(artifact)
 
     def _build_approval_payload(self, event: dict[str, Any]) -> dict[str, Any]:
         params = event.get("params") if isinstance(event.get("params"), dict) else {}
@@ -354,7 +400,9 @@ class CodexAppServerSession:
             "command": str(params.get("command") or ""),
             "cwd": str(params.get("cwd") or self._workdir),
             "reason": str(params.get("reason") or ""),
+            "grant_root": str(params.get("grantRoot") or ""),
         }
+        payload["raw_params"] = params
         available = params.get("availableDecisions")
         if isinstance(available, list):
             payload["available_decisions"] = available
@@ -368,6 +416,14 @@ class CodexAppServerSession:
 
     def _matches_trusted_command_prefix(self, approval: dict[str, Any]) -> bool:
         return _matches_trusted_command_prefix(approval, self._trusted_command_prefixes)
+
+    def _should_auto_approve(self, approval: dict[str, Any], *, auto_approve_routine_approvals: bool) -> bool:
+        return _is_auto_approved_workspace_approval(
+            approval,
+            allowed_roots=self._allowed_write_roots,
+            trusted_command_prefixes=self._trusted_command_prefixes,
+            auto_approve_routine_approvals=auto_approve_routine_approvals,
+        )
 
     def _append_line(self, path: Path, line: str) -> None:
         try:
@@ -389,12 +445,14 @@ def run_codex_app_server_turn(
     instruction: str,
     timeout_seconds: int,
     trusted_command_prefixes: list[str] | None = None,
+    allowed_write_roots: list[Path] | None = None,
 ) -> CodexAppServerRunResult:
     session = CodexAppServerSession(
         provider_command=provider_command,
         workdir=workdir,
         run_dir=run_dir,
         trusted_command_prefixes=trusted_command_prefixes,
+        allowed_write_roots=allowed_write_roots,
     )
     try:
         return session.start_turn(instruction=instruction, timeout_seconds=timeout_seconds)
@@ -541,6 +599,122 @@ def _turn_completion_error(event: dict[str, Any]) -> str:
     return ""
 
 
+def _thread_token_usage_from_event(event: dict[str, Any]) -> TokenUsage | None:
+    if str(event.get("method") or "") != "thread/tokenUsage/updated":
+        return None
+    candidates: list[Any] = [event]
+    params = event.get("params")
+    if isinstance(params, dict):
+        token_usage = params.get("tokenUsage")
+        token_usage_snake = params.get("token_usage")
+        candidates.extend(
+            [
+                params,
+                params.get("usage"),
+                token_usage.get("total") if isinstance(token_usage, dict) else None,
+                token_usage.get("last") if isinstance(token_usage, dict) else None,
+                token_usage,
+                token_usage_snake.get("total") if isinstance(token_usage_snake, dict) else None,
+                token_usage_snake.get("last") if isinstance(token_usage_snake, dict) else None,
+                token_usage_snake,
+                params.get("tokens"),
+            ]
+        )
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        prompt = _int_field(
+            candidate,
+            "prompt_tokens",
+            "promptTokens",
+            "input_tokens",
+            "inputTokens",
+            "input",
+        )
+        completion = _int_field(
+            candidate,
+            "completion_tokens",
+            "completionTokens",
+            "output_tokens",
+            "outputTokens",
+            "output",
+        )
+        total = _int_field(candidate, "total_tokens", "totalTokens", "total")
+        if total <= 0 and (prompt > 0 or completion > 0):
+            total = prompt + completion
+        if prompt > 0 or completion > 0 or total > 0:
+            return TokenUsage(prompt_tokens=prompt, completion_tokens=completion, total_tokens=total)
+    return None
+
+
+def _int_field(value: dict[str, Any], *keys: str) -> int:
+    for key in keys:
+        raw = value.get(key)
+        if raw is None:
+            continue
+        try:
+            return max(int(raw), 0)
+        except (TypeError, ValueError):
+            continue
+    return 0
+
+
+def _image_generation_artifact(event: dict[str, Any], *, run_dir: Path) -> ToolArtifact | None:
+    if str(event.get("method") or "") != "item/completed":
+        return None
+    params = event.get("params")
+    if not isinstance(params, dict):
+        return None
+    item = params.get("item")
+    if not isinstance(item, dict) or item.get("type") != "imageGeneration":
+        return None
+    raw_result = str(item.get("result") or "").strip()
+    if not raw_result:
+        return None
+    image_bytes = _decode_image_result(raw_result)
+    if not image_bytes:
+        return None
+
+    item_id = str(item.get("id") or uuid4().hex).strip()
+    safe_id = _safe_artifact_filename(item_id)
+    artifacts_dir = run_dir / "artifacts"
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    path = artifacts_dir / f"{safe_id}.png"
+    path.write_bytes(image_bytes)
+    stat = path.stat()
+    return ToolArtifact(
+        artifact_id=f"codex_image:{safe_id}",
+        kind="image",
+        path=str(path),
+        mime_type="image/png",
+        filename=path.name,
+        size_bytes=stat.st_size,
+        metadata={
+            "codex_item_id": item_id,
+            "codex_item_type": "imageGeneration",
+            "revised_prompt": str(item.get("revisedPrompt") or ""),
+            "source_event": "item/completed",
+        },
+    )
+
+
+def _decode_image_result(value: str) -> bytes:
+    text = value.strip()
+    if "," in text and text.lower().startswith("data:"):
+        text = text.split(",", 1)[1]
+    try:
+        decoded = base64.b64decode(text, validate=True)
+    except (binascii.Error, ValueError):
+        return b""
+    if not decoded.startswith(b"\x89PNG\r\n\x1a\n"):
+        return b""
+    return decoded
+
+
+def _safe_artifact_filename(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._") or uuid4().hex
+
+
 def _approval_decision(approval: dict[str, Any], *, approved: bool) -> str | dict[str, Any]:
     available = approval.get("available_decisions")
     if not isinstance(available, list):
@@ -556,6 +730,31 @@ def _approval_decision(approval: dict[str, Any], *, approved: bool) -> str | dic
     if "decline" in available:
         return "decline"
     return "decline"
+
+
+def _is_auto_approved_workspace_approval(
+    approval: dict[str, Any],
+    *,
+    allowed_roots: tuple[Path, ...],
+    trusted_command_prefixes: tuple[str, ...] = (),
+    auto_approve_routine_approvals: bool = False,
+) -> bool:
+    if not _approval_cwd_is_within_allowed_roots(approval, allowed_roots):
+        return False
+    if _matches_trusted_command_prefix(approval, trusted_command_prefixes):
+        return True
+    approval_type = str(approval.get("type") or "").strip()
+    if approval_type == "item/fileChange/requestApproval":
+        return True
+    if _is_routine_repo_git_approval(approval):
+        return True
+    if _is_safe_test_command_approval(approval):
+        return True
+    if _is_safe_cache_cleanup_approval(approval, allowed_roots=allowed_roots):
+        return True
+    if _is_safe_node_manifest_write_approval(approval, allowed_roots=allowed_roots):
+        return True
+    return auto_approve_routine_approvals and _is_routine_repo_git_approval(approval)
 
 
 def _is_routine_repo_git_approval(approval: dict[str, Any]) -> bool:
@@ -592,6 +791,105 @@ def _is_routine_repo_git_approval(approval: dict[str, Any]) -> bool:
     if subcommand == "restore":
         return "--staged" in lower_words and "--worktree" not in lower_words and "--source" not in lower_words
     return False
+
+
+def _is_safe_test_command_approval(approval: dict[str, Any]) -> bool:
+    command = str(approval.get("command") or "").strip()
+    if not command:
+        return False
+    inner = _inner_shell_command(command)
+    if not inner or any(token in inner for token in ("\n", "\r", "&&", "||", ";", "|", ">", "<", "$(", "`")):
+        return False
+    words = _shell_words(inner)
+    if not words:
+        return False
+    executable = words[0].replace("\\", "/").lower().rstrip(".exe")
+    if executable.endswith("/python") or executable in {"python", "py"}:
+        lowered = [word.lower() for word in words[1:]]
+        return len(lowered) >= 2 and lowered[0] == "-m" and lowered[1] == "pytest"
+    return executable.endswith("/pytest") or executable == "pytest"
+
+
+def _is_safe_node_manifest_write_approval(approval: dict[str, Any], *, allowed_roots: tuple[Path, ...]) -> bool:
+    command = str(approval.get("command") or "")
+    lowered = command.lower()
+    if "node_manifest.json" not in lowered or "set-content" not in lowered:
+        return False
+    for raw_path in _windows_paths_from_command(command):
+        if raw_path.lower().endswith("node_manifest.json") and _path_is_within_allowed_roots(Path(raw_path), allowed_roots):
+            return True
+    return False
+
+
+def _is_safe_cache_cleanup_approval(approval: dict[str, Any], *, allowed_roots: tuple[Path, ...]) -> bool:
+    for command in _approval_command_candidates(approval):
+        lowered = command.lower()
+        if "remove-item" not in lowered:
+            continue
+        if not any(pattern in lowered for pattern in ("__pycache__", ".pytest_cache", "pytest-cache-files")):
+            continue
+        if not ("startswith($root" in lowered or "startswith($workspace" in lowered):
+            continue
+        raw_paths = _windows_paths_from_command(command)
+        if raw_paths and not all(_path_is_within_allowed_roots(Path(path), allowed_roots) for path in raw_paths):
+            continue
+        return True
+    return False
+
+
+def _approval_command_candidates(approval: dict[str, Any]) -> list[str]:
+    candidates = [str(approval.get("command") or "")]
+    raw_params = approval.get("raw_params")
+    if isinstance(raw_params, dict):
+        command_actions = raw_params.get("commandActions")
+        if isinstance(command_actions, list):
+            for action in command_actions:
+                if isinstance(action, dict):
+                    candidates.append(str(action.get("command") or ""))
+        amendment = raw_params.get("proposedExecpolicyAmendment")
+        if isinstance(amendment, list):
+            candidates.append(" ".join(str(item) for item in amendment))
+    return [candidate for candidate in candidates if candidate.strip()]
+
+
+def _windows_paths_from_command(command: str) -> list[str]:
+    return re.findall(r"[A-Za-z]:\\[^'\"\r\n]+", command)
+
+
+def _approval_cwd_is_within_allowed_roots(approval: dict[str, Any], allowed_roots: tuple[Path, ...]) -> bool:
+    cwd = str(approval.get("cwd") or "").strip()
+    if not cwd:
+        return False
+    return _path_is_within_allowed_roots(Path(cwd), allowed_roots)
+
+
+def _path_is_within_allowed_roots(path: Path, allowed_roots: tuple[Path, ...]) -> bool:
+    try:
+        resolved = path.expanduser().resolve(strict=False)
+    except OSError:
+        return False
+    for root in allowed_roots:
+        try:
+            resolved.relative_to(root)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def _unique_resolved_paths(paths: list[Path]) -> tuple[Path, ...]:
+    result: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        try:
+            resolved = path.expanduser().resolve(strict=False)
+        except OSError:
+            continue
+        key = os.path.normcase(str(resolved))
+        if key not in seen:
+            seen.add(key)
+            result.append(resolved)
+    return tuple(result)
 
 
 def approval_command_prefix(command: str) -> str:

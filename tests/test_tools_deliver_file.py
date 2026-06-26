@@ -1,5 +1,5 @@
 from pathlib import Path
-from types import SimpleNamespace
+from uuid import uuid4
 
 from app.agent_react.delivery import register_delivery_handler
 from app.api.agent import InMemoryConversationStore
@@ -9,8 +9,8 @@ from app.tools.deliver_file import run_deliver_file
 
 def test_deliver_file_sends_artifact_once_with_delivery_manager(monkeypatch) -> None:
     store = InMemoryConversationStore()
-    artifact_dir = Path(".pytest_tmp_deliver_file")
-    artifact_dir.mkdir(exist_ok=True)
+    artifact_dir = Path("data") / "artifact_previews" / f"deliver-file-{uuid4().hex}"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
     image_path = artifact_dir / "diagram.png"
     image_path.write_bytes(b"\x89PNG\r\n\x1a\nfake")
 
@@ -48,15 +48,7 @@ def test_deliver_file_sends_artifact_once_with_delivery_manager(monkeypatch) -> 
     handler = FakeHandler()
     register_delivery_handler(handler)
 
-    def _fake_registry():
-        return SimpleNamespace(
-            list_repositories=lambda: [
-                SimpleNamespace(canonical_root_path=artifact_dir.resolve()),
-            ],
-        )
-
     monkeypatch.setattr("app.tools.deliver_file._conversation_store", lambda: store)
-    monkeypatch.setattr("app.agent_react.artifacts.get_repository_registry", _fake_registry)
 
     try:
         request = ToolExecutionRequest(
@@ -93,8 +85,8 @@ def test_deliver_file_sends_artifact_once_with_delivery_manager(monkeypatch) -> 
 
 def test_deliver_file_accepts_file_path_alias(monkeypatch) -> None:
     store = InMemoryConversationStore()
-    artifact_dir = Path(".pytest_tmp_deliver_file_alias")
-    artifact_dir.mkdir(exist_ok=True)
+    artifact_dir = Path("data") / "artifact_previews" / f"deliver-file-alias-{uuid4().hex}"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
     image_path = artifact_dir / "diagram.png"
     image_path.write_bytes(b"\x89PNG\r\n\x1a\nfake")
 
@@ -112,15 +104,7 @@ def test_deliver_file_accepts_file_path_alias(monkeypatch) -> None:
 
     register_delivery_handler(FakeHandler())
 
-    def _fake_registry():
-        return SimpleNamespace(
-            list_repositories=lambda: [
-                SimpleNamespace(canonical_root_path=artifact_dir.resolve()),
-            ],
-        )
-
     monkeypatch.setattr("app.tools.deliver_file._conversation_store", lambda: store)
-    monkeypatch.setattr("app.agent_react.artifacts.get_repository_registry", _fake_registry)
 
     try:
         result = run_deliver_file(

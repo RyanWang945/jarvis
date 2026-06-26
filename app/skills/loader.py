@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -27,14 +26,10 @@ class SkillPackageLoader:
         self._search_paths = search_paths
 
     @classmethod
-    def from_default_paths(cls, *, data_dir: Path, extra_paths: list[Path] | None = None) -> "SkillPackageLoader":
+    def from_default_paths(cls, *, workspace_root: Path, extra_paths: list[Path] | None = None) -> "SkillPackageLoader":
         paths = [
-            data_dir / "skills",
-            Path.home() / ".jarvis" / "skills",
+            workspace_root / "skills",
         ]
-        env_path = os.environ.get("JARVIS_SKILL_PATH")
-        if env_path:
-            paths.extend(Path(item).expanduser() for item in env_path.split(os.pathsep) if item.strip())
         if extra_paths:
             paths.extend(extra_paths)
         return cls(paths)
@@ -62,12 +57,16 @@ class SkillPackageLoader:
 
     def load_package(self, path: Path) -> LoadedSkillPackage:
         manifest = _read_manifest(path)
+        content_path = (path / "SKILL.md") if (path / "SKILL.md").exists() else None
+        skill_id = path.name
+        effective_description = _effective_description(manifest, content_path)
         skill = Skill(
-            name=manifest.name,
+            skill_id=skill_id,
             description=manifest.description,
+            effective_description=effective_description,
             path=path,
             manifest=manifest,
-            content_path=(path / "SKILL.md") if (path / "SKILL.md").exists() else None,
+            content_path=content_path,
         )
         return LoadedSkillPackage(path=path, manifest=manifest, skill=skill)
 
@@ -98,3 +97,24 @@ def _read_skill_md_frontmatter(path: Path) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise ValueError("SKILL.md frontmatter must be a mapping")
     return raw
+
+
+def _effective_description(manifest: SkillManifest, content_path: Path | None) -> str:
+    if manifest.effective_description:
+        return manifest.effective_description.strip()
+    if manifest.description:
+        return manifest.description.strip()
+    if content_path is None or not content_path.exists():
+        return ""
+
+    from app.skills.skill import _strip_frontmatter
+
+    body = _strip_frontmatter(content_path.read_text(encoding="utf-8")).strip()
+    for paragraph in body.split("\n\n"):
+        text = paragraph.strip()
+        if not text:
+            continue
+        if text.startswith("#"):
+            return text.lstrip("#").strip()
+        return " ".join(line.strip() for line in text.splitlines() if line.strip())
+    return ""

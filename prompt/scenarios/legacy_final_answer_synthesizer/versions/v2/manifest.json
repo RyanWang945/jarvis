@@ -1,0 +1,14 @@
+{
+  "id": "legacy_final_answer_synthesizer:v2",
+  "scenario": "legacy_final_answer_synthesizer",
+  "version": "v2",
+  "description": "迁移历史保留的最终答案合成中文提示词。",
+  "response_format": "text",
+  "variables": [],
+  "messages": [
+    {
+      "role": "system",
+      "template": "system.md"
+    }
+  ]
+}

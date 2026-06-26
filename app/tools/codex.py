@@ -4,12 +4,14 @@ import json
 import logging
 import os
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 from shutil import which
 from uuid import uuid4
 
 from app.config import get_settings
 from app.repositories import RepositoryRef, RepositoryRegistryError, get_repository_registry
+from app.runtime_usage import usage_record_from_token_usage
 from app.tools.coder_common import (
     build_coder_instruction,
     check_coder_permissions,
@@ -18,7 +20,7 @@ from app.tools.coder_common import (
     prepare_workspace,
 )
 from app.tools.codex_app_server import CodexAppServerRunResult, run_codex_app_server_turn
-from app.tools.common import ToolExecutionRequest, ToolExecutionResult
+from app.tools.common import ToolArtifact, ToolExecutionRequest, ToolExecutionResult
 
 
 logger = logging.getLogger(__name__)
@@ -42,7 +44,10 @@ def run_codex_coder_tool(request: ToolExecutionRequest) -> ToolExecutionResult:
     except RepositoryRegistryError as exc:
         return ToolExecutionResult(ok=False, exit_code=None, summary=str(exc))
 
-    workdir = repo.canonical_root_path
+    try:
+        workdir = _runtime_workdir(request, repo)
+    except RepositoryRegistryError as exc:
+        return ToolExecutionResult(ok=False, exit_code=None, summary=str(exc))
 
     provider_command = _resolve_codex_command()
     if provider_command is None:
@@ -50,7 +55,7 @@ def run_codex_coder_tool(request: ToolExecutionRequest) -> ToolExecutionResult:
 
     settings = get_settings()
     run_id = uuid4().hex
-    run_dir = _coder_run_dir(run_id)
+    run_dir = _runtime_run_dir(request.args, run_id)
     run_dir.mkdir(parents=True, exist_ok=True)
     allow_commit = bool(request.args.get("allow_commit"))
     allow_push = bool(request.args.get("allow_push"))
@@ -67,7 +72,7 @@ def run_codex_coder_tool(request: ToolExecutionRequest) -> ToolExecutionResult:
         separators=(",", ":"),
     )
     logger.info(
-        "delegate_to_codex starting run_id=%s repo_id=%s workdir=%s permissions=%s timeout_seconds=%s",
+        "codex coder provider starting run_id=%s repo_id=%s workdir=%s permissions=%s timeout_seconds=%s",
         run_id,
         repo.repo_id,
         str(workdir),
@@ -75,7 +80,7 @@ def run_codex_coder_tool(request: ToolExecutionRequest) -> ToolExecutionResult:
         settings.coder_timeout_seconds,
     )
     logger.info(
-        "delegate_to_codex log paths run_id=%s run_dir=%s events_path=%s audit_path=%s stderr_path=%s approval_requests_path=%s",
+        "codex coder provider log paths run_id=%s run_dir=%s events_path=%s audit_path=%s stderr_path=%s approval_requests_path=%s",
         run_id,
         str(run_dir),
         str(run_dir / "codex-events.jsonl"),
@@ -140,6 +145,8 @@ def run_codex_coder_tool(request: ToolExecutionRequest) -> ToolExecutionResult:
             stdout=_compose_user_stdout(summary),
             stderr=raw_stderr,
             artifacts=artifacts,
+            tool_artifacts=_codex_tool_artifacts(app_server_result, run_id=run_id),
+            metadata=_codex_usage_metadata(app_server_result),
             summary=summary,
         )
 
@@ -216,8 +223,36 @@ def run_codex_coder_tool(request: ToolExecutionRequest) -> ToolExecutionResult:
         stdout=stdout,
         stderr=raw_stderr,
         artifacts=artifacts,
+        tool_artifacts=_codex_tool_artifacts(app_server_result, run_id=run_id),
+        metadata=_codex_usage_metadata(app_server_result),
         summary=summary,
     )
+
+
+def _codex_usage_metadata(result: CodexAppServerRunResult) -> dict[str, object]:
+    record = usage_record_from_token_usage(
+        result.usage,
+        source="codex_app_server",
+        provider="codex",
+        model="codex",
+        stage="coder",
+    )
+    return {"usage_records": [record]} if record is not None else {}
+
+
+def _codex_tool_artifacts(result: CodexAppServerRunResult, *, run_id: str) -> list[ToolArtifact]:
+    artifacts: list[ToolArtifact] = []
+    for artifact in result.tool_artifacts:
+        metadata = dict(artifact.metadata)
+        metadata.setdefault("codex_run_id", run_id)
+        artifacts.append(
+            replace(
+                artifact,
+                source_tool=artifact.source_tool or "coder",
+                metadata=metadata,
+            )
+        )
+    return artifacts
 
 
 def _apply_read_only_permission_check(
@@ -253,6 +288,7 @@ def _run_codex_app_server(
         instruction=instruction,
         timeout_seconds=timeout_seconds,
         trusted_command_prefixes=trusted_command_prefixes,
+        allowed_write_roots=[run_dir.parent],
     )
 
 
@@ -289,7 +325,7 @@ def _run_codex_process(
     env = os.environ.copy()
     env["GIT_CONFIG_COUNT"] = "1"
     env["GIT_CONFIG_KEY_0"] = "safe.directory"
-    env["GIT_CONFIG_VALUE_0"] = str(workdir)
+    env["GIT_CONFIG_VALUE_0"] = workdir.resolve().as_posix()
     return subprocess.run(
         command,
         cwd=str(workdir),
@@ -326,6 +362,23 @@ def _resolve_repository(request: ToolExecutionRequest) -> tuple[RepositoryRef, l
         return repo, warnings
 
     raise RepositoryRegistryError("Coder repo_id or registered workdir is required.")
+
+
+def _runtime_workdir(request: ToolExecutionRequest, repo: RepositoryRef) -> Path:
+    raw = str(request.args.get("_runtime_workdir") or "").strip()
+    if not raw:
+        return repo.canonical_root_path
+    path = Path(raw).resolve()
+    if not path.is_dir():
+        raise RepositoryRegistryError(f"Runtime workdir does not exist: {path}")
+    return path
+
+
+def _runtime_run_dir(args: dict[str, object], run_id: str) -> Path:
+    raw = str(args.get("_runtime_run_dir") or "").strip()
+    if raw:
+        return Path(raw).resolve()
+    return _coder_run_dir(run_id)
 
 
 def _resolve_codex_command() -> list[str] | None:

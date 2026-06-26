@@ -9,18 +9,11 @@ from typing import Any
 import sqlalchemy as sa
 from sqlalchemy import create_engine
 
-from app.agent_react.artifact_context import artifact_records_to_context
 from app.agent_react.session_state import (
     ConversationSessionState,
     dump_session_state,
     load_session_state,
     render_session_state,
-)
-from app.agent_react.turn_classifier import (
-    classification_to_metadata,
-    classify_turn,
-    should_apply_repo_update,
-    should_apply_session_mode_update,
 )
 from app.api.schemas import (
     ConversationCreateRequest,
@@ -31,6 +24,7 @@ from app.api.schemas import (
 )
 from app.config import get_settings
 from app.llm.model_profiles import model_command_response, render_model_status, runtime_preferences_metadata
+from app.observability import instrument_sqlalchemy_engine
 from app.persistence.models import (
     ArtifactRecord,
     ConversationRecord,
@@ -116,6 +110,25 @@ def _turn_type(content: str) -> str:
     return "chat"
 
 
+def _task_runtime_ingest_classification(content: str, session_state: ConversationSessionState) -> tuple[str, dict[str, Any], ConversationSessionState]:
+    turn_type = _turn_type(content)
+    metadata = {
+        "source": "task_runtime_ingest",
+        "scene": "chat",
+        "access": "read",
+        "deliver": False,
+        "confidence": 1.0,
+        "reason": "Legacy turn classifier skipped for task runtime; PlanningRouter owns routing.",
+        "session_mode_update": None,
+        "active_repo_id_update": None,
+        "target_resources": [],
+        "task_plan": {},
+        "routing_basis": "task_runtime",
+    }
+    return turn_type, metadata, session_state
+
+
+
 class MySQLConversationStore:
     """MySQL-backed conversation store for V1 multi-turn dialogue."""
 
@@ -127,6 +140,7 @@ class MySQLConversationStore:
             f"?charset=utf8mb4"
         )
         self._engine = create_engine(url, pool_pre_ping=True, pool_recycle=3600)
+        instrument_sqlalchemy_engine(self._engine, settings)
         logger.info("mysql store initialized host=%s db=%s", settings.mysql_host, settings.mysql_database)
         self._ensure_extension_schema()
         self._reset_stale_turns()
@@ -1068,27 +1082,17 @@ class MySQLConversationStore:
 
         turn_id: int | None = None
         if should_respond:
-            classification = classify_turn(
-                content=content,
-                session_state=load_session_state(conversation.metadata),
-                conversation_metadata=conversation.metadata,
-                recent_artifacts=artifact_records_to_context(
-                    self._list_recent_artifacts_by_conversation(conn, conversation.id)
-                ),
+            original_session_state = load_session_state(conversation.metadata)
+            turn_type, classification_metadata, session_state = _task_runtime_ingest_classification(
+                content,
+                original_session_state,
             )
-            classification_metadata = classification_to_metadata(classification)
             logger.info(
-                "turn classified conversation_id=%s turn_type=%s classification=%s",
+                "turn lightweight-classified conversation_id=%s turn_type=%s classification=%s",
                 conversation.id,
-                classification.turn_type,
+                turn_type,
                 json.dumps(classification_metadata, ensure_ascii=False),
             )
-            original_session_state = load_session_state(conversation.metadata)
-            session_state = original_session_state
-            if should_apply_session_mode_update(classification) and classification.session_mode_update is not None:
-                session_state = replace(session_state, session_mode=classification.session_mode_update)
-            if should_apply_repo_update(classification):
-                session_state = replace(session_state, active_repo_id=classification.active_repo_id_update)
             if session_state != original_session_state:
                 session_patch = dump_session_state(session_state)
                 conversation.metadata = {**conversation.metadata, **session_patch}
@@ -1110,7 +1114,7 @@ class MySQLConversationStore:
                 conversation_id=conversation.id,
                 trigger_message_id=message.id,
                 trigger_type=trigger_type,
-                turn_type=classification.turn_type,
+                turn_type=turn_type,
                 started_by_user_id=user_id,
                 mentions=mentions,
                 classification=classification_metadata,

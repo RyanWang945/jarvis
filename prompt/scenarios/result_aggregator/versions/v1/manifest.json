@@ -1,0 +1,18 @@
+{
+  "id": "result_aggregator:v1",
+  "scenario": "result_aggregator",
+  "version": "v1",
+  "description": "Aggregate executed Jarvis plan node results into a final turn outcome.",
+  "response_format": "json_object",
+  "variables": ["input_json"],
+  "messages": [
+    {
+      "role": "system",
+      "template": "system.md"
+    },
+    {
+      "role": "user",
+      "template": "user.md"
+    }
+  ]
+}

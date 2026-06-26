@@ -1,0 +1,14 @@
+{
+  "id": "legacy_completion_assessor:v1",
+  "scenario": "legacy_completion_assessor",
+  "version": "v1",
+  "description": "Legacy worker completion assessor prompt preserved for migration history.",
+  "response_format": "json_object",
+  "variables": [],
+  "messages": [
+    {
+      "role": "system",
+      "template": "system.md"
+    }
+  ]
+}

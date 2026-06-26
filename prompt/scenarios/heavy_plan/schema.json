@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "执行计划",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["user_objective", "nodes"],
+  "properties": {
+    "user_objective": {
+      "type": "string"
+    },
+    "nodes": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["id", "runtime", "mode", "objective", "input_refs", "output_hint"],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "runtime": {
+            "type": "string",
+            "enum": ["react", "coder"]
+          },
+          "mode": {
+            "type": "string",
+            "enum": ["read", "write"]
+          },
+          "objective": {
+            "type": "string"
+          },
+          "input_refs": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^(artifact|node):[A-Za-z0-9_.:-]+$"
+            }
+          },
+          "output_hint": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

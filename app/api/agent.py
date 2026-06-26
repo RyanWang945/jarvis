@@ -2,27 +2,18 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import replace
 from datetime import UTC, datetime
 from functools import lru_cache
-from threading import Lock
+from threading import RLock
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, status
 
-from app.agent_react import AgentRuntime
-from app.agent_react.artifact_context import artifact_records_to_context
 from app.agent_react.session_state import (
     ConversationSessionState,
     dump_session_state,
     load_session_state,
     render_session_state,
-)
-from app.agent_react.turn_classifier import (
-    classification_to_metadata,
-    classify_turn,
-    should_apply_repo_update,
-    should_apply_session_mode_update,
 )
 from app.api.schemas import (
     ConversationCreateRequest,
@@ -46,8 +37,9 @@ from app.persistence.models import (
     TurnRecord as _TurnRecord,
     UserRecord as _UserRecord,
 )
-from app.persistence.conversation_store import MySQLConversationStore
+from app.persistence.conversation_store import MySQLConversationStore, _task_runtime_ingest_classification
 from app.repositories import render_repository_report
+from app.task_runtime import TaskAgentRuntime
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +63,7 @@ class InMemoryConversationStore:
     """
 
     def __init__(self) -> None:
-        self._lock = Lock()
+        self._lock = RLock()
         self._next_user_id = 1
         self._next_conversation_id = 1
         self._next_message_id = 1
@@ -693,29 +685,18 @@ class InMemoryConversationStore:
 
         turn_id: int | None = None
         if should_respond:
-            classification = classify_turn(
-                content=content,
-                session_state=load_session_state(conversation.metadata),
-                conversation_metadata=conversation.metadata,
-                recent_artifacts=artifact_records_to_context(
-                    self.list_recent_artifacts_by_conversation(conversation.id)
-                ),
+            original_session_state = load_session_state(conversation.metadata)
+            turn_type, classification_metadata, session_state = _task_runtime_ingest_classification(
+                content,
+                original_session_state,
             )
-            classification_metadata = classification_to_metadata(classification)
             logger.info(
-                "turn classified conversation_id=%s turn_type=%s classification=%s",
+                "turn lightweight-classified conversation_id=%s turn_type=%s classification=%s",
                 conversation.id,
-                classification.turn_type,
+                turn_type,
                 json.dumps(classification_metadata, ensure_ascii=False),
             )
-            session_state = load_session_state(conversation.metadata)
-            if should_apply_session_mode_update(classification) and classification.session_mode_update is not None:
-                session_state = replace(session_state, session_mode=classification.session_mode_update)
-            if should_apply_repo_update(classification):
-                session_state = replace(session_state, active_repo_id=classification.active_repo_id_update)
-            if (
-                session_state != load_session_state(conversation.metadata)
-            ):
+            if session_state != original_session_state:
                 conversation.metadata = {
                     **conversation.metadata,
                     **dump_session_state(session_state),
@@ -728,7 +709,7 @@ class InMemoryConversationStore:
                 trigger_message_id=message.id,
                 trigger_type=trigger_type,
                 status="queued",
-                turn_type=classification.turn_type,
+                turn_type=turn_type,
                 started_by_user_id=user_id,
                 started_at=_now(),
                 metadata={
@@ -1302,8 +1283,8 @@ def get_conversation_store() -> MySQLConversationStore:
     return MySQLConversationStore()
 
 
-def get_agent_runtime() -> AgentRuntime:
-    return AgentRuntime(get_conversation_store())
+def get_agent_runtime() -> TaskAgentRuntime:
+    return TaskAgentRuntime(get_conversation_store())
 
 
 def _conversation_response(conversation: _ConversationRecord) -> ConversationResponse:

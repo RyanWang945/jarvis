@@ -1,0 +1,18 @@
+{
+  "id": "kb_eval_gold_span_refine:v1",
+  "scenario": "kb_eval_gold_span_refine",
+  "version": "v1",
+  "description": "Refine chunk-level retrieval eval evidence into the minimal answer span.",
+  "response_format": "json_object",
+  "variables": ["input_json"],
+  "messages": [
+    {
+      "role": "system",
+      "template": "system.md"
+    },
+    {
+      "role": "user",
+      "template": "user.md"
+    }
+  ]
+}

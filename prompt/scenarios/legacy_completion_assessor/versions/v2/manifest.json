@@ -1,0 +1,14 @@
+{
+  "id": "legacy_completion_assessor:v2",
+  "scenario": "legacy_completion_assessor",
+  "version": "v2",
+  "description": "迁移历史保留的 worker 完成度评估中文提示词。",
+  "response_format": "json_object",
+  "variables": [],
+  "messages": [
+    {
+      "role": "system",
+      "template": "system.md"
+    }
+  ]
+}

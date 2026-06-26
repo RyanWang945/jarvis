@@ -1,0 +1,20 @@
+{
+  "id": "coder_worker:v1",
+  "scenario": "coder_worker",
+  "version": "v1",
+  "description": "Instruction contract for delegated local repository coder workers.",
+  "response_format": "text",
+  "variables": [
+    "instruction",
+    "read_only",
+    "allow_commit",
+    "allow_push",
+    "verification_cmd"
+  ],
+  "messages": [
+    {
+      "role": "user",
+      "template": "instruction.md"
+    }
+  ]
+}

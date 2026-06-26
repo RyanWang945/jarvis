@@ -10,6 +10,8 @@ wheels/
 pytest_tmp*/
 tmp_pytest_root*/
 pytest-cache-files-*/
+.coverage
+coverage.xml
 
 # IDE files
 .idea/
@@ -24,12 +26,13 @@ __MACOSX/
 .claude/
 logs/
 sandbox/
+sessions/
+projects/
 *.db
 *.db-journal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.spec
 nul
 data/*
-!data/skills/
-!data/skills/**
-data/skills/**/.DS_Store
-data/skills/**/__pycache__/
-data/skills/**/*.py[oc]

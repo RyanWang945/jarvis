@@ -1,0 +1,14 @@
+{
+  "id": "repository_context:v1",
+  "scenario": "repository_context",
+  "version": "v1",
+  "description": "Repository context injected into Jarvis model-visible context.",
+  "response_format": "text",
+  "variables": ["active_repo_line", "repository_lines"],
+  "messages": [
+    {
+      "role": "system",
+      "template": "context.md"
+    }
+  ]
+}

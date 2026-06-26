@@ -1,0 +1,16 @@
+{
+  "id": "coder_node_finalize:v1",
+  "scenario": "coder_node_finalize",
+  "version": "v1",
+  "description": "Optional LLM synthesis for coder node finalization. Produces candidate JSON that runtime validates deterministically.",
+  "response_format": "json_object",
+  "variables": [
+    "input_json"
+  ],
+  "messages": [
+    {
+      "role": "user",
+      "template": "instruction.md"
+    }
+  ]
+}

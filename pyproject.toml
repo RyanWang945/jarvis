@@ -11,12 +11,19 @@ dependencies = [
     "lark-oapi>=1.4.0",
     "langgraph>=1.1.8",
     "langgraph-checkpoint-sqlite>=3.0.3",
+    "opentelemetry-api>=1.36.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.36.0",
+    "opentelemetry-instrumentation-fastapi>=0.57b0",
+    "opentelemetry-instrumentation-httpx>=0.57b0",
+    "opentelemetry-instrumentation-sqlalchemy>=0.57b0",
+    "opentelemetry-sdk>=1.36.0",
     "pydantic-settings>=2.7.0",
     "pymysql>=1.1.0",
     "pyyaml>=6.0.3",
     "sqlalchemy>=2.0.0",
     "tokenizers>=0.23.1",
     "uvicorn[standard]>=0.34.0",
+    "claude-agent-sdk>=0.2.109",
 ]
 
 [project.scripts]
@@ -26,6 +33,7 @@ jarvis-cli = "app.cli:main"
 [dependency-groups]
 dev = [
     "httpx>=0.28.0",
+    "pyinstaller>=6.21.0",
     "pytest>=8.3.0",
 ]
 
@@ -35,3 +43,26 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["app"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"prompt" = "prompt"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: slow test (e.g. real LLM calls, opt-in only)",
+]
+norecursedirs = [
+    ".git",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".venv",
+    "build",
+    "data",
+    "dist",
+    "htmlcov",
+    "logs",
+    "sandbox",
+    "sessions",
+]

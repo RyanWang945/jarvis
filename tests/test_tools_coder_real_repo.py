@@ -8,7 +8,12 @@ import pytest
 from app.tools.codex import run_codex_coder_tool
 from app.tools.common import ToolExecutionRequest
 
-REAL_REPO = Path(os.environ.get("JARVIS_REAL_CODER_REPO", r"G:\pycharm-project\nltk"))
+REAL_REPO = Path(
+    os.environ.get(
+        "JARVIS_REAL_CODER_REPO",
+        str(Path(__file__).resolve().parents[1] / "data" / "projects" / "smoke-test"),
+    )
+)
 RUN_REAL_TESTS = os.environ.get("JARVIS_RUN_REAL_CODER_TESTS") == "1"
 
 
@@ -73,7 +78,7 @@ def test_real_repo_bootstrap_and_extend_greeter() -> None:
 
 def _run_real_coder(instruction: str, *, verification_cmd: str | None = None):
     request = ToolExecutionRequest(
-        tool_name="delegate_to_codex",
+        tool_name="codex_coder_provider",
         workdir=str(REAL_REPO),
         args={
             "instruction": instruction,

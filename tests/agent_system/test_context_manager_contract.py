@@ -5,7 +5,6 @@ from types import SimpleNamespace
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from app.agent_react.context_manager import ContextManager
-from app.agent_react.runtime_policy import RuntimePolicy
 from app.agent_react.session_state import ConversationSessionState
 
 
@@ -28,7 +27,7 @@ def _record(
 
 def test_context_contract_keeps_current_turn_contract_under_tight_budget() -> None:
     manager = ContextManager()
-    messages, _skills = manager.build_initial_messages(
+    messages = manager.build_initial_messages(
         [
             _record(1, "user", "old context " * 200, turn_id=1),
             _record(2, "assistant", "old answer " * 200, turn_id=1),
@@ -40,12 +39,7 @@ def test_context_contract_keeps_current_turn_contract_under_tight_budget() -> No
             SimpleNamespace(id=1, status="completed", started_at="2026-05-01T00:00:00Z"),
             SimpleNamespace(id=2, status="running", started_at="2026-05-01T00:01:00Z"),
         ],
-        session_state=ConversationSessionState(session_mode="coding", active_repo_id="jarvis"),
-        runtime_policy=RuntimePolicy(
-            mode="image_generation",
-            allowed_tools=("load_skill_guidance", "delegate_to_codex"),
-            context_sections=("session_state", "workspace_protocol"),
-        ),
+        session_state=ConversationSessionState(session_mode="coding"),
         task_plan={
             "objective": "修改 jarvis-architecture-v3.png 的路由关系",
         },
@@ -67,10 +61,10 @@ def test_context_contract_keeps_current_turn_contract_under_tight_budget() -> No
 
     assert model_messages[0].role == "system"
     assert "Conversation session state:" in system
-    assert "Active repository: jarvis" in system
+    assert "jarvis:" in system
     assert "Current turn objective:" in system
     assert "修改 jarvis-architecture-v3.png 的路由关系" in system
-    assert "Recent artifacts:" in system
+    assert "近期 artifacts：" in system
     assert "filename=jarvis-architecture-v3.png" in system
     assert model_messages[-1].role == "user"
     assert model_messages[-1].content == "这个图不对，按路由关系改一下"
@@ -78,7 +72,7 @@ def test_context_contract_keeps_current_turn_contract_under_tight_budget() -> No
 
 def test_context_contract_strips_historical_tool_protocol_and_usage_footer() -> None:
     manager = ContextManager()
-    messages, _skills = manager.build_initial_messages(
+    messages = manager.build_initial_messages(
         [
             _record(1, "user", "review repo", turn_id=1),
             _record(
@@ -117,58 +111,23 @@ def test_context_contract_strips_historical_tool_protocol_and_usage_footer() -> 
     assert model_messages[-1].content == "next request"
 
 
-def test_context_contract_gates_policy_sections_by_runtime_policy() -> None:
+def test_context_contract_omits_policy_specific_sections() -> None:
     manager = ContextManager()
     records = [_record(1, "user", "hello")]
 
-    chat_messages, _ = manager.build_initial_messages(
+    messages = manager.build_initial_messages(
         records,
         trigger_message_id=1,
-        runtime_policy=RuntimePolicy(mode="chat", allowed_tools=("obsidian_wiki_query",), context_sections=("session_state",)),
-    )
-    file_messages, _ = manager.build_initial_messages(
-        records,
-        trigger_message_id=1,
-        runtime_policy=RuntimePolicy(
-            mode="coding",
-            allowed_tools=("read_file", "search_files"),
-            context_sections=("session_state", "workspace_file_protocol"),
-        ),
-    )
-    delivery_messages, _ = manager.build_initial_messages(
-        records,
-        trigger_message_id=1,
-        runtime_policy=RuntimePolicy(
-            mode="coding",
-            allowed_tools=("deliver_file", "search_files"),
-            context_sections=("session_state", "artifact_delivery_protocol"),
-        ),
-    )
-    research_messages, _ = manager.build_initial_messages(
-        records,
-        trigger_message_id=1,
-        runtime_policy=RuntimePolicy(
-            mode="research",
-            allowed_tools=("tavily_search",),
-            context_sections=("session_state", "research_protocol"),
-        ),
     )
 
-    chat_system = str(chat_messages[0].content)
-    file_system = str(file_messages[0].content)
-    delivery_system = str(delivery_messages[0].content)
-    research_system = str(research_messages[0].content)
-
-    assert "Workspace protocol:" not in chat_system
-    assert "Workspace file protocol:" in file_system
-    assert "Workspace protocol:" not in file_system
-    assert "Artifact delivery protocol:" in delivery_system
-    assert "Research protocol:" in research_system
+    system = str(messages[0].content)
+    assert "Runtime policy:" not in system
+    assert "Allowed tools:" not in system
 
 
 def test_context_contract_excludes_incomplete_prior_turns_when_building_current_context() -> None:
     manager = ContextManager()
-    messages, _skills = manager.build_initial_messages(
+    messages = manager.build_initial_messages(
         [
             _record(1, "user", "completed user", turn_id=1),
             _record(2, "assistant", "completed assistant", turn_id=1),

@@ -1,0 +1,18 @@
+{
+  "id": "kb_eval_query_generation:v1",
+  "scenario": "kb_eval_query_generation",
+  "version": "v1",
+  "description": "Generate one realistic Chinese retrieval-eval query from a source document chunk.",
+  "response_format": "json_object",
+  "variables": ["input_json"],
+  "messages": [
+    {
+      "role": "system",
+      "template": "system.md"
+    },
+    {
+      "role": "user",
+      "template": "user.md"
+    }
+  ]
+}

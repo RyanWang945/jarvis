@@ -5,57 +5,24 @@ import subprocess
 from pathlib import Path
 from typing import Any, Iterable
 
+from app.prompting import PromptRegistry
+
 
 def build_coder_instruction(instruction: str, request_args: dict[str, Any]) -> str:
     if not instruction:
         return ""
-    allow_commit = bool(request_args.get("allow_commit"))
-    allow_push = bool(request_args.get("allow_push"))
     read_only = bool(request_args.get("_read_only"))
-    rules = [
-        "You are running as a Jarvis coder worker for a local repository.",
-        "Operate only inside the working directory provided by the process cwd.",
-        "Treat the provided task contract and permissions as hard constraints.",
-        "Do not modify unrelated files.",
-        "Use Codex's approval flow for elevated actions instead of working around permission failures.",
-        "Ask for approval only when the action is materially beyond routine repository work.",
-        "Approval authority lives in the Codex approval flow; do not replace it with chat confirmations.",
-        "Treat generated planning details in the task text as hints, not as stop conditions.",
-        "Do not stop to ask Jarvis or the user to confirm routine execution details such as commit messages, file staging, command order, or retry strategy.",
-        "Ask a normal chat question only when required information is missing and no reasonable default exists.",
-        "Before committing or pushing, inspect git status and the relevant diff.",
-        "When committing existing work, prefer one coherent commit unless the user explicitly asks for multiple commits.",
-        "Group routine local git staging and commit work; do not create per-file approval churn.",
-    ]
-    if read_only:
-        rules.append("This is a read-only task: inspect, analyze, review, and report only.")
-        rules.append("Do not edit, create, delete, rename, stage, commit, or push files.")
-        rules.append("Do not run tests, builds, formatters, or generators when they are likely to write workspace artifacts.")
-        rules.append("If the requested outcome requires repository writes, describe the required changes and stop.")
-        rules.append("End with a concise inline report; do not claim that files were changed.")
-    else:
-        rules.append("Prefer direct file edits over explaining what should be changed.")
-        rules.append("End with a concise summary of files changed, commit hash if created, and push result if pushed.")
-    if allow_commit:
-        rules.append("You may create a focused git commit only if it is needed to complete the task.")
-        rules.append("When a commit is needed, choose a concise commit message yourself unless the user explicitly supplied an exact message.")
-    else:
-        rules.append("Do not create any git commit.")
-    if allow_push:
-        rules.append("You may push to origin only after a successful commit if needed by the task.")
-    else:
-        rules.append("Do not push to origin.")
-    verification_cmd = request_args.get("verification_cmd")
-    if verification_cmd:
-        rules.append(f"Run this verification command before finishing: {verification_cmd}")
-    return "\n".join(
-        [
-            "Jarvis coder worker instructions:",
-            *[f"- {rule}" for rule in rules],
-            "",
-            "User task:",
-            instruction,
-        ]
+    return PromptRegistry().load("coder_worker").render_text(
+        {
+            "instruction": instruction,
+            "read_only": read_only,
+            "allow_commit": bool(request_args.get("allow_commit")) and not read_only,
+            "allow_push": bool(request_args.get("allow_push")) and not read_only,
+            "source_branch": str(request_args.get("source_branch") or "").strip(),
+            "target_branch": str(request_args.get("target_branch") or "").strip(),
+            "node_branch": str(request_args.get("node_branch") or "").strip(),
+            "verification_cmd": str(request_args.get("verification_cmd") or "").strip(),
+        }
     )
 
 

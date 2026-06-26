@@ -1,0 +1,18 @@
+{
+  "id": "llm_node_execute:v3",
+  "scenario": "llm_node_execute",
+  "version": "v3",
+  "description": "执行一个无工具 Jarvis plan node 的中文提示词。",
+  "response_format": "text",
+  "variables": ["input_json"],
+  "messages": [
+    {
+      "role": "system",
+      "template": "system.md"
+    },
+    {
+      "role": "user",
+      "template": "user.md"
+    }
+  ]
+}

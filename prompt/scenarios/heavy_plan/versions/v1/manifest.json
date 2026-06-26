@@ -1,0 +1,18 @@
+{
+  "id": "heavy_plan:v1",
+  "scenario": "heavy_plan",
+  "version": "v1",
+  "description": "Compile one user turn into a Jarvis vNext TaskDAG.",
+  "response_format": "json_object",
+  "variables": ["input_json"],
+  "messages": [
+    {
+      "role": "system",
+      "template": "system.md"
+    },
+    {
+      "role": "user",
+      "template": "user.md"
+    }
+  ]
+}

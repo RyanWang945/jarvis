@@ -1,0 +1,14 @@
+{
+  "id": "legacy_final_answer_synthesizer:v1",
+  "scenario": "legacy_final_answer_synthesizer",
+  "version": "v1",
+  "description": "Legacy final-answer synthesizer prompt preserved for migration history.",
+  "response_format": "text",
+  "variables": [],
+  "messages": [
+    {
+      "role": "system",
+      "template": "system.md"
+    }
+  ]
+}

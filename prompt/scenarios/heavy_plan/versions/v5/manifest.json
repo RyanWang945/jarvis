@@ -1,0 +1,18 @@
+{
+  "id": "heavy_plan:v5",
+  "scenario": "heavy_plan",
+  "version": "v5",
+  "description": "Compile one user turn into a lightweight Jarvis execution plan without node-level runtime hints.",
+  "response_format": "json_object",
+  "variables": ["input_json"],
+  "messages": [
+    {
+      "role": "system",
+      "template": "system.md"
+    },
+    {
+      "role": "user",
+      "template": "user.md"
+    }
+  ]
+}

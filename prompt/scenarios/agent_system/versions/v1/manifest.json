@@ -1,0 +1,14 @@
+{
+  "id": "agent_system:v1",
+  "scenario": "agent_system",
+  "version": "v1",
+  "description": "Primary Jarvis ReAct agent system instructions.",
+  "response_format": "text",
+  "variables": [],
+  "messages": [
+    {
+      "role": "system",
+      "template": "system.md"
+    }
+  ]
+}

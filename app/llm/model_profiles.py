@@ -146,10 +146,9 @@ def render_model_status(metadata: dict[str, Any] | None, settings: Settings) -> 
     agent_step = _override_or_active(metadata, LLMNode.AGENT_STEP, active_text)
     classifier = _override_or_classifier_default(metadata, settings, active_text)
     planner = _override_or_active(metadata, LLMNode.PLANNER, active_text)
-    loop = runtime_loop_provider(metadata)
     return (
         f"LLM: {active_text}\n"
-        f"Loop: {loop}\n"
+        "Runtime: task_dag\n"
         f"Agent step: {agent_step}\n"
         f"Intent classifier: {classifier}\n"
         f"Planner: {planner}"
@@ -196,22 +195,16 @@ def runtime_preferences_metadata(metadata: dict[str, Any] | None) -> dict[str, A
     if not isinstance(metadata, dict):
         return {}
     kept: dict[str, Any] = {}
-    for key in ("active_model_profile", "runtime_profile", "model_overrides"):
+    for key in ("active_model_profile", "model_overrides"):
         value = metadata.get(key)
         if value is not None:
             kept[key] = value
-    return kept
-
-
-def runtime_loop_provider(metadata: dict[str, Any] | None) -> str:
-    if not isinstance(metadata, dict):
-        return "react"
     runtime_profile = metadata.get("runtime_profile")
     if isinstance(runtime_profile, dict):
-        loop = runtime_profile.get("loop_provider")
-        if isinstance(loop, str) and loop.strip():
-            return loop.strip()
-    return "react"
+        model_overrides = runtime_profile.get("model_overrides")
+        if isinstance(model_overrides, dict):
+            kept["runtime_profile"] = {"model_overrides": model_overrides}
+    return kept
 
 
 def _override_or_active(metadata: dict[str, Any] | None, node: LLMNode, active: str) -> str:

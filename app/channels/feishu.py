@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import http
+import inspect
 import json
 import logging
 import os
@@ -11,6 +13,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -40,11 +43,17 @@ from lark_oapi.ws.model import Response
 from app.agent_react import ChannelAttachment, ChannelMessage, TurnResult
 from app.agent_react.delivery import DeliveryManager, register_delivery_handler
 from app.api.agent import get_agent_runtime, get_conversation_store
+from app.channels.feishu_progress import FeishuCardKitProgressSink, FeishuProgressSink
 from app.channels.feishu_renderer import FeishuDelivery, FeishuRenderer
 from app.config import get_settings
 from app.gateway import InboundEvent, get_gateway_service
+from app.observability import span_context
+from app.progress import NoopProgressReporter, ProgressEvent, ProgressReporter
 from app.persistence.models import DeliveryRecord
-from app.tools.codex_app_server import approval_command_prefix, respond_to_codex_approval
+from app.runtime_usage import collect_usage_records, usage_totals
+from app.task_runtime.approval_types import approval_request_from_mapping
+from app.task_runtime.approval_runtime import continue_approval
+from app.tools.codex_app_server import approval_command_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +70,54 @@ class _ArtifactDeliveryState:
     upload_key: str | None = None
     external_message_id: str | None = None
     error_message: str | None = None
+
+
+_PROGRESS_ACTIVATION_EVENTS = {
+    "planning_started",
+    "plan_created",
+    "node_started",
+    "node_completed",
+    "node_failed",
+    "aggregation_started",
+    "aggregation_completed",
+}
+
+
+class _LazyFeishuProgressReporter(ProgressReporter):
+    """Create the visible Feishu progress entry only after a planned path starts."""
+
+    def __init__(self, channel: "FeishuChannel", receive_id: str, prompt: str) -> None:
+        super().__init__([])
+        self._channel = channel
+        self._receive_id = receive_id
+        self._prompt = prompt
+        self._message_id: str | None = None
+        self._sink: FeishuProgressSink | None = None
+        self._closed = False
+
+    @property
+    def message_id(self) -> str | None:
+        return self._message_id
+
+    def emit(self, event_type: str, **payload: Any) -> None:
+        if self._closed:
+            return
+        if self._message_id is None:
+            if event_type not in _PROGRESS_ACTIVATION_EVENTS:
+                return
+            self._message_id = self._channel._send_progress_entry_card(self._receive_id, self._prompt)
+            if self._message_id is None:
+                return
+            self._sink = self._channel._progress_sink_for(self._message_id)
+        if self._sink is not None:
+            self._sink.on_progress(ProgressEvent(event_type=event_type, **payload))
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._sink is not None:
+            self._sink.close()
 
 
 class _JarvisFeishuWsClient(ws.Client):
@@ -137,6 +194,8 @@ class FeishuChannel:
         self._token_expires_at: float = 0.0
         self._renderer = FeishuRenderer(title=bot_name)
         self._artifact_deliveries: dict[tuple[str, str], _ArtifactDeliveryState] = {}
+        self._cardkit_progress_message_ids: set[str] = set()
+        self._progress_sinks: dict[str, FeishuProgressSink] = {}
         self.channel = "feishu"
 
     def start(self) -> None:
@@ -333,7 +392,9 @@ class FeishuChannel:
             approval_id = str(value.get("approval_id") or "")
             command = str(value.get("command") or "")
             reason = str(value.get("reason") or "")
-            language = str(value.get("language") or _codex_approval_language(conversation_id or 0))
+            language = str(value.get("language") or _approval_language(conversation_id or 0))
+            approval_source = str(value.get("approval_source") or "codex_provider")
+            approval_payload = value.get("payload") if isinstance(value.get("payload"), dict) else {}
             context = getattr(event, "context", None)
             message_id = getattr(context, "open_message_id", None)
             chat_id = getattr(context, "open_chat_id", None) or str(value.get("chat_id") or "")
@@ -342,9 +403,10 @@ class FeishuChannel:
                 value.get("sender_open_id") or "feishu_approval"
             )
             logger.info(
-                "feishu codex approval action received decision=%s conversation_id=%s "
+                "feishu approval action received decision=%s source=%s conversation_id=%s "
                 "turn_id=%s approval_id=%s chat_id=%s message_id=%s",
                 decision,
+                approval_source,
                 conversation_id,
                 turn_id,
                 approval_id,
@@ -355,7 +417,7 @@ class FeishuChannel:
                 return _card_action_toast("error", "审批上下文缺失。")
 
             terminal_statuses = {"approved", "rejected", "completed", "failed", "timeout", "missing"}
-            approval_status = _codex_approval_status(conversation_id, approval_id)
+            approval_status = _approval_status(conversation_id, approval_id)
             if approval_status in terminal_statuses:
                 delivery = self._renderer.render_approval_decision_card(
                     decision=approval_status or "completed",
@@ -370,13 +432,13 @@ class FeishuChannel:
                         logger.exception("failed to refresh processed approval card message_id=%s", message_id)
                 return _card_action_response("info", "该审批已处理。", delivery=delivery)
 
-            _record_codex_approval_decision(
+            _record_approval_decision(
                 conversation_id=conversation_id,
                 approval_id=approval_id,
                 decision="approved" if decision == "approve" else "rejected",
                 decided_by=sender_open_id,
             )
-            if decision == "approve":
+            if decision == "approve" and approval_source == "codex_provider":
                 _remember_codex_approval_prefix(conversation_id, command)
             delivery = self._renderer.render_approval_decision_card(
                 decision=decision,
@@ -390,22 +452,24 @@ class FeishuChannel:
                 except Exception:
                     logger.exception("failed to update approval card message_id=%s", message_id)
 
-            content = "已同意 Codex 审批请求。" if decision == "approve" else "已拒绝 Codex 审批请求。"
+            content = "已同意审批请求。" if decision == "approve" else "已拒绝审批请求。"
             logger.info(
-                "feishu codex approval decision decision=%s turn_id=%s approval_id=%s command=%s",
+                "feishu approval decision decision=%s source=%s turn_id=%s approval_id=%s command=%s",
                 decision,
+                approval_source,
                 turn_id,
                 approval_id,
                 _safe_preview(command),
             )
             self._executor.submit(
-                self._complete_codex_approval,
+                self._complete_approval,
                 chat_id,
                 conversation_id,
                 turn_id,
                 approval_id,
                 decision == "approve",
-                message_id,
+                approval_source,
+                approval_payload,
             )
             return _card_action_response("success", content, delivery=delivery)
         except Exception:
@@ -437,46 +501,57 @@ class FeishuChannel:
         )
         return self._on_card_action(SimpleNamespace(event=event))
 
-    def _complete_codex_approval(
+    def _complete_approval(
         self,
         chat_id: str,
         conversation_id: int,
         turn_id: int,
         approval_id: str,
         approved: bool,
-        message_id: str | None = None,
+        approval_source: str,
+        payload: dict[str, Any],
     ) -> None:
         drain_after = True
         try:
-            result = respond_to_codex_approval(
-                approval_id,
+            result = continue_approval(
+                source=approval_source,
+                approval_id=approval_id,
                 approved=approved,
                 timeout_seconds=get_settings().coder_timeout_seconds,
+                payload=payload,
                 trusted_command_prefixes=_codex_approval_prefixes(conversation_id),
             )
             logger.info(
-                "codex approval continuation finished approval_id=%s status=%s final_len=%s error=%s",
+                "approval continuation finished approval_id=%s source=%s status=%s final_len=%s error=%s",
                 approval_id,
+                approval_source,
                 result.status,
                 len(result.final_text or ""),
                 _safe_preview(result.error or ""),
             )
             if result.status == "completed":
-                _record_codex_approval_decision(
+                _record_approval_decision(
                     conversation_id=conversation_id,
                     approval_id=approval_id,
                     decision="completed",
-                    decided_by="codex_app_server",
+                    decided_by=approval_source or "approval_runtime",
                 )
-                reply = result.final_text.strip() or "Codex completed after the approval decision."
-                self._send_channel_message(chat_id, ChannelMessage(content=reply, content_type="markdown"))
+                token_usage = usage_totals(collect_usage_records(result.metadata))
+                self._send_channel_message(
+                    chat_id,
+                    ChannelMessage(
+                        content=result.final_text.strip() or "Approval continuation completed.",
+                        content_type="markdown",
+                        metadata={"usage": token_usage} if token_usage is not None else {},
+                    ),
+                )
                 return
 
             if result.status == "approval_requested":
                 approval = result.approval_requests[0] if result.approval_requests else {}
-                next_approval_id = str(approval.get("id") or approval_id)
-                next_command = str(approval.get("command") or "")
-                next_reason = str(approval.get("reason") or "")
+                next_approval_id = _approval_value(approval, "approval_id") or _approval_value(approval, "id") or approval_id
+                next_command = _approval_value(approval, "command")
+                next_reason = _approval_value(approval, "reason")
                 logger.info(
                     "codex approval continuation requested next approval previous_approval_id=%s next_approval_id=%s command=%s reason=%s",
                     approval_id,
@@ -484,14 +559,16 @@ class FeishuChannel:
                     _safe_preview(next_command),
                     _safe_preview(next_reason),
                 )
-                _record_codex_approval(
+                _record_approval(
                     conversation_id=conversation_id,
                     approval_id=next_approval_id,
                     turn_id=turn_id,
                     chat_id=chat_id,
                     command=next_command,
                     reason=next_reason,
-                    language=_codex_approval_language(conversation_id),
+                    language=_approval_language(conversation_id),
+                    approval_source=approval_source,
+                    payload={},
                 )
                 delivery = self._renderer.render_approval_card(
                     approval_id=next_approval_id,
@@ -500,26 +577,30 @@ class FeishuChannel:
                     chat_id=chat_id,
                     command=next_command,
                     reason=next_reason,
-                    language=_codex_approval_language(conversation_id),
+                    language=_approval_language(conversation_id),
+                    approval_source=approval_source,
+                    payload={},
                 )
                 self._send_delivery(chat_id, delivery)
                 drain_after = False
                 return
 
-            _record_codex_approval_decision(
+            _record_approval_decision(
                 conversation_id=conversation_id,
                 approval_id=approval_id,
                 decision=result.status,
-                decided_by="codex_app_server",
+                decided_by=approval_source or "approval_runtime",
             )
             if result.status == "missing":
                 message = "Codex 审批会话已失效，通常是 Jarvis 重启或审批卡过期导致。请重新发起任务。"
+            elif result.status == "rejected":
+                message = "已拒绝审批请求。"
             else:
-                message = result.error or f"Codex approval continuation ended with status: {result.status}"
+                message = result.error or f"Approval continuation ended with status: {result.status}"
             self._send_text_message(chat_id, message)
         except Exception:
-            logger.exception("failed to complete codex approval approval_id=%s", approval_id)
-            self._send_text_message(chat_id, "Codex approval continuation failed.")
+            logger.exception("failed to complete approval approval_id=%s source=%s", approval_id, approval_source)
+            self._send_text_message(chat_id, "Approval continuation failed.")
         finally:
             if drain_after:
                 self._submit_next_queued_turn(conversation_id, chat_id)
@@ -533,7 +614,39 @@ class FeishuChannel:
         conversation_id: int,
         turn_id: int | None,
     ) -> None:
+        with span_context(
+            "feishu.agent_run",
+            **{
+                "messaging.system": "feishu",
+                "jarvis.platform": "feishu",
+                "jarvis.chat_id": chat_id,
+                "jarvis.chat_type": chat_type,
+                "jarvis.conversation_id": conversation_id,
+                "jarvis.turn_id": turn_id,
+                "jarvis.sender_open_id": sender_open_id,
+            },
+        ):
+            self._handle_agent_run_inner(
+                sender_open_id=sender_open_id,
+                chat_id=chat_id,
+                chat_type=chat_type,
+                text=text,
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+            )
+
+    def _handle_agent_run_inner(
+        self,
+        *,
+        sender_open_id: str,
+        chat_id: str,
+        chat_type: str,
+        text: str,
+        conversation_id: int,
+        turn_id: int | None,
+    ) -> None:
         thinking_message_id: str | None = None
+        progress: ProgressReporter | None = None
         drain_after = True
         try:
             logger.info(
@@ -547,9 +660,20 @@ class FeishuChannel:
             )
             if turn_id is None:
                 raise ValueError("Feishu triggered message did not create a turn.")
-            thinking_message_id = self._send_thinking_card(chat_id, text)
-            result = get_agent_runtime().run_turn(turn_id)
+            runtime = get_agent_runtime()
+            if _runtime_accepts_progress(runtime):
+                progress = _LazyFeishuProgressReporter(self, chat_id, text)
+                result = _run_turn_with_optional_progress(runtime, turn_id, progress)
+                thinking_message_id = progress.message_id if isinstance(progress, _LazyFeishuProgressReporter) else None
+            else:
+                thinking_message_id = self._send_progress_entry_card(chat_id, text)
+                progress = self._progress_reporter_for(thinking_message_id)
+                result = _run_turn_with_optional_progress(runtime, turn_id, progress)
+            progress.close()
         except Exception:
+            if progress is not None:
+                progress.close()
+                thinking_message_id = thinking_message_id or getattr(progress, "message_id", None)
             logger.exception("agent run failed for feishu message")
             if turn_id is not None:
                 get_conversation_store().complete_turn(
@@ -558,10 +682,7 @@ class FeishuChannel:
                     error_message="agent run failed",
                 )
             if thinking_message_id:
-                self._update_card_message(
-                    thinking_message_id,
-                    self._renderer.render_error_card("Sorry, something went wrong. Please try again later."),
-                )
+                self._update_error_message(thinking_message_id, "Sorry, something went wrong. Please try again later.")
             else:
                 self._send_text_message(
                     chat_id,
@@ -580,21 +701,20 @@ class FeishuChannel:
         if result.status == "failed":
             error_text = result.reply.strip() or "抱歉，调用模型时出错了，请稍后再试。"
             if thinking_message_id:
-                self._update_card_message(
-                    thinking_message_id,
-                    self._renderer.render_error_card(error_text),
-                )
+                self._update_error_message(thinking_message_id, error_text)
             else:
                 self._send_text_message(chat_id, error_text)
             if drain_after:
                 self._submit_next_queued_turn(conversation_id, chat_id)
             return
 
-        approval = _extract_codex_approval_from_reply(result.reply)
+        approval = _extract_approval_from_turn_result(result)
         if approval is not None:
             approval_id = approval.get("approval_id", "") or f"turn_{turn_id}"
             approval["approval_id"] = approval_id
-            _record_codex_approval(
+            approval_source = approval.get("approval_source", "") or "codex_provider"
+            approval_payload = approval.get("payload") if isinstance(approval.get("payload"), dict) else {}
+            _record_approval(
                 conversation_id=conversation_id,
                 approval_id=approval_id,
                 turn_id=turn_id,
@@ -602,6 +722,8 @@ class FeishuChannel:
                 command=approval.get("command", ""),
                 reason=approval.get("reason", ""),
                 language=_detect_approval_language(text),
+                approval_source=approval_source,
+                payload=approval_payload,
             )
             delivery = self._renderer.render_approval_card(
                 approval_id=approval_id,
@@ -611,6 +733,8 @@ class FeishuChannel:
                 command=approval.get("command", ""),
                 reason=approval.get("reason", ""),
                 language=_detect_approval_language(text),
+                approval_source=approval_source,
+                payload=approval_payload,
             )
             if thinking_message_id:
                 self._update_card_message(thinking_message_id, delivery)
@@ -622,12 +746,48 @@ class FeishuChannel:
 
         message = self._format_result(result)
         if thinking_message_id:
-            self._update_channel_message(thinking_message_id, message)
+            try:
+                self._update_channel_message(thinking_message_id, message)
+            except Exception:
+                logger.exception(
+                    "failed to update final feishu message_id=%s; sending fallback message",
+                    thinking_message_id,
+                )
+                self._send_channel_message(chat_id, message)
             self._send_message_attachments(chat_id, message)
         else:
             self._send_channel_message(chat_id, message)
         if drain_after:
             self._submit_next_queued_turn(conversation_id, chat_id)
+
+    def _progress_reporter_for(self, thinking_message_id: str | None) -> ProgressReporter:
+        sink = self._progress_sink_for(thinking_message_id)
+        if sink is None:
+            return NoopProgressReporter()
+        return ProgressReporter([sink])
+
+    def _progress_sink_for(self, thinking_message_id: str | None) -> FeishuProgressSink | None:
+        settings = get_settings()
+        if not thinking_message_id or not settings.feishu_progress_updates_enabled:
+            return None
+        mode = _progress_mode(settings.feishu_progress_mode)
+        logger.info(
+            "feishu progress enabled mode=%s message_id=%s min_interval_seconds=%s",
+            mode,
+            thinking_message_id,
+            settings.feishu_progress_min_interval_seconds,
+        )
+        sink_class = FeishuCardKitProgressSink if mode == "cardkit" else FeishuProgressSink
+        sink = sink_class(
+            message_id=thinking_message_id,
+            renderer=self._renderer,
+            update_card=self._update_card_message,
+            min_interval_seconds=settings.feishu_progress_min_interval_seconds,
+            max_recent_events=settings.feishu_progress_max_recent_events,
+            flush_on_close=False,
+        )
+        self._progress_sinks[thinking_message_id] = sink
+        return sink
 
     def _submit_next_queued_turn(self, conversation_id: int, chat_id: str) -> None:
         try:
@@ -711,12 +871,29 @@ class FeishuChannel:
             self._send_message_attachments(receive_id, message)
 
     def _update_channel_message(self, message_id: str, message: ChannelMessage) -> None:
-        delivery = self._renderer.render(message)
+        if message_id in self._cardkit_progress_message_ids:
+            sink = self._progress_sinks.get(message_id)
+            snapshot = sink.snapshot if sink is not None else _initial_progress_snapshot()
+            usage = message.metadata.get("usage") if isinstance(message.metadata, dict) else None
+            delivery = self._renderer.render_cardkit_progress_card(
+                snapshot,
+                output_markdown=message.content,
+                usage=usage if isinstance(usage, dict) else None,
+            )
+        else:
+            delivery = self._renderer.render(message)
         if delivery.msg_type != "interactive":
             raise RuntimeError("Only interactive card messages can be updated.")
         self._update_card_message(message_id, delivery)
         # Thinking-card updates do not carry chat_id. The caller sends attachments
         # after update when it has the receive_id available.
+
+    def _update_error_message(self, message_id: str, error_text: str) -> None:
+        if message_id in self._cardkit_progress_message_ids:
+            message = ChannelMessage(content=error_text, content_type="markdown")
+            self._update_channel_message(message_id, message)
+            return
+        self._update_card_message(message_id, self._renderer.render_error_card(error_text))
 
     def _send_thinking_card(self, receive_id: str, prompt: str) -> str | None:
         try:
@@ -726,29 +903,100 @@ class FeishuChannel:
             return None
         return _extract_message_id(payload)
 
+    def _send_progress_entry_card(self, receive_id: str, prompt: str) -> str | None:
+        settings = get_settings()
+        if settings.feishu_progress_updates_enabled and _progress_mode(settings.feishu_progress_mode) == "cardkit":
+            try:
+                payload = self._send_delivery(receive_id, self._renderer.render_cardkit_progress_card(_initial_progress_snapshot()))
+                message_id = _extract_message_id(payload)
+                if message_id:
+                    self._cardkit_progress_message_ids.add(message_id)
+                return message_id
+            except Exception:
+                logger.exception("failed to send cardkit progress card to %s, falling back to thinking card", receive_id)
+        return self._send_thinking_card(receive_id, prompt)
+
     def _send_text_message(self, receive_id: str, text: str) -> None:
         self._send_delivery(receive_id, self._renderer.render_text_fallback(text))
 
     def _send_delivery(self, receive_id: str, delivery: FeishuDelivery) -> dict[str, Any]:
         token = self._ensure_token()
+        request_payload = {
+            "receive_id": receive_id,
+            "msg_type": delivery.msg_type,
+            "content": delivery.content,
+        }
+        request_meta = _feishu_payload_meta(
+            operation="send",
+            msg_type=delivery.msg_type,
+            content=delivery.content,
+            receive_id=receive_id,
+        )
+        logger.info(
+            "feishu message send starting receive_id=%s msg_type=%s content_bytes=%s content_sha1=%s",
+            receive_id,
+            delivery.msg_type,
+            request_meta["content_bytes"],
+            request_meta["content_sha1"],
+        )
         resp = self._http.post(
             "https://open.feishu.cn/open-apis/im/v1/messages",
             params={"receive_id_type": "chat_id"},
             headers={"Authorization": f"Bearer {token}"},
-            json={
-                "receive_id": receive_id,
-                "msg_type": delivery.msg_type,
-                "content": delivery.content,
-            },
+            json=request_payload,
         )
-        resp.raise_for_status()
-        payload = resp.json()
+        log_id = _feishu_log_id(resp)
+        payload = _response_payload(resp)
+        if resp.status_code >= 400:
+            capture_path = _capture_feishu_payload(
+                "send",
+                request_meta=request_meta,
+                request_payload=request_payload,
+                response_status=resp.status_code,
+                response_payload=payload,
+                response_headers=_selected_feishu_headers(resp),
+                force_error=True,
+            )
+            logger.error(
+                "feishu send message http_error status=%s log_id=%s receive_id=%s msg_type=%s content_bytes=%s content_sha1=%s capture_path=%s payload=%s",
+                resp.status_code,
+                log_id,
+                receive_id,
+                delivery.msg_type,
+                request_meta["content_bytes"],
+                request_meta["content_sha1"],
+                capture_path,
+                payload,
+            )
+            raise RuntimeError(f"feishu send message http_error status={resp.status_code} log_id={log_id} capture_path={capture_path} payload={payload}")
         if payload.get("code") != 0:
-            raise RuntimeError(f"feishu send message failed: {payload}")
+            capture_path = _capture_feishu_payload(
+                "send",
+                request_meta=request_meta,
+                request_payload=request_payload,
+                response_status=resp.status_code,
+                response_payload=payload,
+                response_headers=_selected_feishu_headers(resp),
+                force_error=True,
+            )
+            raise RuntimeError(f"feishu send message failed log_id={log_id} capture_path={capture_path} payload={payload}")
+        _capture_feishu_payload(
+            "send",
+            request_meta=request_meta,
+            request_payload=request_payload,
+            response_status=resp.status_code,
+            response_payload=payload,
+            response_headers=_selected_feishu_headers(resp),
+        )
+        message_id = _extract_message_id(payload) or ""
         logger.info(
-            "feishu message sent receive_id=%s msg_type=%s",
+            "feishu message sent receive_id=%s msg_type=%s message_id=%s content_bytes=%s content_sha1=%s log_id=%s",
             receive_id,
             delivery.msg_type,
+            message_id,
+            request_meta["content_bytes"],
+            request_meta["content_sha1"],
+            log_id,
         )
         return payload
 
@@ -983,16 +1231,74 @@ class FeishuChannel:
         if delivery.msg_type != "interactive":
             raise RuntimeError("Only interactive card messages can be updated.")
         token = self._ensure_token()
+        request_payload = {"content": delivery.content}
+        request_meta = _feishu_payload_meta(
+            operation="patch",
+            msg_type=delivery.msg_type,
+            content=delivery.content,
+            message_id=message_id,
+        )
+        logger.info(
+            "feishu message update starting message_id=%s msg_type=%s content_bytes=%s content_sha1=%s",
+            message_id,
+            delivery.msg_type,
+            request_meta["content_bytes"],
+            request_meta["content_sha1"],
+        )
         resp = self._http.patch(
             f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}",
             headers={"Authorization": f"Bearer {token}"},
-            json={"content": delivery.content},
+            json=request_payload,
         )
-        resp.raise_for_status()
-        payload = resp.json()
+        log_id = _feishu_log_id(resp)
+        payload = _response_payload(resp)
+        if resp.status_code >= 400:
+            capture_path = _capture_feishu_payload(
+                "patch",
+                request_meta=request_meta,
+                request_payload=request_payload,
+                response_status=resp.status_code,
+                response_payload=payload,
+                response_headers=_selected_feishu_headers(resp),
+                force_error=True,
+            )
+            logger.error(
+                "feishu update message http_error status=%s log_id=%s message_id=%s content_bytes=%s content_sha1=%s capture_path=%s payload=%s",
+                resp.status_code,
+                log_id,
+                message_id,
+                request_meta["content_bytes"],
+                request_meta["content_sha1"],
+                capture_path,
+                payload,
+            )
+            raise RuntimeError(f"feishu update message http_error status={resp.status_code} log_id={log_id} capture_path={capture_path} payload={payload}")
         if payload.get("code") != 0:
-            raise RuntimeError(f"feishu update message failed: {payload}")
-        logger.info("feishu message updated message_id=%s", message_id)
+            capture_path = _capture_feishu_payload(
+                "patch",
+                request_meta=request_meta,
+                request_payload=request_payload,
+                response_status=resp.status_code,
+                response_payload=payload,
+                response_headers=_selected_feishu_headers(resp),
+                force_error=True,
+            )
+            raise RuntimeError(f"feishu update message failed log_id={log_id} capture_path={capture_path} payload={payload}")
+        _capture_feishu_payload(
+            "patch",
+            request_meta=request_meta,
+            request_payload=request_payload,
+            response_status=resp.status_code,
+            response_payload=payload,
+            response_headers=_selected_feishu_headers(resp),
+        )
+        logger.info(
+            "feishu message updated message_id=%s content_bytes=%s content_sha1=%s log_id=%s",
+            message_id,
+            request_meta["content_bytes"],
+            request_meta["content_sha1"],
+            log_id,
+        )
 
     def send_message(self, receive_id: str, text: str) -> bool:
         try:
@@ -1017,6 +1323,38 @@ def build_feishu_channel() -> FeishuChannel | None:
         app_id=settings.feishu_app_id,
         app_secret=settings.feishu_app_secret,
         bot_name=settings.feishu_bot_name or "Jarvis",
+    )
+
+
+def _run_turn_with_optional_progress(runtime: Any, turn_id: int, progress: ProgressReporter) -> TurnResult:
+    if _runtime_accepts_progress(runtime):
+        return runtime.run_turn(turn_id, progress=progress)
+    return runtime.run_turn(turn_id)
+
+
+def _runtime_accepts_progress(runtime: Any) -> bool:
+    run_turn = runtime.run_turn
+    try:
+        signature = inspect.signature(run_turn)
+    except (TypeError, ValueError):
+        return False
+    parameters = signature.parameters
+    return "progress" in parameters or any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
+
+
+def _progress_mode(value: str) -> str:
+    return "cardkit" if str(value or "").strip().lower() in {"cardkit", "cardkit_v2", "json2"} else "patch"
+
+
+def _initial_progress_snapshot() -> Any:
+    return SimpleNamespace(
+        current_stage="准备中",
+        current_action="正在理解请求",
+        completed_items=[],
+        recent_events=["已收到请求"],
+        node_total=None,
+        node_completed=0,
+        status="running",
     )
 
 
@@ -1094,28 +1432,36 @@ def _reply_to_bot(message: Any) -> bool:
     return False
 
 
-def _extract_codex_approval_from_reply(reply: str) -> dict[str, str] | None:
-    text = str(reply or "").strip()
-    if not text.startswith("Codex requested approval"):
-        return None
-    approval_id = ""
-    command = ""
-    reason = ""
-    for line in text.splitlines():
-        if line.startswith("Approval ID:"):
-            approval_id = line.split(":", 1)[1].strip()
-        elif line.startswith("Command:"):
-            command = line.split(":", 1)[1].strip()
-        elif line.startswith("Reason:"):
-            reason = line.split(":", 1)[1].strip()
-    return {
-        "approval_id": approval_id,
-        "command": command,
-        "reason": reason,
-    }
+def _extract_approval_from_turn_result(result: TurnResult) -> dict[str, Any] | None:
+    metadata = result.message.metadata if isinstance(result.message.metadata, dict) else {}
+    raw_requests = metadata.get("approval_requests")
+    if isinstance(raw_requests, list):
+        for item in raw_requests:
+            request = approval_request_from_mapping(item)
+            if request is None:
+                continue
+            payload = dict(request.payload)
+            command = request.command or ""
+            reason = request.reason
+            payload.setdefault("command", command)
+            payload.setdefault("reason", reason)
+            return {
+                "approval_id": request.approval_id,
+                "command": command,
+                "reason": reason,
+                "approval_source": str(payload.get("source") or "codex_provider"),
+                "payload": payload,
+            }
+    return None
 
 
-def _record_codex_approval(
+def _approval_value(approval: Any, key: str) -> str:
+    if isinstance(approval, dict):
+        return str(approval.get(key) or "").strip()
+    return str(getattr(approval, key, "") or "").strip()
+
+
+def _record_approval(
     *,
     conversation_id: int,
     approval_id: str,
@@ -1124,10 +1470,12 @@ def _record_codex_approval(
     command: str,
     reason: str,
     language: str = "zh",
+    approval_source: str = "codex_provider",
+    payload: dict[str, Any] | None = None,
 ) -> None:
     patch = {
-        "codex_approval_language": language,
-        "codex_approvals": {
+        "approval_language": language,
+        "approvals": {
             approval_id: {
                 "status": "pending",
                 "turn_id": turn_id,
@@ -1135,6 +1483,8 @@ def _record_codex_approval(
                 "command": command,
                 "reason": reason,
                 "language": language,
+                "approval_source": approval_source,
+                "payload": payload or {},
                 "created_at": int(time.time()),
             }
         }
@@ -1142,10 +1492,10 @@ def _record_codex_approval(
     try:
         get_conversation_store().update_conversation_metadata(conversation_id, patch)
     except Exception:
-        logger.exception("failed to record codex approval conversation_id=%s approval_id=%s", conversation_id, approval_id)
+        logger.exception("failed to record approval conversation_id=%s approval_id=%s", conversation_id, approval_id)
 
 
-def _record_codex_approval_decision(
+def _record_approval_decision(
     *,
     conversation_id: int,
     approval_id: str,
@@ -1153,7 +1503,7 @@ def _record_codex_approval_decision(
     decided_by: str,
 ) -> None:
     patch = {
-        "codex_approvals": {
+        "approvals": {
             approval_id: {
                 "status": decision,
                 "decided_by": decided_by,
@@ -1192,12 +1542,12 @@ def _codex_approval_prefixes(conversation_id: int) -> list[str]:
     return [str(item) for item in prefixes if str(item).strip()]
 
 
-def _codex_approval_status(conversation_id: int, approval_id: str) -> str | None:
+def _approval_status(conversation_id: int, approval_id: str) -> str | None:
     conversation = get_conversation_store().get_conversation(conversation_id)
     if conversation is None:
         return None
     metadata = getattr(conversation, "metadata", None) or {}
-    approvals = metadata.get("codex_approvals")
+    approvals = metadata.get("approvals")
     if not isinstance(approvals, dict):
         return None
     approval = approvals.get(approval_id)
@@ -1207,16 +1557,16 @@ def _codex_approval_status(conversation_id: int, approval_id: str) -> str | None
     return str(status) if status else None
 
 
-def _codex_approval_language(conversation_id: int) -> str:
+def _approval_language(conversation_id: int) -> str:
     try:
         conversation = get_conversation_store().get_conversation(conversation_id)
     except Exception:
-        logger.exception("failed to load codex approval language conversation_id=%s", conversation_id)
+        logger.exception("failed to load approval language conversation_id=%s", conversation_id)
         return "zh"
     if conversation is None:
         return "zh"
     metadata = getattr(conversation, "metadata", None) or {}
-    language = str(metadata.get("codex_approval_language") or "").strip().lower()
+    language = str(metadata.get("approval_language") or "").strip().lower()
     return "en" if language == "en" else "zh"
 
 
@@ -1317,6 +1667,187 @@ def _safe_preview(value: str, *, limit: int = 120) -> str:
     if len(normalized) <= limit:
         return normalized
     return normalized[:limit] + "...[truncated]"
+
+
+def _feishu_payload_meta(
+    *,
+    operation: str,
+    msg_type: str,
+    content: str,
+    receive_id: str | None = None,
+    message_id: str | None = None,
+) -> dict[str, Any]:
+    content_bytes = content.encode("utf-8")
+    meta: dict[str, Any] = {
+        "operation": operation,
+        "msg_type": msg_type,
+        "content_chars": len(content),
+        "content_bytes": len(content_bytes),
+        "content_sha1": hashlib.sha1(content_bytes).hexdigest(),
+    }
+    if receive_id:
+        meta["receive_id"] = receive_id
+    if message_id:
+        meta["message_id"] = message_id
+    card = _json_object_or_none(content)
+    if card is not None:
+        meta.update(_feishu_card_meta(card))
+    return meta
+
+
+def _feishu_card_meta(card: dict[str, Any]) -> dict[str, Any]:
+    schema = card.get("schema")
+    result: dict[str, Any] = {
+        "card_schema": schema if isinstance(schema, str) else "legacy",
+        "element_count": 0,
+        "markdown_blocks": [],
+    }
+    if schema == "2.0":
+        body = card.get("body")
+        elements = body.get("elements") if isinstance(body, dict) else []
+    else:
+        elements = card.get("elements")
+    if not isinstance(elements, list):
+        elements = []
+    result["element_count"] = len(elements)
+    result["markdown_blocks"] = _feishu_markdown_block_meta(card)
+    return result
+
+
+def _feishu_markdown_block_meta(card: dict[str, Any]) -> list[dict[str, Any]]:
+    blocks: list[dict[str, Any]] = []
+
+    def visit(value: Any, path: str) -> None:
+        if isinstance(value, dict):
+            if value.get("tag") in {"markdown", "lark_md"} and isinstance(value.get("content"), str):
+                content = value["content"]
+                blocks.append(
+                    {
+                        "path": path,
+                        "element_id": value.get("element_id"),
+                        "tag": value.get("tag"),
+                        "chars": len(content),
+                        "bytes": len(content.encode("utf-8")),
+                    }
+                )
+            text = value.get("text")
+            if isinstance(text, dict) and text.get("tag") in {"markdown", "lark_md"} and isinstance(text.get("content"), str):
+                content = text["content"]
+                blocks.append(
+                    {
+                        "path": f"{path}.text",
+                        "element_id": value.get("element_id"),
+                        "tag": text.get("tag"),
+                        "chars": len(content),
+                        "bytes": len(content.encode("utf-8")),
+                    }
+                )
+            for key, item in value.items():
+                visit(item, f"{path}.{key}" if path else str(key))
+        elif isinstance(value, list):
+            for index, item in enumerate(value):
+                visit(item, f"{path}[{index}]")
+
+    visit(card, "")
+    return blocks
+
+
+def _capture_feishu_payload(
+    operation: str,
+    *,
+    request_meta: dict[str, Any],
+    request_payload: dict[str, Any],
+    response_status: int,
+    response_payload: dict[str, Any],
+    response_headers: dict[str, str],
+    force_error: bool = False,
+) -> str | None:
+    try:
+        settings = get_settings()
+        should_capture = bool(settings.feishu_capture_payload_always or (force_error and settings.feishu_capture_payload_on_error))
+        if not should_capture:
+            return None
+        log_dir = settings.feishu_payload_log_dir
+        log_dir.mkdir(parents=True, exist_ok=True)
+        sha1 = str(request_meta.get("content_sha1") or "unknown")
+        target_id = str(request_meta.get("message_id") or request_meta.get("receive_id") or "unknown")
+        safe_target_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", target_id)[:96]
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        path = log_dir / f"{timestamp}-{operation}-{safe_target_id}-{sha1[:12]}.json"
+        record = {
+            "request_meta": request_meta,
+            "request_payload": request_payload,
+            "response": {
+                "status_code": response_status,
+                "headers": response_headers,
+                "payload": response_payload,
+            },
+        }
+        text = json.dumps(record, ensure_ascii=False, indent=2)
+        max_bytes = max(0, int(settings.feishu_payload_log_max_bytes or 0))
+        encoded = text.encode("utf-8")
+        if max_bytes and len(encoded) > max_bytes:
+            record["request_payload"] = {
+                **request_payload,
+                "content": _truncate_utf8(str(request_payload.get("content") or ""), max_bytes=max(1024, max_bytes // 2)),
+                "content_truncated": True,
+            }
+            record["response"]["payload"] = _truncate_nested_strings(response_payload, max_bytes=max(1024, max_bytes // 4))
+            record["truncated"] = True
+            text = json.dumps(record, ensure_ascii=False, indent=2)
+        path.write_text(text, encoding="utf-8")
+        return str(path)
+    except Exception:
+        logger.exception("failed to capture feishu payload operation=%s", operation)
+        return None
+
+
+def _truncate_nested_strings(value: Any, *, max_bytes: int) -> Any:
+    if isinstance(value, str):
+        return _truncate_utf8(value, max_bytes=max_bytes)
+    if isinstance(value, dict):
+        return {key: _truncate_nested_strings(item, max_bytes=max_bytes) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_truncate_nested_strings(item, max_bytes=max_bytes) for item in value]
+    return value
+
+
+def _truncate_utf8(value: str, *, max_bytes: int) -> str:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value
+    suffix = "\n...[truncated]"
+    budget = max(0, max_bytes - len(suffix.encode("utf-8")))
+    return encoded[:budget].decode("utf-8", errors="ignore") + suffix
+
+
+def _response_payload(resp: httpx.Response) -> dict[str, Any]:
+    try:
+        payload = resp.json()
+    except ValueError:
+        return {"status_code": resp.status_code, "body": resp.text}
+    return payload if isinstance(payload, dict) else {"payload": payload}
+
+
+def _selected_feishu_headers(resp: httpx.Response) -> dict[str, str]:
+    selected: dict[str, str] = {}
+    for key in ("x-tt-logid", "X-Tt-Logid", "x-request-id", "X-Request-Id"):
+        value = resp.headers.get(key)
+        if value:
+            selected[key] = value
+    return selected
+
+
+def _feishu_log_id(resp: httpx.Response) -> str | None:
+    return resp.headers.get("x-tt-logid") or resp.headers.get("X-Tt-Logid")
+
+
+def _json_object_or_none(value: str) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 def _extract_message_id(payload: dict[str, Any]) -> str | None:

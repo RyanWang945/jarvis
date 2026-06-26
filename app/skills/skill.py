@@ -8,11 +8,16 @@ from app.skills.manifest import SkillManifest
 
 @dataclass(frozen=True)
 class Skill:
-    name: str
+    skill_id: str
     description: str
+    effective_description: str
     path: Path
     manifest: SkillManifest
     content_path: Path | None = None
+
+    @property
+    def display_name(self) -> str:
+        return self.manifest.name or self.skill_id
 
     def load_body(self) -> str:
         if self.content_path is None or not self.content_path.exists():

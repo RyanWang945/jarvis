@@ -47,7 +47,11 @@ class Settings(BaseSettings):
     llm_max_context_tokens: int = 12000
     llm_max_output_tokens: int = 2000
     llm_context_safety_buffer: int = 1000
+    coder_runtime_provider: str = "codex"
     coder_timeout_seconds: int = 1800
+    coder_node_finalizer_llm_enabled: bool = False
+    react_runtime_backend: str = "builtin"  # builtin | claude_agent_sdk
+    result_aggregator_backend: str = "llm"  # llm | claude_agent_sdk
     repositories_config_path: Path | None = Field(default=Path("data/repositories.json"))
     deepseek_api_key: str | None = None
     deepseek_base_url: str = "https://api.deepseek.com"
@@ -69,9 +73,28 @@ class Settings(BaseSettings):
     feishu_app_id: str | None = None
     feishu_app_secret: str | None = None
     feishu_bot_name: str = "Jarvis"
+    feishu_progress_updates_enabled: bool = False
+    feishu_progress_mode: str = "patch"
+    feishu_progress_min_interval_seconds: float = 2.0
+    feishu_progress_max_recent_events: int = 5
+    feishu_capture_payload_on_error: bool = True
+    feishu_capture_payload_always: bool = False
+    feishu_payload_log_dir: Path = Field(default=Path("logs/feishu-payloads"))
+    feishu_payload_log_max_bytes: int = 256 * 1024
     obsidian_workspace_path: Path | None = None
     obsidian_vault_path: Path | None = None
     default_timezone: str = "Asia/Shanghai"
+    mcp_enabled: bool = False
+    mcp_config_path: Path | None = None
+    mcp_servers_json: str | None = None
+    mcp_tools_cache_ttl_seconds: float = 300.0
+    otel_enabled: bool = False
+    otel_service_name: str = "jarvis-api"
+    otel_exporter_otlp_endpoint: str = "http://127.0.0.1:4318"
+    otel_exporter_otlp_protocol: str = "http/protobuf"
+    otel_traces_sampler: str = "parentbased_traceidratio"
+    otel_traces_sampler_arg: float = 1.0
+    otel_capture_content: bool = True
 
     # MySQL configuration
     mysql_host: str = "127.0.0.1"

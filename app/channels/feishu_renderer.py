@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from typing import Any
 
 from app.agent_react import ChannelMessage
 
@@ -27,7 +28,7 @@ class _ParsedTable:
 @dataclass(frozen=True)
 class _ModelUsageFooter:
     body: str
-    model: str
+    model: str | None
     prompt_tokens: str
     completion_tokens: str
     total_tokens: str
@@ -39,7 +40,10 @@ class FeishuRenderer:
 
     def render(self, message: ChannelMessage) -> FeishuDelivery:
         if message.content_type == "markdown":
-            return self.render_markdown_card(message.content)
+            return self.render_markdown_card(
+                message.content,
+                usage_footer=_model_usage_footer_from_metadata(message.metadata),
+            )
         return self.render_text_fallback(message.content)
 
     def render_thinking_card(self, prompt: str | None = None) -> FeishuDelivery:
@@ -50,6 +54,81 @@ class FeishuRenderer:
             ],
             update_multi=True,
         )
+
+    def render_progress_card(self, snapshot: Any) -> FeishuDelivery:
+        blocks = [
+            "**🟡 Jarvis 正在处理**",
+            f"**当前阶段**: {_snapshot_value(snapshot, 'current_stage', '准备中')}",
+            f"**正在做**: {_snapshot_value(snapshot, 'current_action', '正在处理请求')}",
+        ]
+        node_total = getattr(snapshot, "node_total", None)
+        if isinstance(node_total, int) and node_total > 0:
+            node_completed = getattr(snapshot, "node_completed", 0)
+            blocks.append(f"**节点进度**: {node_completed}/{node_total}")
+
+        completed_items = list(getattr(snapshot, "completed_items", []) or [])[-4:]
+        if completed_items:
+            blocks.append("**已完成**\n" + "\n".join(f"- {item}" for item in completed_items))
+
+        recent_events = list(getattr(snapshot, "recent_events", []) or [])[-5:]
+        if recent_events:
+            blocks.append("**最近进展**\n" + "\n".join(f"- {item}" for item in recent_events))
+
+        return self._render_card_from_blocks(blocks, update_multi=True)
+
+    def render_cardkit_progress_card(
+        self,
+        snapshot: Any,
+        *,
+        output_markdown: str | None = None,
+        usage: dict[str, Any] | None = None,
+    ) -> FeishuDelivery:
+        elements = [
+            {
+                "tag": "markdown",
+                "element_id": "progress_stream",
+                "content": _cardkit_stream_status(snapshot),
+            },
+        ]
+        output, usage_footer = _cardkit_output_content(
+            snapshot,
+            output_markdown,
+            usage_footer=_model_usage_footer_from_totals(usage),
+        )
+        if output:
+            elements.extend(
+                [
+                    {"tag": "hr", "element_id": "progress_output_divider"},
+                    {
+                        "tag": "markdown",
+                        "element_id": "progress_output",
+                        "content": output,
+                    },
+                ]
+            )
+        if usage_footer is not None:
+            elements.extend(_cardkit_model_usage_elements(usage_footer))
+        card = {
+            "schema": "2.0",
+            "config": {
+                "update_multi": True,
+                "style": {
+                    "text_size": {
+                        "normal_v2": {"default": "normal", "pc": "normal", "mobile": "normal"},
+                    }
+                },
+            },
+            "header": {
+                "title": {"tag": "plain_text", "content": self._title},
+                "template": "blue",
+            },
+            "body": {
+                "direction": "vertical",
+                "padding": "12px 12px 12px 12px",
+                "elements": elements,
+            },
+        }
+        return FeishuDelivery(msg_type="interactive", content=json.dumps(card, ensure_ascii=False))
 
     def render_error_card(self, message: str) -> FeishuDelivery:
         return self._render_card_from_blocks(
@@ -70,8 +149,10 @@ class FeishuRenderer:
         command: str = "",
         reason: str = "",
         language: str = "zh",
+        approval_source: str = "codex_provider",
+        payload: dict[str, Any] | None = None,
     ) -> FeishuDelivery:
-        blocks = ["**Codex 权限审批**"]
+        blocks = ["**Jarvis 权限审批**"]
         elements = self._blocks_to_elements(blocks)
         if command:
             elements.extend(_command_elements(command))
@@ -87,6 +168,8 @@ class FeishuRenderer:
             "command": command,
             "reason": reason,
             "language": language,
+            "approval_source": approval_source,
+            "payload": payload or {},
         }
         elements.append(
             {
@@ -137,7 +220,7 @@ class FeishuRenderer:
             "timeout": "已超时",
             "missing": "已失效",
         }.get(decision, "已处理")
-        blocks = [f"**Codex 权限审批：{label}**"]
+        blocks = [f"**Jarvis 权限审批：{label}**"]
         elements = self._blocks_to_elements(blocks)
         if command:
             elements.extend(_command_elements(command))
@@ -145,9 +228,15 @@ class FeishuRenderer:
             elements.extend(_reason_elements(reason, language=language))
         return self._render_card_from_elements(elements, update_multi=True)
 
-    def render_markdown_card(self, markdown: str) -> FeishuDelivery:
-        usage_footer = extract_model_usage_footer(markdown)
-        markdown_body = usage_footer.body if usage_footer is not None else markdown
+    def render_markdown_card(
+        self,
+        markdown: str,
+        *,
+        usage_footer: _ModelUsageFooter | None = None,
+    ) -> FeishuDelivery:
+        parsed_footer = extract_model_usage_footer(markdown)
+        usage_footer = usage_footer or parsed_footer
+        markdown_body = parsed_footer.body if parsed_footer is not None else markdown
         normalized = normalize_markdown(markdown_body)
         if not normalized:
             if usage_footer is None:
@@ -237,8 +326,8 @@ def extract_model_usage_footer(markdown: str) -> _ModelUsageFooter | None:
         (?P<body>.*?)
         (?:\n{2,}|\A)
         ---\s*
-        \n-\s*模型：`(?P<model>[^`]+)`\s*
-        \n-\s*Token：输入\s*`(?P<prompt>\d+)`\s*/\s*输出\s*`(?P<completion>\d+)`\s*/\s*合计\s*`(?P<total>\d+)`\s*
+        \n(?:-\s*模型：`(?P<model>[^`]+)`\s*\n)?
+        -\s*Token：输入\s*`(?P<prompt>\d+)`\s*/\s*输出\s*`(?P<completion>\d+)`\s*/\s*合计\s*`(?P<total>\d+)`\s*
         \Z
         """,
         flags=re.DOTALL | re.VERBOSE,
@@ -248,7 +337,7 @@ def extract_model_usage_footer(markdown: str) -> _ModelUsageFooter | None:
         return None
     return _ModelUsageFooter(
         body=match.group("body").rstrip(),
-        model=match.group("model").strip(),
+        model=match.group("model").strip() if match.group("model") else None,
         prompt_tokens=match.group("prompt").strip(),
         completion_tokens=match.group("completion").strip(),
         total_tokens=match.group("total").strip(),
@@ -460,19 +549,11 @@ def _render_table_row(headers: list[str], row: list[str]) -> list[str]:
     if not pairs:
         return []
 
-    primary: list[str] = []
-    details: list[str] = []
-    for index, (header, value) in enumerate(pairs):
-        safe_value = value or "-"
-        if index < 2:
-            primary.append(safe_value)
-        else:
-            details.append(f"**{header}**: {safe_value}")
-
-    title = " | ".join(primary) if primary else "Record"
+    title = pairs[0][1] or pairs[0][0] or "Record"
     rendered = [f"**{title}**"]
-    if details:
-        rendered.extend(details)
+    for header, value in pairs[1:]:
+        safe_value = value or "-"
+        rendered.append(f"- **{header}**：{safe_value}")
     return rendered
 
 
@@ -531,11 +612,8 @@ def _model_usage_elements(footer: _ModelUsageFooter) -> list[dict]:
             "tag": "note",
             "elements": [
                 {
-                    "tag": "plain_text",
-                    "content": (
-                        f"模型：{footer.model} · "
-                        f"Token：输入 {footer.prompt_tokens} / 输出 {footer.completion_tokens} / 合计 {footer.total_tokens}"
-                    ),
+                    "tag": "lark_md",
+                    "content": _model_usage_text(footer),
                 }
             ],
         },
@@ -586,3 +664,138 @@ def _truncate_card_text(text: str, limit: int) -> str:
     if len(normalized) <= limit:
         return normalized
     return normalized[: limit - 14].rstrip() + "\n...[truncated]"
+
+
+def _snapshot_value(snapshot: Any, name: str, default: str) -> str:
+    value = str(getattr(snapshot, name, "") or "").strip()
+    return _truncate_card_text(value or default, 300)
+
+
+def _cardkit_stream_status(snapshot: Any) -> str:
+    status = str(getattr(snapshot, "status", "running") or "running")
+    current_action = _snapshot_value(snapshot, "current_action", "")
+    current_stage = str(getattr(snapshot, "current_stage", "") or "").strip()
+    if status == "completed":
+        return "任务完成"
+    if status == "failed":
+        detail = _normalize_progress_action(current_action, current_stage)
+        return _truncate_card_text(f"任务失败：{detail}" if detail and detail != "任务执行失败" else "任务失败", 140)
+    return _normalize_progress_action(current_action, current_stage) or _stage_fallback_status(current_stage)
+
+
+def _normalize_progress_action(action: str, stage: str = "") -> str:
+    text = " ".join(str(action or "").split())
+    if not text:
+        return ""
+    if text in {"正在生成执行计划", "开始规划任务"} or "生成执行计划" in text:
+        return "生成计划中"
+    if text.startswith("已生成 ") and "执行节点" in text:
+        return "执行计划已生成"
+    if "汇总" in text:
+        if "完成" in text:
+            return "汇总完成"
+        return "正在汇总结果"
+    if "任务已完成" in text or "任务完成" in text:
+        return "任务完成"
+    if text.startswith("正在执行 ") and text.endswith(" 节点"):
+        return _truncate_card_text(text, 140)
+    if text.startswith("完成 ") and stage == "执行节点":
+        return "节点执行完成"
+    if " 节点 completed:" in text or " 节点 completed：" in text:
+        return "节点执行完成"
+    return _truncate_card_text(text, 140)
+
+
+def _stage_fallback_status(stage: str) -> str:
+    if stage == "规划":
+        return "生成计划中"
+    if stage == "汇总":
+        return "正在汇总结果"
+    if stage == "完成":
+        return "任务完成"
+    if stage == "失败":
+        return "任务失败"
+    return "正在理解请求"
+
+
+def _cardkit_output_content(
+    snapshot: Any,
+    output_markdown: str | None,
+    *,
+    usage_footer: _ModelUsageFooter | None = None,
+) -> tuple[str, _ModelUsageFooter | None]:
+    if output_markdown is not None:
+        parsed_footer = extract_model_usage_footer(output_markdown)
+        usage_footer = usage_footer or parsed_footer
+        markdown_body = parsed_footer.body if parsed_footer is not None else output_markdown
+        output = normalize_markdown(markdown_body)
+        return output or "结果已生成。", usage_footer
+    return "", None
+
+
+def _cardkit_model_usage_elements(footer: _ModelUsageFooter) -> list[dict[str, Any]]:
+    return [
+        {"tag": "hr", "element_id": "progress_usage_divider"},
+        {
+            "tag": "markdown",
+            "element_id": "progress_usage",
+            "content": _model_usage_text(footer, muted=True),
+            "text_size": "notation",
+        },
+    ]
+
+
+def _model_usage_text(footer: _ModelUsageFooter, *, muted: bool = False) -> str:
+    text = (
+        f"**用量：** {_format_usage_number(footer.total_tokens)} tokens · "
+        f"输入 {_format_usage_number(footer.prompt_tokens)} / "
+        f"输出 {_format_usage_number(footer.completion_tokens)}"
+    )
+    return f"<font color='grey'>{text}</font>" if muted else text
+
+
+def _format_usage_number(value: str) -> str:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if number >= 1000:
+        return f"{number / 1000:.1f}k"
+    return str(number)
+
+
+def _model_usage_footer_from_metadata(metadata: dict[str, Any] | None) -> _ModelUsageFooter | None:
+    if not isinstance(metadata, dict):
+        return None
+    usage = metadata.get("usage")
+    return _model_usage_footer_from_totals(usage if isinstance(usage, dict) else None)
+
+
+def _model_usage_footer_from_totals(totals: dict[str, Any] | None) -> _ModelUsageFooter | None:
+    if not isinstance(totals, dict):
+        return None
+    prompt = _int_usage_value(totals.get("prompt_tokens"), totals.get("input_tokens"))
+    completion = _int_usage_value(totals.get("completion_tokens"), totals.get("output_tokens"))
+    total = _int_usage_value(totals.get("total_tokens"))
+    if total <= 0 and (prompt > 0 or completion > 0):
+        total = prompt + completion
+    if prompt <= 0 and completion <= 0 and total <= 0:
+        return None
+    return _ModelUsageFooter(
+        body="",
+        model=str(totals.get("model") or "").strip() or None,
+        prompt_tokens=str(prompt),
+        completion_tokens=str(completion),
+        total_tokens=str(total),
+    )
+
+
+def _int_usage_value(*values: Any) -> int:
+    for value in values:
+        if value is None:
+            continue
+        try:
+            return max(int(value), 0)
+        except (TypeError, ValueError):
+            continue
+    return 0

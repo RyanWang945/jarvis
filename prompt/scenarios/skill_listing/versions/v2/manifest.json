@@ -1,0 +1,14 @@
+{
+  "id": "skill_listing:v2",
+  "scenario": "skill_listing",
+  "version": "v2",
+  "description": "向模型可见 Skill 工具列出可用 Jarvis skills 的中文提示词。",
+  "response_format": "text",
+  "variables": ["skill_lines"],
+  "messages": [
+    {
+      "role": "user",
+      "template": "message.md"
+    }
+  ]
+}

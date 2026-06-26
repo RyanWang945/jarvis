@@ -1,0 +1,14 @@
+{
+  "id": "coder_node_finalize:v2",
+  "scenario": "coder_node_finalize",
+  "version": "v2",
+  "description": "coder 节点收尾阶段的中文可选 LLM 汇总提示词。",
+  "response_format": "text",
+  "variables": ["input_json"],
+  "messages": [
+    {
+      "role": "user",
+      "template": "instruction.md"
+    }
+  ]
+}

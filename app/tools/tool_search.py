@@ -42,7 +42,7 @@ def run_tool_search(request: ToolExecutionRequest) -> ToolExecutionResult:
             "candidates": candidates,
             "selection_instruction": (
                 "Select only a candidate that directly matches the original user intent. "
-                "The runtime will expose approved candidates for this turn only."
+                "The runtime exposes tools broadly and applies permission checks before execution."
             ),
         }
     stdout = json.dumps(payload, ensure_ascii=False)
@@ -66,7 +66,11 @@ def _candidate_tools(text: str) -> list[dict[str, Any]]:
         candidates.append(_candidate("scheduled_task", "high", "low", "Create, list, or remove reminders from explicit reminder intent."))
     if _looks_like_file_delivery(lowered):
         candidates.append(_candidate("deliver_file", "high", "medium", "Deliver or resend a generated artifact or explicitly named workspace file."))
-    if _looks_like_web_search(lowered) or _looks_like_social_search(lowered):
+    social_search = _looks_like_social_search(lowered)
+    web_search = _looks_like_web_search(lowered)
+    if social_search:
+        candidates.append(_candidate("x_search", "high", "low", "Search public X/Twitter posts directly."))
+    if web_search:
         candidates.append(_candidate("tavily_search", "high", "low", "Search the web for current or external facts."))
     if _looks_like_wiki_write(lowered):
         candidates.append(_candidate("obsidian_wiki_draft", "medium", "medium", "Draft a wiki page or note before applying it."))

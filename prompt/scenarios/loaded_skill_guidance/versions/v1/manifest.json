@@ -1,0 +1,14 @@
+{
+  "id": "loaded_skill_guidance:v1",
+  "scenario": "loaded_skill_guidance",
+  "version": "v1",
+  "description": "Message injected after one or more skills are loaded for a turn.",
+  "response_format": "text",
+  "variables": ["skill_sections"],
+  "messages": [
+    {
+      "role": "user",
+      "template": "message.md"
+    }
+  ]
+}

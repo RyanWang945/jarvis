@@ -1,0 +1,14 @@
+{
+  "id": "skill_listing:v1",
+  "scenario": "skill_listing",
+  "version": "v1",
+  "description": "List available Jarvis skills for the model-visible Skill tool.",
+  "response_format": "text",
+  "variables": ["skill_lines"],
+  "messages": [
+    {
+      "role": "user",
+      "template": "message.md"
+    }
+  ]
+}

@@ -10,6 +10,7 @@ from langchain_core.messages import BaseMessage, HumanMessage
 from app.config import get_settings
 from app.tools.common import ToolExecutionRequest, ToolExecutionResult
 from app.tools.definitions import ToolDefinition, builtin_tool_definitions
+from app.tools.mcp.manager import get_mcp_tool_manager
 
 _CODE_REQUEST_MARKERS = (
     "code",
@@ -39,7 +40,7 @@ _CODE_REQUEST_MARKERS = (
     ".md",
 )
 
-_TOOLS = {tool.name: tool for tool in builtin_tool_definitions()}
+_BUILTIN_TOOLS = {tool.name: tool for tool in builtin_tool_definitions()}
 _SHELL_SEPARATOR_PATTERN = re.compile(r"(\&\&)|(\|\|)|(;)|(\|)")
 _INSPECT_ALLOW_PREFIXES = (
     "pwd",
@@ -83,7 +84,7 @@ _POSIX_ABSOLUTE_PATH_PATTERN = re.compile(r"(?<![A-Za-z0-9_.-])/[^\s\"']*")
 
 
 def list_tool_definitions(*, exposed_to_llm: bool | None = None) -> list[ToolDefinition]:
-    tools = list(_TOOLS.values())
+    tools = list(_all_tools().values())
     if exposed_to_llm is not None:
         tools = [tool for tool in tools if tool.exposed_to_llm is exposed_to_llm]
     return tools
@@ -91,7 +92,7 @@ def list_tool_definitions(*, exposed_to_llm: bool | None = None) -> list[ToolDef
 
 def get_tool_definition(name: str) -> ToolDefinition:
     try:
-        return _TOOLS[name]
+        return _all_tools()[name]
     except KeyError as exc:
         raise ValueError(f"unknown tool: {name}") from exc
 
@@ -157,6 +158,17 @@ def execute_tool(tool: ToolDefinition, tool_args: dict[str, Any], *, timeout_sec
     return tool.handler(request)
 
 
+def _all_tools() -> dict[str, ToolDefinition]:
+    tools = dict(_BUILTIN_TOOLS)
+    try:
+        for tool in get_mcp_tool_manager().list_tool_definitions():
+            tools.setdefault(tool.name, tool)
+    except Exception:
+        # MCP discovery should not make built-in Jarvis tools unavailable.
+        pass
+    return tools
+
+
 def _latest_user_message(messages: list[BaseMessage]) -> str:
     for message in reversed(messages):
         if isinstance(message, HumanMessage):
@@ -192,7 +204,7 @@ def _check_shell_command(command: str) -> str | None:
         return "Rejected: shell_run_command only allows one command at a time."
     normalized = command.strip()
     if any(normalized.startswith(prefix) for prefix in _COMMAND_DENY_PREFIXES):
-        return "Rejected: this command is too risky for shell_run_command; use delegate_to_codex or ask explicitly."
+        return "Rejected: this command is too risky for shell_run_command; use a coder runtime node or ask explicitly."
     path_rejection = _check_workspace_path_constraints(command)
     if path_rejection is not None:
         return path_rejection

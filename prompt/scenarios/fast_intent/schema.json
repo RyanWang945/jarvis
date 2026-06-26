@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "FastIntentNeedsPlanArguments",
+  "description": "FastIntent 对直接回复返回普通 assistant 文本；对所有需要执行的工作，使用这些参数调用 needs_plan。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["confidence", "reason"],
+  "properties": {
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "reason": {
+      "type": "string"
+    }
+  }
+}

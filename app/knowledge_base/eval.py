@@ -15,7 +15,8 @@ from app.knowledge_base.embedding import DashScopeEmbeddingClient
 from app.knowledge_base.reranking import RerankerClient
 from app.knowledge_base.search import OpenSearchClient
 from app.knowledge_base.search import SearchHit
-from app.llm.client import ChatClient, LLMMessage, parse_json_content
+from app.llm.client import ChatClient, parse_json_content
+from app.prompting import PromptRegistry
 
 
 @dataclass(frozen=True)
@@ -65,8 +66,9 @@ class EvalEvidenceSpan:
 
 
 class QueryGenerationService:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, *, prompt_registry: PromptRegistry | None = None) -> None:
         self._settings = settings
+        self._prompt_registry = prompt_registry or PromptRegistry()
 
     def generate(
         self,
@@ -90,60 +92,21 @@ class QueryGenerationService:
             model=_provider_model(self._settings),
             timeout_seconds=self._settings.llm_timeout_seconds,
         )
+        prompt = self._prompt_registry.load("kb_eval_query_generation")
         message = client.chat(
-            [
-                LLMMessage(
-                    role="system",
-                    content=(
-                        "You generate realistic Chinese evaluation queries for a retrieval system. "
-                        "The goal is to simulate what real users would type into search or ask in a chat product, "
-                        "not to restate encyclopedia titles. "
-                        "Return strict JSON with keys: query_text, query_type, difficulty, gold_answer."
-                    ),
-                ),
-                LLMMessage(
-                    role="user",
-                    content=json.dumps(
+            prompt.render(
+                {
+                    "input_json": json.dumps(
                         {
                             "title": document["title"],
                             "chunk_text": chunk["normalized_content"][:1200],
                             "preferred_style": preferred_style,
-                            "instructions": [
-                                "Generate exactly one realistic Chinese query that this chunk should answer.",
-                                "Simulate a real user query, not an encyclopedia heading rewrite.",
-                                "Avoid copying the title or the first sentence verbatim.",
-                                "Avoid generic templates like 'X是什么', '请介绍X', or 'X的定义' unless the chunk is truly best served by a definition query.",
-                                "Prefer natural search-style wording such as partial descriptions, aliases, colloquial phrasing, task-oriented wording, or incomplete memory cues.",
-                                "Use the preferred_style when it fits the chunk, but keep the final query natural.",
-                                "Make the query answerable mainly from this chunk, without depending on unrelated context.",
-                                "Keep the query concise: usually 8 to 24 Chinese characters, and avoid unnecessary punctuation.",
-                                "Use query_type in {fact, definition, entity, paraphrase}. Use definition only when necessary.",
-                                "Use difficulty in {easy, medium, hard}. easy=direct mention or title-like, medium=paraphrased or partial clue, hard=alias, indirect clue, or colloquial phrasing.",
-                                "Keep gold_answer short and grounded in the chunk.",
-                            ],
-                            "style_reference": {
-                                "definition": "A direct definitional question, used sparingly.",
-                                "fact": "A factual question about a property, role, time, place, or relationship.",
-                                "entity": "A query that refers to a person, place, concept, or thing by alias or description.",
-                                "paraphrase": "A colloquial or reworded query that does not mirror the title.",
-                            },
-                            "good_patterns": [
-                                "开源操作系统内核是谁发起的",
-                                "那个提倡自由软件运动的人是谁",
-                                "URL一般指什么",
-                                "2003年7月香港23条相关事件",
-                            ],
-                            "avoid_patterns": [
-                                "Linux是什么？",
-                                "请介绍Linux",
-                                "Linux的定义是什么",
-                            ],
                         },
                         ensure_ascii=False,
-                    ),
-                ),
-            ],
-            response_format={"type": "json_object"},
+                    )
+                }
+            ),
+            response_format=prompt.response_format,
         )
         body = parse_json_content(message)
         query_text = str(body.get("query_text") or "").strip()

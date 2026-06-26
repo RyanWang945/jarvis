@@ -12,7 +12,8 @@ from pathlib import Path
 from typing import Any
 
 from app.config import get_settings
-from app.llm.client import ChatClient, LLMMessage, parse_json_content
+from app.llm.client import ChatClient, parse_json_content
+from app.prompting import PromptRegistry
 
 
 DEFAULT_MODEL = "deepseek-v4-flash"
@@ -356,35 +357,21 @@ def _ask_llm_for_answer_span(*, client: ChatClient, row: sqlite3.Row, payload: d
     base = _base_legacy_evidence(_legacy_evidence(_evidence_list(payload)))
     if base is None:
         return {}
+    prompt = PromptRegistry().load("kb_eval_gold_span_refine")
     message = client.chat(
-        [
-            LLMMessage(
-                role="system",
-                content=(
-                    "你是检索评测数据标注助手。你的任务是在给定证据文本中找出能回答 query 的最小充分原文片段。"
-                    "必须只返回严格 JSON。answer_text 必须是 evidence_text 中逐字连续出现的原文子串，不要改写、总结或翻译。"
-                ),
-            ),
-            LLMMessage(
-                role="user",
-                content=json.dumps(
+        prompt.render(
+            {
+                "input_json": json.dumps(
                     {
                         "query": row["query_text"],
                         "gold_answer": row["gold_answer"],
-                        "instructions": [
-                            "选择最小但足够回答 query 的连续原文片段。",
-                            "优先包含答案实体及必要限定词，不要包含整段冗余背景。",
-                            "answer_text 必须能在 evidence_text 中精确匹配。",
-                            "如果 evidence_text 不能回答 query，answer_text 返回空字符串。",
-                            "返回 JSON: {\"answer_text\": \"...\", \"confidence\": 0.0到1.0, \"reason\": \"...\"}",
-                        ],
                         "evidence_text": str(base.get("evidence_text") or "")[:6000],
                     },
                     ensure_ascii=False,
-                ),
-            ),
-        ],
-        response_format={"type": "json_object"},
+                )
+            }
+        ),
+        response_format=prompt.response_format,
     )
     return parse_json_content(message)
 

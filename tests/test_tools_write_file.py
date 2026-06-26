@@ -1,7 +1,16 @@
 from pathlib import Path
 
+import pytest
+
 from app.config import get_settings
 from app.tools.runtime import execute_tool, get_tool_definition
+
+
+@pytest.fixture(autouse=True)
+def reset_settings_cache():
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
 
 
 def test_write_file_writes_inside_workspace(tmp_path: Path, monkeypatch) -> None:
@@ -23,6 +32,13 @@ def test_write_file_writes_inside_workspace(tmp_path: Path, monkeypatch) -> None
     assert result.ok is True
     assert (target_dir / "sample.md").read_text(encoding="utf-8") == "# Sample\n\nhello"
     assert str(target_dir / "sample.md") in result.stdout
+    assert len(result.tool_artifacts) == 1
+    artifact = result.tool_artifacts[0]
+    assert artifact.kind == "file"
+    assert artifact.path == str((target_dir / "sample.md").resolve())
+    assert artifact.mime_type == "text/markdown"
+    assert artifact.filename == "sample.md"
+    assert artifact.source_tool == "write_file"
 
 
 def test_write_file_rejects_missing_directory(tmp_path: Path, monkeypatch) -> None:

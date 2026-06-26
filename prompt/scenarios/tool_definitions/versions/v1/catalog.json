@@ -1,0 +1,134 @@
+{
+  "read_file": {
+    "description": "Read a known local workspace file by path for lightweight inspection. Use this for file content snippets, logs, configuration files, and existence checks when a specific path is known. Use it when the user's final goal is to inspect, verify, or deliver a specific file or artifact. This tool is read-only and returns bounded text content plus file metadata. Do not use it as the primary strategy when the user needs repository-level judgment such as architecture analysis, integration planning, code review, design recommendations, execution-chain analysis, or multi-file reasoning; use a coder runtime node for those.",
+    "properties": {
+      "path": "Workspace-relative file path such as app/tools/runtime.py.",
+      "start_line": "1-based line number to start reading from. Defaults to 1.",
+      "max_lines": "Maximum lines to return, capped by the runtime. Defaults to 200."
+    }
+  },
+  "search_files": {
+    "description": "Search local workspace files without invoking shell commands. Use mode=path to find files by path/name or check exact path existence; use mode=content for bounded text search. Use this when the user's final goal is to locate, verify, read, or deliver a specific known or guessable file/path/artifact. This tool is read-only and returns matching paths plus small metadata or previews. Do not use it as the primary strategy when the user needs repository-level judgment such as architecture analysis, integration planning, code review, design recommendations, execution-chain analysis, or multi-file reasoning; use a coder runtime node for those.",
+    "properties": {
+      "query": "Path/name/content query to search inside the workspace.",
+      "mode": "path searches file paths and exact existence; content searches file text.",
+      "max_results": "Maximum results to return, capped by the runtime."
+    }
+  },
+  "shell_inspect": {
+    "description": "Inspect the local environment and repository using read-only shell commands. Use this for listing files, reading file content, searching text, and checking git or tool status. Do NOT use this for web searches, factual lookups, or current events.",
+    "properties": {}
+  },
+  "shell_run_command": {
+    "description": "Run one explicit local shell command after Jarvis safety checks. Use this for targeted commands such as tests, lint, build, or diagnostic commands. Do NOT use this for web searches, factual lookups, or current events. Do not use this for multi-step repository workflows, code editing, git commit, or git push; use a coder runtime node for those.",
+    "properties": {}
+  },
+  "ask_user": {
+    "description": "Ask the user one concise clarification question when required information is missing. Use this when Jarvis cannot safely continue without a user choice, such as an ambiguous target, unclear time, missing recipient, missing repository, or a required preference. Do not use ask_user for permission to perform coder runtime operations; provider approvals have their own flow. Ask only the minimum necessary question, then stop and wait for the user's reply.",
+    "properties": {
+      "question": "The exact short question to show to the user.",
+      "reason": "Brief internal reason why the answer is needed.",
+      "choices": "Optional concise choices when expected_answer_type is choice."
+    }
+  },
+  "tool_search": {
+    "description": "Search Jarvis's tool catalog when the currently exposed low-risk tools cannot satisfy the user's request. This tool only discovers candidate tools; it never executes them and never grants permission by itself. Tool discovery is internal: never tell the user you are searching available tools or looking up related tools. Use it before asking for a hidden capability such as reminders, web search, repository work, or wiki writes. If the request can be answered from the current conversation without any tool, or no suitable tool exists, return no_capable_tool rather than forcing a tool. Never use tool_search as a retry mechanism after an unrelated tool failure unless the original user request still clearly needs another capability.",
+    "properties": {
+      "query": "Capability search query, expanded from the user's request without adding new intent.",
+      "original_user_request": "The user's original request or the relevant quoted part of it.",
+      "max_results": "Maximum candidate tools to return. Defaults to 3."
+    }
+  },
+  "Skill": {
+    "description": "Load one Jarvis skill by skill_id from the skill listing. Use this when the user's task matches an available skill. Loading a skill reveals turn-scoped procedural guidance for the next model step; it does not execute scripts, grant permissions, perform routing, replace the planner, or complete the task by itself.",
+    "properties": {
+      "skill": "The skill_id from the skill listing, such as weather-1.0.0.",
+      "args": "Optional user-provided arguments or context for the skill."
+    }
+  },
+  "obsidian_wiki_query": {
+    "description": "Query the obsidian_wiki long-term knowledge store. Use this for project memory, concepts, decisions, and supporting raw evidence.",
+    "properties": {
+      "workspace_path": "Obsidian wiki workspace root containing vault/ and system/. Defaults to data/obsidian_wiki.",
+      "vault_path": "Deprecated alias for workspace_path."
+    }
+  },
+  "obsidian_wiki_draft": {
+    "description": "Create a candidate obsidian_wiki draft for stable knowledge such as design, decisions, concepts, or playbooks. This does not write to the formal wiki page.",
+    "properties": {
+      "workspace_path": "Obsidian wiki workspace root containing vault/ and system/. Defaults to data/obsidian_wiki.",
+      "vault_path": "Deprecated alias for workspace_path."
+    }
+  },
+  "obsidian_wiki_apply": {
+    "description": "Apply a previously created obsidian_wiki draft to the formal wiki. Use this only after user confirmation.",
+    "properties": {
+      "workspace_path": "Obsidian wiki workspace root containing vault/ and system/. Defaults to data/obsidian_wiki.",
+      "vault_path": "Deprecated alias for workspace_path."
+    }
+  },
+  "obsidian_wiki_maintain": {
+    "description": "Run lightweight maintenance on the obsidian_wiki vault, such as checking frontmatter, page types, source ids, and dead links.",
+    "properties": {
+      "workspace_path": "Obsidian wiki workspace root containing vault/ and system/. Defaults to data/obsidian_wiki.",
+      "vault_path": "Deprecated alias for workspace_path."
+    }
+  },
+  "business_knowledge_search": {
+    "description": "Query the OpenSearch-backed business knowledge store. Use this for business corpora such as deep research materials, imported documents, Wikipedia-style reference corpora, and SEC filings. Do not use this for personal memory, user notes, project decisions, or Obsidian wiki pages; use obsidian_wiki_query for those.",
+    "properties": {
+      "language": "Corpus language, default zh; sec_filing defaults to en.",
+      "source_type": "Optional business source type, for example wikipedia, deep_research, sec_filing, or generic.",
+      "source_id": "Optional exact source id filter.",
+      "source_ids": "Optional list of source ids to search within.",
+      "ticker": "SEC filing ticker filter.",
+      "company_name": "SEC filing company filter.",
+      "form_type": "SEC filing form type such as 10-K or 10-Q.",
+      "fiscal_year": "SEC filing fiscal year filter.",
+      "section_title": "SEC filing section title filter."
+    }
+  },
+  "write_file": {
+    "description": "Write a UTF-8 markdown file inside the local Jarvis workspace. Use this when the user explicitly asks to create or overwrite a markdown file in the repository. Always provide a workspace-relative .md path. Do not guess paths outside the project. If the target directory does not already exist, stop and ask the user before proceeding.",
+    "properties": {
+      "relative_path": "Workspace-relative markdown path such as docs/research/2026-05/example.md.",
+      "content": "Full markdown content to write."
+    }
+  },
+  "scheduled_task": {
+    "description": "Create, list, or remove Jarvis reminder tasks when the user asks to be reminded, notified later, woken up, or shown/cancelled existing reminders. Use natural-language time_text such as 今天10点 or in 20 minutes; Jarvis parses and validates the concrete schedule. The runtime supplies conversation_id, platform, and external_chat_id automatically; do not ask the user for those fields.",
+    "properties": {}
+  },
+  "deliver_file": {
+    "description": "Deliver a previously generated local artifact or an explicitly requested workspace file to the current conversation channel. Use only when the user explicitly asks to send, resend, upload, or deliver a file/image. Do not use this as part of ordinary image generation; generated artifacts are delivered automatically by the runtime. Prefer artifact_id for historical artifacts and use path only when the user explicitly names a file. The runtime supplies conversation_id, turn_id, platform, and external_chat_id automatically.",
+    "properties": {
+      "artifact_id": "Preferred artifact id to deliver or redeliver.",
+      "path": "Workspace-local file path fallback when artifact_id is unavailable.",
+      "file_path": "Deprecated alias for path.",
+      "filename": "Optional display filename."
+    }
+  },
+  "x_search": {
+    "description": "Use xAI server-side X/Twitter search for direct public X/Twitter post lookup. Use this specialized tool for direct X/Twitter search when the user asks for latest twitter posts, X/Twitter discussion, public posts from handles, or queries like 马斯克的最新twitter. Prefer this over tavily_search when the user's target is specifically X/Twitter content.",
+    "properties": {
+      "query": "The X/Twitter search query.",
+      "handles": "Optional X handles to include, without @.",
+      "exclude_handles": "Optional X handles to exclude, without @.",
+      "date_from": "Optional lower date bound in YYYY-MM-DD.",
+      "date_to": "Optional upper date bound in YYYY-MM-DD.",
+      "max_results": "Desired maximum result count, 1-20.",
+      "model": "Optional xAI responses model override."
+    }
+  },
+  "tavily_search": {
+    "description": "Search the web using Tavily AI Search API. Use this when the user asks about current events, facts, or anything that requires up-to-date information from the internet. It can also find indexed X/Twitter pages or web coverage of X/Twitter activity when a general web/news search is enough; prefer the specialized x_search tool when the user specifically asks for direct X/Twitter posts. Search ONCE per question. After receiving results, summarize them and reply to the user immediately. Do NOT search the same topic multiple times.",
+    "properties": {
+      "query": "The search query string.",
+      "search_depth": "'basic' for fast results (1-2s), 'advanced' for comprehensive research (5-10s).",
+      "topic": "'general' for broad web search, 'news' for current events in the last 7 days.",
+      "max_results": "Maximum number of results to return (1-10).",
+      "include_domains": "Optional list of domains to specifically include.",
+      "exclude_domains": "Optional list of domains to exclude."
+    }
+  }
+}
