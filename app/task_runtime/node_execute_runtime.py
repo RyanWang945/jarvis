@@ -11,7 +11,7 @@ from typing import Any, Callable, Protocol
 from app.agent_react.context_manager import ContextManager
 from app.config import get_settings
 from app.llm.client import LLMMessage, parse_json_content
-from app.observability import add_event, record_exception, set_attributes, span_context
+from app.observability import add_event, content_capture_enabled, record_exception, set_attributes, span_context, trace_preview
 from app.llm.provider_adapters import NormalizedLLMResponse, NormalizedToolCall
 from app.llm.model_profiles import LLMNode
 from app.llm.model_router import ModelRouter
@@ -59,6 +59,7 @@ _REACT_WRITE_TOOLS = {"write_file"}
 _SKILL_TOOL_NAMES = {"Skill"}
 _MAX_REACT_SELECTED_SKILLS = 3
 _MAX_REACT_SKILL_GUIDANCE_CHARS = 12000
+_TOOL_TRACE_CONTENT_LIMIT = 4000
 
 
 @dataclass(frozen=True)
@@ -129,6 +130,7 @@ class LLMNodeExecuteRuntime:
                         "jarvis.node_id": context.node.id,
                         "jarvis.provider": getattr(resolved.profile, "provider", ""),
                         "jarvis.model": getattr(resolved.profile, "id", ""),
+                        "langfuse.observation.type": "generation",
                     },
                 ):
                     response = resolved.client.chat_normalized(
@@ -143,6 +145,7 @@ class LLMNodeExecuteRuntime:
                             "jarvis.usage.prompt_tokens": response.usage.prompt_tokens if response.usage is not None else None,
                             "jarvis.usage.completion_tokens": response.usage.completion_tokens if response.usage is not None else None,
                             "jarvis.usage.total_tokens": response.usage.total_tokens if response.usage is not None else None,
+                            "langfuse.observation.model.name": response.model,
                         }
                     )
                 usage_record = usage_record_from_response(response, stage="llm_node")
@@ -151,7 +154,7 @@ class LLMNodeExecuteRuntime:
                 if response.tool_calls:
                     messages.append(_assistant_tool_call_message(response))
                     for tool_call in response.tool_calls:
-                        observation, record = self._run_skill_tool_call(tool_call)
+                        observation, record = self._run_skill_tool_call(context, tool_call)
                         tool_calls.append(record)
                         messages.append(
                             LLMMessage(
@@ -183,7 +186,11 @@ class LLMNodeExecuteRuntime:
             return _failed(context.node, "llm_runtime_no_response", "LLM runtime finished without a response.", retryable=True)
         return _llm_result_from_response(context, response, tool_calls, usage_records)
 
-    def _run_skill_tool_call(self, tool_call: NormalizedToolCall) -> tuple[dict[str, Any], dict[str, Any]]:
+    def _run_skill_tool_call(
+        self,
+        context: NodeExecutionContext,
+        tool_call: NormalizedToolCall,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         started = time.perf_counter()
         record: dict[str, Any] = {
             "id": tool_call.id,
@@ -196,27 +203,63 @@ class LLMNodeExecuteRuntime:
             return {"ok": False, "status": "rejected", "error": message}, record
         try:
             tool = get_tool_definition(tool_call.name)
+        except Exception as exc:
+            message = str(exc)
+            record.update({"status": "failed", "summary": message})
+            logger.exception("llm node skill tool definition failed tool_call_id=%s elapsed_ms=%s", tool_call.id, int((time.perf_counter() - started) * 1000))
+            return {"ok": False, "status": "failed", "error": message}, record
+        try:
             with span_context(
                 "tool.call",
                 **{
+                    "jarvis.turn_id": context.runtime_context.turn.turn_id,
+                    "jarvis.conversation_id": context.runtime_context.turn.conversation_id,
+                    "jarvis.node_id": context.node.id,
                     "jarvis.tool_name": tool.name,
                     "jarvis.tool_call_id": tool_call.id,
+                    "langfuse.observation.type": "span",
+                    **_tool_input_trace_attributes(tool_call),
                 },
             ):
-                result = self._skill_tool_runner(
-                    tool,
-                    tool_call.args,
-                    timeout_seconds=self._skill_tool_timeout_seconds,
+                try:
+                    result = self._skill_tool_runner(
+                        tool,
+                        tool_call.args,
+                        timeout_seconds=self._skill_tool_timeout_seconds,
+                    )
+                except Exception as exc:
+                    error_observation = {"ok": False, "status": "failed", "error": str(exc)}
+                    set_attributes(
+                        **{
+                            "jarvis.status": "failed",
+                            **_tool_output_trace_attributes(error_observation),
+                        }
+                    )
+                    record_exception(exc, **{"jarvis.tool_name": tool_call.name, "jarvis.tool_call_id": tool_call.id})
+                    raise
+                status = "completed" if result.ok else "failed"
+                observation = {
+                    "ok": result.ok,
+                    "status": status,
+                    "tool_name": tool.name,
+                    "summary": result.summary,
+                    "stdout": truncate(_tool_observation_stdout(tool.name, result.stdout)),
+                    "stderr": truncate(result.stderr),
+                }
+                set_attributes(
+                    **{
+                        "jarvis.status": status,
+                        "jarvis.exit_code": result.exit_code,
+                        **_tool_output_trace_attributes(observation),
+                    }
                 )
         except Exception as exc:
             message = str(exc)
             record.update({"status": "failed", "summary": message})
-            record_exception(exc, **{"jarvis.tool_name": tool_call.name, "jarvis.tool_call_id": tool_call.id})
             logger.exception("llm node skill tool failed tool_call_id=%s elapsed_ms=%s", tool_call.id, int((time.perf_counter() - started) * 1000))
             return {"ok": False, "status": "failed", "error": message}, record
 
         status = "completed" if result.ok else "failed"
-        set_attributes(**{"jarvis.status": status})
         record.update(
             {
                 "status": status,
@@ -227,14 +270,6 @@ class LLMNodeExecuteRuntime:
         loaded_skill = _loaded_skill_from_tool_result(tool.name, result.stdout)
         if loaded_skill is not None:
             record["loaded_skill"] = loaded_skill
-        observation = {
-            "ok": result.ok,
-            "status": status,
-            "tool_name": tool.name,
-            "summary": result.summary,
-            "stdout": truncate(_tool_observation_stdout(tool.name, result.stdout)),
-            "stderr": truncate(result.stderr),
-        }
         return observation, record
 
 
@@ -286,6 +321,7 @@ class ReactNodeExecuteRuntime:
                         "jarvis.node_id": context.node.id,
                         "jarvis.provider": getattr(resolved.profile, "provider", ""),
                         "jarvis.model": getattr(resolved.profile, "id", ""),
+                        "langfuse.observation.type": "generation",
                     },
                 ):
                     response = resolved.client.chat_normalized(
@@ -300,6 +336,7 @@ class ReactNodeExecuteRuntime:
                             "jarvis.usage.prompt_tokens": response.usage.prompt_tokens if response.usage is not None else None,
                             "jarvis.usage.completion_tokens": response.usage.completion_tokens if response.usage is not None else None,
                             "jarvis.usage.total_tokens": response.usage.total_tokens if response.usage is not None else None,
+                            "langfuse.observation.model.name": response.model,
                         }
                     )
                 usage_record = usage_record_from_response(response, stage="react_node")
@@ -400,18 +437,49 @@ class ReactNodeExecuteRuntime:
                     "jarvis.node_id": context.node.id,
                     "jarvis.tool_name": tool.name,
                     "jarvis.tool_call_id": tool_call.id,
+                    "langfuse.observation.type": "span",
+                    **_tool_input_trace_attributes(tool_call),
                 },
             ):
-                result = self._tool_runner(tool, tool_call.args, timeout_seconds=self._tool_timeout_seconds)
+                try:
+                    result = self._tool_runner(tool, tool_call.args, timeout_seconds=self._tool_timeout_seconds)
+                except Exception as exc:
+                    error_observation = {"ok": False, "status": "failed", "error": str(exc)}
+                    set_attributes(
+                        **{
+                            "jarvis.status": "failed",
+                            **_tool_output_trace_attributes(error_observation),
+                        }
+                    )
+                    record_exception(exc, **{"jarvis.tool_name": tool_call.name, "jarvis.tool_call_id": tool_call.id})
+                    raise
+                status = "completed" if result.ok else "failed"
+                observation = {
+                    "ok": result.ok,
+                    "status": status,
+                    "tool_name": tool.name,
+                    "summary": result.summary,
+                    "stdout": truncate(_tool_observation_stdout(tool.name, result.stdout)),
+                    "stderr": truncate(result.stderr),
+                    "artifacts": list(result.artifacts),
+                    "tool_artifacts": [_tool_artifact_dict(item) for item in result.tool_artifacts],
+                }
+                set_attributes(
+                    **{
+                        "jarvis.status": status,
+                        "jarvis.exit_code": result.exit_code,
+                        "jarvis.artifact_count": len(result.artifacts),
+                        "jarvis.tool_artifact_count": len(result.tool_artifacts),
+                        **_tool_output_trace_attributes(observation),
+                    }
+                )
         except Exception as exc:
             message = str(exc)
             record.update({"status": "failed", "summary": message})
-            record_exception(exc, **{"jarvis.tool_name": tool_call.name, "jarvis.tool_call_id": tool_call.id})
             logger.exception("react node tool failed tool=%s tool_call_id=%s elapsed_ms=%s", tool_call.name, tool_call.id, int((time.perf_counter() - started) * 1000))
             return {"ok": False, "status": "failed", "error": message}, record
 
         status = "completed" if result.ok else "failed"
-        set_attributes(**{"jarvis.status": status})
         logger.info(
             "react node tool finished tool=%s tool_call_id=%s status=%s exit_code=%s artifact_count=%s elapsed_ms=%s summary=%s",
             tool_call.name,
@@ -434,16 +502,6 @@ class ReactNodeExecuteRuntime:
         loaded_skill = _loaded_skill_from_tool_result(tool.name, result.stdout)
         if loaded_skill is not None:
             record["loaded_skill"] = loaded_skill
-        observation = {
-            "ok": result.ok,
-            "status": status,
-            "tool_name": tool.name,
-            "summary": result.summary,
-            "stdout": truncate(_tool_observation_stdout(tool.name, result.stdout)),
-            "stderr": truncate(result.stderr),
-            "artifacts": list(result.artifacts),
-            "tool_artifacts": [_tool_artifact_dict(item) for item in result.tool_artifacts],
-        }
         return observation, record
 
 
@@ -554,6 +612,7 @@ class CoderNodeExecuteRuntime:
                     "jarvis.provider": self._provider.name,
                     "jarvis.repo_id": repo_id,
                     "jarvis.approval_required": False,
+                    "langfuse.observation.type": "span",
                 },
             ):
                 result = self._provider.run(request)
@@ -1226,6 +1285,40 @@ def _tool_artifact_dict(artifact: Any) -> dict[str, Any]:
     }
 
 
+def _tool_input_trace_attributes(tool_call: NormalizedToolCall) -> dict[str, Any]:
+    if not content_capture_enabled():
+        return {}
+    payload = {
+        "tool_call_id": tool_call.id,
+        "tool_name": tool_call.name,
+        "args": _redact_trace_mapping(tool_call.args),
+    }
+    return {"langfuse.observation.input": trace_preview(payload, limit=_TOOL_TRACE_CONTENT_LIMIT)}
+
+
+def _tool_output_trace_attributes(observation: dict[str, Any]) -> dict[str, Any]:
+    if not content_capture_enabled():
+        return {}
+    return {"langfuse.observation.output": trace_preview(observation, limit=_TOOL_TRACE_CONTENT_LIMIT)}
+
+
+def _redact_trace_mapping(value: dict[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, item in value.items():
+        if _looks_secret_key(key):
+            result[str(key)] = "[redacted]"
+        elif isinstance(item, dict):
+            result[str(key)] = _redact_trace_mapping(item)
+        else:
+            result[str(key)] = item
+    return result
+
+
+def _looks_secret_key(key: str) -> bool:
+    text = str(key).lower()
+    return any(part in text for part in ("token", "secret", "password", "api_key", "auth"))
+
+
 def _optional_text(value: Any) -> str | None:
     if value is None:
         return None
@@ -1322,21 +1415,21 @@ def _llm_coder_git_context(
         LLMMessage(
             role="system",
             content=(
-                "You resolve Git workspace intent for one Jarvis coder node. "
-                "Return JSON only. Do not plan code changes. "
-                "Jarvis runtime will perform checkout/worktree/merge; the coder must not."
+                "你负责为一个 Jarvis coder node 解析 Git workspace 意图。"
+                "只返回 JSON。不要规划代码变更。"
+                "checkout/worktree/merge 由 Jarvis runtime 执行；coder 不得执行这些操作。"
             ),
         ),
         LLMMessage(
             role="user",
             content=(
-                "Choose the registered repository and Git branch context for this coder node.\n"
-                "Set target_branch to the branch the user wants Jarvis runtime to integrate work into when one is named. "
-                "Do not decide approval here; Jarvis permission gates check protected Git actions at execution time.\n"
-                "Output exactly this shape with empty strings for unknown optional fields:\n"
+                "为这个 coder node 选择已注册仓库和 Git 分支上下文。\n"
+                "如果用户命名了希望 Jarvis runtime 集成工作的分支，将 target_branch 设为该分支。"
+                "不要在这里决定 approval；Jarvis permission gates 会在执行时检查受保护 Git 操作。\n"
+                "严格输出以下结构；未知的可选字段使用空字符串：\n"
                 '{"repo_id":"", "source_branch":"", "target_branch":"", "worktree_mode":"node_branch_worktree|", '
                 '"confidence":0.0}\n\n'
-                f"Input:\n{json.dumps(payload, ensure_ascii=False, default=str)}"
+                f"输入：\n{json.dumps(payload, ensure_ascii=False, default=str)}"
             ),
         ),
     ]

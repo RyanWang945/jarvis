@@ -77,7 +77,7 @@ def span_context(name: str, **attributes: Any):
         for key, value in attributes.items():
             if value is None:
                 continue
-        span.set_attribute(key, _normalize_value(value))
+            span.set_attribute(key, _normalize_value(value))
         yield span
 
 

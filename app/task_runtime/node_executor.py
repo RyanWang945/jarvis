@@ -73,6 +73,7 @@ class NodeExecutor:
                         "jarvis.turn_id": base_runtime_context.turn.turn_id,
                         "jarvis.node_id": node.id,
                         "jarvis.runtime": node.runtime,
+                        "langfuse.observation.type": "span",
                     },
                 ):
                     logger.info(

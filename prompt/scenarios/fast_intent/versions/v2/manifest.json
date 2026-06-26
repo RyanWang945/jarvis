@@ -1,0 +1,18 @@
+{
+  "id": "fast_intent:v2",
+  "scenario": "fast_intent",
+  "version": "v2",
+  "description": "用于简单对话快速回复或路由的中文判断提示词。",
+  "response_format": "text",
+  "variables": ["input_json"],
+  "messages": [
+    {
+      "role": "system",
+      "template": "system.md"
+    },
+    {
+      "role": "user",
+      "template": "user.md"
+    }
+  ]
+}

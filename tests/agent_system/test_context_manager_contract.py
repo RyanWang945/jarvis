@@ -64,7 +64,7 @@ def test_context_contract_keeps_current_turn_contract_under_tight_budget() -> No
     assert "jarvis:" in system
     assert "Current turn objective:" in system
     assert "修改 jarvis-architecture-v3.png 的路由关系" in system
-    assert "Recent artifacts:" in system
+    assert "近期 artifacts：" in system
     assert "filename=jarvis-architecture-v3.png" in system
     assert model_messages[-1].role == "user"
     assert model_messages[-1].content == "这个图不对，按路由关系改一下"

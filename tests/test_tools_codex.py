@@ -85,7 +85,7 @@ def test_codex_coder_runs_with_clean_stdout_and_jsonl_artifact(monkeypatch, tmp_
     assert result.ok is True
     assert captured["provider_command"] == ["codex"]
     assert captured["workdir"] == repo.resolve()
-    assert "Jarvis coder worker instructions" in str(captured["instruction"])
+    assert "Jarvis coder worker 指令" in str(captured["instruction"])
     assert "Changed README and ran tests." in result.stdout
     assert "{\"type\"" not in result.stdout
     assert "[JARVIS_" not in result.stdout
@@ -191,10 +191,10 @@ def test_codex_instruction_contract_overrides_generated_preconfirmation() -> Non
         {"allow_commit": True, "allow_push": True},
     )
 
-    assert "Approval authority lives in the Codex approval flow" in instruction
-    assert "do not replace it with chat confirmations" in instruction
-    assert "Do not stop to ask Jarvis or the user to confirm routine execution details" in instruction
-    assert "choose a concise commit message yourself" in instruction
+    assert "approval 权限属于 Codex approval 流程" in instruction
+    assert "不要用普通聊天确认替代它" in instruction
+    assert "不要停下来询问 Jarvis 或用户来确认常规执行细节" in instruction
+    assert "你自行选择一个简洁 commit message" in instruction
     assert "请在执行前让我确认 commit message" in instruction
 
 
@@ -204,10 +204,10 @@ def test_codex_instruction_contract_respects_read_only_delegation() -> None:
         {"_read_only": True, "allow_commit": True, "allow_push": True},
     )
 
-    assert "This is a read-only task: inspect, analyze, review, and report only." in instruction
-    assert "Do not edit, create, delete, rename, stage, commit, or push files." in instruction
-    assert "Prefer direct file edits" not in instruction
-    assert "End with a concise inline report" in instruction
+    assert "这是只读任务：只能检查、分析、评审和报告" in instruction
+    assert "不要编辑、创建、删除、重命名、暂存、提交或 push 文件" in instruction
+    assert "优先直接修改文件" not in instruction
+    assert "以简洁的内联报告结束" in instruction
 
 
 def test_codex_logs_startup_context_and_log_paths(monkeypatch, tmp_path: Path) -> None:

@@ -1,0 +1,18 @@
+{
+  "id": "kb_eval_gold_span_refine:v2",
+  "scenario": "kb_eval_gold_span_refine",
+  "version": "v2",
+  "description": "将检索评测证据细化为最小答案 span 的中文提示词。",
+  "response_format": "json_object",
+  "variables": ["input_json"],
+  "messages": [
+    {
+      "role": "system",
+      "template": "system.md"
+    },
+    {
+      "role": "user",
+      "template": "user.md"
+    }
+  ]
+}

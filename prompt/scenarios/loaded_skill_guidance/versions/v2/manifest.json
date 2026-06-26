@@ -1,0 +1,14 @@
+{
+  "id": "loaded_skill_guidance:v2",
+  "scenario": "loaded_skill_guidance",
+  "version": "v2",
+  "description": "一个或多个 skill 被加载后注入的中文消息。",
+  "response_format": "text",
+  "variables": ["skill_sections"],
+  "messages": [
+    {
+      "role": "user",
+      "template": "message.md"
+    }
+  ]
+}

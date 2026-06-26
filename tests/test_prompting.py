@@ -28,7 +28,7 @@ def test_prompt_registry_loads_project_prompt_and_renders_messages() -> None:
 def test_prompt_registry_uses_project_default_versions() -> None:
     bundle = PromptRegistry().load("heavy_plan")
 
-    assert bundle.id == "heavy_plan:v6"
+    assert bundle.id == "heavy_plan:v7"
 
 
 def test_project_prompt_config_defaults_are_loadable() -> None:
@@ -60,9 +60,9 @@ def test_tool_definitions_prompt_catalog_populates_llm_tool_schema() -> None:
     tools = build_llm_tools(allowed_tools={"read_file"})
     read_file = tools[0]["function"]
 
-    assert PromptRegistry().load("tool_definitions").id == "tool_definitions:v1"
-    assert read_file["description"].startswith("Read a known local workspace file")
-    assert read_file["parameters"]["properties"]["path"]["description"].startswith("Workspace-relative file path")
+    assert PromptRegistry().load("tool_definitions").id == "tool_definitions:v2"
+    assert read_file["description"].startswith("按路径读取本地 workspace")
+    assert read_file["parameters"]["properties"]["path"]["description"].startswith("workspace 相对文件路径")
 
 
 def test_prompt_registry_uses_active_version_from_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

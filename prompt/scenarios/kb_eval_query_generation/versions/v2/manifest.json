@@ -1,0 +1,18 @@
+{
+  "id": "kb_eval_query_generation:v2",
+  "scenario": "kb_eval_query_generation",
+  "version": "v2",
+  "description": "从源文档 chunk 生成真实中文检索评测 query 的中文提示词。",
+  "response_format": "json_object",
+  "variables": ["input_json"],
+  "messages": [
+    {
+      "role": "system",
+      "template": "system.md"
+    },
+    {
+      "role": "user",
+      "template": "user.md"
+    }
+  ]
+}

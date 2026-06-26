@@ -16,7 +16,7 @@ from typing import Any
 from app.config import Settings, get_settings
 from app.llm.model_profiles import LLMNode
 from app.llm.model_router import ModelRouter
-from app.observability import add_event, content_capture_enabled, set_attributes, trace_preview
+from app.observability import add_event, content_capture_enabled, set_attributes, span_context, trace_preview
 from app.prompting import PromptRegistry
 from app.task_runtime.node_result import NodeArtifact, NodeError, NodeResult
 from app.task_runtime.planner import PlanNode
@@ -35,7 +35,7 @@ _REACT_TIMEOUT_SECONDS = 900  # 15 minutes
 _FINALIZE_TIMEOUT_SECONDS = 180  # 3 minutes
 _FINALIZE_MAX_TURNS = 1
 _CLAUDE_NATIVE_MUTATION_TOOLS = ["Write", "Edit", "MultiEdit", "NotebookEdit"]
-_CLAUDE_ALWAYS_DISALLOWED_TOOLS = ["Bash"]
+_CLAUDE_ALWAYS_DISALLOWED_TOOLS = ["Bash", "WebFetch", "WebSearch"]
 _REACT_WRITE_TOOLS = {"write_file"}
 _FINALIZE_DISALLOWED_TOOLS = [
     "Bash",
@@ -284,9 +284,11 @@ async def _run_agent(
         "ANTHROPIC_BASE_URL": endpoint,
         "ANTHROPIC_AUTH_TOKEN": api_key,
     }
+    trace_attributes = _claude_trace_attributes(context)
     mcp_server, _jarvis_tool_names = build_claude_mcp_server(
         _claude_react_tool_definitions(context),
         tool_timeout_seconds=tool_timeout_seconds,
+        trace_attributes=trace_attributes,
     )
 
     options = ClaudeAgentOptions(
@@ -304,10 +306,12 @@ async def _run_agent(
     summary = ""
     tool_calls: list[dict[str, Any]] = []
     tool_start_times: dict[str, float] = {}  # tool_call_id -> perf_counter
-    usage_records: list[dict[str, Any]] = []
+    step_usage_records: list[dict[str, Any]] = []
+    result_usage_record: dict[str, Any] | None = None
     final_text = ""
     ok = False
     step_index = 0
+    llm_call_index = 0
     max_turns_reached = False
     session_id = ""
 
@@ -361,7 +365,20 @@ async def _run_agent(
                 # Some SDK versions attach usage to AssistantMessage
                 msg_usage = getattr(msg, "usage", None) or getattr(msg, "model_usage", None)
                 if isinstance(msg_usage, dict) and msg_usage:
-                    usage_records.append(_normalize_usage(msg_usage, step_index))
+                    step_usage_records.append(_normalize_usage(msg_usage, step_index))
+                llm_call_index += 1
+                _record_claude_llm_span(
+                    context,
+                    model=model,
+                    llm_call_index=llm_call_index,
+                    step_index=step_index,
+                    sdk_message_type=msg_type,
+                    usage=msg_usage if isinstance(msg_usage, dict) else None,
+                    input_preview={"system_prompt": system_prompt, "prompt": prompt}
+                    if llm_call_index == 1
+                    else None,
+                    output_preview=final_text,
+                )
 
             elif msg_type == "UserMessage":
                 if hasattr(msg, "content") and isinstance(msg.content, list):
@@ -396,6 +413,8 @@ async def _run_agent(
                                             tc.get("summary", ""), limit=240
                                         )
                                     add_event("node.tool.completed", **event_attributes)
+                                    if not _is_jarvis_mcp_tool_name(tc.get("tool_name")):
+                                        _record_claude_tool_span(context, tc, elapsed_ms=elapsed_ms)
                                     break
 
             elif msg_type == "ResultMessage":
@@ -406,7 +425,22 @@ async def _run_agent(
                 # Extract usage from the result message
                 result_usage = getattr(msg, "usage", None) or getattr(msg, "model_usage", None)
                 if isinstance(result_usage, dict) and result_usage:
-                    usage_records.append(_normalize_usage(result_usage, -1))
+                    result_usage_record = _normalize_usage(result_usage, -1)
+                usage_records = _billable_claude_usage_records(
+                    step_usage_records,
+                    result_usage_record,
+                )
+                llm_call_index += 1
+                _record_claude_llm_span(
+                    context,
+                    model=model,
+                    llm_call_index=llm_call_index,
+                    step_index=step_index,
+                    sdk_message_type=msg_type,
+                    usage=result_usage if isinstance(result_usage, dict) else None,
+                    output_preview=final_text,
+                    status="completed" if ok else "failed",
+                )
                 if usage_records:
                     total_input = sum(r.get("input_tokens", r.get("prompt_tokens", 0)) for r in usage_records if isinstance(r, dict))
                     total_output = sum(r.get("output_tokens", r.get("completion_tokens", 0)) for r in usage_records if isinstance(r, dict))
@@ -490,7 +524,10 @@ async def _run_agent(
         "final_text_len": len(final_text),
         "max_turns_reached": max_turns_reached,
         "session_id": session_id,
-        "usage_records": usage_records,
+        "usage_records": _billable_claude_usage_records(
+            step_usage_records,
+            result_usage_record,
+        ),
     }
 
 
@@ -528,10 +565,12 @@ async def _run_finalize_agent(
     prompt = _build_finalize_prompt(context, primary_result)
     final_text = ""
     summary = ""
-    usage_records: list[dict[str, Any]] = []
+    step_usage_records: list[dict[str, Any]] = []
+    result_usage_record: dict[str, Any] | None = None
     finalize_session_id = ""
     tool_calls: list[dict[str, Any]] = []
     ok = False
+    llm_call_index = 0
 
     try:
         async for msg in query(prompt=prompt, options=options):
@@ -540,7 +579,7 @@ async def _run_finalize_agent(
             if msg_type == "AssistantMessage":
                 msg_usage = getattr(msg, "usage", None) or getattr(msg, "model_usage", None)
                 if isinstance(msg_usage, dict) and msg_usage:
-                    usage_records.append(_normalize_usage(msg_usage, _FINALIZE_MAX_TURNS))
+                    step_usage_records.append(_normalize_usage(msg_usage, _FINALIZE_MAX_TURNS))
                 if hasattr(msg, "content") and isinstance(msg.content, list):
                     for block in msg.content:
                         block_type = type(block).__name__
@@ -555,6 +594,18 @@ async def _run_finalize_agent(
                                     "status": "unexpected",
                                 }
                             )
+                llm_call_index += 1
+                _record_claude_llm_span(
+                    context,
+                    model=model,
+                    llm_call_index=llm_call_index,
+                    step_index=_FINALIZE_MAX_TURNS,
+                    sdk_message_type=msg_type,
+                    usage=msg_usage if isinstance(msg_usage, dict) else None,
+                    input_preview=prompt if llm_call_index == 1 else None,
+                    output_preview=final_text,
+                    phase="finalize",
+                )
             elif msg_type == "ResultMessage":
                 ok = not bool(getattr(msg, "is_error", False)) and getattr(msg, "status", "") != "error"
                 result_text = _result_message_text(msg)
@@ -562,7 +613,19 @@ async def _run_finalize_agent(
                     final_text = result_text
                 result_usage = getattr(msg, "usage", None) or getattr(msg, "model_usage", None)
                 if isinstance(result_usage, dict) and result_usage:
-                    usage_records.append(_normalize_usage(result_usage, -2))
+                    result_usage_record = _normalize_usage(result_usage, -2)
+                llm_call_index += 1
+                _record_claude_llm_span(
+                    context,
+                    model=model,
+                    llm_call_index=llm_call_index,
+                    step_index=_FINALIZE_MAX_TURNS,
+                    sdk_message_type=msg_type,
+                    usage=result_usage if isinstance(result_usage, dict) else None,
+                    output_preview=final_text,
+                    status="completed" if ok else "failed",
+                    phase="finalize",
+                )
     except Exception as exc:
         logger.warning("claude react finalize fork failed session_id=%s error=%s", session_id, exc, exc_info=True)
         add_event(
@@ -577,7 +640,10 @@ async def _run_finalize_agent(
             "summary": f"Finalize fork failed: {exc}",
             "final_text": "",
             "final_text_len": 0,
-            "usage_records": usage_records,
+            "usage_records": _billable_claude_usage_records(
+                step_usage_records,
+                result_usage_record,
+            ),
             "session_id": finalize_session_id,
             "tool_calls": tool_calls,
         }
@@ -618,7 +684,10 @@ async def _run_finalize_agent(
         "summary": summary or final_text.strip(),
         "final_text": final_text,
         "final_text_len": len(final_text),
-        "usage_records": usage_records,
+        "usage_records": _billable_claude_usage_records(
+            step_usage_records,
+            result_usage_record,
+        ),
         "session_id": finalize_session_id,
         "tool_calls": tool_calls,
     }
@@ -697,8 +766,8 @@ def _result_message_text(msg: Any) -> str:
 def _build_finalize_prompt(context, primary_result: dict[str, Any]) -> str:
     payload = {
         "instruction": (
-            "Finalize the current node using only the existing resumed conversation and tool results. "
-            "Do not call any tools. Return the required JSON schema now."
+            "只使用已恢复会话中已有的对话和工具结果来收尾当前节点。"
+            "不要调用任何工具。现在返回要求的 JSON schema。"
         ),
         "user_objective": context.user_objective,
         "node": context.node.model_dump(mode="json"),
@@ -711,12 +780,12 @@ def _build_finalize_prompt(context, primary_result: dict[str, Any]) -> str:
 def _finalize_system_prompt(context) -> str:
     temporal_line = _build_temporal_context_line(context)
     parts = [
-        "You are Jarvis ClaudeReactNodeExecuteRuntime finalizer.",
-        "You are resuming a prior tool-using session that reached its step limit before producing final output.",
-        "Use only the conversation and tool observations already present in the resumed session.",
-        "Do not call tools, search the web, read files, or request more information.",
-        "Return JSON matching the configured schema: status, summary, findings, sources, data, artifacts.",
-        "If the existing evidence is insufficient, return status 'blocked' with a concrete summary of what is missing.",
+        "你是 Jarvis ClaudeReactNodeExecuteRuntime finalizer。",
+        "你正在恢复一个之前使用工具的会话；该会话在产出最终结果前达到了步骤上限。",
+        "只能使用已恢复会话中已有的对话和工具 observations。",
+        "不要调用工具、搜索网页、读取文件或请求更多信息。",
+        "返回符合已配置 schema 的 JSON：status、summary、findings、sources、data、artifacts。",
+        "如果已有证据不足，返回 status 'blocked'，并在 summary 中具体说明缺少什么。",
     ]
     if temporal_line:
         parts.append(temporal_line)
@@ -811,6 +880,109 @@ def _looks_secret_key(key: str) -> bool:
     return any(part in text for part in ("token", "secret", "password", "api_key", "auth"))
 
 
+def _is_jarvis_mcp_tool_name(tool_name: Any) -> bool:
+    return str(tool_name or "").startswith("mcp__jarvis__")
+
+
+def _claude_trace_attributes(context) -> dict[str, Any]:
+    runtime_context = getattr(context, "runtime_context", None) or RuntimeContext.from_hints(context.legacy_hints)
+    return {
+        "jarvis.turn_id": runtime_context.turn.turn_id,
+        "jarvis.conversation_id": runtime_context.turn.conversation_id,
+        "jarvis.node_id": context.node.id,
+    }
+
+
+def _record_claude_llm_span(
+    context,
+    *,
+    model: str,
+    llm_call_index: int,
+    step_index: int,
+    sdk_message_type: str,
+    usage: dict[str, Any] | None = None,
+    input_preview: Any | None = None,
+    output_preview: Any | None = None,
+    status: str | None = None,
+    phase: str = "agent",
+) -> None:
+    attributes: dict[str, Any] = {
+        **_claude_trace_attributes(context),
+        "jarvis.provider": "deepseek",
+        "jarvis.model": model,
+        "jarvis.runtime_backend": "claude_agent_sdk",
+        "jarvis.llm_call_index": llm_call_index,
+        "jarvis.step_index": step_index,
+        "jarvis.sdk_message_type": sdk_message_type,
+        "jarvis.phase": phase,
+        "langfuse.observation.type": "generation",
+        "langfuse.observation.model.name": model,
+    }
+    if status is not None:
+        attributes["jarvis.status"] = status
+    if usage:
+        input_tokens = usage.get("input_tokens") or usage.get("prompt_tokens")
+        output_tokens = usage.get("output_tokens") or usage.get("completion_tokens")
+        attributes.update(
+            {
+                "jarvis.usage.prompt_tokens": input_tokens,
+                "jarvis.usage.completion_tokens": output_tokens,
+                "jarvis.usage.total_tokens": usage.get("total_tokens"),
+            }
+        )
+    if content_capture_enabled():
+        if input_preview is not None:
+            attributes["langfuse.observation.input"] = trace_preview(input_preview, limit=1200)
+        if output_preview:
+            attributes["langfuse.observation.output"] = trace_preview(output_preview, limit=1200)
+    with span_context("llm.call", **attributes):
+        pass
+
+
+def _record_claude_tool_span(
+    context,
+    tool_call: dict[str, Any],
+    *,
+    elapsed_ms: int,
+    phase: str = "agent",
+) -> None:
+    attributes: dict[str, Any] = {
+        **_claude_trace_attributes(context),
+        "jarvis.tool_call_id": tool_call.get("id"),
+        "jarvis.tool_name": tool_call.get("tool_name"),
+        "jarvis.runtime_backend": "claude_agent_sdk",
+        "jarvis.phase": phase,
+        "jarvis.status": tool_call.get("status"),
+        "jarvis.elapsed_ms": elapsed_ms,
+        "jarvis.artifact_count": len(tool_call.get("artifacts") or []),
+        "jarvis.tool_artifact_count": len(tool_call.get("tool_artifacts") or []),
+        "langfuse.observation.type": "span",
+    }
+    if content_capture_enabled():
+        raw_args = tool_call.get("args")
+        args = raw_args if isinstance(raw_args, dict) else {}
+        attributes["langfuse.observation.input"] = trace_preview(
+            {
+                "tool_call_id": tool_call.get("id"),
+                "tool_name": tool_call.get("tool_name"),
+                "args": _trace_tool_args(args),
+            },
+            limit=4000,
+        )
+        attributes["langfuse.observation.output"] = trace_preview(
+            {
+                "ok": tool_call.get("ok"),
+                "status": tool_call.get("status"),
+                "summary": tool_call.get("summary"),
+                "artifacts": tool_call.get("artifacts") or [],
+                "tool_artifacts": tool_call.get("tool_artifacts") or [],
+            },
+            limit=4000,
+        )
+    with span_context("tool.call", **attributes):
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Prompt construction
 # ---------------------------------------------------------------------------
@@ -901,29 +1073,29 @@ def _build_temporal_context_line(context) -> str:
     tz = temporal.get("timezone", "")
     if not date:
         return ""
-    parts = [f"Current date: {date}"]
+    parts = [f"当前日期：{date}"]
     if time_:
-        parts.append(f"Current time: {time_}")
+        parts.append(f"当前时间：{time_}")
     if tz:
-        parts.append(f"Timezone: {tz}")
+        parts.append(f"时区：{tz}")
     return " | ".join(parts)
 
 
 _FINAL_RESPONSE_GUIDANCE = """
-Execute only this node. The final answer is a machine-readable node result, not a user-facing reply.
-Respect node.mode: read nodes gather evidence only; write nodes may create requested artifacts with Claude native file tools.
-For written files, include artifacts with paths relative to runtime_context.session_workspace_dir when available.
-Return JSON matching the configured schema with status, summary, findings, sources, data, and artifacts.
-If the task cannot be completed, set status to failed or blocked and explain the reason in summary.
+只执行这个节点。最终答案是机器可读的节点结果，不是面向用户的回复。
+遵循 node.mode：read 节点只收集证据；write 节点可以用 Claude 原生文件工具创建被请求的 artifacts。
+对于写入的文件，如可用，请在 artifacts 中包含相对于 runtime_context.session_workspace_dir 的路径。
+返回符合已配置 schema 的 JSON，包含 status、summary、findings、sources、data 和 artifacts。
+如果任务无法完成，将 status 设为 failed 或 blocked，并在 summary 中解释原因。
 """.strip()
 
 
 def _fallback_system_prompt(context=None) -> str:
     parts = [
-        "You are Jarvis ClaudeReactNodeExecuteRuntime. "
-        "Execute one non-repository plan node using available tools. "
-        "Do not perform code edits, shell commands, or repository workflows "
-        "(code and shell work belongs to coder runtime nodes).",
+        "你是 Jarvis ClaudeReactNodeExecuteRuntime。"
+        "使用可用工具执行一个非仓库计划节点。"
+        "不要执行代码编辑、shell 命令或仓库工作流"
+        "（代码和 shell 工作属于 coder runtime nodes）。",
     ]
     if context is not None:
         temporal_line = _build_temporal_context_line(context)
@@ -1081,7 +1253,7 @@ def _artifacts_from_data(data: dict[str, Any]) -> list[NodeArtifact]:
 def _normalize_usage(usage: dict[str, Any], step_index: int) -> dict[str, Any]:
     """Normalize SDK usage dict to Jarvis usage record format."""
     return {
-        "source": "claude_react",
+        "source": "claude_agent_sdk",
         "stage": f"claude_react_step_{step_index}" if step_index >= 0 else "claude_react",
         "provider": "deepseek",
         "model": usage.get("model", ""),
@@ -1092,6 +1264,16 @@ def _normalize_usage(usage: dict[str, Any], step_index: int) -> dict[str, Any]:
         "cache_creation_input_tokens": usage.get("cache_creation_input_tokens", 0),
         "_raw": usage,
     }
+
+
+def _billable_claude_usage_records(
+    step_usage_records: list[dict[str, Any]],
+    result_usage_record: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Use SDK aggregate usage when present; step usage is only a fallback."""
+    if result_usage_record is not None:
+        return [result_usage_record]
+    return list(step_usage_records)
 
 
 def _truncate(text: str, *, limit: int = 300) -> str:

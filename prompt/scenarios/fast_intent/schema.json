@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "FastIntentNeedsPlanArguments",
-  "description": "FastIntent returns ordinary assistant text for direct replies. For all executable work it calls needs_plan with these arguments.",
+  "description": "FastIntent 对直接回复返回普通 assistant 文本；对所有需要执行的工作，使用这些参数调用 needs_plan。",
   "type": "object",
   "additionalProperties": false,
   "required": ["confidence", "reason"],

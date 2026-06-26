@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import asyncio
+from contextlib import contextmanager
 from copy import deepcopy
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -37,6 +39,12 @@ def _context(**kwargs):
         legacy_hints=kwargs.get("legacy_hints", {}),
         instructions=kwargs.get("instructions", []),
     )
+
+
+@contextmanager
+def _recording_span_context(records, name: str, **attributes):
+    records.append((name, attributes))
+    yield None
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +110,62 @@ class TestToolAdapter:
         assert "mcp__jarvis__tavily_search" in tool_names
         assert "mcp__jarvis__shell_inspect" not in tool_names
         assert "mcp__jarvis__delegate_to_claude_code" not in tool_names
+
+    def test_sdk_tool_wrapper_creates_tool_call_span(self, monkeypatch):
+        from app.tools.common import ToolExecutionResult
+        from app.tools.definitions import ToolDefinition
+
+        records = []
+        attribute_updates = []
+        monkeypatch.setattr(
+            "app.task_runtime.claude_tool_adapter.span_context",
+            lambda name, **attrs: _recording_span_context(records, name, **attrs),
+        )
+        monkeypatch.setattr("app.task_runtime.claude_tool_adapter.content_capture_enabled", lambda: True)
+        monkeypatch.setattr(
+            "app.task_runtime.claude_tool_adapter.set_attributes",
+            lambda **attrs: attribute_updates.append(attrs),
+        )
+
+        mock_sdk = MagicMock()
+        mock_sdk.tool = lambda **kw: (lambda fn: fn)
+
+        def _handler(req):
+            return ToolExecutionResult(ok=True, exit_code=0, stdout="hello", summary="done")
+
+        tool_def = ToolDefinition(
+            name="read_file",
+            description="Read",
+            args_schema={"type": "object", "properties": {}},
+            handler=_handler,
+        )
+
+        with patch.dict("sys.modules", {"claude_agent_sdk": mock_sdk}):
+            from app.task_runtime.claude_tool_adapter import adapt_jarvis_tool_to_sdk_tool
+
+            wrapped = adapt_jarvis_tool_to_sdk_tool(
+                tool_def,
+                trace_attributes={
+                    "jarvis.turn_id": "turn-1",
+                    "jarvis.conversation_id": "conv-1",
+                    "jarvis.node_id": "node-1",
+                },
+            )
+            asyncio.run(wrapped({"path": "README.md"}))
+
+        assert records
+        name, attrs = records[0]
+        assert name == "tool.call"
+        assert attrs["jarvis.turn_id"] == "turn-1"
+        assert attrs["jarvis.conversation_id"] == "conv-1"
+        assert attrs["jarvis.node_id"] == "node-1"
+        assert attrs["jarvis.tool_name"] == "read_file"
+        assert attrs["langfuse.observation.type"] == "span"
+        assert "langfuse.observation.input" in attrs
+        assert "README.md" in attrs["langfuse.observation.input"]
+        output_updates = [item for item in attribute_updates if "langfuse.observation.output" in item]
+        assert output_updates
+        assert "hello" in output_updates[-1]["langfuse.observation.output"]
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +285,177 @@ class TestClaudeReactRuntimeExecution:
         assert result.data.get("runtime_backend") == "claude_agent_sdk"
         assert "Mocked response" in result.summary
 
+    def test_execution_creates_llm_call_spans(self, monkeypatch):
+        from app.task_runtime.claude_react_runtime import ClaudeReactNodeExecuteRuntime
+
+        records = []
+        monkeypatch.setattr(
+            "app.task_runtime.claude_react_runtime.span_context",
+            lambda name, **attrs: _recording_span_context(records, name, **attrs),
+        )
+
+        runtime = ClaudeReactNodeExecuteRuntime(
+            model_resolver=lambda ctx: MagicMock(
+                profile=MagicMock(api_key="test-key", model="deepseek-v4-flash"),
+            ),
+            max_turns=3,
+        )
+        result = runtime.run(
+            _context(
+                legacy_hints={
+                    "turn_id": 1,
+                    "conversation_id": 2,
+                }
+            )
+        )
+
+        llm_spans = [(name, attrs) for name, attrs in records if name == "llm.call"]
+        assert result.status == "completed"
+        assert llm_spans
+        assert llm_spans[0][1]["jarvis.turn_id"] == 1
+        assert llm_spans[0][1]["jarvis.conversation_id"] == 2
+        assert llm_spans[0][1]["jarvis.node_id"] == "node-1"
+        assert llm_spans[0][1]["jarvis.runtime_backend"] == "claude_agent_sdk"
+        assert llm_spans[0][1]["langfuse.observation.type"] == "generation"
+
+    def test_native_sdk_tool_result_creates_tool_call_span(self, monkeypatch):
+        from app.task_runtime.claude_react_runtime import _record_claude_tool_span
+
+        records = []
+        monkeypatch.setattr(
+            "app.task_runtime.claude_react_runtime.span_context",
+            lambda name, **attrs: _recording_span_context(records, name, **attrs),
+        )
+        monkeypatch.setattr("app.task_runtime.claude_react_runtime.content_capture_enabled", lambda: True)
+
+        _record_claude_tool_span(
+            _context(legacy_hints={"turn_id": 1, "conversation_id": 2}),
+            {
+                "id": "toolu_1",
+                "tool_name": "Read",
+                "args": {"file_path": "README.md"},
+                "status": "completed",
+                "ok": True,
+                "summary": "read file",
+            },
+            elapsed_ms=12,
+        )
+
+        tool_spans = [(name, attrs) for name, attrs in records if name == "tool.call"]
+        assert tool_spans
+        attrs = tool_spans[0][1]
+        assert attrs["jarvis.turn_id"] == 1
+        assert attrs["jarvis.conversation_id"] == 2
+        assert attrs["jarvis.node_id"] == "node-1"
+        assert attrs["jarvis.tool_name"] == "Read"
+        assert attrs["langfuse.observation.type"] == "span"
+        assert "README.md" in attrs["langfuse.observation.input"]
+        assert "read file" in attrs["langfuse.observation.output"]
+
+    def test_execution_counts_result_usage_instead_of_step_plus_result_usage(self):
+        """ClaudeAgentSDK result usage is aggregate usage, not another step to add."""
+        async def _fake_query(**kwargs):
+            text = json.dumps(
+                {
+                    "status": "completed",
+                    "summary": "usage counted once",
+                    "findings": [],
+                    "sources": [],
+                    "data": {},
+                    "artifacts": [],
+                }
+            )
+            step_usage = {
+                "model": "deepseek-v4-flash",
+                "prompt_tokens": 200,
+                "completion_tokens": 100,
+                "total_tokens": 300,
+            }
+            result_usage = {
+                "model": "deepseek-v4-flash",
+                "prompt_tokens": 1000,
+                "completion_tokens": 100,
+                "total_tokens": 1100,
+            }
+            yield type(
+                "AssistantMessage",
+                (),
+                {"content": [type("TextBlock", (), {"text": text})()], "usage": step_usage},
+            )()
+            yield type(
+                "ResultMessage",
+                (),
+                {"status": "completed", "usage": result_usage},
+            )()
+
+        mock_sdk = MagicMock()
+        mock_sdk.ClaudeAgentOptions = MagicMock(return_value=MagicMock())
+        mock_sdk.query = _fake_query
+        mock_sdk.create_sdk_mcp_server = MagicMock(return_value=MagicMock())
+        mock_sdk.tool = lambda **kw: (lambda fn: fn)
+
+        with patch.dict("sys.modules", {"claude_agent_sdk": mock_sdk}):
+            from app.runtime_usage import usage_totals
+            from app.task_runtime.claude_react_runtime import ClaudeReactNodeExecuteRuntime
+
+            runtime = ClaudeReactNodeExecuteRuntime(
+                model_resolver=lambda ctx: MagicMock(
+                    profile=MagicMock(api_key="test-key", model="deepseek-v4-flash"),
+                ),
+                max_turns=3,
+            )
+            result = runtime.run(_context())
+
+        assert result.status == "completed"
+        assert len(result.usage_records) == 1
+        assert result.usage_records[0]["stage"] == "claude_react"
+        assert result.usage_records[0]["source"] == "claude_agent_sdk"
+        assert usage_totals(result.usage_records)["total_tokens"] == 1100
+
+    def test_execution_falls_back_to_step_usage_when_result_usage_is_missing(self):
+        async def _fake_query(**kwargs):
+            text = json.dumps(
+                {
+                    "status": "completed",
+                    "summary": "step usage fallback",
+                    "findings": [],
+                    "sources": [],
+                    "data": {},
+                    "artifacts": [],
+                }
+            )
+            yield type(
+                "AssistantMessage",
+                (),
+                {
+                    "content": [type("TextBlock", (), {"text": text})()],
+                    "usage": {"prompt_tokens": 20, "completion_tokens": 5, "total_tokens": 25},
+                },
+            )()
+            yield type("ResultMessage", (), {"status": "completed"})()
+
+        mock_sdk = MagicMock()
+        mock_sdk.ClaudeAgentOptions = MagicMock(return_value=MagicMock())
+        mock_sdk.query = _fake_query
+        mock_sdk.create_sdk_mcp_server = MagicMock(return_value=MagicMock())
+        mock_sdk.tool = lambda **kw: (lambda fn: fn)
+
+        with patch.dict("sys.modules", {"claude_agent_sdk": mock_sdk}):
+            from app.runtime_usage import usage_totals
+            from app.task_runtime.claude_react_runtime import ClaudeReactNodeExecuteRuntime
+
+            runtime = ClaudeReactNodeExecuteRuntime(
+                model_resolver=lambda ctx: MagicMock(
+                    profile=MagicMock(api_key="test-key", model="deepseek-v4-flash"),
+                ),
+            )
+            result = runtime.run(_context())
+
+        assert result.status == "completed"
+        assert len(result.usage_records) == 1
+        assert result.usage_records[0]["stage"] == "claude_react_step_0"
+        assert usage_totals(result.usage_records)["total_tokens"] == 25
+
     def test_execution_handles_error(self):
         """Runtime should handle SDK query errors gracefully."""
         import sys as _sys
@@ -294,6 +529,8 @@ class TestClaudeReactRuntimeExecution:
         assert "Write" in kwargs["disallowed_tools"]
         assert "Edit" in kwargs["disallowed_tools"]
         assert "Bash" in kwargs["disallowed_tools"]
+        assert "WebFetch" in kwargs["disallowed_tools"]
+        assert "WebSearch" in kwargs["disallowed_tools"]
         assert kwargs["max_turns"] == 3
 
     def test_sdk_options_allow_native_write_tools_for_write_mode(self):
@@ -335,6 +572,8 @@ class TestClaudeReactRuntimeExecution:
         assert "MultiEdit" not in disallowed
         assert "NotebookEdit" not in disallowed
         assert "Bash" in disallowed
+        assert "WebFetch" in disallowed
+        assert "WebSearch" in disallowed
 
     def test_sdk_options_use_node_workspace_as_cwd(self, tmp_path):
         captured = {}

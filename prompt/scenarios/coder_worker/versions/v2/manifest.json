@@ -1,0 +1,14 @@
+{
+  "id": "coder_worker:v2",
+  "scenario": "coder_worker",
+  "version": "v2",
+  "description": "委派给本地仓库 coder worker 的中文执行契约。",
+  "response_format": "text",
+  "variables": ["instruction", "read_only", "allow_commit", "allow_push", "verification_cmd", "target_branch", "node_branch"],
+  "messages": [
+    {
+      "role": "user",
+      "template": "instruction.md"
+    }
+  ]
+}

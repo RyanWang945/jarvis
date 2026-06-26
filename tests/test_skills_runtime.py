@@ -87,7 +87,7 @@ def test_weather_skill_is_listed_without_body(monkeypatch) -> None:
     )
 
     reminder_content = str(messages[1].content)
-    assert "The following skills are available for use with the Skill tool:" in reminder_content
+    assert "以下 skills 可通过 Skill 工具使用：" in reminder_content
     assert "- weather-1.0.0:" in reminder_content
     assert "[Skill: weather-1.0.0]" not in reminder_content
     assert "If `tavily_search` is available" not in reminder_content

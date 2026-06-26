@@ -1,0 +1,15 @@
+{
+  "id": "tool_definitions:v2",
+  "scenario": "tool_definitions",
+  "version": "v2",
+  "description": "面向模型的中文工具描述和参数 schema 描述。",
+  "response_format": "text",
+  "variables": [],
+  "assets": ["catalog.json"],
+  "messages": [
+    {
+      "role": "system",
+      "template": "catalog.md"
+    }
+  ]
+}

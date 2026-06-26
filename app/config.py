@@ -94,7 +94,7 @@ class Settings(BaseSettings):
     otel_exporter_otlp_protocol: str = "http/protobuf"
     otel_traces_sampler: str = "parentbased_traceidratio"
     otel_traces_sampler_arg: float = 1.0
-    otel_capture_content: bool = False
+    otel_capture_content: bool = True
 
     # MySQL configuration
     mysql_host: str = "127.0.0.1"

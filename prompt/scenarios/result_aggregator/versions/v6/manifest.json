@@ -1,0 +1,18 @@
+{
+  "id": "result_aggregator:v6",
+  "scenario": "result_aggregator",
+  "version": "v6",
+  "description": "将已执行 Jarvis plan node results 汇总为最终 turn outcome 的中文提示词。",
+  "response_format": "json_object",
+  "variables": ["input_json"],
+  "messages": [
+    {
+      "role": "system",
+      "template": "system.md"
+    },
+    {
+      "role": "user",
+      "template": "user.md"
+    }
+  ]
+}

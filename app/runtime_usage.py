@@ -53,6 +53,7 @@ def usage_totals(records: list[dict[str, Any]]) -> dict[str, Any] | None:
     total = 0
     models: list[str] = []
     breakdown: list[dict[str, Any]] = []
+    by_source: dict[str, dict[str, int]] = {}
     for record in records:
         if not isinstance(record, dict):
             continue
@@ -66,6 +67,14 @@ def usage_totals(records: list[dict[str, Any]]) -> dict[str, Any] | None:
         prompt += prompt_tokens
         completion += completion_tokens
         total += total_tokens
+        source = _usage_source_bucket(record)
+        source_totals = by_source.setdefault(
+            source,
+            {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        )
+        source_totals["prompt_tokens"] += prompt_tokens
+        source_totals["completion_tokens"] += completion_tokens
+        source_totals["total_tokens"] += total_tokens
         model = str(record.get("model") or record.get("provider") or "").strip()
         if model and model not in models:
             models.append(model)
@@ -84,6 +93,7 @@ def usage_totals(records: list[dict[str, Any]]) -> dict[str, Any] | None:
         "prompt_tokens": prompt,
         "completion_tokens": completion,
         "total_tokens": total,
+        "by_source": by_source,
         "records": breakdown,
     }
 
@@ -125,6 +135,13 @@ def _provider_from_model(model: str) -> str:
     if "gpt" in text or "codex" in text or "openai" in text:
         return "openai"
     return text or "unknown"
+
+
+def _usage_source_bucket(record: dict[str, Any]) -> str:
+    source = str(record.get("source") or "").strip()
+    if source == "claude_agent_sdk":
+        return "claude_agent_sdk"
+    return "direct_api"
 
 
 def _int_value(*values: Any) -> int:

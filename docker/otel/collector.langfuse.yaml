@@ -1,0 +1,49 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 256
+  batch:
+    timeout: 1s
+    send_batch_size: 512
+  filter/langfuse_business:
+    error_mode: ignore
+    traces:
+      span:
+        - 'not (name == "feishu.agent_run" or name == "turn.run" or name == "node.execute" or name == "llm.call" or name == "tool.call" or name == "coder.run")'
+
+exporters:
+  debug:
+    verbosity: basic
+  otlp_grpc/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+  otlp_http/langfuse:
+    endpoint: http://langfuse-web:3000/api/public/otel
+    headers:
+      Authorization: ${env:LANGFUSE_OTEL_AUTH_HEADER}
+      x-langfuse-ingestion-version: "4"
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces/jaeger:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [debug, otlp_grpc/jaeger]
+    traces/langfuse:
+      receivers: [otlp]
+      processors: [memory_limiter, filter/langfuse_business, batch]
+      exporters: [otlp_http/langfuse]

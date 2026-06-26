@@ -61,11 +61,11 @@ def test_context_header_includes_runtime_temporal_context() -> None:
     )
 
     content = str(messages[0].content)
-    assert "Runtime temporal context:" in content
-    assert "- Current date:" in content
-    assert "- Current time:" in content
-    assert "- Timezone: Asia/Shanghai" in content
-    assert "今天, 当前, 最新, 最近, today, current, latest, and recent" in content
+    assert "Runtime 时间上下文：" in content
+    assert "- 当前日期：" in content
+    assert "- 当前时间：" in content
+    assert "- 时区：Asia/Shanghai" in content
+    assert "今天、当前、最新、最近、today、current、latest、recent" in content
     assert "必须以 Runtime temporal context 中的当前日期" in content
 
 
@@ -99,11 +99,11 @@ def test_context_header_includes_task_plan_and_recent_artifacts() -> None:
     )
 
     content = str(messages[0].content)
-    assert "Task plan for this turn:" in content
+    assert "当前 turn 的任务计划：" in content
     assert "revise_existing_artifact" in content
-    assert "Recent artifacts:" in content
+    assert "近期 artifacts：" in content
     assert "filename=jarvis-architecture-v3.png" in content
-    assert "Use recent artifacts to resolve references" in content
+    assert "请用这些近期 artifacts 解析" in content
 
 
 def test_coding_context_includes_active_registered_repository(monkeypatch, tmp_path) -> None:
@@ -135,7 +135,7 @@ def test_coding_context_includes_active_registered_repository(monkeypatch, tmp_p
     )
 
     content = str(messages[0].content)
-    assert "Repository context:" in content
+    assert "仓库上下文：" in content
     assert "- nltk:" in content
     assert "coder runtime node" in content
 
@@ -169,7 +169,7 @@ def test_workspace_context_includes_active_registered_repository(monkeypatch, tm
     )
 
     content = str(messages[0].content)
-    assert "Repository context:" in content
+    assert "仓库上下文：" in content
     assert "- jarvis:" in content
     assert "- jarvis:" in content
 

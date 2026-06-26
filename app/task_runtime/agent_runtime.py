@@ -140,6 +140,8 @@ class TaskAgentRuntime:
                 "jarvis.platform": conversation.platform,
                 "jarvis.conversation_id": turn.conversation_id,
                 "jarvis.turn_id": turn_id,
+                "langfuse.trace.name": f"turn.run:{turn_id}",
+                "langfuse.session.id": f"conversation:{turn.conversation_id}",
             },
         ):
             return self._run_turn_inner(
@@ -183,6 +185,8 @@ class TaskAgentRuntime:
             "jarvis.user_input_preview": trace_preview(user_input),
             "jarvis.recent_artifact_count": len(recent_artifacts),
         }
+        if content_capture_enabled():
+            turn_attributes["langfuse.trace.input"] = trace_preview(user_input, limit=1200)
         set_attributes(**turn_attributes)
         progress.emit(
             "turn_started",
@@ -207,7 +211,7 @@ class TaskAgentRuntime:
                 instructions=[],
                 progress=progress,
             )
-            set_attributes(**{"jarvis.route": router_result.route})
+            set_attributes(**{"jarvis.route": router_result.route, "langfuse.trace.metadata.route": router_result.route})
             planner_attributes: dict[str, Any] = {
                 "jarvis.route": router_result.route,
                 "jarvis.fast_route": router_result.fast_intent.route,
@@ -276,7 +280,13 @@ class TaskAgentRuntime:
                     content_type="markdown",
                     raw_payload=raw_payload,
                 )
-                set_attributes(**{"jarvis.status": "completed"})
+                completed_attributes: dict[str, Any] = {
+                    "jarvis.status": "completed",
+                    "langfuse.trace.metadata.status": "completed",
+                }
+                if content_capture_enabled():
+                    completed_attributes["langfuse.trace.output"] = trace_preview(reply, limit=1200)
+                set_attributes(**completed_attributes)
                 logger.info(
                     "task runtime fast reply finished turn_id=%s reply_len=%s elapsed_ms=%s",
                     turn_id,
@@ -495,7 +505,13 @@ class TaskAgentRuntime:
                     raw_payload=raw_payload,
                 )
                 status = "completed"
-            set_attributes(**{"jarvis.status": status})
+            status_attributes: dict[str, Any] = {
+                "jarvis.status": status,
+                "langfuse.trace.metadata.status": status,
+            }
+            if content_capture_enabled():
+                status_attributes["langfuse.trace.output"] = trace_preview(reply, limit=1200)
+            set_attributes(**status_attributes)
             self._session_workspace_manager.update_status(session_workspace, status)
             logger.info(
                 "task runtime turn finished turn_id=%s status=%s elapsed_ms=%s",
@@ -539,7 +555,7 @@ class TaskAgentRuntime:
                 ),
             )
         except Exception as exc:
-            set_attributes(**{"jarvis.status": "failed"})
+            set_attributes(**{"jarvis.status": "failed", "langfuse.trace.metadata.status": "failed"})
             record_exception(exc, **{"jarvis.turn_id": turn_id, "jarvis.conversation_id": turn.conversation_id})
             logger.exception(
                 "task runtime failed turn_id=%s elapsed_ms=%s",

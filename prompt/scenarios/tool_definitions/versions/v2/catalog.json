@@ -1,0 +1,134 @@
+{
+  "read_file": {
+    "description": "按路径读取本地 workspace 中已知文件，用于轻量检查。适合读取文件片段、日志、配置文件，或在已知具体路径时做存在性检查。当用户最终目标是检查、验证或交付某个具体文件或 artifact 时使用。本工具只读，返回有界文本内容和文件元数据。当用户需要仓库级判断，例如架构分析、集成规划、代码 review、设计建议、执行链路分析或多文件推理时，不要把它作为主要策略；应使用 coder runtime node。",
+    "properties": {
+      "path": "workspace 相对文件路径，例如 app/tools/runtime.py。",
+      "start_line": "从第几行开始读取，1-based。默认 1。",
+      "max_lines": "最多返回多少行，受 runtime 上限限制。默认 200。"
+    }
+  },
+  "search_files": {
+    "description": "在本地 workspace 文件中搜索，不调用 shell 命令。mode=path 用于按路径/文件名查找或检查精确路径是否存在；mode=content 用于有界文本搜索。当用户最终目标是定位、验证、读取或交付某个具体或可猜测的文件/路径/artifact 时使用。本工具只读，返回匹配路径及少量元数据或预览。当用户需要仓库级判断，例如架构分析、集成规划、代码 review、设计建议、执行链路分析或多文件推理时，不要把它作为主要策略；应使用 coder runtime node。",
+    "properties": {
+      "query": "在 workspace 中搜索的路径、名称或内容 query。",
+      "mode": "path 搜索文件路径并检查精确存在性；content 搜索文件文本。",
+      "max_results": "最多返回多少条结果，受 runtime 上限限制。"
+    }
+  },
+  "shell_inspect": {
+    "description": "使用只读 shell 命令检查本地环境和仓库。适合列文件、读取文件内容、搜索文本、检查 git 或工具状态。不要用于网页搜索、事实查询或实时事件查询。",
+    "properties": {}
+  },
+  "shell_run_command": {
+    "description": "在 Jarvis 安全检查后运行一个明确的本地 shell 命令。适合测试、lint、build 或诊断命令等有目标的命令。不要用于网页搜索、事实查询或实时事件查询。不要用于多步骤仓库工作流、代码编辑、git commit 或 git push；这些应使用 coder runtime node。",
+    "properties": {}
+  },
+  "ask_user": {
+    "description": "当缺少必要信息时，向用户提出一个简洁澄清问题。适合 Jarvis 无法安全继续、必须由用户选择的情况，例如目标不明确、时间不明确、收件人缺失、仓库缺失或必须确认偏好。不要用 ask_user 请求执行 coder runtime 操作的权限；provider approvals 有独立流程。只问最少必要问题，然后停止等待用户回复。",
+    "properties": {
+      "question": "展示给用户的准确简短问题。",
+      "reason": "为什么需要该答案的简短内部原因。",
+      "choices": "expected_answer_type 为 choice 时的可选简洁选项。"
+    }
+  },
+  "tool_search": {
+    "description": "当当前暴露的低风险工具无法满足用户请求时，搜索 Jarvis 工具目录。该工具只发现候选工具；不会执行工具，也不会自行授予权限。工具发现是内部行为：不要告诉用户你正在搜索可用工具或查找相关工具。对于提醒、网页搜索、仓库工作或 wiki 写入等隐藏能力，应在请求这些能力前使用它。如果请求可直接从当前对话回答，或不存在合适工具，返回 no_capable_tool，不要强行使用工具。除非原始用户请求仍然明确需要另一种能力，否则不要在无关工具失败后把 tool_search 当作重试机制。",
+    "properties": {
+      "query": "根据用户请求扩展但不新增意图的能力搜索 query。",
+      "original_user_request": "用户原始请求或相关引用片段。",
+      "max_results": "最多返回多少个候选工具。默认 3。"
+    }
+  },
+  "Skill": {
+    "description": "从 skill listing 中按 skill_id 加载一个 Jarvis skill。当用户任务匹配某个可用 skill 时使用。加载 skill 会为下一次模型步骤展示本 turn 范围内的流程指引；它本身不执行脚本、不授予权限、不执行路由、不替代 planner，也不单独完成任务。",
+    "properties": {
+      "skill": "skill listing 中的 skill_id，例如 weather-1.0.0。",
+      "args": "可选的用户参数或上下文。"
+    }
+  },
+  "obsidian_wiki_query": {
+    "description": "查询 obsidian_wiki 长期知识库。适合项目记忆、概念、决策和支撑性原始证据。",
+    "properties": {
+      "workspace_path": "Obsidian wiki workspace 根目录，包含 vault/ 和 system/。默认 data/obsidian_wiki。",
+      "vault_path": "workspace_path 的废弃别名。"
+    }
+  },
+  "obsidian_wiki_draft": {
+    "description": "为设计、决策、概念或 playbook 等稳定知识创建候选 obsidian_wiki draft。该操作不会写入正式 wiki 页面。",
+    "properties": {
+      "workspace_path": "Obsidian wiki workspace 根目录，包含 vault/ 和 system/。默认 data/obsidian_wiki。",
+      "vault_path": "workspace_path 的废弃别名。"
+    }
+  },
+  "obsidian_wiki_apply": {
+    "description": "将之前创建的 obsidian_wiki draft 应用到正式 wiki。只在用户确认后使用。",
+    "properties": {
+      "workspace_path": "Obsidian wiki workspace 根目录，包含 vault/ 和 system/。默认 data/obsidian_wiki。",
+      "vault_path": "workspace_path 的废弃别名。"
+    }
+  },
+  "obsidian_wiki_maintain": {
+    "description": "对 obsidian_wiki vault 做轻量维护，例如检查 frontmatter、page types、source ids 和 dead links。",
+    "properties": {
+      "workspace_path": "Obsidian wiki workspace 根目录，包含 vault/ 和 system/。默认 data/obsidian_wiki。",
+      "vault_path": "workspace_path 的废弃别名。"
+    }
+  },
+  "business_knowledge_search": {
+    "description": "查询基于 OpenSearch 的业务知识库。适合 deep research 材料、导入文档、Wikipedia 风格参考语料和 SEC filings 等业务语料。不要用于个人记忆、用户笔记、项目决策或 Obsidian wiki 页面；这些应使用 obsidian_wiki_query。",
+    "properties": {
+      "language": "语料语言，默认 zh；sec_filing 默认 en。",
+      "source_type": "可选业务来源类型，例如 wikipedia、deep_research、sec_filing 或 generic。",
+      "source_id": "可选的精确 source id 过滤器。",
+      "source_ids": "可选的 source id 列表，用于限定搜索范围。",
+      "ticker": "SEC filing ticker 过滤器。",
+      "company_name": "SEC filing 公司过滤器。",
+      "form_type": "SEC filing 表单类型，例如 10-K 或 10-Q。",
+      "fiscal_year": "SEC filing 财年过滤器。",
+      "section_title": "SEC filing 章节标题过滤器。"
+    }
+  },
+  "write_file": {
+    "description": "在本地 Jarvis workspace 内写入 UTF-8 markdown 文件。当用户明确要求在仓库中创建或覆盖 markdown 文件时使用。必须提供 workspace 相对的 .md 路径。不要猜测项目外路径。如果目标目录尚不存在，先停止并询问用户。",
+    "properties": {
+      "relative_path": "workspace 相对 markdown 路径，例如 docs/research/2026-05/example.md。",
+      "content": "要写入的完整 markdown 内容。"
+    }
+  },
+  "scheduled_task": {
+    "description": "当用户要求提醒、稍后通知、叫醒、查看或取消已有提醒时，创建、列出或删除 Jarvis reminder tasks。使用自然语言 time_text，例如 今天10点 或 in 20 minutes；Jarvis 会解析并校验具体日程。runtime 会自动提供 conversation_id、platform 和 external_chat_id；不要向用户询问这些字段。",
+    "properties": {}
+  },
+  "deliver_file": {
+    "description": "把之前生成的本地 artifact 或用户明确请求的 workspace 文件交付到当前会话渠道。只有当用户明确要求发送、重发、上传或交付文件/图片时使用。不要把它作为普通图片生成流程的一部分；生成的 artifacts 会由 runtime 自动交付。历史 artifacts 优先使用 artifact_id；只有用户明确指定文件时才使用 path。runtime 会自动提供 conversation_id、turn_id、platform 和 external_chat_id。",
+    "properties": {
+      "artifact_id": "优先使用的 artifact id，用于交付或重新交付。",
+      "path": "当 artifact_id 不可用时的 workspace 本地文件路径 fallback。",
+      "file_path": "path 的废弃别名。",
+      "filename": "可选展示文件名。"
+    }
+  },
+  "x_search": {
+    "description": "使用 xAI server-side X/Twitter search 直接查找公开 X/Twitter 帖子。当用户要求最新 twitter 帖子、X/Twitter 讨论、指定 handles 的公开帖子，或类似“马斯克的最新twitter”的 query 时，使用该专用工具。用户目标明确是 X/Twitter 内容时，优先使用它而不是 tavily_search。",
+    "properties": {
+      "query": "X/Twitter 搜索 query。",
+      "handles": "可选的 X handles，省略 @。",
+      "exclude_handles": "可选的要排除的 X handles，省略 @。",
+      "date_from": "可选起始日期下界，格式 YYYY-MM-DD。",
+      "date_to": "可选结束日期上界，格式 YYYY-MM-DD。",
+      "max_results": "期望最大结果数，1-20。",
+      "model": "可选 xAI responses model override。"
+    }
+  },
+  "tavily_search": {
+    "description": "使用 Tavily AI Search API 搜索网页。当用户询问当前事件、事实或任何需要互联网最新信息的内容时使用。它也可以查找已索引的 X/Twitter 页面或 X/Twitter 活动的网页/新闻报道；当用户明确要求直接 X/Twitter 帖子时，优先使用专用 x_search 工具。每个问题只搜索一次。收到结果后，立即总结并回复用户。不要对同一主题重复搜索。",
+    "properties": {
+      "query": "搜索 query 字符串。",
+      "search_depth": "'basic' 表示快速结果（1-2 秒），'advanced' 表示更全面研究（5-10 秒）。",
+      "topic": "'general' 表示广泛网页搜索，'news' 表示最近 7 天的当前事件。",
+      "max_results": "最多返回结果数（1-10）。",
+      "include_domains": "可选的指定包含 domains 列表。",
+      "exclude_domains": "可选的排除 domains 列表。"
+    }
+  }
+}

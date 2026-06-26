@@ -175,8 +175,25 @@ def test_result_aggregator_uses_claude_agent_sdk_backend_with_no_tools() -> None
             "approval_requests": [],
             "data": {"confidence": "medium"},
         }
-        yield type("AssistantMessage", (), {"content": [], "session_id": "agg-session"})()
-        yield type("ResultMessage", (), {"status": "completed", "structured_output": payload, "session_id": "agg-session"})()
+        yield type(
+            "AssistantMessage",
+            (),
+            {
+                "content": [],
+                "session_id": "agg-session",
+                "usage": {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120},
+            },
+        )()
+        yield type(
+            "ResultMessage",
+            (),
+            {
+                "status": "completed",
+                "structured_output": payload,
+                "session_id": "agg-session",
+                "usage": {"prompt_tokens": 300, "completion_tokens": 30, "total_tokens": 330},
+            },
+        )()
 
     mock_sdk = MagicMock()
     mock_sdk.ClaudeAgentOptions = lambda **kwargs: kwargs
@@ -200,6 +217,10 @@ def test_result_aggregator_uses_claude_agent_sdk_backend_with_no_tools() -> None
     assert "| 维度 | Claude Tag | YouMind |" in result.reply
     assert result.data["aggregator_backend"] == "claude_agent_sdk"
     assert result.data["agent_session_id"] == "agg-session"
+    assert len(result.usage_records) == 1
+    assert result.usage_records[0]["source"] == "claude_agent_sdk"
+    assert result.usage_records[0]["stage"] == "result_aggregator_claude_sdk"
+    assert result.usage_records[0]["total_tokens"] == 330
     options = captured_options[0]
     assert options["max_turns"] == 1
     assert options["tools"] == []

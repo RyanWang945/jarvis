@@ -368,7 +368,8 @@ async def _run_claude_agent_aggregation(*, payload: dict[str, Any], resolved) ->
     prompt = _claude_aggregator_user_prompt(payload)
     final_text = ""
     parsed_payload: dict[str, Any] | None = None
-    usage_records: list[dict[str, Any]] = []
+    step_usage_records: list[dict[str, Any]] = []
+    result_usage_record: dict[str, Any] | None = None
     session_id = ""
 
     async for msg in query(prompt=prompt, options=options):
@@ -377,7 +378,7 @@ async def _run_claude_agent_aggregation(*, payload: dict[str, Any], resolved) ->
         if msg_type == "AssistantMessage":
             msg_usage = getattr(msg, "usage", None) or getattr(msg, "model_usage", None)
             if isinstance(msg_usage, dict) and msg_usage:
-                usage_records.append(_normalize_claude_usage(msg_usage, "result_aggregator_claude_sdk_step"))
+                step_usage_records.append(_normalize_claude_usage(msg_usage, "result_aggregator_claude_sdk_step"))
             if hasattr(msg, "content") and isinstance(msg.content, list):
                 for block in msg.content:
                     if type(block).__name__ == "TextBlock":
@@ -385,7 +386,7 @@ async def _run_claude_agent_aggregation(*, payload: dict[str, Any], resolved) ->
         elif msg_type == "ResultMessage":
             result_usage = getattr(msg, "usage", None) or getattr(msg, "model_usage", None)
             if isinstance(result_usage, dict) and result_usage:
-                usage_records.append(_normalize_claude_usage(result_usage, "result_aggregator_claude_sdk"))
+                result_usage_record = _normalize_claude_usage(result_usage, "result_aggregator_claude_sdk")
             structured = getattr(msg, "structured_output", None)
             if isinstance(structured, dict):
                 parsed_payload = structured
@@ -399,34 +400,34 @@ async def _run_claude_agent_aggregation(*, payload: dict[str, Any], resolved) ->
         parsed_payload = parse_json_content({"content": final_text})
     return {
         "payload": parsed_payload,
-        "usage_records": usage_records,
+        "usage_records": _billable_claude_usage_records(step_usage_records, result_usage_record),
         "session_id": session_id,
     }
 
 
 def _claude_aggregator_system_prompt() -> str:
     return """
-You are Jarvis ResultAggregator. Convert execution results into the final user-facing answer.
-Output must be a JSON object matching the configured schema.
-The reply field must be clean Markdown, not plain pseudo-table text.
-For comparison tasks, prefer a valid Markdown table with headers such as | 维度 | Claude Tag | YouMind |.
-If Markdown table evidence is too long, use concise Markdown sections and bullet lists.
-Do not claim that an attachment, report, or artifact exists unless artifact_refs is non-empty and references it.
-Do not invent facts missing from execution_report. Mark uncertain or time-sensitive facts explicitly.
-If execution_report indicates failed or blocked work, explain the concrete failure or missing input without generic apologies.
-Do not call tools. Use only the JSON payload supplied by the user message.
+你是 Jarvis ResultAggregator。请把执行结果转换为最终的面向用户答案。
+输出必须是符合已配置 schema 的 JSON 对象。
+reply 字段必须是干净的 Markdown，不要输出纯文本伪表格。
+对比任务优先使用带表头的合法 Markdown 表格，例如 | 维度 | Claude Tag | YouMind |。
+如果 Markdown 表格证据过长，使用简洁的 Markdown 小节和 bullet lists。
+除非 artifact_refs 非空且引用了附件、报告或 artifact，否则不要声称它们存在。
+不要编造 execution_report 中不存在的事实。对不确定或时间敏感的事实要明确标注。
+如果 execution_report 表明工作失败或被阻塞，说明具体失败原因或缺失输入，不要泛泛道歉。
+不要调用工具。只使用 user message 提供的 JSON payload。
 """.strip()
 
 
 def _claude_aggregator_user_prompt(payload: dict[str, Any]) -> str:
     return json.dumps(
         {
-            "task": "Produce the final AggregationResult for this turn.",
+            "task": "为这个 turn 生成最终 AggregationResult。",
             "requirements": [
-                "reply must be Markdown.",
-                "Use real Markdown tables for comparisons, never pseudo tables.",
-                "Only mention attachments/artifacts that appear in artifact_refs.",
-                "Preserve approval_requests from blocked node results when needed.",
+                "reply 必须是 Markdown。",
+                "对比内容使用真正的 Markdown 表格，不要使用伪表格。",
+                "只提及 artifact_refs 中出现的附件或 artifacts。",
+                "需要时保留 blocked node results 中的 approval_requests。",
             ],
             "input": payload,
         },
@@ -487,6 +488,15 @@ def _normalize_claude_usage(usage: dict[str, Any], stage: str) -> dict[str, Any]
         "total_tokens": total_tokens,
         "_raw": usage,
     }
+
+
+def _billable_claude_usage_records(
+    step_usage_records: list[dict[str, Any]],
+    result_usage_record: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    if result_usage_record is not None:
+        return [result_usage_record]
+    return list(step_usage_records)
 
 
 def _local_aggregation_result(

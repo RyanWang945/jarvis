@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 from app.task_runtime.node_execute_runtime import NodeExecutionContext
 from app.task_runtime.node_executor import NodeExecutor
 from app.task_runtime.node_result import NodeResult, ResolvedInput
@@ -50,6 +52,12 @@ class ScriptedNodeChat:
         return self.responses.pop(0)
 
 
+@contextmanager
+def recording_span_context(records, name: str, **attributes):
+    records.append((name, attributes))
+    yield None
+
+
 def llm_response(content: str = "", *, tool_calls: tuple[NormalizedToolCall, ...] = ()) -> NormalizedLLMResponse:
     return NormalizedLLMResponse(
         content=content,
@@ -80,6 +88,29 @@ def test_node_executor_runs_ready_nodes_and_passes_node_result_inputs() -> None:
     assert [result.node_id for result in report.node_results] == ["research", "review"]
     assert coder.calls[0].resolved_inputs[0].ref == "node:research"
     assert coder.calls[0].resolved_inputs[0].summary == "research:research"
+
+
+def test_node_execute_span_has_langfuse_observation_type(monkeypatch) -> None:
+    records = []
+    monkeypatch.setattr(
+        "app.task_runtime.node_executor.span_context",
+        lambda name, **attrs: recording_span_context(records, name, **attrs),
+    )
+    react = RecordingRuntime("react", "research")
+    executor = NodeExecutor(runtimes={"react": react})
+    plan = ExecutionPlan(
+        user_objective="research",
+        nodes=[PlanNode(id="research", runtime="react", objective="Research agent runtime")],
+    )
+
+    executor.execute(plan, runtime_context=RuntimeContext.from_hints({"turn_id": 1, "conversation_id": 2}))
+
+    node_spans = [(name, attrs) for name, attrs in records if name == "node.execute"]
+    assert node_spans
+    assert node_spans[0][1]["jarvis.turn_id"] == 1
+    assert node_spans[0][1]["jarvis.conversation_id"] == 2
+    assert node_spans[0][1]["jarvis.node_id"] == "research"
+    assert node_spans[0][1]["langfuse.observation.type"] == "span"
 
 
 def test_node_executor_resolves_artifact_inputs() -> None:
@@ -545,6 +576,63 @@ def test_llm_node_execute_runtime_can_load_skill_for_own_call(monkeypatch, tmp_p
     assert "[Skill: llm-skill]" in second_call_text
     assert "Skill guidance marker for llm-skill." in second_call_text
     assert "<system-reminder>\nLoaded skills for this turn." not in second_call_text
+
+
+def test_llm_node_skill_tool_span_includes_node_context(monkeypatch, tmp_path) -> None:
+    from app.task_runtime.node_execute_runtime import LLMNodeExecuteRuntime
+
+    _install_test_skill_registry(monkeypatch, tmp_path, "llm-skill")
+    records = []
+    attribute_updates = []
+    monkeypatch.setattr(
+        "app.task_runtime.node_execute_runtime.span_context",
+        lambda name, **attrs: recording_span_context(records, name, **attrs),
+    )
+    monkeypatch.setattr("app.task_runtime.node_execute_runtime.content_capture_enabled", lambda: True)
+    monkeypatch.setattr(
+        "app.task_runtime.node_execute_runtime.set_attributes",
+        lambda **attrs: attribute_updates.append(attrs),
+    )
+    chat = ScriptedNodeChat(
+        [
+            llm_response(
+                tool_calls=(
+                    NormalizedToolCall(
+                        id="call_skill_1",
+                        name="Skill",
+                        args={"skill": "llm-skill"},
+                    ),
+                )
+            ),
+            llm_response('{"summary":"used llm skill"}'),
+        ]
+    )
+    runtime = LLMNodeExecuteRuntime(
+        model_resolver=lambda context: FakeResolvedModel(chat),
+        max_skill_steps=3,
+    )
+
+    runtime.run(
+        NodeExecutionContext(
+            user_objective="answer with a skill",
+            node=PlanNode(id="answer", runtime="llm", objective="Answer with optional procedural guidance"),
+            legacy_hints={"turn_id": 1, "conversation_id": 2},
+        )
+    )
+
+    tool_spans = [(name, attrs) for name, attrs in records if name == "tool.call"]
+    assert tool_spans
+    assert tool_spans[0][1]["jarvis.turn_id"] == 1
+    assert tool_spans[0][1]["jarvis.conversation_id"] == 2
+    assert tool_spans[0][1]["jarvis.node_id"] == "answer"
+    assert tool_spans[0][1]["jarvis.tool_name"] == "Skill"
+    assert tool_spans[0][1]["jarvis.tool_call_id"] == "call_skill_1"
+    assert tool_spans[0][1]["langfuse.observation.type"] == "span"
+    assert "langfuse.observation.input" in tool_spans[0][1]
+    assert "llm-skill" in tool_spans[0][1]["langfuse.observation.input"]
+    output_updates = [attrs for attrs in attribute_updates if "langfuse.observation.output" in attrs]
+    assert output_updates
+    assert "llm-skill" in output_updates[-1]["langfuse.observation.output"]
 
 
 def test_llm_node_execute_runtime_preserves_explicit_reply() -> None:
