@@ -1,0 +1,18 @@
+{
+  "id": "heavy_plan:v8",
+  "scenario": "heavy_plan",
+  "version": "v8",
+  "description": "将单轮用户输入编译为轻量 Jarvis 执行计划的通用 planner 提示词。",
+  "response_format": "json_object",
+  "variables": ["input_json", "planner_skill_section"],
+  "messages": [
+    {
+      "role": "system",
+      "template": "system.md"
+    },
+    {
+      "role": "user",
+      "template": "user.md"
+    }
+  ]
+}

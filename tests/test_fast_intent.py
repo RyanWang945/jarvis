@@ -7,7 +7,9 @@ from pydantic import ValidationError
 
 from app.config import get_settings
 from app.llm.provider_adapters import NormalizedLLMResponse, NormalizedToolCall
+from app.agent_react.context_manager import ContextMessage, ConversationContext
 from app.agent_react.session_state import ConversationSessionState
+from app.prompting import PromptRegistry
 from app.task_runtime.fast_intent import (
     FastIntentDecision,
     FastIntentNode,
@@ -148,6 +150,34 @@ def test_fast_intent_messages_include_temporal_context() -> None:
 
     assert "temporal_context" in messages[1].content
     assert "2026-05-25" in messages[1].content
+
+
+def test_fast_intent_default_prompt_version_is_v3() -> None:
+    assert PromptRegistry().load("fast_intent").id == "fast_intent:v3"
+
+
+def test_fast_intent_messages_include_lightweight_conversation_context() -> None:
+    messages = _fast_intent_messages(
+        "那翻译成英文",
+        session_state=ConversationSessionState(working_summary="Earlier summary."),
+        recent_artifacts=[],
+        conversation_context=ConversationContext(
+            messages=(
+                ContextMessage(role="user", content="把这个标题润色一下"),
+                ContextMessage(role="assistant", content="更清晰的中文标题"),
+            ),
+            fast_messages=(
+                ContextMessage(role="user", content="把这个标题润色一下"),
+                ContextMessage(role="assistant", content="更清晰的中文标题"),
+            ),
+            older_summary="Earlier summary.",
+        ),
+    )
+
+    assert "conversation_context" in messages[1].content
+    assert "older_summary" in messages[1].content
+    assert "Earlier summary." in messages[1].content
+    assert "更清晰的中文标题" in messages[1].content
 
 
 def test_fast_intent_unknown_virtual_tool_falls_back_to_needs_plan() -> None:

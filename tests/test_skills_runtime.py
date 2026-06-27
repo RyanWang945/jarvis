@@ -1,6 +1,5 @@
 import json
 from pathlib import Path
-from types import SimpleNamespace
 
 from langchain_core.messages import HumanMessage
 
@@ -42,6 +41,30 @@ def test_skill_body_strips_frontmatter_and_manifest_supports_guide_fields(tmp_pa
     assert "when_to_use:" not in body
 
 
+def test_planner_skill_manifest_supports_planning_fields(tmp_path: Path) -> None:
+    skill_dir = tmp_path / "code-planning"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: Code Planning\n"
+        "description: Code planning rules.\n"
+        "skill_type: planner\n"
+        "user_invocable: false\n"
+        "routing_summary: Use for code tasks.\n"
+        "planning_guidance: Plan code work as coarse coder nodes.\n"
+        "---\n\n"
+        "Planner-only body.\n",
+        encoding="utf-8",
+    )
+
+    package = SkillPackageLoader([]).load_package(skill_dir)
+
+    assert package.skill.manifest.is_planner_skill is True
+    assert package.skill.manifest.user_invocable is False
+    assert package.skill.manifest.routing_summary == "Use for code tasks."
+    assert package.skill.manifest.planning_guidance == "Plan code work as coarse coder nodes."
+
+
 def test_skill_registry_get_uses_skill_id_not_display_name(tmp_path: Path) -> None:
     skill_dir = tmp_path / "release-checklist"
     skill_dir.mkdir()
@@ -71,22 +94,10 @@ def test_weather_skill_is_listed_without_body(monkeypatch) -> None:
     registry = SkillRegistry([package.skill])
     monkeypatch.setattr("app.agent_react.context_manager.get_skill_registry", lambda: registry)
 
-    messages = ContextManager().build_initial_messages(
-        [
-            SimpleNamespace(
-                id=1,
-                role="user",
-                content="查一下上海天气",
-                raw_payload={},
-                turn_id=1,
-            )
-        ],
-        trigger_message_id=1,
-        turn_records=[],
-        current_turn_id=None,
-    )
+    message = ContextManager().build_skill_listing_message()
 
-    reminder_content = str(messages[1].content)
+    assert isinstance(message, HumanMessage)
+    reminder_content = str(message.content)
     assert "以下 skills 可通过 Skill 工具使用：" in reminder_content
     assert "- weather-1.0.0:" in reminder_content
     assert "[Skill: weather-1.0.0]" not in reminder_content
@@ -109,28 +120,52 @@ def test_skill_listing_shows_menu_without_body(monkeypatch, tmp_path: Path) -> N
     registry = SkillRegistry([package.skill])
     monkeypatch.setattr("app.agent_react.context_manager.get_skill_registry", lambda: registry)
 
-    messages = ContextManager().build_initial_messages(
-        [
-            SimpleNamespace(
-                id=1,
-                role="user",
-                content="用codex给我个jarvis项目当前架构的svg图",
-                raw_payload={},
-                turn_id=1,
-            )
-        ],
-        trigger_message_id=1,
-        turn_records=[],
-        current_turn_id=None,
-    )
+    message = ContextManager().build_skill_listing_message()
 
-    assert isinstance(messages[1], HumanMessage)
-    reminder_content = str(messages[1].content)
+    assert isinstance(message, HumanMessage)
+    reminder_content = str(message.content)
     assert reminder_content.startswith("<system-reminder>")
     assert reminder_content.endswith("</system-reminder>")
     assert "- artifact-planner:" in reminder_content
     assert "[Skill: artifact-planner]" not in reminder_content
     assert "Preserve the user's requested format." not in reminder_content
+
+
+def test_skill_listing_excludes_planner_skills(monkeypatch, tmp_path: Path) -> None:
+    runtime_skill_dir = tmp_path / "runtime-skill"
+    runtime_skill_dir.mkdir()
+    (runtime_skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "description: Runtime guidance.\n"
+        "---\n\n"
+        "Runtime body.\n",
+        encoding="utf-8",
+    )
+    planner_skill_dir = tmp_path / "planner-skill"
+    planner_skill_dir.mkdir()
+    (planner_skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "description: Planner guidance.\n"
+        "skill_type: planner\n"
+        "user_invocable: false\n"
+        "planning_guidance: Planner-only guidance.\n"
+        "---\n\n"
+        "Planner body.\n",
+        encoding="utf-8",
+    )
+    packages = [
+        SkillPackageLoader([]).load_package(runtime_skill_dir),
+        SkillPackageLoader([]).load_package(planner_skill_dir),
+    ]
+    registry = SkillRegistry([package.skill for package in packages])
+    monkeypatch.setattr("app.agent_react.context_manager.get_skill_registry", lambda: registry)
+
+    message = ContextManager().build_skill_listing_message()
+
+    assert isinstance(message, HumanMessage)
+    reminder_content = str(message.content)
+    assert "- runtime-skill:" in reminder_content
+    assert "planner-skill" not in reminder_content
 
 
 def test_load_skill_loads_exact_skill_id_and_injects_body(monkeypatch, tmp_path: Path) -> None:

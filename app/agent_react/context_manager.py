@@ -4,35 +4,25 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import UTC, datetime, timedelta, timezone
 from dataclasses import dataclass
 from typing import Any
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
 from app.agent_react.model_usage import strip_token_usage_footer
-from app.agent_react.session_state import ConversationSessionState, render_session_state_for_model
-from app.config import get_settings
+from app.agent_react.session_state import ConversationSessionState
 from app.llm.client import LLMMessage
 from app.prompting import PromptRegistry
-from app.repositories import RepositoryRegistryError, get_repository_registry
 from app.skills.bootstrap import get_skill_registry
 from utils.token_counter import count_text_tokens
-
-def load_agent_system_prompt(
-    prompt_registry: PromptRegistry | None = None,
-    prompt_version: str | None = None,
-) -> str:
-    return (prompt_registry or PromptRegistry()).load("agent_system", prompt_version).render_text({})
-
-
-SYSTEM_PROMPT = _SYSTEM_PROMPT = load_agent_system_prompt()
 
 _MAX_SKILL_LISTING_TOKENS = 900
 _MAX_SKILL_LISTING_ITEM_CHARS = 250
 _MAX_HISTORY_MESSAGE_TOKENS = 180
-_MAX_FAST_HISTORY_MESSAGES = 2
+_MAX_FAST_HISTORY_ROUNDS = 6
+_MAX_FAST_MESSAGE_CHARS = 1200
+_FAST_MESSAGE_HEAD_CHARS = 700
+_FAST_MESSAGE_TAIL_CHARS = 300
 _MAX_PLANNER_HISTORY_MESSAGES = 12
 _MAX_PLANNER_HISTORY_TOKENS = 1800
 _MAX_WORKING_SUMMARY_CHARS = 2400
@@ -101,19 +91,27 @@ class ConversationContext:
 
     messages: tuple[ContextMessage, ...]
     context_reference_detected: bool = False
+    older_summary: str = ""
+    fast_messages: tuple[ContextMessage, ...] = ()
 
     @property
     def has_history(self) -> bool:
         return bool(self.messages)
 
     def fast_payload(self) -> dict[str, Any]:
+        recent_messages = [
+            {
+                "role": message.role,
+                "content": message.content,
+            }
+            for message in self.fast_messages
+        ]
         return {
             "has_history": self.has_history,
             "context_reference_detected": self.context_reference_detected,
-            "recent_messages": [
-                {"role": message.role, "content": message.content}
-                for message in self.messages[-_MAX_FAST_HISTORY_MESSAGES:]
-            ],
+            "older_summary": self.older_summary,
+            "recent_round_limit": _MAX_FAST_HISTORY_ROUNDS,
+            "recent_messages": recent_messages,
         }
 
     def planner_payload(self) -> dict[str, Any]:
@@ -125,33 +123,6 @@ class ConversationContext:
                 for message in self.messages
             ],
         }
-
-
-def _render_runtime_temporal_context(
-    now: datetime | None = None,
-    *,
-    prompt_registry: PromptRegistry | None = None,
-) -> str:
-    settings = get_settings()
-    timezone_name = settings.default_timezone
-    tz = _resolve_timezone(timezone_name)
-    current = now.astimezone(tz) if now is not None else datetime.now(tz)
-    return (prompt_registry or PromptRegistry()).load("runtime_temporal_context").render_text(
-        {
-            "current_date": current.date().isoformat(),
-            "current_time": current.isoformat(timespec="seconds"),
-            "timezone": timezone_name,
-        }
-    )
-
-
-def _resolve_timezone(timezone_name: str):
-    try:
-        return ZoneInfo(timezone_name)
-    except ZoneInfoNotFoundError:
-        if timezone_name in {"Asia/Shanghai", "Asia/Chongqing"}:
-            return timezone(timedelta(hours=8), name=timezone_name)
-        return UTC
 
 
 def slice_records_through_trigger(records: list, trigger_message_id: int | None) -> list:
@@ -229,13 +200,6 @@ def select_records_for_turn(
     return selected
 
 
-def latest_user_text(messages: list[BaseMessage]) -> str:
-    for message in reversed(messages):
-        if isinstance(message, HumanMessage):
-            return str(message.content or "")
-    return ""
-
-
 def _looks_like_raw_tool_markup(content: str) -> bool:
     normalized = content.lstrip()
     return normalized.startswith("<｜｜DSML｜｜tool_calls>") or normalized.startswith("<|tool_calls|>")
@@ -263,109 +227,8 @@ class ContextManager:
         self,
         *,
         prompt_registry: PromptRegistry | None = None,
-        agent_system_prompt_version: str | None = None,
     ) -> None:
         self._prompt_registry = prompt_registry or PromptRegistry()
-        self._agent_system_prompt_version = agent_system_prompt_version
-
-    def system_prompt(self) -> str:
-        return load_agent_system_prompt(
-            prompt_registry=self._prompt_registry,
-            prompt_version=self._agent_system_prompt_version,
-        )
-
-    def records_to_lc_messages(self, messages: list) -> list[BaseMessage]:
-        lc: list[BaseMessage] = []
-        for msg in messages:
-            role = getattr(msg, "role", None)
-            content = getattr(msg, "content", "") or ""
-            raw = getattr(msg, "raw_payload", {}) or {}
-            if role == "system" and raw.get("source") == "clear_command":
-                continue
-            if role == "user":
-                lc.append(HumanMessage(content=content))
-            elif role == "assistant":
-                response_metadata: dict[str, Any] = {}
-                reasoning = raw.get("reasoning_content")
-                if reasoning is not None:
-                    response_metadata["reasoning_content"] = reasoning
-                lc.append(
-                    AIMessage(
-                        content=content,
-                        tool_calls=[
-                            {
-                                "id": tc.get("id", ""),
-                                "name": tc.get("name", ""),
-                                "args": tc.get("args", {}) or {},
-                            }
-                            for tc in raw.get("tool_calls", [])
-                            if tc.get("id") and tc.get("name")
-                        ],
-                        response_metadata=response_metadata if response_metadata else {},
-                    )
-                )
-            elif role == "tool":
-                tool_call_id = raw.get("tool_call_id", "unknown")
-                lc.append(ToolMessage(content=content, tool_call_id=tool_call_id))
-            elif role == "system":
-                lc.append(SystemMessage(content=content))
-        return lc
-
-    def strip_historical_tool_protocol(self, messages: list[BaseMessage]) -> list[BaseMessage]:
-        """Persisted tool protocol is turn-local; do not replay it into later turns."""
-        stripped: list[BaseMessage] = []
-        for message in messages:
-            if isinstance(message, ToolMessage):
-                continue
-            if isinstance(message, AIMessage):
-                content = str(message.content or "").strip()
-                if not content or _looks_like_raw_tool_markup(content):
-                    continue
-                stripped.append(
-                    AIMessage(
-                        content=content,
-                        response_metadata=message.response_metadata if message.response_metadata else {},
-                    )
-                )
-                continue
-            stripped.append(message)
-        return stripped
-
-    def inject_skill_listing(self, messages: list[BaseMessage]) -> list[BaseMessage]:
-        skill_message = self.build_skill_listing_message()
-        if skill_message is None:
-            return messages
-        insert_at = 1 if messages and isinstance(messages[0], SystemMessage) else 0
-        return [*messages[:insert_at], skill_message, *messages[insert_at:]]
-
-    def build_context_header(
-        self,
-        *,
-        session_state: ConversationSessionState | None,
-        task_plan: dict[str, Any] | None = None,
-        recent_artifacts: list[dict[str, Any]] | None = None,
-    ) -> SystemMessage:
-        sections = [self.system_prompt().strip()]
-        sections.append(_render_runtime_temporal_context(prompt_registry=self._prompt_registry))
-
-        if session_state is not None:
-            rendered_session = render_session_state_for_model(session_state)
-            if rendered_session is not None:
-                sections.append(rendered_session)
-
-        rendered_repositories = self._render_repository_context(session_state)
-        if rendered_repositories is not None:
-            sections.append(rendered_repositories)
-
-        rendered_task_plan = self._render_task_plan(task_plan)
-        if rendered_task_plan is not None:
-            sections.append(rendered_task_plan)
-
-        rendered_artifacts = self._render_recent_artifacts(recent_artifacts)
-        if rendered_artifacts is not None:
-            sections.append(rendered_artifacts)
-
-        return SystemMessage(content="\n\n".join(sections))
 
     def build_conversation_context(
         self,
@@ -391,6 +254,7 @@ class ContextManager:
         ]
         # Step 1: records → ContextMessage with per-message token truncation
         context_messages = self._records_to_context_messages(history_records)
+        fast_messages = self._records_to_fast_context_messages(history_records)
 
         # Step 2: two-layer compression — single-big then batch-old
         compressed = self._compress_context_messages(context_messages)
@@ -401,6 +265,8 @@ class ContextManager:
         return ConversationContext(
             messages=tuple(compressed),
             context_reference_detected=_has_context_reference(current_user_input),
+            older_summary=str(getattr(session_state, "working_summary", "") or "").strip(),
+            fast_messages=tuple(_recent_round_messages(fast_messages, _MAX_FAST_HISTORY_ROUNDS)),
         )
 
     def update_working_summary(
@@ -446,6 +312,8 @@ class ContextManager:
         for skill in skills:
             if skill.manifest.disable_model_invocation:
                 continue
+            if skill.manifest.is_planner_skill or not skill.manifest.user_invocable:
+                continue
             description = (skill.effective_description or "").strip()
             if not description:
                 continue
@@ -476,77 +344,6 @@ class ContextManager:
         max_chars = max(0, max_tokens * 4)
         return text[:max_chars].rstrip() + "\n\n[Content truncated by Jarvis token budget.]"
 
-    def _render_repository_context(
-        self,
-        session_state: ConversationSessionState | None,
-    ) -> str | None:
-        try:
-            repositories = get_repository_registry().list_repositories()
-        except (RepositoryRegistryError, OSError):
-            return None
-        if not repositories:
-            return None
-
-        repository_lines: list[str] = []
-        for repo in repositories:
-            repository_lines.append(f"- {repo.repo_id}: {repo.canonical_root_path}")
-        return self._prompt_registry.load("repository_context").render_text(
-            {
-                "active_repo_line": "",
-                "repository_lines": "\n".join(repository_lines),
-            }
-        )
-
-    def _render_task_plan(self, task_plan: dict[str, Any] | None) -> str | None:
-        if not isinstance(task_plan, dict) or not task_plan:
-            return None
-        rendered = json.dumps(task_plan, ensure_ascii=False, default=str, indent=2)
-        objective = str(task_plan.get("objective") or task_plan.get("user_objective") or "").strip()
-        objective_line = f"Current turn objective: {objective}" if objective else ""
-        return self._prompt_registry.load("task_plan_context").render_text(
-            {
-                "objective_line": objective_line,
-                "task_plan_json": rendered,
-            }
-        )
-
-    def _render_recent_artifacts(self, recent_artifacts: list[dict[str, Any]] | None) -> str | None:
-        if not recent_artifacts:
-            return None
-        lines: list[str] = []
-        for artifact in recent_artifacts[:5]:
-            if not isinstance(artifact, dict):
-                continue
-            artifact_id = str(artifact.get("artifact_id") or artifact.get("id") or "").strip()
-            kind = str(artifact.get("kind") or "").strip()
-            filename = str(artifact.get("filename") or "").strip()
-            path = str(artifact.get("path") or "").strip()
-            source_tool = str(artifact.get("source_tool") or "").strip()
-            turn_id = artifact.get("turn_id")
-            status = str(artifact.get("status") or "").strip()
-            parts = []
-            if artifact_id:
-                parts.append(f"id={artifact_id}")
-            if kind:
-                parts.append(f"kind={kind}")
-            if filename:
-                parts.append(f"filename={filename}")
-            if path:
-                parts.append(f"path={path}")
-            if source_tool:
-                parts.append(f"source_tool={source_tool}")
-            if turn_id is not None:
-                parts.append(f"turn_id={turn_id}")
-            if status:
-                parts.append(f"status={status}")
-            if parts:
-                lines.append("- " + "; ".join(parts))
-        if not lines:
-            return None
-        return self._prompt_registry.load("recent_artifacts_context").render_text(
-            {"artifact_lines": "\n".join(lines)}
-        )
-
     def _records_to_context_messages(self, records: list) -> list[ContextMessage]:
         """Convert raw records to ContextMessage, applying per-message token truncation."""
         messages: list[ContextMessage] = []
@@ -567,6 +364,28 @@ class ContextManager:
                     content=content,
                     original_index=idx,
                     original_token_count=original_tokens,
+                )
+            )
+        return messages
+
+    def _records_to_fast_context_messages(self, records: list) -> list[ContextMessage]:
+        messages: list[ContextMessage] = []
+        for idx, record in enumerate(records):
+            role = getattr(record, "role", None)
+            if role not in {"user", "assistant"}:
+                continue
+            content = str(getattr(record, "content", "") or "").strip()
+            if not content or _looks_like_raw_tool_markup(content):
+                continue
+            if role == "assistant":
+                content = strip_token_usage_footer(content)
+            content = _truncate_fast_context_message(content)
+            messages.append(
+                ContextMessage(
+                    role=role,
+                    content=content,
+                    original_index=idx,
+                    original_token_count=self.estimate_text_tokens(content),
                 )
             )
         return messages
@@ -644,66 +463,6 @@ class ContextManager:
         if assistant:
             lines.append(f"Assistant: {assistant[:800]}")
         return "\n".join(lines)
-
-    def ensure_system_prompt(self, messages: list[BaseMessage]) -> list[BaseMessage]:
-        system_prompt = self.system_prompt()
-        if not messages:
-            return [SystemMessage(content=system_prompt)]
-
-        first = messages[0]
-        if isinstance(first, SystemMessage):
-            content = str(first.content or "")
-            if system_prompt in content:
-                return messages
-            updated = SystemMessage(content=f"{content}\n\n{system_prompt}" if content else system_prompt)
-            return [updated, *messages[1:]]
-
-        return [SystemMessage(content=system_prompt), *messages]
-
-    def inject_session_state(
-        self,
-        messages: list[BaseMessage],
-        session_state: ConversationSessionState | None,
-    ) -> list[BaseMessage]:
-        if session_state is None:
-            return messages
-        rendered = render_session_state_for_model(session_state)
-        if rendered is None:
-            return messages
-
-        insert_at = 1 if messages and isinstance(messages[0], SystemMessage) else 0
-        return [
-            *messages[:insert_at],
-            SystemMessage(content=rendered),
-            *messages[insert_at:],
-        ]
-
-    def build_initial_messages(
-        self,
-        records: list,
-        trigger_message_id: int | None,
-        *,
-        turn_records: list | None = None,
-        current_turn_id: int | None = None,
-        session_state: ConversationSessionState | None = None,
-        task_plan: dict[str, Any] | None = None,
-        recent_artifacts: list[dict[str, Any]] | None = None,
-    ) -> list[BaseMessage]:
-        bounded_records = select_records_for_turn(
-            records,
-            turn_records or [],
-            current_turn_id=current_turn_id,
-            trigger_message_id=trigger_message_id,
-        )
-        lc_messages = self.records_to_lc_messages(bounded_records)
-        lc_messages = self.strip_historical_tool_protocol(lc_messages)
-        header = self.build_context_header(
-            session_state=session_state,
-            task_plan=task_plan,
-            recent_artifacts=recent_artifacts,
-        )
-        messages = self.inject_skill_listing([header, *lc_messages])
-        return messages
 
     def estimate_text_tokens(self, text: str) -> int:
         return count_text_tokens(text)
@@ -822,6 +581,35 @@ def _truncate_chars(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
     return text[: max(0, max_chars - 1)].rstrip() + "…"
+
+
+def _recent_round_messages(
+    messages: tuple[ContextMessage, ...],
+    max_rounds: int,
+) -> list[ContextMessage]:
+    if max_rounds <= 0:
+        return []
+
+    selected_reversed: list[ContextMessage] = []
+    user_count = 0
+    for message in reversed(messages):
+        if message.role == "system":
+            continue
+        selected_reversed.append(message)
+        if message.role == "user":
+            user_count += 1
+            if user_count >= max_rounds:
+                break
+    return list(reversed(selected_reversed))
+
+
+def _truncate_fast_context_message(content: str) -> str:
+    text = str(content or "")
+    if len(text) <= _MAX_FAST_MESSAGE_CHARS:
+        return text
+    head = text[:_FAST_MESSAGE_HEAD_CHARS].rstrip()
+    tail = text[-_FAST_MESSAGE_TAIL_CHARS:].lstrip()
+    return f"{head}\n\n[Content truncated by Jarvis fast context budget.]\n\n{tail}"
 
 
 def _build_batch_summary(user_texts: list[str], max_tokens: int) -> str:

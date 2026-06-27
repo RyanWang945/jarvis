@@ -1,0 +1,18 @@
+{
+  "id": "planner_skill_router:v1",
+  "scenario": "planner_skill_router",
+  "version": "v1",
+  "description": "为通用 Planner 选择至多一个 planner skill 的中文路由提示词。",
+  "response_format": "json_object",
+  "variables": ["input_json"],
+  "messages": [
+    {
+      "role": "system",
+      "template": "system.md"
+    },
+    {
+      "role": "user",
+      "template": "user.md"
+    }
+  ]
+}

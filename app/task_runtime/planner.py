@@ -19,6 +19,8 @@ from app.llm.model_router import ModelRouter
 from app.prompting import PromptRegistry
 from app.runtime_usage import usage_record_from_response
 from app.repositories import get_repository_registry
+from app.task_runtime.plan_validator import issues_payload, validate_plan
+from app.task_runtime.planner_skills import PlannerSkillRouter, PlannerSkillSelection
 from app.task_runtime.runtime_context import RuntimeContext
 
 logger = logging.getLogger(__name__)
@@ -149,9 +151,16 @@ class PlanInput(BaseModel):
 class TurnPlanner:
     """LLM-backed planner that compiles one user turn into a lightweight plan."""
 
-    def __init__(self, *, prompt_registry: PromptRegistry | None = None, prompt_version: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        prompt_registry: PromptRegistry | None = None,
+        prompt_version: str | None = None,
+        planner_skill_router: PlannerSkillRouter | None = None,
+    ) -> None:
         self._prompt_registry = prompt_registry or PromptRegistry()
         self._prompt_version = prompt_version
+        self._planner_skill_router = planner_skill_router or PlannerSkillRouter(prompt_registry=self._prompt_registry)
 
     def prompt_metadata(self) -> dict[str, Any]:
         return self._prompt_registry.load("heavy_plan", self._prompt_version).metadata()
@@ -192,12 +201,20 @@ class TurnPlanner:
         instructions: list[str] | None = None,
     ) -> TurnPlannerResult:
         session = session_state or ConversationSessionState()
+        runtime = runtime_context or RuntimeContext.from_hints({})
+        planner_skill = self._planner_skill_router.select(
+            content=content,
+            session_state=session,
+            conversation_metadata=conversation_metadata,
+            conversation_context=conversation_context,
+            runtime_context=runtime,
+        )
         plan_input = build_plan_input(
             current_user_input=content,
             conversation_context=conversation_context,
             artifacts=recent_artifacts or [],
             previous_node_results=previous_node_results or [],
-            runtime_context=runtime_context,
+            runtime_context=runtime,
             session_state=session,
             instructions=instructions or [],
         )
@@ -222,6 +239,7 @@ class TurnPlanner:
             plan_input,
             prompt_registry=self._prompt_registry,
             prompt_version=self._prompt_version,
+            planner_skill=planner_skill,
         )
         logger.info(
             "turn planner llm request profile=%s provider=%s response_format=%s prompt_version=%s input=%s",
@@ -253,8 +271,20 @@ class TurnPlanner:
             allowed_runtimes=_allowed_runtimes(plan_input.runtime_context),
         )
         usage_record = usage_record_from_response(response, stage="planner")
+        repair_usage_records: list[dict[str, Any]] = []
+        plan, repair_usage_records = _repair_plan_if_needed(
+            plan,
+            plan_input=plan_input,
+            conversation_metadata=conversation_metadata,
+            prompt_registry=self._prompt_registry,
+            planner_skill=planner_skill,
+        )
         logger.info("turn planner plan output=%s", _json_for_log(plan.model_dump(mode="json")))
-        return TurnPlannerResult(plan=plan, usage_records=[usage_record] if usage_record is not None else [])
+        usage_records = list(planner_skill.usage_records or [])
+        if usage_record is not None:
+            usage_records.append(usage_record)
+        usage_records.extend(repair_usage_records)
+        return TurnPlannerResult(plan=plan, usage_records=usage_records)
 
 
 def build_plan_input(
@@ -301,6 +331,7 @@ def _planner_messages(
     *,
     prompt_registry: PromptRegistry | None = None,
     prompt_version: str | None = None,
+    planner_skill: PlannerSkillSelection | None = None,
 ) -> list[LLMMessage]:
     registry = prompt_registry or PromptRegistry()
     prompt = registry.load("heavy_plan", prompt_version)
@@ -309,9 +340,110 @@ def _planner_messages(
             "input_json": json.dumps(
                 plan_input.model_dump(mode="json"),
                 ensure_ascii=False,
-            )
+            ),
+            "planner_skill_section": _planner_skill_section(planner_skill),
         }
     )
+
+
+def _planner_skill_section(planner_skill: PlannerSkillSelection | None) -> str:
+    if planner_skill is None or not planner_skill.skill_id or not planner_skill.guidance.strip():
+        return ""
+    reason = planner_skill.reason.strip()
+    lines = [
+        "## 专用规划原则",
+        "",
+        f"已选择 planner skill：{planner_skill.skill_id}",
+    ]
+    if reason:
+        lines.append(f"选择原因：{reason}")
+    lines.extend(["", planner_skill.guidance.strip()])
+    return "\n".join(lines)
+
+
+def _repair_plan_if_needed(
+    plan: ExecutionPlan,
+    *,
+    plan_input: PlanInput,
+    conversation_metadata: dict[str, Any] | None,
+    prompt_registry: PromptRegistry,
+    planner_skill: PlannerSkillSelection | None = None,
+) -> tuple[ExecutionPlan, list[dict[str, Any]]]:
+    issues = validate_plan(
+        plan,
+        allowed_runtimes=_allowed_runtimes(plan_input.runtime_context),
+        known_artifact_refs=_known_artifact_refs(plan_input.artifacts),
+        registered_repo_ids=_registered_repo_ids(plan_input.registered_repositories),
+    )
+    if not issues:
+        return plan, []
+
+    logger.info("turn planner validation requested repair issues=%s", issues_payload(issues))
+    try:
+        resolved = ModelRouter().resolve(LLMNode.PLAN_REPAIR, conversation_metadata)
+    except Exception:
+        logger.exception("turn planner repair model resolution failed")
+        return _fallback_single_node_plan(
+            plan_input.current_user_input,
+            allowed_runtimes=_allowed_runtimes(plan_input.runtime_context),
+        ), []
+    if not resolved.profile.api_key:
+        return _fallback_single_node_plan(
+            plan_input.current_user_input,
+            allowed_runtimes=_allowed_runtimes(plan_input.runtime_context),
+        ), []
+
+    prompt = prompt_registry.load("plan_repair")
+    repair_payload = {
+        "current_user_input": plan_input.current_user_input,
+        "conversation_context": plan_input.conversation_context,
+        "runtime_context": plan_input.runtime_context,
+        "registered_repositories": plan_input.registered_repositories,
+        "artifacts": plan_input.artifacts,
+        "previous_node_results": plan_input.previous_node_results,
+        "selected_planner_skill": planner_skill.as_payload() if planner_skill is not None else {},
+        "invalid_plan": plan.model_dump(mode="json"),
+        "validation_errors": issues_payload(issues),
+    }
+    response_format = prompt.response_format if resolved.profile.supports_json_object else None
+    try:
+        response = resolved.client.chat_normalized(
+            prompt.render({"input_json": json.dumps(repair_payload, ensure_ascii=False)}),
+            response_format=response_format,
+        )
+        payload = parse_json_content({"content": response.content})
+        repaired = _plan_from_payload(
+            payload,
+            fallback_objective=plan_input.current_user_input,
+            known_artifact_refs=_known_artifact_refs(plan_input.artifacts),
+            previous_node_results=plan_input.previous_node_results,
+            allowed_runtimes=_allowed_runtimes(plan_input.runtime_context),
+        )
+        remaining = validate_plan(
+            repaired,
+            allowed_runtimes=_allowed_runtimes(plan_input.runtime_context),
+            known_artifact_refs=_known_artifact_refs(plan_input.artifacts),
+            registered_repo_ids=_registered_repo_ids(plan_input.registered_repositories),
+        )
+        usage_record = usage_record_from_response(response, stage="plan_repair")
+        usage_records = [usage_record] if usage_record is not None else []
+        if remaining:
+            logger.warning("turn planner repair still invalid issues=%s", issues_payload(remaining))
+            return _fallback_single_node_plan(
+                plan_input.current_user_input,
+                allowed_runtimes=_allowed_runtimes(plan_input.runtime_context),
+            ), usage_records
+        return repaired, usage_records
+    except Exception:
+        logger.exception("turn planner repair failed")
+        return _fallback_single_node_plan(
+            plan_input.current_user_input,
+            allowed_runtimes=_allowed_runtimes(plan_input.runtime_context),
+        ), []
+
+
+def _registered_repo_ids(repositories: list[dict[str, str]]) -> set[str]:
+    return {str(repo.get("repo_id") or "").strip() for repo in repositories if str(repo.get("repo_id") or "").strip()}
 
 
 def _normalize_artifact_context(artifacts: list[dict[str, Any]]) -> list[dict[str, Any]]:

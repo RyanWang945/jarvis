@@ -7,7 +7,8 @@ from pydantic import ValidationError
 
 from app.agent_react.session_state import ConversationSessionState
 from app.config import get_settings
-from app.task_runtime.planner import ExecutionPlan, PlanNode, TurnPlanner, _plan_from_payload, build_plan_input
+from app.task_runtime.planner import ExecutionPlan, PlanNode, TurnPlanner, _planner_messages, _plan_from_payload, build_plan_input
+from app.task_runtime.planner_skills import PlannerSkillSelection
 from app.task_runtime.runtime_context import RuntimeContext
 
 
@@ -94,6 +95,28 @@ def test_build_plan_input_normalizes_artifacts_and_hints() -> None:
     dumped = plan_input.model_dump(mode="json")
     assert "runtime_hints" not in dumped
     assert "typed_runtime_context" not in dumped
+
+
+def test_planner_messages_render_selected_planner_skill_as_system_section() -> None:
+    plan_input = build_plan_input(
+        current_user_input="review jarvis planner",
+        artifacts=[],
+        previous_node_results=[],
+        runtime_context=RuntimeContext.from_hints({"available_runtimes": ["react", "coder"]}),
+    )
+    messages = _planner_messages(
+        plan_input,
+        planner_skill=PlannerSkillSelection(
+            skill_id="code-planning",
+            reason="repository task",
+            guidance="Use coarse coder nodes.",
+        ),
+    )
+
+    assert "## 专用规划原则" in messages[0].content
+    assert "code-planning" in messages[0].content
+    assert "Use coarse coder nodes." in messages[0].content
+    assert "selected_planner_skill" not in messages[1].content
 
 
 def test_plan_from_payload_derives_llm_finalization_for_non_llm_nodes() -> None:
