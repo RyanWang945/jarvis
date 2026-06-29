@@ -65,6 +65,34 @@ def test_planner_skill_manifest_supports_planning_fields(tmp_path: Path) -> None
     assert package.skill.manifest.planning_guidance == "Plan code work as coarse coder nodes."
 
 
+def test_finance_analysis_planning_skill_is_planner_skill() -> None:
+    package = SkillPackageLoader([]).load_package(Path("skills/finance-analysis-planning"))
+
+    assert package.skill.skill_id == "finance-analysis-planning"
+    assert package.skill.manifest.is_planner_skill is True
+    assert package.skill.manifest.user_invocable is False
+    assert "股票" in package.skill.manifest.routing_summary
+    assert "evidence_claims.md" in package.skill.manifest.planning_guidance
+    assert "不要写 JSON" in package.skill.manifest.planning_guidance
+    assert "mode=write" in package.skill.manifest.planning_guidance
+    assert "公司业务" in package.skill.manifest.planning_guidance
+    assert "竞对格局" in package.skill.manifest.planning_guidance
+    assert "产品市场景气" in package.skill.manifest.planning_guidance
+
+
+def test_stock_analysis_planning_skill_is_planner_skill() -> None:
+    package = SkillPackageLoader([]).load_package(Path("skills/stock-analysis-planning"))
+
+    assert package.skill.skill_id == "stock-analysis-planning"
+    assert package.skill.manifest.is_planner_skill is True
+    assert package.skill.manifest.user_invocable is False
+    guidance = package.skill.manifest.planning_guidance
+    assert "tushareMcp" in guidance
+    assert "market_data.md" in guidance
+    assert "总市值（亿元）= 收盘价（元/股） × 总股本（股） / 100,000,000" in guidance
+    assert "billion CNY = 10 亿元人民币" in guidance
+
+
 def test_skill_registry_get_uses_skill_id_not_display_name(tmp_path: Path) -> None:
     skill_dir = tmp_path / "release-checklist"
     skill_dir.mkdir()

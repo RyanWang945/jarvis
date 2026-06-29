@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import time
+from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
@@ -26,6 +27,8 @@ logger = logging.getLogger(__name__)
 AggregationStatus = Literal["completed", "needs_user_input", "failed"]
 _CLAUDE_AGGREGATOR_TIMEOUT_SECONDS = 180
 _CLAUDE_AGGREGATOR_MAX_TURNS = 1
+_EVIDENCE_ARTIFACT_FILENAMES = {"evidence_claims.md"}
+_MAX_EVIDENCE_ARTIFACT_BYTES = 128 * 1024
 
 _AGGREGATION_OUTPUT_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -316,6 +319,7 @@ def _aggregation_input(
     runtime_context: dict[str, Any],
     instructions: list[str],
 ) -> dict[str, Any]:
+    runtime_payload = runtime_context
     return {
         "current_user_input": current_user_input or plan.user_objective,
         "route": route,
@@ -325,7 +329,12 @@ def _aggregation_input(
         "plan": plan.model_dump(mode="json"),
         "execution_report": report.model_dump(mode="json", exclude_none=True),
         "artifacts": artifacts,
-        "runtime_context": runtime_context,
+        "evidence_artifacts": _load_evidence_artifacts(
+            report=report,
+            artifacts=artifacts,
+            runtime_context=runtime_payload,
+        ),
+        "runtime_context": runtime_payload,
         "instructions": instructions,
     }
 
@@ -414,6 +423,7 @@ reply 字段必须是干净的 Markdown，不要输出纯文本伪表格。
 如果 Markdown 表格证据过长，使用简洁的 Markdown 小节和 bullet lists。
 除非 artifact_refs 非空且引用了附件、报告或 artifact，否则不要声称它们存在。
 不要编造 execution_report 中不存在的事实。对不确定或时间敏感的事实要明确标注。
+如果 user message payload 中包含 evidence_artifacts，优先基于其中的 evidence_claims.md Markdown 证据表汇总；金融、股票、公告、行情和财务数字没有来源 URL 支撑时不要写成确定事实。
 如果 execution_report 表明工作失败或被阻塞，说明具体失败原因或缺失输入，不要泛泛道歉。
 不要调用工具。只使用 user message 提供的 JSON payload。
 """.strip()
@@ -470,6 +480,146 @@ def _message_session_id(msg: Any) -> str:
     if value is None:
         return ""
     return str(value).strip()
+
+
+def _load_evidence_artifacts(
+    *,
+    report: ExecutionReport,
+    artifacts: list[dict[str, Any]],
+    runtime_context: dict[str, Any],
+) -> list[dict[str, Any]]:
+    candidates = _evidence_artifact_candidates(report=report, artifacts=artifacts, runtime_context=runtime_context)
+    loaded: list[dict[str, Any]] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        path = candidate.get("path")
+        if not isinstance(path, Path) or path in seen:
+            continue
+        seen.add(path)
+        payload = _read_evidence_artifact(path)
+        if payload is None:
+            continue
+        loaded.append(
+            {
+                "node_id": candidate.get("node_id") or "",
+                "artifact_ref": candidate.get("artifact_ref") or "",
+                "filename": path.name,
+                "content": payload,
+            }
+        )
+    return loaded
+
+
+def _evidence_artifact_candidates(
+    *,
+    report: ExecutionReport,
+    artifacts: list[dict[str, Any]],
+    runtime_context: dict[str, Any],
+) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    session_root = _safe_existing_dir(runtime_context.get("session_workspace_dir"))
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        path = _candidate_path_from_payload(artifact, session_root=session_root)
+        if path is None or not _is_evidence_artifact(path, artifact):
+            continue
+        candidates.append(
+            {
+                "path": path,
+                "node_id": artifact.get("node_id"),
+                "artifact_ref": artifact.get("artifact_id") or artifact.get("ref"),
+            }
+        )
+    for result in report.node_results:
+        for artifact in result.artifacts:
+            path = _candidate_path_from_payload(
+                artifact.model_dump(mode="json", exclude_none=True),
+                session_root=session_root,
+            )
+            if path is None or not _is_evidence_artifact(path, artifact.model_dump(mode="json", exclude_none=True)):
+                continue
+            candidates.append(
+                {
+                    "path": path,
+                    "node_id": result.node_id,
+                    "artifact_ref": f"artifact:{artifact.ref}",
+                }
+            )
+    return candidates
+
+
+def _candidate_path_from_payload(payload: dict[str, Any], *, session_root: Path | None) -> Path | None:
+    raw_path = str(payload.get("path") or "").strip()
+    raw_relative = str(payload.get("session_relative_path") or "").strip()
+    for raw in (raw_path, raw_relative):
+        if not raw:
+            continue
+        path = Path(raw)
+        if path.is_absolute():
+            resolved = _safe_existing_file(path, session_root=session_root)
+        elif session_root is not None:
+            resolved = _safe_existing_file(session_root / path, session_root=session_root)
+        else:
+            resolved = None
+        if resolved is not None:
+            return resolved
+    return None
+
+
+def _safe_existing_dir(value: Any) -> Path | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        path = Path(text).expanduser().resolve(strict=True)
+    except OSError:
+        return None
+    return path if path.is_dir() else None
+
+
+def _safe_existing_file(path: Path, *, session_root: Path | None) -> Path | None:
+    try:
+        resolved = path.expanduser().resolve(strict=True)
+    except OSError:
+        return None
+    if session_root is not None:
+        try:
+            resolved.relative_to(session_root)
+        except ValueError:
+            return None
+    return resolved if resolved.is_file() else None
+
+
+def _is_evidence_artifact(path: Path, payload: dict[str, Any]) -> bool:
+    filename = str(payload.get("filename") or path.name or "").strip().lower()
+    if filename in _EVIDENCE_ARTIFACT_FILENAMES:
+        return True
+    metadata = payload.get("metadata")
+    if isinstance(metadata, dict):
+        purpose = str(metadata.get("purpose") or metadata.get("artifact_type") or "").strip().lower()
+        if purpose in {"evidence_claims", "claim_evidence", "evidence"} and path.suffix.lower() in {".md", ".markdown"}:
+            return True
+    return False
+
+
+def _read_evidence_artifact(path: Path) -> dict[str, Any] | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    if stat.st_size <= 0 or stat.st_size > _MAX_EVIDENCE_ARTIFACT_BYTES:
+        return None
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        try:
+            text = path.read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeDecodeError):
+            return None
+    except OSError:
+        return None
+    return {"markdown": text[:_MAX_EVIDENCE_ARTIFACT_BYTES]}
 
 
 def _normalize_claude_usage(usage: dict[str, Any], stage: str) -> dict[str, Any]:

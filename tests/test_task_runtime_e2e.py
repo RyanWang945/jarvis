@@ -3,7 +3,6 @@ from __future__ import annotations
 from pathlib import Path
 from uuid import uuid4
 
-from app.api.agent import InMemoryConversationStore
 from app.gateway.events import InboundEvent
 from app.gateway.service import GatewayService
 from app.progress import ProgressEvent
@@ -15,6 +14,7 @@ from app.task_runtime.planner import ExecutionPlan, PlanNode
 from app.task_runtime.planning_router import PlanningRouterResult
 from app.task_runtime.result_aggregator import ResultAggregator
 from app.task_runtime.session_workspace import SessionWorkspaceManager
+from tests.helpers.in_memory_store import InMemoryConversationStore
 
 
 class StaticPlanningRouter:

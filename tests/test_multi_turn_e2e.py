@@ -23,12 +23,12 @@ from typing import Any
 
 import pytest
 
-from app.api.agent import InMemoryConversationStore
 from app.config import get_settings
 from app.gateway.events import InboundEvent
 from app.gateway.service import GatewayService
 from app.llm.client import ChatClient, LLMMessage, parse_json_content
 from app.task_runtime import TaskAgentRuntime
+from tests.helpers.in_memory_store import InMemoryConversationStore
 
 logger = logging.getLogger(__name__)
 

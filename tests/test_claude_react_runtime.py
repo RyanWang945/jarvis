@@ -41,6 +41,47 @@ def _context(**kwargs):
     )
 
 
+def test_build_node_result_completes_when_evidence_markdown_was_written(tmp_path):
+    from app.task_runtime.claude_react_runtime import _build_node_result
+
+    evidence_path = tmp_path / "artifacts" / "evidence_claims.md"
+    evidence_path.parent.mkdir()
+    evidence_path.write_text("# Evidence\n\n| Claim | 来源URL |\n| --- | --- |\n| ok | https://example.com |\n", encoding="utf-8")
+    context = _context(
+        node=_plan_node(id="collect_evidence", mode="write"),
+        legacy_hints={"session_workspace_dir": str(tmp_path)},
+    )
+
+    result = _build_node_result(
+        context,
+        {
+            "ok": False,
+            "summary": "Claude react runtime reached the step limit after collecting tool results, but did not produce the required final structured output.",
+            "final_text": "",
+            "final_text_len": 0,
+            "max_turns_reached": True,
+            "error_code": "react_max_turns_no_final_output",
+            "retryable": True,
+            "tool_calls": [
+                {
+                    "id": "write_1",
+                    "tool_name": "Write",
+                    "args": {"file_path": str(evidence_path)},
+                    "status": "completed",
+                }
+            ],
+        },
+    )
+
+    assert result.status == "completed"
+    assert result.error is None
+    assert result.artifacts[0].ref == "evidence_claims.md"
+    assert result.artifacts[0].name == "collect_evidence/evidence_claims.md"
+    assert result.artifacts[0].session_relative_path == "artifacts/evidence_claims.md"
+    assert result.artifacts[0].publish is False
+    assert result.artifacts[0].metadata["source_node_id"] == "collect_evidence"
+
+
 @contextmanager
 def _recording_span_context(records, name: str, **attributes):
     records.append((name, attributes))

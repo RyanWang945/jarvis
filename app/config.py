@@ -68,6 +68,8 @@ class Settings(BaseSettings):
     gemini_available_models: str = ""
     tavily_api_key: str | None = None
     tavily_base_url: str = "https://api.tavily.com"
+    tushare_token: str | None = None
+    tushare_mcp_enabled: bool = False
     xai_api_key: str | None = None
     xai_base_url: str = "https://api.x.ai/v1"
     feishu_app_id: str | None = None

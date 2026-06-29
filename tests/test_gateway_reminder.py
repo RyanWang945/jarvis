@@ -1,8 +1,8 @@
 from dataclasses import dataclass
 
-from app.api.agent import InMemoryConversationStore
 from app.gateway.events import InboundEvent
 from app.gateway.service import GatewayService
+from tests.helpers.in_memory_store import InMemoryConversationStore
 
 
 @dataclass(frozen=True)

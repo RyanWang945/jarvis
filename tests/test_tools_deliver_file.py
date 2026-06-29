@@ -2,9 +2,9 @@ from pathlib import Path
 from uuid import uuid4
 
 from app.agent_react.delivery import register_delivery_handler
-from app.api.agent import InMemoryConversationStore
 from app.tools.common import ToolArtifact, ToolExecutionRequest
 from app.tools.deliver_file import run_deliver_file
+from tests.helpers.in_memory_store import InMemoryConversationStore
 
 
 def test_deliver_file_sends_artifact_once_with_delivery_manager(monkeypatch) -> None:

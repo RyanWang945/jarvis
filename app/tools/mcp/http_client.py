@@ -106,24 +106,26 @@ class HttpMcpClient:
         if self._session_id:
             headers["Mcp-Session-Id"] = self._session_id
 
-        response = self._client.post(self.config.url, json=payload, headers=headers, timeout=timeout)
-        session_id = response.headers.get("mcp-session-id") or response.headers.get("Mcp-Session-Id")
-        if session_id:
-            self._session_id = session_id
+        with self._client.stream("POST", self.config.url, json=payload, headers=headers, timeout=timeout) as response:
+            session_id = response.headers.get("mcp-session-id") or response.headers.get("Mcp-Session-Id")
+            if session_id:
+                self._session_id = session_id
 
-        if allow_empty and response.status_code in {202, 204}:
-            return {}
-        response.raise_for_status()
-        text = response.text.strip()
+            if allow_empty and response.status_code in {202, 204}:
+                return {}
+            response.raise_for_status()
+
+            content_type = response.headers.get("content-type", "")
+            if "text/event-stream" in content_type:
+                return _parse_sse_lines(response.iter_lines())
+
+            text = response.read().decode(response.encoding or "utf-8", errors="replace").strip()
         if not text:
             if allow_empty:
                 return {}
             raise RuntimeError(f"MCP server '{self.config.name}' returned an empty response.")
 
-        content_type = response.headers.get("content-type", "")
-        if "text/event-stream" in content_type:
-            return _parse_sse_json(text)
-        parsed = response.json()
+        parsed = json.loads(text)
         if isinstance(parsed, list):
             if not parsed:
                 return {}
@@ -133,15 +135,26 @@ class HttpMcpClient:
         return parsed
 
 
-def _parse_sse_json(text: str) -> dict[str, Any]:
+def _parse_sse_lines(lines: Any) -> dict[str, Any]:
     data_lines: list[str] = []
-    for line in text.splitlines():
-        line = line.strip()
-        if line.startswith("data:"):
-            data_lines.append(line.removeprefix("data:").strip())
+    for line in lines:
+        text = str(line or "").strip()
+        if not text:
+            if data_lines:
+                break
+            continue
+        if text.startswith("data:"):
+            data_lines.append(text.removeprefix("data:").strip())
+            continue
+        if data_lines and text.startswith("event:"):
+            break
     if not data_lines:
         raise RuntimeError("MCP SSE response did not contain data lines.")
     parsed = json.loads("\n".join(data_lines))
     if not isinstance(parsed, dict):
         raise RuntimeError("MCP SSE data was not a JSON object.")
     return parsed
+
+
+def _parse_sse_json(text: str) -> dict[str, Any]:
+    return _parse_sse_lines(text.splitlines())

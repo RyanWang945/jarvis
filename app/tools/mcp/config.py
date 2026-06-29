@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -67,7 +68,9 @@ def load_mcp_server_configs(settings: Settings) -> list[McpServerConfig]:
     for name, item in servers.items():
         if not isinstance(name, str) or not isinstance(item, dict):
             raise ValueError("Each MCP server entry must be a mapping.")
-        config = _load_server(name, item)
+        config = _load_server(name, item, settings=settings)
+        if _is_tushare_server(config) and not settings.tushare_mcp_enabled:
+            continue
         if config.enabled:
             loaded.append(config)
     return loaded
@@ -91,7 +94,7 @@ def _load_yaml(path: Path) -> dict[str, Any]:
     return parsed
 
 
-def _load_server(name: str, item: dict[str, Any]) -> McpServerConfig:
+def _load_server(name: str, item: dict[str, Any], *, settings: Settings) -> McpServerConfig:
     transport = str(item.get("transport") or item.get("type") or "streamable_http").replace("-", "_")
     if transport == "http":
         transport = "streamable_http"
@@ -101,6 +104,7 @@ def _load_server(name: str, item: dict[str, Any]) -> McpServerConfig:
     url = item.get("url") or item.get("endpoint")
     if not isinstance(url, str) or not url.strip():
         raise ValueError(f"MCP server '{name}' requires url.")
+    expanded_url = _expand_config_vars(url.strip(), settings=settings)
 
     http_headers = _string_map(item.get("http_headers") or item.get("headers") or {}, f"{name}.http_headers")
     env_http_headers = _string_map(item.get("env_http_headers") or {}, f"{name}.env_http_headers")
@@ -109,7 +113,7 @@ def _load_server(name: str, item: dict[str, Any]) -> McpServerConfig:
 
     return McpServerConfig(
         name=name,
-        url=url.strip(),
+        url=expanded_url,
         transport=transport,
         enabled=bool(item.get("enabled", True)),
         required=bool(item.get("required", False)),
@@ -155,6 +159,27 @@ def _optional_string(value: object) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+_CONFIG_VAR_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def _expand_config_vars(value: str, *, settings: Settings) -> str:
+    def replace(match: re.Match[str]) -> str:
+        name = match.group(1)
+        env_value = os.getenv(name)
+        if env_value is not None:
+            return env_value
+        if name == "JARVIS_TUSHARE_TOKEN" and settings.tushare_token:
+            return settings.tushare_token
+        return match.group(0)
+
+    return os.path.expandvars(_CONFIG_VAR_PATTERN.sub(replace, value))
+
+
+def _is_tushare_server(config: McpServerConfig) -> bool:
+    text = f"{config.name} {config.url}".lower()
+    return "tushare" in text
 
 
 def _positive_float(value: object, *, default: float) -> float:

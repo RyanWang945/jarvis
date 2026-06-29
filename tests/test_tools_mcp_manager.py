@@ -3,6 +3,7 @@ from typing import Any
 
 from app.tools.common import ToolExecutionRequest
 from app.tools.mcp.config import McpServerConfig
+from app.tools.mcp.http_client import _parse_sse_json
 from app.tools.mcp.manager import McpToolManager
 
 
@@ -50,6 +51,19 @@ class FakeMcpClient:
         return None
 
 
+def test_parse_sse_json_uses_first_data_event() -> None:
+    payload = (
+        "event: message\n"
+        'data: {"jsonrpc":"2.0","id":1,"result":{"ok":true}}\n'
+        "\n"
+    )
+
+    parsed = _parse_sse_json(payload)
+
+    assert parsed["id"] == 1
+    assert parsed["result"]["ok"] is True
+
+
 def test_manager_registers_filtered_mcp_tools_and_executes_original_tool_name() -> None:
     fake = FakeMcpClient()
     manager = McpToolManager(
@@ -78,6 +92,35 @@ def test_manager_registers_filtered_mcp_tools_and_executes_original_tool_name() 
     assert result.ok
     assert fake.calls == [("fred_get_macro_snapshot", {"include_metadata": False})]
     assert json.loads(result.stdout)["data"]["tool"] == "fred_get_macro_snapshot"
+
+
+def test_manager_registers_tushare_mcp_tools_with_qualified_names() -> None:
+    class TushareClient(FakeMcpClient):
+        def list_tools(self) -> list[dict[str, Any]]:
+            return [
+                {
+                    "name": "daily_basic",
+                    "description": "Get daily basic A-share indicators.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "ts_code": {"type": "string"},
+                            "trade_date": {"type": "string"},
+                        },
+                    },
+                }
+            ]
+
+    manager = McpToolManager(
+        [McpServerConfig(name="tushareMcp", url="https://api.tushare.pro/mcp/?token=test")],
+        client_factory=lambda _config: TushareClient(),
+        cache_ttl_seconds=0,
+    )
+
+    tools = {tool.name: tool for tool in manager.list_tool_definitions()}
+
+    assert list(tools) == ["mcp__tushareMcp__daily_basic"]
+    assert tools["mcp__tushareMcp__daily_basic"].args_schema["properties"]["ts_code"]["type"] == "string"
 
 
 def test_manager_marks_business_error_envelope_as_failed() -> None:

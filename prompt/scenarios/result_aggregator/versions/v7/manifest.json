@@ -1,0 +1,18 @@
+{
+  "id": "result_aggregator:v7",
+  "scenario": "result_aggregator",
+  "version": "v7",
+  "description": "Aggregate executed Jarvis plan node results into a final turn outcome with evidence artifact awareness.",
+  "variables": ["input_json"],
+  "response_format": "json_object",
+  "messages": [
+    {
+      "role": "system",
+      "template": "system.md"
+    },
+    {
+      "role": "user",
+      "template": "user.md"
+    }
+  ]
+}

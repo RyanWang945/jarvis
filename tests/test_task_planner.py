@@ -8,7 +8,7 @@ from pydantic import ValidationError
 from app.agent_react.session_state import ConversationSessionState
 from app.config import get_settings
 from app.task_runtime.planner import ExecutionPlan, PlanNode, TurnPlanner, _planner_messages, _plan_from_payload, build_plan_input
-from app.task_runtime.planner_skills import PlannerSkillSelection
+from app.task_runtime.planner_skills import PlannerSkillSelection, SelectedPlannerSkill
 from app.task_runtime.runtime_context import RuntimeContext
 
 
@@ -78,7 +78,11 @@ def test_plan_node_normalizes_mode() -> None:
     assert PlanNode(id="bad", runtime="react", mode="deliver", objective="Deliver report").mode == "read"
 
 
-def test_build_plan_input_normalizes_artifacts_and_hints() -> None:
+def test_build_plan_input_normalizes_artifacts_and_hints(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "app.task_runtime.planner._available_tool_names",
+        lambda: ["Skill", "mcp__tushareMcp__daily_basic"],
+    )
     plan_input = build_plan_input(
         current_user_input="把刚刚那个报告发我",
         artifacts=[{"id": "report-1", "filename": "rag_eval_report.md", "summary": "RAG report"}],
@@ -92,6 +96,7 @@ def test_build_plan_input_normalizes_artifacts_and_hints() -> None:
     assert plan_input.runtime_context["current_date"]
     assert plan_input.runtime_context["current_time"]
     assert plan_input.runtime_context["timezone"] == "Asia/Shanghai"
+    assert plan_input.runtime_context["available_tools"] == ["Skill", "mcp__tushareMcp__daily_basic"]
     dumped = plan_input.model_dump(mode="json")
     assert "runtime_hints" not in dumped
     assert "typed_runtime_context" not in dumped
@@ -117,6 +122,37 @@ def test_planner_messages_render_selected_planner_skill_as_system_section() -> N
     assert "code-planning" in messages[0].content
     assert "Use coarse coder nodes." in messages[0].content
     assert "selected_planner_skill" not in messages[1].content
+
+
+def test_planner_messages_render_multiple_selected_planner_skills() -> None:
+    plan_input = build_plan_input(
+        current_user_input="分析固高科技股票",
+        artifacts=[],
+        previous_node_results=[],
+        runtime_context=RuntimeContext.from_hints({"available_runtimes": ["react", "coder"]}),
+    )
+    messages = _planner_messages(
+        plan_input,
+        planner_skill=PlannerSkillSelection(
+            selected_skills=(
+                SelectedPlannerSkill(
+                    skill_id="finance-analysis-planning",
+                    reason="金融研究",
+                    guidance="Plan finance evidence.",
+                ),
+                SelectedPlannerSkill(
+                    skill_id="stock-analysis-planning",
+                    reason="A股指标",
+                    guidance="Plan stock market data.",
+                ),
+            )
+        ),
+    )
+
+    assert "finance-analysis-planning" in messages[0].content
+    assert "stock-analysis-planning" in messages[0].content
+    assert "Plan finance evidence." in messages[0].content
+    assert "Plan stock market data." in messages[0].content
 
 
 def test_plan_from_payload_derives_llm_finalization_for_non_llm_nodes() -> None:
@@ -163,6 +199,34 @@ def test_plan_from_payload_coerces_llm_when_not_available() -> None:
     assert plan.nodes[0].runtime == "react"
     assert plan.finalization_hint.mode == "llm"
     assert plan.finalization_hint.user_facing is False
+
+
+def test_plan_from_payload_rewrites_placeholder_node_ids_and_refs() -> None:
+    plan = _plan_from_payload(
+        {
+            "user_objective": "调研一下固高科技这只股票",
+            "finalization_hint": {"user_facing": False},
+            "nodes": [
+                {
+                    "id": "node_1",
+                    "runtime": "react",
+                    "mode": "write",
+                    "objective": "调研固高科技股票，收集财务数据、行情估值和公告事件。每个关键事实形成claim并绑定来源URL。",
+                    "output_hint": "产出内部artifact evidence_claims.md，使用Markdown格式，不生成面向用户的报告。",
+                },
+                {
+                    "id": "node_2",
+                    "runtime": "react",
+                    "objective": "基于证据做初步分析。",
+                    "input_refs": ["node:node_1"],
+                },
+            ],
+        },
+        fallback_objective="调研一下固高科技这只股票",
+    )
+
+    assert [node.id for node in plan.nodes] == ["collect_financial_evidence", "analyze"]
+    assert plan.nodes[1].input_refs == ["node:collect_financial_evidence"]
 
 
 def test_plan_from_payload_keeps_pass_through_for_single_llm_node() -> None:

@@ -1,0 +1,18 @@
+{
+  "id": "plan_repair:v2",
+  "scenario": "plan_repair",
+  "version": "v2",
+  "description": "根据确定性校验错误修复 Jarvis Planner 输出的 JSON 计划，支持多个 planner skill 上下文。",
+  "response_format": "json_object",
+  "variables": ["input_json"],
+  "messages": [
+    {
+      "role": "system",
+      "template": "system.md"
+    },
+    {
+      "role": "user",
+      "template": "user.md"
+    }
+  ]
+}

@@ -199,22 +199,24 @@ class TurnPlanner:
         previous_node_results: list[dict[str, Any]] | None = None,
         runtime_context: RuntimeContext | None = None,
         instructions: list[str] | None = None,
-    ) -> TurnPlannerResult:
+        ) -> TurnPlannerResult:
         session = session_state or ConversationSessionState()
         runtime = runtime_context or RuntimeContext.from_hints({})
+        available_tools = _available_tool_names()
+        runtime_for_planning = runtime.with_hints({"available_tools": available_tools})
         planner_skill = self._planner_skill_router.select(
             content=content,
             session_state=session,
             conversation_metadata=conversation_metadata,
             conversation_context=conversation_context,
-            runtime_context=runtime,
+            runtime_context=runtime_for_planning,
         )
         plan_input = build_plan_input(
             current_user_input=content,
             conversation_context=conversation_context,
             artifacts=recent_artifacts or [],
             previous_node_results=previous_node_results or [],
-            runtime_context=runtime,
+            runtime_context=runtime_for_planning,
             session_state=session,
             instructions=instructions or [],
         )
@@ -299,6 +301,9 @@ def build_plan_input(
 ) -> PlanInput:
     resolved_runtime_context = runtime_context or RuntimeContext.from_hints({})
     resolved_runtime_context = RuntimeContext.from_hints(_ensure_temporal_hints(resolved_runtime_context.to_legacy_hints()))
+    runtime_hints = resolved_runtime_context.to_legacy_hints()
+    if "available_tools" not in runtime_hints:
+        runtime_hints["available_tools"] = _available_tool_names()
     return PlanInput(
         current_user_input=current_user_input,
         conversation_context=(
@@ -312,7 +317,7 @@ def build_plan_input(
         ),
         artifacts=_normalize_artifact_context(artifacts),
         previous_node_results=[item for item in previous_node_results if isinstance(item, dict)],
-        runtime_context=resolved_runtime_context.to_legacy_hints(),
+        runtime_context=runtime_hints,
         instructions=[str(item).strip() for item in (instructions or []) if str(item).strip()],
         registered_repositories=_registered_repo_list(),
     )
@@ -324,6 +329,16 @@ def _registered_repo_list() -> list[dict[str, str]]:
     except Exception:
         return []
     return [{"repo_id": repo.repo_id, "name": repo.name} for repo in repos]
+
+
+def _available_tool_names() -> list[str]:
+    try:
+        from app.tools.runtime import list_tool_definitions
+
+        return sorted(tool.name for tool in list_tool_definitions(exposed_to_llm=True))
+    except Exception:
+        logger.warning("planner tool listing unavailable", exc_info=True)
+        return []
 
 
 def _planner_messages(
@@ -347,17 +362,26 @@ def _planner_messages(
 
 
 def _planner_skill_section(planner_skill: PlannerSkillSelection | None) -> str:
-    if planner_skill is None or not planner_skill.skill_id or not planner_skill.guidance.strip():
+    skills = planner_skill.skills if planner_skill is not None else ()
+    skills = tuple(skill for skill in skills if skill.skill_id and skill.guidance.strip())
+    if not skills:
         return ""
-    reason = planner_skill.reason.strip()
     lines = [
         "## 专用规划原则",
         "",
-        f"已选择 planner skill：{planner_skill.skill_id}",
+        "已选择 planner skills：",
     ]
-    if reason:
-        lines.append(f"选择原因：{reason}")
-    lines.extend(["", planner_skill.guidance.strip()])
+    for skill in skills:
+        lines.append(f"- {skill.skill_id}" + (f"：{skill.reason.strip()}" if skill.reason.strip() else ""))
+    for skill in skills:
+        lines.extend(
+            [
+                "",
+                f"### {skill.skill_id}",
+                "",
+                skill.guidance.strip(),
+            ]
+        )
     return "\n".join(lines)
 
 
@@ -401,7 +425,9 @@ def _repair_plan_if_needed(
         "registered_repositories": plan_input.registered_repositories,
         "artifacts": plan_input.artifacts,
         "previous_node_results": plan_input.previous_node_results,
-        "selected_planner_skill": planner_skill.as_payload() if planner_skill is not None else {},
+        "selected_planner_skills": planner_skill.as_payload().get("selected_planner_skills", [])
+        if planner_skill is not None
+        else [],
         "invalid_plan": plan.model_dump(mode="json"),
         "validation_errors": issues_payload(issues),
     }
@@ -605,6 +631,7 @@ def _normalize_plan_payload(
             for node in raw_nodes
             if isinstance(node, dict)
         ]
+        _normalize_placeholder_node_ids(normalized["nodes"])
     normalized["finalization_hint"] = _derive_finalization_hint(
         normalized.get("nodes"),
         raw_finalization_hint,
@@ -660,6 +687,91 @@ def _normalize_node_payload(
         node["output_hint"] = str(output_hint).strip()
     node["input_refs"] = _normalize_input_refs(node.get("input_refs"), known_artifact_refs=known_artifact_refs)
     return node
+
+
+def _normalize_placeholder_node_ids(nodes: list[dict[str, Any]]) -> None:
+    id_map: dict[str, str] = {}
+    used: set[str] = set()
+    for node in nodes:
+        original = str(node.get("id") or "").strip()
+        if not _is_placeholder_node_id(original):
+            if original:
+                used.add(original)
+            continue
+        replacement = _unique_node_id(_semantic_node_id(node), used)
+        node["id"] = replacement
+        used.add(replacement)
+        if original:
+            id_map[original] = replacement
+
+    if not id_map:
+        return
+
+    for node in nodes:
+        refs: list[str] = []
+        for ref in node.get("input_refs") or []:
+            text = str(ref).strip()
+            if text.startswith("node:"):
+                target = text.removeprefix("node:")
+                text = f"node:{id_map.get(target, target)}"
+            if text and text not in refs:
+                refs.append(text)
+        node["input_refs"] = refs
+
+
+def _is_placeholder_node_id(value: str) -> bool:
+    return bool(re.fullmatch(r"(?:node|task|step)[_-]?\d+", value.strip().lower()))
+
+
+def _semantic_node_id(node: dict[str, Any]) -> str:
+    text = " ".join(
+        str(node.get(key) or "")
+        for key in ("objective", "output_hint")
+    ).lower()
+    runtime = str(node.get("runtime") or "").strip().lower()
+    if "evidence_claims" in text or "claim" in text:
+        if _contains_any(text, ("股票", "金融", "财务", "行情", "估值", "stock", "finance", "financial")):
+            return "collect_financial_evidence"
+        return "collect_evidence"
+    if _contains_any(text, ("调研", "研究", "搜索", "查找", "资料", "新闻", "research", "search")):
+        if _contains_any(text, ("股票", "金融", "财务", "行情", "估值", "stock", "finance", "financial")):
+            return "research_finance"
+        return "research"
+    if _contains_any(text, ("对比", "比较", "compare")):
+        return "compare"
+    if _contains_any(text, ("分析", "analyze", "analysis")):
+        return "analyze"
+    if "证据" in text:
+        return "collect_evidence"
+    if _contains_any(text, ("总结", "汇总", "summarize", "summary")):
+        return "summarize"
+    if _contains_any(text, ("review", "审查", "检查")):
+        return "review"
+    if _contains_any(text, ("修复", "fix", "bug")):
+        return "fix"
+    if _contains_any(text, ("实现", "开发", "修改", "编写", "代码", "implement", "code", "write")):
+        return "implement"
+    if _contains_any(text, ("报告", "report")):
+        return "write_report"
+    if _contains_any(text, ("解释", "回答", "说明", "explain", "answer")):
+        return "answer"
+    if runtime in _RUNTIMES:
+        return f"{runtime}_work"
+    return "work"
+
+
+def _contains_any(text: str, markers: tuple[str, ...]) -> bool:
+    return any(marker in text for marker in markers)
+
+
+def _unique_node_id(base: str, used: set[str]) -> str:
+    safe = re.sub(r"[^a-z0-9_]+", "_", base.lower()).strip("_") or "work"
+    if safe not in used:
+        return safe
+    index = 2
+    while f"{safe}_{index}" in used:
+        index += 1
+    return f"{safe}_{index}"
 
 
 def _normalize_runtime(value: Any) -> NodeRuntime:

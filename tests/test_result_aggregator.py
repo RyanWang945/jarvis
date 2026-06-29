@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from app.llm.provider_adapters import NormalizedLLMResponse
@@ -100,6 +101,49 @@ def test_result_aggregator_uses_llm_json_result() -> None:
     prompt_payload = json.loads(chat.calls[0]["messages"][1].content.split("\n\n", 1)[1])
     assert prompt_payload["runtime_context"]["active_repo"] == "jarvis"
     assert "runtime_hints" not in prompt_payload
+
+
+def test_result_aggregator_includes_evidence_claim_artifact_in_prompt(tmp_path: Path) -> None:
+    evidence_path = tmp_path / "evidence_claims.md"
+    evidence_path.write_text(
+        "# 固高科技证据记录\n\n"
+        "| Claim | 来源URL | 日期/期间 | 置信度 | 备注 |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        "| 固高科技股票代码为301510.SZ | https://example.com/301510 | 2026-06-27 | high | 证券身份 |\n",
+        encoding="utf-8",
+    )
+    chat = ScriptedSummaryChat('{"status":"completed","reply":"已基于证据汇总。","artifact_refs":[],"data":{}}')
+    aggregator = ResultAggregator(model_resolver=lambda metadata: FakeResolvedModel(chat))
+    report = ExecutionReport(
+        status="completed",
+        node_results=[
+            NodeResult(
+                node_id="collect_financial_evidence",
+                runtime="react",
+                status="completed",
+                summary="Collected evidence claims.",
+                artifacts=[
+                    NodeArtifact(
+                        ref="evidence_claims",
+                        kind="file",
+                        path=str(evidence_path),
+                        filename="evidence_claims.md",
+                        mime_type="text/markdown",
+                    )
+                ],
+            )
+        ],
+    )
+
+    result = aggregator.aggregate(plan=_plan(), report=report)
+
+    assert result.status == "completed"
+    prompt_payload = json.loads(chat.calls[0]["messages"][1].content.split("\n\n", 1)[1])
+    evidence_artifacts = prompt_payload["evidence_artifacts"]
+    assert evidence_artifacts[0]["node_id"] == "collect_financial_evidence"
+    assert evidence_artifacts[0]["filename"] == "evidence_claims.md"
+    assert "固高科技股票代码为301510.SZ" in evidence_artifacts[0]["content"]["markdown"]
+    assert "https://example.com/301510" in evidence_artifacts[0]["content"]["markdown"]
 
 
 def test_result_aggregator_does_not_downgrade_completed_report_to_failed() -> None:

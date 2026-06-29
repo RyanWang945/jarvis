@@ -20,15 +20,12 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
-class PlannerSkillSelection:
-    skill_id: str | None = None
+class SelectedPlannerSkill:
+    skill_id: str
     reason: str = ""
     guidance: str = ""
-    usage_records: list[dict[str, Any]] | None = None
 
     def as_payload(self) -> dict[str, Any]:
-        if not self.skill_id:
-            return {}
         return {
             "skill_id": self.skill_id,
             "reason": self.reason,
@@ -36,8 +33,39 @@ class PlannerSkillSelection:
         }
 
 
+@dataclass(frozen=True)
+class PlannerSkillSelection:
+    skill_id: str | None = None
+    reason: str = ""
+    guidance: str = ""
+    selected_skills: tuple[SelectedPlannerSkill, ...] = ()
+    usage_records: list[dict[str, Any]] | None = None
+
+    @property
+    def skills(self) -> tuple[SelectedPlannerSkill, ...]:
+        if self.selected_skills:
+            return self.selected_skills
+        if not self.skill_id:
+            return ()
+        return (
+            SelectedPlannerSkill(
+                skill_id=self.skill_id,
+                reason=self.reason,
+                guidance=self.guidance,
+            ),
+        )
+
+    def as_payload(self) -> dict[str, Any]:
+        skills = self.skills
+        if not skills:
+            return {}
+        return {
+            "selected_planner_skills": [skill.as_payload() for skill in skills],
+        }
+
+
 class PlannerSkillRouter:
-    """Select at most one planner skill before the generic heavy planner runs."""
+    """Select planner skills before the generic heavy planner runs."""
 
     def __init__(self, *, prompt_registry: PromptRegistry | None = None, prompt_version: str | None = None) -> None:
         self._prompt_registry = prompt_registry or PromptRegistry()
@@ -81,10 +109,12 @@ class PlannerSkillRouter:
         selected = _selection_from_payload(parsed, candidates)
         usage_record = usage_record_from_response(response, stage="planner_skill_router")
         usage_records = [usage_record] if usage_record is not None else []
+        first = selected.skills[0] if selected.skills else None
         return PlannerSkillSelection(
-            skill_id=selected.skill_id,
+            skill_id=first.skill_id if first is not None else None,
             reason=selected.reason,
-            guidance=selected.guidance,
+            guidance=first.guidance if first is not None else "",
+            selected_skills=selected.skills,
             usage_records=usage_records,
         )
 
@@ -136,20 +166,57 @@ def _router_input(
 
 def _selection_from_payload(payload: dict[str, Any], candidates: list[Skill]) -> PlannerSkillSelection:
     candidate_by_id = {skill.skill_id: skill for skill in candidates}
+    raw_selected_many = payload.get("selected_planner_skills")
+    selected_items: list[dict[str, Any]] = []
+    if isinstance(raw_selected_many, list):
+        selected_items = [item for item in raw_selected_many if isinstance(item, dict)]
+    elif isinstance(raw_selected_many, dict):
+        selected_items = [raw_selected_many]
+
     selected = payload.get("selected_planner_skill")
-    if isinstance(selected, dict):
-        selected_id = str(selected.get("skill_id") or selected.get("id") or "").strip()
-        reason = str(selected.get("reason") or payload.get("reason") or "").strip()
-    else:
-        selected_id = str(selected or payload.get("skill_id") or "").strip()
+    if not selected_items and isinstance(selected, dict):
+        selected_items = [selected]
+    elif not selected_items and selected is not None:
+        selected_items = [{"skill_id": selected, "reason": payload.get("reason") or ""}]
+    elif not selected_items and payload.get("skill_id"):
+        selected_items = [{"skill_id": payload.get("skill_id"), "reason": payload.get("reason") or ""}]
+
+    if not selected_items:
         reason = str(payload.get("reason") or "").strip()
-    if selected_id in {"", "none", "null", "general"}:
         return PlannerSkillSelection(reason=reason or "no planner skill selected")
-    skill = candidate_by_id.get(selected_id)
-    if skill is None:
-        return PlannerSkillSelection(reason=f"ignored unknown planner skill: {selected_id}")
-    return PlannerSkillSelection(
-        skill_id=skill.skill_id,
-        reason=reason,
-        guidance=skill.manifest.planning_guidance,
-    )
+
+    selected_skills: list[SelectedPlannerSkill] = []
+    ignored: list[str] = []
+    seen: set[str] = set()
+    for item in selected_items:
+        selected_id = str(item.get("skill_id") or item.get("id") or "").strip()
+        reason = str(item.get("reason") or payload.get("reason") or "").strip()
+        if selected_id in {"", "none", "null", "general"}:
+            continue
+        skill = candidate_by_id.get(selected_id)
+        if skill is None:
+            ignored.append(selected_id)
+            continue
+        if skill.skill_id in seen:
+            continue
+        seen.add(skill.skill_id)
+        selected_skills.append(
+            SelectedPlannerSkill(
+                skill_id=skill.skill_id,
+                reason=reason,
+                guidance=skill.manifest.planning_guidance,
+            )
+        )
+
+    if selected_skills:
+        reason = "; ".join(skill.reason for skill in selected_skills if skill.reason)
+        first = selected_skills[0]
+        return PlannerSkillSelection(
+            skill_id=first.skill_id,
+            reason=reason,
+            guidance=first.guidance,
+            selected_skills=tuple(selected_skills),
+        )
+    if ignored:
+        return PlannerSkillSelection(reason=f"ignored unknown planner skill: {', '.join(ignored)}")
+    return PlannerSkillSelection(reason=str(payload.get("reason") or "no planner skill selected").strip())
