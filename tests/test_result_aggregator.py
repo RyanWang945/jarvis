@@ -74,6 +74,30 @@ def test_result_aggregator_fallback_completed_summarizes_node_results() -> None:
     assert result.artifact_refs == ["artifact:R1"]
 
 
+def test_result_aggregator_fallback_prefers_workspace_result_markdown(tmp_path: Path) -> None:
+    result_path = tmp_path / "RESULT.md"
+    result_path.write_text("# Final Workspace Result\n\nDetailed result from workspace.", encoding="utf-8")
+    aggregator = ResultAggregator(model_resolver=lambda metadata: _missing_key_model())
+    report = ExecutionReport(
+        status="completed",
+        node_results=[
+            NodeResult(
+                node_id="review",
+                runtime="coder",
+                status="completed",
+                summary="short summary",
+                data={"workspace": {"result_markdown_path": str(result_path)}},
+            )
+        ],
+    )
+
+    result = aggregator.aggregate(plan=_plan(), report=report)
+
+    assert result.status == "completed"
+    assert "# Final Workspace Result" in result.reply
+    assert "short summary" not in result.reply
+
+
 def test_result_aggregator_uses_llm_json_result() -> None:
     chat = ScriptedSummaryChat(
         '{"status":"completed","reply":"调研和 review 都完成了。","artifact_refs":["artifact:R1"],"data":{"confidence":"high"}}'

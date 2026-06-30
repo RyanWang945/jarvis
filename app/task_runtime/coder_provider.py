@@ -82,6 +82,8 @@ class CodexCoderProvider:
                     "source_branch": str(request.metadata.get("source_branch") or ""),
                     "target_branch": str(request.metadata.get("target_branch") or ""),
                     "node_branch": str(request.metadata.get("node_branch") or ""),
+                    "allow_commit": bool(request.metadata.get("allow_commit")),
+                    "allow_push": bool(request.metadata.get("allow_push")),
                 },
                 timeout_seconds=request.timeout_seconds,
             )

@@ -63,7 +63,7 @@ class NodeWorkspaceRuntimeContext:
 
     @classmethod
     def from_hints(cls, hints: Mapping[str, Any] | None) -> NodeWorkspaceRuntimeContext:
-        return cls(repos_dir=_optional_path(_hint(hints, "node_repos_dir")))
+        return cls(repos_dir=_optional_path(_hint(hints, "node_repo_dir") or _hint(hints, "node_repos_dir")))
 
 
 @dataclass(frozen=True)

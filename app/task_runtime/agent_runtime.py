@@ -185,6 +185,12 @@ class TaskAgentRuntime:
             "jarvis.user_input_preview": trace_preview(user_input),
             "jarvis.recent_artifact_count": len(recent_artifacts),
         }
+        previous_node_results = _previous_node_results_from_messages(
+            self._store.list_messages(turn.conversation_id),
+            current_turn_id=turn_id,
+        ) if _should_include_previous_node_results(user_input, conversation_context) else []
+        if previous_node_results:
+            turn_attributes["jarvis.previous_node_result_count"] = len(previous_node_results)
         if content_capture_enabled():
             turn_attributes["langfuse.trace.input"] = trace_preview(user_input, limit=1200)
         set_attributes(**turn_attributes)
@@ -206,7 +212,7 @@ class TaskAgentRuntime:
                 conversation_metadata=conversation.metadata,
                 recent_artifacts=recent_artifacts,
                 conversation_context=conversation_context,
-                previous_node_results=[],
+                previous_node_results=previous_node_results,
                 runtime_context=runtime_context,
                 instructions=[],
                 progress=progress,
@@ -378,7 +384,7 @@ class TaskAgentRuntime:
             report = self._node_executor.execute(
                 router_result.plan,
                 artifacts=recent_artifacts,
-                previous_node_results=[],
+                previous_node_results=previous_node_results,
                 runtime_context=execution_context,
                 instructions=[],
                 progress=progress,
@@ -647,6 +653,130 @@ def _recent_artifacts(store: ConversationStore, conversation_id: int) -> list[di
     except Exception:
         logger.warning("task runtime failed to load recent artifacts conversation_id=%s", conversation_id, exc_info=True)
         return []
+
+
+def _previous_node_results_from_messages(
+    messages: list[Any],
+    *,
+    current_turn_id: int | None = None,
+    max_results: int = 12,
+) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for message in reversed(messages):
+        if current_turn_id is not None and getattr(message, "turn_id", None) == current_turn_id:
+            continue
+        if getattr(message, "role", None) != "assistant":
+            continue
+        raw_payload = getattr(message, "raw_payload", None)
+        if not isinstance(raw_payload, dict) or raw_payload.get("source") != "task_runtime":
+            continue
+        workspace_nodes = _workspace_nodes_by_id(raw_payload.get("session_workspace"))
+        report = raw_payload.get("execution_report")
+        node_results = report.get("node_results") if isinstance(report, dict) else None
+        if not isinstance(node_results, list):
+            continue
+        for item in reversed(node_results):
+            if not isinstance(item, dict):
+                continue
+            node_id = str(item.get("node_id") or item.get("id") or "").strip()
+            runtime = item.get("runtime")
+            if not node_id or node_id in seen or runtime not in {"llm", "react", "coder"}:
+                continue
+            if item.get("status") != "completed":
+                continue
+            result = _compact_previous_node_result(item, workspace_nodes.get(node_id))
+            if result is None:
+                continue
+            results.append(result)
+            seen.add(node_id)
+            if len(results) >= max_results:
+                return results
+    return results
+
+
+def _should_include_previous_node_results(user_input: str, conversation_context: Any) -> bool:
+    if conversation_context is not None and getattr(conversation_context, "context_reference_detected", False):
+        return True
+    text = str(user_input or "").strip().lower()
+    if not text:
+        return False
+    continuation_terms = (
+        "继续",
+        "接着",
+        "刚才",
+        "刚刚",
+        "上次",
+        "之前",
+        "那个",
+        "这个",
+        "再",
+        "补",
+        "另开",
+        "合并",
+        "发布",
+        "continue",
+        "resume",
+        "previous",
+        "last",
+        "same",
+        "that",
+        "fork",
+        "publish",
+        "merge",
+    )
+    return any(term in text for term in continuation_terms)
+
+
+def _workspace_nodes_by_id(session_workspace: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(session_workspace, dict):
+        return {}
+    nodes = session_workspace.get("nodes")
+    if not isinstance(nodes, dict):
+        return {}
+    return {str(node_id): dict(value) for node_id, value in nodes.items() if isinstance(value, dict)}
+
+
+def _compact_previous_node_result(item: dict[str, Any], workspace_meta: dict[str, Any] | None) -> dict[str, Any] | None:
+    node_id = str(item.get("node_id") or item.get("id") or "").strip()
+    runtime = item.get("runtime")
+    if not node_id or runtime not in {"llm", "react", "coder"}:
+        return None
+    data = dict(item.get("data")) if isinstance(item.get("data"), dict) else {}
+    workspace = dict(data.get("workspace")) if isinstance(data.get("workspace"), dict) else {}
+    if workspace_meta:
+        _fill_workspace_from_meta(workspace, workspace_meta)
+    if workspace:
+        data["workspace"] = workspace
+        if workspace.get("workspace_path"):
+            data.setdefault("workspace_path", workspace["workspace_path"])
+    result: dict[str, Any] = {
+        "node_id": node_id,
+        "runtime": runtime,
+        "status": "completed",
+        "summary": str(item.get("summary") or ""),
+        "artifacts": item.get("artifacts") if isinstance(item.get("artifacts"), list) else [],
+        "data": data,
+    }
+    if isinstance(item.get("git"), dict) and item["git"]:
+        result["git"] = item["git"]
+    return result
+
+
+def _fill_workspace_from_meta(workspace: dict[str, Any], meta: dict[str, Any]) -> None:
+    mapping = {
+        "root_path": "workspace_path",
+        "task_path": "task_path",
+        "progress_path": "progress_path",
+        "result_markdown_path": "result_markdown_path",
+        "state_path": "state_path",
+        "artifacts_dir": "artifacts_dir",
+        "repo_path": "repo_path",
+    }
+    for source_key, target_key in mapping.items():
+        value = meta.get(source_key)
+        if value is not None and not workspace.get(target_key):
+            workspace[target_key] = str(value)
 
 
 def _runtime_temporal_hints(now: datetime | None = None) -> dict[str, str]:

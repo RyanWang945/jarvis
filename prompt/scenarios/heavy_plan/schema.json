@@ -25,7 +25,7 @@
           },
           "mode": {
             "type": "string",
-            "enum": ["read", "write"]
+            "enum": ["read", "write", "publish"]
           },
           "objective": {
             "type": "string"
@@ -34,7 +34,7 @@
             "type": "array",
             "items": {
               "type": "string",
-              "pattern": "^(artifact|node):[A-Za-z0-9_.:-]+$"
+              "pattern": "^(artifact|node|branch):[A-Za-z0-9_./:-]+$"
             }
           },
           "output_hint": {

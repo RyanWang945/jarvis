@@ -76,6 +76,13 @@ class NodeExecutionContext:
         return RuntimeContext.from_hints(self.legacy_hints)
 
 
+@dataclass(frozen=True)
+class _HistoricalCoderWorkspace:
+    workspace_path: Path
+    repo_path: Path
+    repo_workspace: NodeRepoWorkspace | None = None
+
+
 class NodeExecuteRuntime(Protocol):
     def run(self, context: NodeExecutionContext) -> NodeResult: ...
 
@@ -544,21 +551,35 @@ class CoderNodeExecuteRuntime:
             logger.info("coder node blocked node_id=%s repo_id=%s reason=repository_error error=%s", context.node.id, repo_id, exc)
             return _blocked(context.node, "repository_not_available", str(exc))
         run_dir = context.runtime_context.repo.provider_run_dir
+        publish_mode = _is_publish_node(context.node)
         try:
-            repo_workspace = prepare_node_repo_workspace(
-                repo_id=repo.repo_id,
-                project_path=repo.canonical_root_path,
-                legacy_hints=context.legacy_hints,
-                node_id=context.node.id,
-            )
-            workdir = repo_workspace.repo_path if repo_workspace is not None else repo.canonical_root_path
+            historical_workspace = None if publish_mode else _historical_coder_workspace(context, default_repo_id=repo.repo_id)
+            if historical_workspace is not None:
+                repo_workspace = historical_workspace.repo_workspace
+                repo_workdir = historical_workspace.repo_path
+                agent_workdir = historical_workspace.workspace_path
+            elif publish_mode:
+                repo_workspace = None
+                repo_workdir = repo.canonical_root_path.resolve()
+                agent_workdir = repo_workdir
+            else:
+                repo_workspace = prepare_node_repo_workspace(
+                    repo_id=repo.repo_id,
+                    project_path=repo.canonical_root_path,
+                    legacy_hints=context.legacy_hints,
+                    node_id=context.node.id,
+                )
+                repo_workdir = repo_workspace.repo_path if repo_workspace is not None else repo.canonical_root_path
+                agent_workdir = context.runtime_context.workspace.node_workspace or repo_workdir
         except (RuntimeError, ValueError, OSError) as exc:
             logger.info("coder node blocked node_id=%s repo_id=%s reason=node_repo_prepare_failed error=%s", context.node.id, repo_id, exc)
             return _blocked(context.node, "node_repo_prepare_failed", str(exc))
         request_metadata = {
             "node_id": context.node.id,
             "project_path": str(repo.canonical_root_path),
-            "workdir": str(workdir),
+            "workdir": str(agent_workdir),
+            "workspace_path": str(agent_workdir),
+            "repo_path": str(repo_workdir),
         }
         if context.usage_records:
             request_metadata["usage_records"] = list(context.usage_records)
@@ -584,10 +605,23 @@ class CoderNodeExecuteRuntime:
             request_metadata["run_dir"] = str(run_dir)
         if context.runtime_context.workspace.session_id:
             request_metadata["session_id"] = context.runtime_context.workspace.session_id
+        if publish_mode:
+            request_metadata["allow_commit"] = True
+            request_metadata["allow_push"] = _objective_requests_push(context.node.objective)
+            request_metadata["publish_mode"] = True
+            context = replace(
+                context,
+                legacy_hints=context.runtime_context.with_hints(
+                    {
+                        "publish_mode": True,
+                        "publish_workdir": str(agent_workdir),
+                    }
+                ).to_legacy_hints(),
+            )
         instruction = _coder_instruction(context)
         request = CoderRunRequest(
             repo_id=repo.repo_id,
-            workdir=workdir,
+            workdir=agent_workdir,
             instruction=instruction,
             timeout_seconds=int(getattr(get_settings(), "coder_timeout_seconds", 1800)),
             run_dir=run_dir,
@@ -595,11 +629,12 @@ class CoderNodeExecuteRuntime:
         )
         try:
             logger.info(
-                "coder node start node_id=%s repo_id=%s provider=%s workdir=%s run_dir=%s",
+                "coder node start node_id=%s repo_id=%s provider=%s workdir=%s repo_path=%s run_dir=%s",
                 context.node.id,
                 repo_id,
                 self._provider.name,
-                str(workdir),
+                str(agent_workdir),
+                str(repo_workdir),
                 str(run_dir) if run_dir is not None else "",
             )
             with span_context(
@@ -620,18 +655,18 @@ class CoderNodeExecuteRuntime:
                 if result.approval_requests:
                     set_attributes(**{"jarvis.approval_required": True})
                     add_event("approval_requested", count=len(result.approval_requests))
-                if result.ok and repo_workspace is not None:
+                if result.ok and repo_workspace is not None and not publish_mode:
                     try:
                         result = _commit_coder_node_worktree(
                             result,
-                            workdir=workdir,
+                            workdir=repo_workdir,
                             node_id=context.node.id,
                             objective=context.node.objective,
                             repo_workspace=repo_workspace,
                         )
                     except (RuntimeError, OSError) as exc:
                         record_exception(exc, **{"jarvis.node_id": context.node.id, "jarvis.provider": self._provider.name})
-                        logger.exception("coder node worktree commit/merge failed node_id=%s workdir=%s", context.node.id, workdir)
+                        logger.exception("coder node worktree commit/merge failed node_id=%s workdir=%s", context.node.id, repo_workdir)
                         return _failed(context.node, "node_repo_commit_failed", str(exc), retryable=True)
         except Exception as exc:
             record_exception(exc, **{"jarvis.node_id": context.node.id, "jarvis.provider": self._provider.name})
@@ -1051,6 +1086,108 @@ def _first_item_text(item: dict[str, Any], keys: tuple[str, ...]) -> str:
     return ""
 
 
+def _historical_coder_workspace(context: NodeExecutionContext, *, default_repo_id: str) -> _HistoricalCoderWorkspace | None:
+    for item in context.resolved_inputs:
+        workspace = item.data.get("workspace") if isinstance(item.data, dict) else None
+        if not isinstance(workspace, dict):
+            continue
+        repo_path_text = str(workspace.get("repo_path") or "").strip()
+        if not repo_path_text:
+            continue
+        repo_path = Path(repo_path_text).resolve()
+        if not _is_git_worktree(repo_path):
+            continue
+        workspace_path_text = str(workspace.get("workspace_path") or "").strip()
+        workspace_path = Path(workspace_path_text).resolve() if workspace_path_text else repo_path.parent
+        state = _read_historical_workspace_state(workspace=workspace, workspace_path=workspace_path)
+        repo_workspace = _repo_workspace_from_state(state, repo_path=repo_path, default_repo_id=default_repo_id)
+        logger.info(
+            "coder node reusing historical workspace node_id=%s input_ref=%s workspace=%s repo=%s has_repo_workspace=%s",
+            context.node.id,
+            item.ref,
+            workspace_path,
+            repo_path,
+            repo_workspace is not None,
+        )
+        return _HistoricalCoderWorkspace(
+            workspace_path=workspace_path,
+            repo_path=repo_path,
+            repo_workspace=repo_workspace,
+        )
+    return None
+
+
+def _read_historical_workspace_state(*, workspace: dict[str, Any], workspace_path: Path) -> dict[str, Any]:
+    candidates = []
+    state_path_text = str(workspace.get("state_path") or "").strip()
+    if state_path_text:
+        candidates.append(Path(state_path_text))
+    candidates.append(workspace_path / "state.json")
+    for path in candidates:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return {}
+
+
+def _repo_workspace_from_state(
+    state: dict[str, Any],
+    *,
+    repo_path: Path,
+    default_repo_id: str,
+) -> NodeRepoWorkspace | None:
+    git = state.get("git") if isinstance(state, dict) else None
+    payload = git.get("repo_workspace") if isinstance(git, dict) else None
+    if not isinstance(payload, dict):
+        return None
+    source_branch = str(payload.get("source_branch") or "").strip()
+    target_branch = str(payload.get("target_branch") or "").strip()
+    node_branch = str(payload.get("node_branch") or "").strip()
+    base_commit = str(payload.get("base_commit") or "").strip()
+    if not target_branch or not node_branch or not base_commit:
+        return None
+    integration_text = str(payload.get("integration_path") or "").strip()
+    return NodeRepoWorkspace(
+        repo_path=repo_path,
+        repo_id=str(payload.get("repo_id") or default_repo_id),
+        source_branch=source_branch or target_branch,
+        target_branch=target_branch,
+        node_branch=node_branch,
+        base_commit=base_commit,
+        integration_path=Path(integration_text).resolve() if integration_text else None,
+    )
+
+
+def _is_git_worktree(path: Path) -> bool:
+    if not path.is_dir():
+        return False
+    try:
+        completed = subprocess.run(
+            ["git", "-c", f"safe.directory={path.as_posix()}", "rev-parse", "--is-inside-work-tree"],
+            cwd=str(path),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return completed.returncode == 0 and completed.stdout.strip() == "true"
+
+
+def _is_publish_node(node: PlanNode) -> bool:
+    return str(getattr(node, "mode", "") or "").strip().lower() == "publish"
+
+
+def _objective_requests_push(objective: str) -> bool:
+    text = str(objective or "").lower()
+    return any(marker in text for marker in ("push", "origin", "远程", "推送"))
+
+
 def _coder_instruction(context: NodeExecutionContext) -> str:
     resolved_inputs_lines: list[str] = []
     if context.resolved_inputs:
@@ -1071,6 +1208,7 @@ def _coder_instruction(context: NodeExecutionContext) -> str:
             "output_hint": context.node.output_hint or "Repository task result.",
             "node_manifest_path": context.runtime_context.workspace.manifest_name(),
             "coder_workspace_section": _coder_workspace_section(context.runtime_context),
+            "publish_mode": bool(context.runtime_context.legacy_hints.get("publish_mode")),
             "resolved_inputs_section": "\n".join(resolved_inputs_lines),
             "additional_instructions_section": additional_instructions,
         }
@@ -1079,17 +1217,26 @@ def _coder_instruction(context: NodeExecutionContext) -> str:
 
 def _coder_workspace_section(runtime_context: RuntimeContext) -> str:
     lines: list[str] = []
+    publish_mode = bool(runtime_context.legacy_hints.get("publish_mode"))
+    if publish_mode:
+        publish_workdir = str(runtime_context.legacy_hints.get("publish_workdir") or "").strip()
+        lines.append("- Publish mode: true")
+        if publish_workdir:
+            lines.append(f"- Registered project source directory: {publish_workdir}")
     branch_context = runtime_context.branch
     if branch_context.source_branch:
         lines.append(f"- Source branch: {branch_context.source_branch}")
     if branch_context.target_branch:
         lines.append(f"- Target branch: {branch_context.target_branch}")
-    if branch_context.node_branch:
+    if branch_context.node_branch and not publish_mode:
         lines.append(f"- Node branch: {branch_context.node_branch}")
-    if branch_context.worktree_mode:
+    if branch_context.worktree_mode and not publish_mode:
         lines.append(f"- Worktree mode: {branch_context.worktree_mode}")
-    if branch_context.target_branch:
+    if branch_context.target_branch and not publish_mode:
         lines.append("- Branch checkout is managed by Jarvis runtime before provider execution.")
+    if publish_mode:
+        lines.append("- This publish node may checkout/fetch/merge/commit in the registered project source directory.")
+        lines.append("- Remote push must use Codex approval before execution.")
     return "\n".join(lines)
 
 

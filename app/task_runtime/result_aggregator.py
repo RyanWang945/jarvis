@@ -688,6 +688,9 @@ def _pass_through_reply(result: NodeResult) -> str:
     explicit = _first_text(result.data, ("reply", "final_answer", "answer", "result"))
     if explicit:
         return explicit
+    workspace_result = _workspace_result_text(result)
+    if workspace_result:
+        return workspace_result
     structured = _structured_data_reply(result)
     if structured:
         return structured
@@ -846,7 +849,8 @@ def _fallback_aggregation(*, plan: ExecutionPlan, report: ExecutionReport) -> Ag
 
 
 def _completed_reply(plan: ExecutionPlan, report: ExecutionReport) -> str:
-    summaries = [result.summary.strip() for result in report.node_results if result.summary.strip()]
+    summaries = [_result_display_text(result) for result in report.node_results]
+    summaries = [summary for summary in summaries if summary]
     if not summaries:
         return f"已完成：{plan.user_objective}"
     if len(summaries) == 1:
@@ -854,6 +858,27 @@ def _completed_reply(plan: ExecutionPlan, report: ExecutionReport) -> str:
     lines = ["已完成，结果如下："]
     lines.extend(f"- {summary}" for summary in summaries)
     return "\n".join(lines)
+
+
+def _result_display_text(result: NodeResult) -> str:
+    return _workspace_result_text(result) or result.summary.strip()
+
+
+def _workspace_result_text(result: NodeResult) -> str:
+    workspace = result.data.get("workspace") if isinstance(result.data, dict) else None
+    if not isinstance(workspace, dict):
+        return ""
+    path_text = str(workspace.get("result_markdown_path") or "").strip()
+    if not path_text:
+        return ""
+    try:
+        path = Path(path_text).resolve(strict=True)
+        text = path.read_text(encoding="utf-8").strip()
+    except (OSError, ValueError):
+        return ""
+    if text in {"", "# Result"}:
+        return ""
+    return text
 
 
 def _blocked_question(blocked: list[NodeResult], *, approval_requested: bool = False) -> str:

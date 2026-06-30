@@ -75,7 +75,20 @@ def test_plan_node_rejects_legacy_codex_runtime() -> None:
 def test_plan_node_normalizes_mode() -> None:
     assert PlanNode(id="read", runtime="react", objective="Research").mode == "read"
     assert PlanNode(id="write", runtime="react", mode="write", objective="Write report").mode == "write"
+    assert PlanNode(id="publish", runtime="coder", mode="publish", objective="Publish branch").mode == "publish"
     assert PlanNode(id="bad", runtime="react", mode="deliver", objective="Deliver report").mode == "read"
+
+
+def test_plan_node_allows_branch_input_refs() -> None:
+    node = PlanNode(
+        id="publish_to_master",
+        runtime="coder",
+        mode="publish",
+        objective="Merge session branch into master",
+        input_refs=["branch:jarvis/smoke-test/sess_1", "branch:jarvis/smoke-test/sess_1"],
+    )
+
+    assert node.input_refs == ["branch:jarvis/smoke-test/sess_1"]
 
 
 def test_build_plan_input_normalizes_artifacts_and_hints(monkeypatch: pytest.MonkeyPatch) -> None:

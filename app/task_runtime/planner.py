@@ -26,10 +26,10 @@ from app.task_runtime.runtime_context import RuntimeContext
 logger = logging.getLogger(__name__)
 
 NodeRuntime = Literal["llm", "react", "coder"]
-NodeMode = Literal["read", "write"]
+NodeMode = Literal["read", "write", "publish"]
 FinalizationMode = Literal["pass_through", "llm"]
 _RUNTIMES = {"llm", "react", "coder"}
-_NODE_MODES = {"read", "write"}
+_NODE_MODES = {"read", "write", "publish"}
 
 
 class PlanNode(BaseModel):
@@ -795,7 +795,7 @@ def _normalize_input_refs(value: Any, *, known_artifact_refs: set[str] | None = 
         text = str(item).strip()
         if not text:
             continue
-        if not text.startswith(("artifact:", "node:")):
+        if not text.startswith(("artifact:", "node:", "branch:")):
             text = f"artifact:{text}" if known_artifact_refs and f"artifact:{text}" in known_artifact_refs else text
         if not _is_valid_input_ref(text):
             continue
@@ -807,10 +807,10 @@ def _normalize_input_refs(value: Any, *, known_artifact_refs: set[str] | None = 
 
 
 def _is_valid_input_ref(value: str) -> bool:
-    if not value.startswith(("artifact:", "node:")):
+    if not value.startswith(("artifact:", "node:", "branch:")):
         return False
     prefix, ref = value.split(":", 1)
-    return prefix in {"artifact", "node"} and bool(ref.strip())
+    return prefix in {"artifact", "node", "branch"} and bool(ref.strip())
 
 
 def _fallback_plan_for_objective(

@@ -73,6 +73,18 @@ class EchoRuntime:
         )
 
 
+class InputEchoRuntime(EchoRuntime):
+    def run(self, context):
+        self.calls.append(context)
+        input_summary = context.resolved_inputs[0].summary if context.resolved_inputs else "no input"
+        return NodeResult(
+            node_id=context.node.id,
+            runtime=context.node.runtime,
+            status="completed",
+            summary=f"input: {input_summary}",
+        )
+
+
 class UsageRuntime:
     def run(self, context):
         return NodeResult(
@@ -241,6 +253,81 @@ def test_feishu_gateway_can_run_task_runtime_e2e_without_network(tmp_path: Path)
     assert messages[-1].raw_payload["plan"]["nodes"][0]["id"] == "answer"
     assert messages[-1].raw_payload["execution_report"]["status"] == "completed"
     assert messages[-1].raw_payload["aggregation"]["status"] == "completed"
+
+
+def test_task_runtime_feeds_previous_workspace_results_to_planner_and_executor(tmp_path: Path) -> None:
+    store = InMemoryConversationStore()
+    gateway = GatewayService(conversation_store=store)
+    first_plan = ExecutionPlan(
+        user_objective="first task",
+        nodes=[PlanNode(id="first", runtime="llm", objective="Do first task")],
+    )
+    first_runtime = TaskAgentRuntime(
+        store,
+        planning_router=StaticPlanningRouter(first_plan),
+        node_executor=NodeExecutor(runtimes={"llm": EchoRuntime()}),
+        result_aggregator=ResultAggregator(model_resolver=lambda metadata: _missing_key_model()),
+        session_workspace_manager=SessionWorkspaceManager(workdir=tmp_path),
+    )
+    first_gateway_result = gateway.handle_inbound_event(
+        InboundEvent(
+            platform="feishu",
+            external_chat_id="chat-task-runtime-previous-workspace",
+            external_message_id="msg-task-runtime-previous-workspace-1",
+            chat_type="dm",
+            sender_id="ou_1",
+            sender_name="Ryan",
+            text="first task",
+        )
+    )
+
+    first_runtime.run_turn(first_gateway_result.turn_id)
+
+    first_raw_payload = store.list_messages(first_gateway_result.conversation_id)[-1].raw_payload
+    first_result = first_raw_payload["execution_report"]["node_results"][0]
+    assert first_result["data"]["workspace"]["workspace_path"]
+    assert first_result["data"]["workspace"]["repo_path"]
+
+    second_plan = ExecutionPlan(
+        user_objective="continue task",
+        nodes=[
+            PlanNode(
+                id="continue",
+                runtime="llm",
+                objective="Continue from the previous workspace",
+                input_refs=["node:first"],
+            )
+        ],
+    )
+    second_router = StaticPlanningRouter(second_plan)
+    input_runtime = InputEchoRuntime()
+    second_runtime = TaskAgentRuntime(
+        store,
+        planning_router=second_router,
+        node_executor=NodeExecutor(runtimes={"llm": input_runtime}),
+        result_aggregator=ResultAggregator(model_resolver=lambda metadata: _missing_key_model()),
+        session_workspace_manager=SessionWorkspaceManager(workdir=tmp_path),
+    )
+    second_gateway_result = gateway.handle_inbound_event(
+        InboundEvent(
+            platform="feishu",
+            external_chat_id="chat-task-runtime-previous-workspace",
+            external_message_id="msg-task-runtime-previous-workspace-2",
+            chat_type="dm",
+            sender_id="ou_1",
+            sender_name="Ryan",
+            text="继续刚才那个",
+        )
+    )
+
+    second_runtime.run_turn(second_gateway_result.turn_id)
+
+    previous_results = second_router.calls[0]["previous_node_results"]
+    assert previous_results[0]["node_id"] == "first"
+    assert previous_results[0]["data"]["workspace"]["workspace_path"] == first_result["data"]["workspace"]["workspace_path"]
+    assert previous_results[0]["data"]["workspace"]["repo_path"] == first_result["data"]["workspace"]["repo_path"]
+    assert input_runtime.calls[0].resolved_inputs[0].ref == "node:first"
+    assert input_runtime.calls[0].resolved_inputs[0].data["workspace"]["workspace_path"] == first_result["data"]["workspace"]["workspace_path"]
 
 
 def test_task_runtime_returns_combined_usage_metadata(tmp_path: Path) -> None:

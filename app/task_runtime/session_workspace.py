@@ -27,17 +27,28 @@ class NodeWorkspaceRef:
     node_id: str
     safe_node_id: str
     root_path: Path
+    task_path: Path
+    progress_path: Path
+    result_markdown_path: Path
+    state_path: Path
+    artifacts_dir: Path
     input_snapshot_path: Path
     output_path: Path
     result_path: Path
     manifest_path: Path
     provider_run_dir: Path
-    repos_dir: Path
+    repo_path: Path
 
     def to_legacy_hints(self) -> dict[str, str]:
         return {
             "node_workspace_dir": str(self.root_path),
-            "node_repos_dir": str(self.repos_dir),
+            "node_repo_dir": str(self.repo_path),
+            "node_repos_dir": str(self.repo_path),
+            "node_task_path": str(self.task_path),
+            "node_progress_path": str(self.progress_path),
+            "node_result_markdown_path": str(self.result_markdown_path),
+            "node_state_path": str(self.state_path),
+            "node_artifacts_dir": str(self.artifacts_dir),
             "node_input_snapshot_path": str(self.input_snapshot_path),
             "node_output_path": str(self.output_path),
             "node_result_path": str(self.result_path),
@@ -46,7 +57,8 @@ class NodeWorkspaceRef:
         }
 
     def repo_dir(self, repo_id: str) -> Path:
-        return self.repos_dir / _safe_component(repo_id, fallback="repo")
+        del repo_id
+        return self.repo_path
 
 
 @dataclass(frozen=True)
@@ -88,7 +100,12 @@ class SessionWorkspaceRef:
                 node_id: {
                     "safe_node_id": node.safe_node_id,
                     "root_path": str(node.root_path),
-                    "repos_dir": str(node.repos_dir),
+                    "repo_path": str(node.repo_path),
+                    "task_path": str(node.task_path),
+                    "progress_path": str(node.progress_path),
+                    "result_markdown_path": str(node.result_markdown_path),
+                    "state_path": str(node.state_path),
+                    "artifacts_dir": str(node.artifacts_dir),
                     "provider_run_dir": str(node.provider_run_dir),
                 }
                 for node_id, node in self.nodes.items()
@@ -195,7 +212,10 @@ class SessionWorkspaceManager:
         ):
             path.mkdir(parents=True, exist_ok=True)
         for node in node_refs.values():
+            node.root_path.mkdir(parents=True, exist_ok=True)
+            node.artifacts_dir.mkdir(parents=True, exist_ok=True)
             node.provider_run_dir.mkdir(parents=True, exist_ok=True)
+            _write_initial_node_workspace_files(node, plan=plan)
 
         session = SessionWorkspaceRef(
             session_id=session_id,
@@ -269,12 +289,15 @@ def write_node_input_snapshot(
     node_workspace.input_snapshot_path.write_text(_markdown_snapshot("Node Input Snapshot", payload), encoding="utf-8")
 
 
-def write_node_result(node_workspace: NodeWorkspaceRef, result: NodeResult) -> None:
+def write_node_result(node_workspace: NodeWorkspaceRef, result: NodeResult) -> NodeResult:
+    result = _with_workspace_data(node_workspace, result)
     output_path = node_workspace.output_path
-    if output_path.exists():
+    if output_path.exists() and output_path.read_text(encoding="utf-8").strip() != "# Result":
         output_path = output_path.with_name("node_summary.md")
     output_path.write_text(result.summary or "", encoding="utf-8")
     _write_json(node_workspace.result_path, result.model_dump(mode="json", exclude_none=True))
+    _update_node_workspace_state(node_workspace, result)
+    return result
 
 
 def prepare_node_repo(
@@ -287,16 +310,14 @@ def prepare_node_repo(
     if node_context.repos_dir is None:
         return None
 
-    repos_dir = node_context.repos_dir.resolve()
-    node_repo = (repos_dir / _safe_component(repo_id, fallback="repo")).resolve()
-    _assert_child(node_repo, repos_dir)
+    node_repo = node_context.repos_dir.resolve()
     if node_repo.exists():
         _assert_git_worktree(node_repo)
         return node_repo
 
     project = project_path.resolve()
     _assert_git_worktree(project)
-    repos_dir.mkdir(parents=True, exist_ok=True)
+    node_repo.parent.mkdir(parents=True, exist_ok=True)
     try:
         _run_git(project, "worktree", "add", "--detach", str(node_repo), "HEAD")
         return node_repo
@@ -317,9 +338,7 @@ def prepare_node_repo_workspace(
     if node_context.repos_dir is None:
         return None
 
-    repos_dir = node_context.repos_dir.resolve()
-    node_repo = (repos_dir / _safe_component(repo_id, fallback="repo")).resolve()
-    _assert_child(node_repo, repos_dir)
+    node_repo = node_context.repos_dir.resolve()
 
     project = project_path.resolve()
     _assert_git_worktree(project)
@@ -337,7 +356,7 @@ def prepare_node_repo_workspace(
     if node_repo.exists():
         _assert_git_worktree(node_repo)
     else:
-        repos_dir.mkdir(parents=True, exist_ok=True)
+        node_repo.parent.mkdir(parents=True, exist_ok=True)
         _delete_branch_if_exists(project, node_branch)
         _run_git(project, "worktree", "add", "-b", node_branch, str(node_repo), base_commit)
 
@@ -446,6 +465,80 @@ def node_workspace_hints(session_workspace: SessionWorkspaceRef | None, node_id:
     return node_workspace_legacy_hints(session_workspace, node_id)
 
 
+def _write_initial_node_workspace_files(node_workspace: NodeWorkspaceRef, *, plan: ExecutionPlan) -> None:
+    node = next((item for item in plan.nodes if item.id == node_workspace.node_id), None)
+    if node is None:
+        return
+    if not node_workspace.task_path.exists():
+        node_workspace.task_path.write_text(
+            "\n".join(
+                [
+                    f"# Task: {node.id}",
+                    "",
+                    f"- Runtime: `{node.runtime}`",
+                    f"- Mode: `{node.mode}`",
+                    f"- Objective: {node.objective}",
+                    f"- User objective: {plan.user_objective}",
+                    f"- Output hint: {node.output_hint or ''}",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+    if not node_workspace.progress_path.exists():
+        node_workspace.progress_path.write_text("# Progress\n\n- Workspace created.\n", encoding="utf-8")
+    if not node_workspace.result_markdown_path.exists():
+        node_workspace.result_markdown_path.write_text("# Result\n\n", encoding="utf-8")
+    if not node_workspace.state_path.exists():
+        _write_json(
+            node_workspace.state_path,
+            {
+                "schema_version": 1,
+                "workspace_id": node_workspace.safe_node_id,
+                "node_id": node.id,
+                "runtime": node.runtime,
+                "mode": node.mode,
+                "status": "created",
+                "repo_path": "repo",
+                "artifacts_path": "artifacts",
+                "created_at": _now(),
+                "updated_at": _now(),
+            },
+        )
+
+
+def _with_workspace_data(node_workspace: NodeWorkspaceRef, result: NodeResult) -> NodeResult:
+    data = dict(result.data)
+    data.setdefault("workspace_path", str(node_workspace.root_path))
+    data.setdefault("workspace", {})
+    if isinstance(data["workspace"], dict):
+        data["workspace"] = {
+            **data["workspace"],
+            "workspace_path": str(node_workspace.root_path),
+            "task_path": str(node_workspace.task_path),
+            "progress_path": str(node_workspace.progress_path),
+            "result_markdown_path": str(node_workspace.result_markdown_path),
+            "state_path": str(node_workspace.state_path),
+            "artifacts_dir": str(node_workspace.artifacts_dir),
+            "repo_path": str(node_workspace.repo_path),
+            "node_result_path": str(node_workspace.result_path),
+        }
+    return result.model_copy(update={"data": data})
+
+
+def _update_node_workspace_state(node_workspace: NodeWorkspaceRef, result: NodeResult) -> None:
+    try:
+        state = json.loads(node_workspace.state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        state = {"schema_version": 1, "workspace_id": node_workspace.safe_node_id, "node_id": node_workspace.node_id}
+    state["status"] = result.status
+    state["summary"] = result.summary
+    state["updated_at"] = _now()
+    if result.git:
+        state["git"] = result.git
+    _write_json(node_workspace.state_path, state)
+
+
 def _node_refs(root: Path, nodes: list[PlanNode]) -> dict[str, NodeWorkspaceRef]:
     used: set[str] = set()
     result: dict[str, NodeWorkspaceRef] = {}
@@ -456,12 +549,17 @@ def _node_refs(root: Path, nodes: list[PlanNode]) -> dict[str, NodeWorkspaceRef]
             node_id=node.id,
             safe_node_id=safe,
             root_path=node_root,
+            task_path=node_root / "TASK.md",
+            progress_path=node_root / "PROGRESS.md",
+            result_markdown_path=node_root / "RESULT.md",
+            state_path=node_root / "state.json",
+            artifacts_dir=node_root / "artifacts",
             input_snapshot_path=node_root / "input_snapshot.md",
-            output_path=node_root / "output.md",
+            output_path=node_root / "RESULT.md",
             result_path=node_root / "result.json",
             manifest_path=node_root / "node_manifest.json",
             provider_run_dir=node_root / "provider_run",
-            repos_dir=node_root / "repo",
+            repo_path=node_root / "repo",
         )
     return result
 

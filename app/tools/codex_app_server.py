@@ -741,20 +741,13 @@ def _is_auto_approved_workspace_approval(
 ) -> bool:
     if not _approval_cwd_is_within_allowed_roots(approval, allowed_roots):
         return False
-    if _matches_trusted_command_prefix(approval, trusted_command_prefixes):
-        return True
-    approval_type = str(approval.get("type") or "").strip()
-    if approval_type == "item/fileChange/requestApproval":
-        return True
-    if _is_routine_repo_git_approval(approval):
-        return True
-    if _is_safe_test_command_approval(approval):
-        return True
+    if _is_remote_push_approval(approval):
+        return False
     if _is_safe_cache_cleanup_approval(approval, allowed_roots=allowed_roots):
         return True
-    if _is_safe_node_manifest_write_approval(approval, allowed_roots=allowed_roots):
-        return True
-    return auto_approve_routine_approvals and _is_routine_repo_git_approval(approval)
+    if _is_destructive_command_approval(approval):
+        return False
+    return True
 
 
 def _is_routine_repo_git_approval(approval: dict[str, Any]) -> bool:
@@ -790,6 +783,64 @@ def _is_routine_repo_git_approval(approval: dict[str, Any]) -> bool:
         return "--amend" not in lower_words
     if subcommand == "restore":
         return "--staged" in lower_words and "--worktree" not in lower_words and "--source" not in lower_words
+    return False
+
+
+def _is_remote_push_approval(approval: dict[str, Any]) -> bool:
+    for command in _approval_command_candidates(approval):
+        inner = _inner_shell_command(command)
+        if not inner or any(token in inner for token in ("\n", "\r", "&&", "||", ";", "|", ">", "<", "$(", "`")):
+            continue
+        words = _shell_words(inner)
+        if len(words) >= 2 and _is_git_executable(words[0]) and words[1].lower() == "push":
+            return True
+    return False
+
+
+def _is_destructive_command_approval(approval: dict[str, Any]) -> bool:
+    for command in _approval_command_candidates(approval):
+        inner = _inner_shell_command(command)
+        if not inner:
+            continue
+        lowered = inner.lower()
+        if any(marker in lowered for marker in ("__pycache__", ".pytest_cache", "pytest-cache-files")):
+            continue
+        if any(token in inner for token in ("\n", "\r", "&&", "||", ";", "|", ">", "<", "$(", "`")):
+            if any(marker in lowered for marker in ("remove-item", " rm ", " rmdir ", "git reset", "git clean", "git rebase")):
+                return True
+            continue
+        words = _shell_words(inner)
+        if not words:
+            continue
+        executable = words[0].replace("\\", "/").lower().rstrip(".exe")
+        lowered_words = [word.lower() for word in words[1:]]
+        if _is_git_executable(words[0]):
+            subcommand_index = 1
+            while subcommand_index < len(words) and words[subcommand_index].startswith("-"):
+                option = words[subcommand_index].lower()
+                subcommand_index += 1
+                if option in {"-c", "--git-dir", "--work-tree"} and subcommand_index < len(words):
+                    subcommand_index += 1
+            if subcommand_index >= len(words):
+                continue
+            subcommand = words[subcommand_index].lower()
+            git_args = [word.lower() for word in words[subcommand_index + 1 :]]
+            if subcommand == "reset" and "--hard" in git_args:
+                return True
+            if subcommand == "clean" and any(arg.startswith("-") and "f" in arg for arg in git_args):
+                return True
+            if subcommand == "commit" and "--amend" in git_args:
+                return True
+            if subcommand == "branch" and any(arg in {"-d", "--delete"} for arg in git_args):
+                return True
+            if subcommand in {"rebase", "filter-branch"}:
+                return True
+            if subcommand == "restore" and "--staged" not in git_args:
+                return True
+            continue
+        if executable in {"remove-item", "rm", "rmdir", "rd", "del", "erase"} or executable.endswith("/rm"):
+            if any(arg in {"-recurse", "-force", "-r", "-rf", "-fr", "/s", "/q"} for arg in lowered_words):
+                return True
     return False
 
 

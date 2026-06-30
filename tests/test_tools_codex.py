@@ -620,7 +620,7 @@ def test_codex_auto_approves_workspace_file_changes_and_manifest_writes(tmp_path
     )
 
 
-def test_codex_auto_approval_rejects_protected_or_outside_actions(tmp_path: Path) -> None:
+def test_codex_auto_approval_allows_workspace_actions_but_requires_push_approval(tmp_path: Path) -> None:
     node_workspace = tmp_path / "sessions" / "s1" / "nodes" / "n1"
     repo = node_workspace / "repo" / "smoke-test"
     outside = tmp_path / "outside"
@@ -633,6 +633,30 @@ def test_codex_auto_approval_rejects_protected_or_outside_actions(tmp_path: Path
             "type": "item/commandExecution/requestApproval",
             "cwd": str(repo),
             "command": "git push origin main",
+        },
+        allowed_roots=allowed_roots,
+    )
+    assert _is_auto_approved_workspace_approval(
+        {
+            "type": "item/commandExecution/requestApproval",
+            "cwd": str(repo),
+            "command": "git status --short",
+        },
+        allowed_roots=allowed_roots,
+    )
+    assert not _is_auto_approved_workspace_approval(
+        {
+            "type": "item/commandExecution/requestApproval",
+            "cwd": str(repo),
+            "command": "git reset --hard HEAD",
+        },
+        allowed_roots=allowed_roots,
+    )
+    assert not _is_auto_approved_workspace_approval(
+        {
+            "type": "item/commandExecution/requestApproval",
+            "cwd": str(repo),
+            "command": "git clean -fd",
         },
         allowed_roots=allowed_roots,
     )
@@ -650,6 +674,18 @@ def test_codex_auto_approves_workspace_cache_cleanup(tmp_path: Path) -> None:
     repo = node_workspace / "repo" / "smoke-test"
     repo.mkdir(parents=True)
     allowed_roots = (repo.resolve(), node_workspace.resolve())
+
+    assert _is_auto_approved_workspace_approval(
+        {
+            "type": "item/commandExecution/requestApproval",
+            "cwd": str(repo),
+            "command": (
+                '"C:\\Users\\Administrator\\AppData\\Local\\Microsoft\\WindowsApps\\pwsh.exe" '
+                '-Command "Remove-Item -Recurse -Force -LiteralPath app\\__pycache__, tests\\__pycache__"'
+            ),
+        },
+        allowed_roots=allowed_roots,
+    )
 
     assert _is_auto_approved_workspace_approval(
         {

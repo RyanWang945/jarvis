@@ -147,7 +147,7 @@ class NodeExecutor:
                         record_exception(exc, **{"jarvis.node_id": node.id, "jarvis.runtime": node.runtime})
                         raise
                     if node_workspace is not None:
-                        write_node_result(node_workspace, result)
+                        result = write_node_result(node_workspace, result)
                     result_attributes = _node_result_trace_attributes(result)
                     set_attributes(**result_attributes)
                     add_event("node.completed", **result_attributes)
@@ -197,7 +197,7 @@ class NodeExecutor:
                             missing_refs=missing_refs,
                             blocked_refs=blocked_refs,
                         )
-                        write_node_result(node_workspace, result)
+                        result = write_node_result(node_workspace, result)
                     logger.warning(
                         "node executor node blocked node_id=%s runtime=%s missing_refs=%s blocked_refs=%s message=%s",
                         node.id,
@@ -276,6 +276,20 @@ def _resolve_inputs(
                         source_status=result.status,
                     )
                 )
+            continue
+        if ref.startswith("branch:"):
+            branch = ref.removeprefix("branch:").strip()
+            if branch:
+                resolved.append(
+                    ResolvedInput(
+                        ref=ref,
+                        kind="branch",
+                        summary=f"Git branch {branch}",
+                        data={"branch": branch},
+                    )
+                )
+            else:
+                missing.append(ref)
             continue
         missing.append(ref)
     return resolved, missing, blocked

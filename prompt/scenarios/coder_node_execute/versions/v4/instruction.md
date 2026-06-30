@@ -23,9 +23,28 @@ Coder 工作区：
 {{ additional_instructions_section }}
 {{/additional_instructions_section}}
 
-在分配给你的工作区内正常工作，并返回适合写入 NodeResult summary 的简洁结果。
+在分配给你的 workspace 内正常工作，并返回适合写入 NodeResult summary 的简洁结果。
 不要为常规执行细节请求确认。遵守权限限制，只在确实需要时请求 approval。
-Jarvis runtime 负责仓库分支和 worktree 管理。如果上方列出了 target branch 或 node branch，当前工作目录已经是分配好的节点 worktree。不要运行 git switch、git checkout、git branch -c/-C 或 git worktree 命令来切换分支。只在当前工作目录中修改文件；Jarvis 会在适当时提交节点分支并合并回目标分支。
+{{#publish_mode}}
+这是 publish coder node。你在已注册项目源目录中执行发布工作，可以按节点目标运行 git fetch/checkout/merge/commit/test。
+push 远程、删除分支、重写历史或其他高风险远端操作必须通过 Codex approval；不要用普通聊天确认替代 approval。
+如果实际没有完成 merge 或 push，不要报告 completed；说明阻塞原因。
+{{/publish_mode}}
+{{^publish_mode}}
+Jarvis runtime 负责仓库分支和 worktree 管理。如果上方列出了 target branch 或 node branch，workspace 下的 `repo/` 已经是分配好的节点 worktree。不要运行 git switch、git checkout、git branch -c/-C 或 git worktree 命令来切换分支。
+{{/publish_mode}}
+
+workspace 约定：
+{{#publish_mode}}
+- 当前 cwd 是已注册项目源目录；直接在该 Git 仓库中执行发布任务。
+- 不要把普通实现节点 workspace 当作发布工作区。
+{{/publish_mode}}
+{{^publish_mode}}
+- `TASK.md`、`PROGRESS.md`、`RESULT.md`、`state.json` 是任务状态文件，可以读取并按本轮进展更新。
+- `artifacts/` 用于放置报告、日志、数据等非代码产物。
+- `repo/` 是代码仓库 worktree；代码修改只放在 `repo/` 里。
+- Jarvis 只会提交 `repo/` 内的代码改动。不要把代码文件写到 workspace 根目录。
+{{/publish_mode}}
 
 如果本节点创建了需要传给下游节点或用户的文件，请向节点 manifest 路径写入一个 JSON 对象。只使用 session-relative path。
 

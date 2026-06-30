@@ -39,7 +39,7 @@ Jarvis coder worker 指令：
 - 不要创建任何 git commit。
 {{/allow_commit}}
 {{#allow_push}}
-- 只有在成功 commit 后且任务需要时，才可以 push 到 origin。
+- 只有在成功 commit 后且任务需要时，才可以 push 到 origin；push 远程前必须通过 Codex approval。
 {{/allow_push}}
 {{^allow_push}}
 - 不要 push 到 origin。

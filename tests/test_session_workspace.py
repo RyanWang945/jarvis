@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -38,9 +39,15 @@ def test_session_workspace_creates_fixed_node_directories_after_plan(tmp_path: P
     assert workspace.node("inspect/code").provider_run_dir.is_dir()
     assert workspace.node("../modify code").root_path.parent == workspace.nodes_dir
     assert ".." not in workspace.node("../modify code").safe_node_id
-    assert workspace.node("inspect/code").repos_dir == workspace.node("inspect/code").root_path / "repo"
+    assert workspace.node("inspect/code").repo_path == workspace.node("inspect/code").root_path / "repo"
+    assert workspace.node("inspect/code").task_path.exists()
+    assert workspace.node("inspect/code").progress_path.exists()
+    assert workspace.node("inspect/code").result_markdown_path.exists()
+    assert workspace.node("inspect/code").state_path.exists()
+    assert workspace.node("inspect/code").artifacts_dir.is_dir()
     assert workspace.to_legacy_hints()["session_id"] == "session-test"
     assert workspace.node("inspect/code").to_legacy_hints()["node_workspace_dir"] == str(workspace.node("inspect/code").root_path)
+    assert workspace.node("inspect/code").to_legacy_hints()["node_repo_dir"] == str(workspace.node("inspect/code").repo_path)
 
 
 def test_write_node_result_preserves_existing_output_file(tmp_path: Path) -> None:
@@ -64,6 +71,7 @@ def test_write_node_result_preserves_existing_output_file(tmp_path: Path) -> Non
     assert node.output_path.read_text(encoding="utf-8") == "# Detailed report\n\nbody"
     assert (node.root_path / "node_summary.md").read_text(encoding="utf-8") == "short summary"
     assert node.result_path.exists()
+    assert node.state_path.exists()
 
 
 def test_coder_nodes_get_independent_node_repos_and_provider_run_dirs(monkeypatch, tmp_path: Path) -> None:
@@ -103,15 +111,21 @@ def test_coder_nodes_get_independent_node_repos_and_provider_run_dirs(monkeypatc
     assert report.status == "completed"
     assert len(provider.requests) == 2
     first, second = provider.requests
-    assert first.workdir == workspace.node("modify_a").repo_dir("jarvis").resolve()
-    assert second.workdir == workspace.node("modify_b").repo_dir("jarvis").resolve()
+    assert first.workdir == workspace.node("modify_a").root_path.resolve()
+    assert second.workdir == workspace.node("modify_b").root_path.resolve()
+    assert first.metadata["repo_path"] == str(workspace.node("modify_a").repo_dir("jarvis").resolve())
+    assert second.metadata["repo_path"] == str(workspace.node("modify_b").repo_dir("jarvis").resolve())
     assert first.workdir != second.workdir
     assert first.run_dir == workspace.node("modify_a").provider_run_dir
     assert second.run_dir == workspace.node("modify_b").provider_run_dir
     assert (workspace.node("modify_a").input_snapshot_path).exists()
     assert (workspace.node("modify_b").result_path).exists()
-    assert (first.workdir / "README.md").exists()
-    assert (second.workdir / "README.md").exists()
+    saved_result = json.loads(workspace.node("modify_a").result_path.read_text(encoding="utf-8"))
+    assert saved_result["data"]["workspace_path"] == str(workspace.node("modify_a").root_path)
+    assert saved_result["data"]["workspace"]["result_markdown_path"] == str(workspace.node("modify_a").result_markdown_path)
+    assert saved_result["data"]["workspace"]["repo_path"] == str(workspace.node("modify_a").repo_path)
+    assert (first.workdir / "repo" / "README.md").exists()
+    assert (second.workdir / "repo" / "README.md").exists()
 
 
 def test_coder_node_uses_only_registered_repo_when_active_repo_missing(monkeypatch, tmp_path: Path) -> None:
@@ -427,6 +441,133 @@ def test_coder_node_finalizer_loads_node_manifest_artifact(monkeypatch, tmp_path
     assert result.debug["finalizer"]["manifest_loaded"] is True
 
 
+def test_coder_node_reuses_historical_workspace_from_previous_node_result(monkeypatch, tmp_path: Path) -> None:
+    project = _init_repo(tmp_path / "projects" / "jarvis")
+    registry = RepositoryRegistry(
+        [
+            RepositoryRef(
+                repo_id="jarvis",
+                name="Jarvis",
+                root_path=project,
+                canonical_root_path=project.resolve(),
+            )
+        ]
+    )
+    monkeypatch.setattr("app.task_runtime.node_execute_runtime.get_repository_registry", lambda: registry)
+    first_runtime = CoderNodeExecuteRuntime(provider=_WritingProvider(), git_context_resolver=_noop_git_context)
+    first_plan = ExecutionPlan(
+        user_objective="write first",
+        nodes=[PlanNode(id="first", runtime="coder", objective="Write first")],
+    )
+    first_workspace = SessionWorkspaceManager(workdir=tmp_path, session_id_factory=lambda turn_id: "session-first").create_for_plan(
+        first_plan,
+        turn_id=201,
+        conversation_id=5,
+    )
+    first_report = NodeExecutor(runtimes={"coder": first_runtime}).execute(
+        first_plan,
+        runtime_context=RuntimeContext.from_hints({"active_repo": "jarvis"}),
+        session_workspace=first_workspace,
+    )
+    second_provider = _RecordingProvider()
+    second_runtime = CoderNodeExecuteRuntime(provider=second_provider, git_context_resolver=_noop_git_context)
+    second_plan = ExecutionPlan(
+        user_objective="continue first",
+        nodes=[
+            PlanNode(
+                id="continue",
+                runtime="coder",
+                objective="Continue in previous workspace",
+                input_refs=["node:first"],
+            )
+        ],
+    )
+    second_workspace = SessionWorkspaceManager(workdir=tmp_path, session_id_factory=lambda turn_id: "session-second").create_for_plan(
+        second_plan,
+        turn_id=202,
+        conversation_id=5,
+    )
+
+    second_report = NodeExecutor(runtimes={"coder": second_runtime}).execute(
+        second_plan,
+        previous_node_results=first_report.node_results,
+        runtime_context=RuntimeContext.from_hints({"active_repo": "jarvis"}),
+        session_workspace=second_workspace,
+    )
+
+    assert second_report.status == "completed"
+    assert second_provider.requests[0].workdir == first_workspace.node("first").root_path.resolve()
+    assert second_provider.requests[0].metadata["repo_path"] == str(first_workspace.node("first").repo_path.resolve())
+    assert second_provider.requests[0].workdir != second_workspace.node("continue").root_path.resolve()
+
+
+def test_publish_coder_node_uses_registered_source_dir_and_ignores_historical_workspace(monkeypatch, tmp_path: Path) -> None:
+    project = _init_repo(tmp_path / "projects" / "jarvis")
+    registry = RepositoryRegistry(
+        [
+            RepositoryRef(
+                repo_id="jarvis",
+                name="Jarvis",
+                root_path=project,
+                canonical_root_path=project.resolve(),
+            )
+        ]
+    )
+    monkeypatch.setattr("app.task_runtime.node_execute_runtime.get_repository_registry", lambda: registry)
+    first_runtime = CoderNodeExecuteRuntime(provider=_WritingProvider(), git_context_resolver=_noop_git_context)
+    first_plan = ExecutionPlan(
+        user_objective="write first",
+        nodes=[PlanNode(id="first", runtime="coder", objective="Write first")],
+    )
+    first_workspace = SessionWorkspaceManager(workdir=tmp_path, session_id_factory=lambda turn_id: "session-first").create_for_plan(
+        first_plan,
+        turn_id=203,
+        conversation_id=5,
+    )
+    first_report = NodeExecutor(runtimes={"coder": first_runtime}).execute(
+        first_plan,
+        runtime_context=RuntimeContext.from_hints({"active_repo": "jarvis"}),
+        session_workspace=first_workspace,
+    )
+    publish_provider = _RecordingProvider()
+    publish_runtime = CoderNodeExecuteRuntime(provider=publish_provider, git_context_resolver=_noop_git_context)
+    publish_plan = ExecutionPlan(
+        user_objective="publish first",
+        nodes=[
+            PlanNode(
+                id="publish",
+                runtime="coder",
+                mode="publish",
+                objective="Merge branch jarvis/smoke-test/session-first into master and push origin after approval",
+                repo_id="jarvis",
+                input_refs=["node:first"],
+            )
+        ],
+    )
+    publish_workspace = SessionWorkspaceManager(workdir=tmp_path, session_id_factory=lambda turn_id: "session-publish").create_for_plan(
+        publish_plan,
+        turn_id=204,
+        conversation_id=5,
+    )
+
+    publish_report = NodeExecutor(runtimes={"coder": publish_runtime}).execute(
+        publish_plan,
+        previous_node_results=first_report.node_results,
+        runtime_context=RuntimeContext.from_hints({"active_repo": "jarvis"}),
+        session_workspace=publish_workspace,
+    )
+
+    request = publish_provider.requests[0]
+    assert publish_report.status == "completed"
+    assert request.workdir == project.resolve()
+    assert request.workdir != first_workspace.node("first").root_path.resolve()
+    assert request.metadata["repo_path"] == str(project.resolve())
+    assert request.metadata["workspace_path"] == str(project.resolve())
+    assert request.metadata["allow_commit"] is True
+    assert request.metadata["allow_push"] is True
+    assert request.metadata["publish_mode"] is True
+
+
 def test_coder_runtime_does_not_auto_commit_registered_repo_without_node_workspace(monkeypatch, tmp_path: Path) -> None:
     project = _init_repo(tmp_path / "projects" / "jarvis")
     registry = RepositoryRegistry(
@@ -501,7 +642,7 @@ class _WritingProvider:
 
     def run(self, request):
         self.requests.append(request)
-        (request.workdir / "node-output.txt").write_text("created by node\n", encoding="utf-8")
+        (Path(request.metadata["repo_path"]) / "node-output.txt").write_text("created by node\n", encoding="utf-8")
         return CoderRunResult(ok=True, exit_code=0, stdout="wrote file", summary="done")
 
     def resume_approval(self, approval_id, *, approved, timeout_seconds, trusted_command_prefixes=None):
@@ -547,10 +688,11 @@ class _ContinuingProvider:
 
     def run(self, request):
         if request.metadata["node_id"] == "write_first":
-            (request.workdir / "first-output.txt").write_text("created by first node\n", encoding="utf-8")
+            (Path(request.metadata["repo_path"]) / "first-output.txt").write_text("created by first node\n", encoding="utf-8")
             return CoderRunResult(ok=True, exit_code=0, stdout="wrote first", summary="done")
-        self.second_seen = (request.workdir / "first-output.txt").read_text(encoding="utf-8")
-        (request.workdir / "second-output.txt").write_text("created by second node\n", encoding="utf-8")
+        repo_path = Path(request.metadata["repo_path"])
+        self.second_seen = (repo_path / "first-output.txt").read_text(encoding="utf-8")
+        (repo_path / "second-output.txt").write_text("created by second node\n", encoding="utf-8")
         return CoderRunResult(ok=True, exit_code=0, stdout="wrote second", summary="done")
 
     def resume_approval(self, approval_id, *, approved, timeout_seconds, trusted_command_prefixes=None):

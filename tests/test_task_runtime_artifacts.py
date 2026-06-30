@@ -13,17 +13,7 @@ from app.tools.common import ToolArtifact
 
 def _session_workspace() -> SessionWorkspaceRef:
     root = Path("/tmp/jarvis-test-session")
-    node = NodeWorkspaceRef(
-        node_id="review",
-        safe_node_id="review",
-        root_path=root / "nodes" / "review",
-        input_snapshot_path=root / "nodes" / "review" / "input_snapshot.md",
-        output_path=root / "nodes" / "review" / "output.md",
-        result_path=root / "nodes" / "review" / "result.json",
-        manifest_path=root / "nodes" / "review" / "node_manifest.json",
-        provider_run_dir=root / "nodes" / "review" / "provider_run",
-        repos_dir=root / "nodes" / "review" / "repo",
-    )
+    node = _node_workspace(root, "review")
     return SessionWorkspaceRef(
         session_id="test-session",
         root_path=root,
@@ -35,6 +25,30 @@ def _session_workspace() -> SessionWorkspaceRef:
         nodes_dir=root / "nodes",
         nodes={"review": node},
     )
+
+
+def _node_workspace(root: Path, node_id: str) -> NodeWorkspaceRef:
+    return NodeWorkspaceRef(**_node_workspace_kwargs(root, node_id))
+
+
+def _node_workspace_kwargs(root: Path, node_id: str) -> dict[str, Any]:
+    node_root = root / "nodes" / node_id
+    return {
+        "node_id": node_id,
+        "safe_node_id": node_id,
+        "root_path": node_root,
+        "task_path": node_root / "TASK.md",
+        "progress_path": node_root / "PROGRESS.md",
+        "result_markdown_path": node_root / "RESULT.md",
+        "state_path": node_root / "state.json",
+        "artifacts_dir": node_root / "artifacts",
+        "input_snapshot_path": node_root / "input_snapshot.md",
+        "output_path": node_root / "RESULT.md",
+        "result_path": node_root / "result.json",
+        "manifest_path": node_root / "node_manifest.json",
+        "provider_run_dir": node_root / "provider_run",
+        "repo_path": node_root / "repo",
+    }
 
 
 class _FakeStore:
@@ -299,15 +313,7 @@ def test_promote_copies_file_to_session_dir(tmp_path: Path) -> None:
     artifacts_dir.mkdir(parents=True)
 
     node = NodeWorkspaceRef(
-        node_id="coder",
-        safe_node_id="coder",
-        root_path=root / "nodes" / "coder",
-        input_snapshot_path=root / "nodes" / "coder" / "input_snapshot.md",
-        output_path=root / "nodes" / "coder" / "output.md",
-        result_path=root / "nodes" / "coder" / "result.json",
-        manifest_path=root / "nodes" / "coder" / "node_manifest.json",
-        provider_run_dir=root / "nodes" / "coder" / "provider_run",
-        repos_dir=root / "nodes" / "coder" / "repo",
+        **_node_workspace_kwargs(root, "coder"),
     )
     workspace = SessionWorkspaceRef(
         session_id="promote-test",
@@ -382,15 +388,7 @@ def test_publish_returns_promoted_records_and_persists(tmp_path: Path) -> None:
     artifacts_dir.mkdir(parents=True)
 
     node = NodeWorkspaceRef(
-        node_id="n1",
-        safe_node_id="n1",
-        root_path=root / "nodes" / "n1",
-        input_snapshot_path=root / "nodes" / "n1" / "input_snapshot.md",
-        output_path=root / "nodes" / "n1" / "output.md",
-        result_path=root / "nodes" / "n1" / "result.json",
-        manifest_path=root / "nodes" / "n1" / "node_manifest.json",
-        provider_run_dir=root / "nodes" / "n1" / "provider_run",
-        repos_dir=root / "nodes" / "n1" / "repo",
+        **_node_workspace_kwargs(root, "n1"),
     )
     workspace = SessionWorkspaceRef(
         session_id="integ",

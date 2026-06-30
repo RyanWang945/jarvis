@@ -28,7 +28,7 @@
 
 - 只能使用 runtime_context.available_runtimes 中允许的 runtime。
 - runtime 的具体能力以输入中的 runtime_context 为准。
-- input_refs 只能引用可用 artifact 或 node 结果。
+- input_refs 只能引用可用 artifact、node 结果，或已明确解析出的 branch。
 - repo_id 只能来自 registered_repositories；不需要仓库能力的 node 不要设置 repo_id。
 - finalization_hint 只输出 user_facing；已规划的执行计划设为 false。
 - 不要输出 tool_name、runtime_hints、provider、finalization_hint.mode、reason、markdown、注释、隐藏推理或额外字段。
@@ -43,10 +43,10 @@
     {
       "id": "string",
       "runtime": "string",
-      "mode": "read | write",
+      "mode": "read | write | publish",
       "objective": "string",
       "repo_id": "string（仅需要仓库能力时使用）",
-      "input_refs": ["artifact:A1", "node:node_id"],
+      "input_refs": ["artifact:A1", "node:node_id", "branch:repo_branch"],
       "output_hint": "string"
     }
   ]
