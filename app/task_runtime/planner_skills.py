@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -10,6 +11,14 @@ from app.agent_react.session_state import ConversationSessionState
 from app.llm.client import LLMMessage, parse_json_content
 from app.llm.model_profiles import LLMNode
 from app.llm.model_router import ModelRouter
+from app.observability import (
+    add_event,
+    content_capture_enabled,
+    record_exception,
+    set_attributes,
+    span_context,
+    trace_preview,
+)
 from app.prompting import PromptRegistry
 from app.runtime_usage import usage_record_from_response
 from app.skills import get_skill_registry
@@ -83,40 +92,141 @@ class PlannerSkillRouter:
         conversation_context: ConversationContext | None = None,
         runtime_context: RuntimeContext | None = None,
     ) -> PlannerSkillSelection:
+        started = time.perf_counter()
         candidates = _planner_skill_candidates()
-        if not candidates:
-            return PlannerSkillSelection(reason="no planner skills registered", usage_records=[])
+        candidate_ids = _skill_ids(candidates)
+        with span_context(
+            "planner.skill_router",
+            **{
+                "jarvis.planner_skill_candidate_count": len(candidates),
+                "jarvis.planner_skill_candidates": candidate_ids,
+            },
+        ):
+            if not candidates:
+                logger.info("planner skill router skipped reason=no_planner_skills_registered")
+                add_event(
+                    "planner_skill_router.skipped",
+                    **{"jarvis.reason": "no_planner_skills_registered"},
+                )
+                return PlannerSkillSelection(reason="no planner skills registered", usage_records=[])
 
-        payload = _router_input(
-            content=content,
-            candidates=candidates,
-            session_state=session_state,
-            conversation_context=conversation_context,
-            runtime_context=runtime_context,
-        )
-        resolved = ModelRouter().resolve(LLMNode.PLANNER, conversation_metadata)
-        if not resolved.profile.api_key:
-            logger.info("planner skill router skipped reason=missing_api_key profile=%s", resolved.profile.id)
-            return PlannerSkillSelection(reason="missing api key", usage_records=[])
+            payload = _router_input(
+                content=content,
+                candidates=candidates,
+                session_state=session_state,
+                conversation_context=conversation_context,
+                runtime_context=runtime_context,
+            )
+            resolved = ModelRouter().resolve(LLMNode.PLANNER, conversation_metadata)
+            if not resolved.profile.api_key:
+                elapsed_ms = int((time.perf_counter() - started) * 1000)
+                logger.info(
+                    "planner skill router skipped reason=missing_api_key profile=%s "
+                    "candidate_count=%s candidates=%s elapsed_ms=%s",
+                    resolved.profile.id,
+                    len(candidates),
+                    candidate_ids,
+                    elapsed_ms,
+                )
+                set_attributes(
+                    **{
+                        "jarvis.planner_skill_router_status": "skipped",
+                        "jarvis.planner_skill_router_reason": "missing_api_key",
+                        "jarvis.planner_skill_router_elapsed_ms": elapsed_ms,
+                    }
+                )
+                add_event(
+                    "planner_skill_router.skipped",
+                    **{
+                        "jarvis.reason": "missing_api_key",
+                        "jarvis.profile": resolved.profile.id,
+                        "jarvis.elapsed_ms": elapsed_ms,
+                    },
+                )
+                return PlannerSkillSelection(reason="missing api key", usage_records=[])
 
-        prompt = self._prompt_registry.load("planner_skill_router", self._prompt_version)
-        response_format = prompt.response_format if resolved.profile.supports_json_object else None
-        response = resolved.client.chat_normalized(
-            prompt.render({"input_json": json.dumps(payload, ensure_ascii=False)}),
-            response_format=response_format,
-        )
-        parsed = parse_json_content({"content": response.content})
-        selected = _selection_from_payload(parsed, candidates)
-        usage_record = usage_record_from_response(response, stage="planner_skill_router")
-        usage_records = [usage_record] if usage_record is not None else []
-        first = selected.skills[0] if selected.skills else None
-        return PlannerSkillSelection(
-            skill_id=first.skill_id if first is not None else None,
-            reason=selected.reason,
-            guidance=first.guidance if first is not None else "",
-            selected_skills=selected.skills,
-            usage_records=usage_records,
-        )
+            prompt = self._prompt_registry.load("planner_skill_router", self._prompt_version)
+            response_format = prompt.response_format if resolved.profile.supports_json_object else None
+            logger.info(
+                "planner skill router llm request profile=%s provider=%s response_format=%s "
+                "prompt_version=%s candidate_count=%s candidates=%s input_preview=%s",
+                resolved.profile.id,
+                resolved.profile.provider,
+                response_format,
+                prompt.version,
+                len(candidates),
+                candidate_ids,
+                trace_preview(content, limit=160),
+            )
+            try:
+                response = resolved.client.chat_normalized(
+                    prompt.render({"input_json": json.dumps(payload, ensure_ascii=False)}),
+                    response_format=response_format,
+                )
+                parsed = parse_json_content({"content": response.content})
+            except Exception as exc:
+                elapsed_ms = int((time.perf_counter() - started) * 1000)
+                logger.exception(
+                    "planner skill router failed candidate_count=%s candidates=%s elapsed_ms=%s",
+                    len(candidates),
+                    candidate_ids,
+                    elapsed_ms,
+                )
+                record_exception(exc, **{"jarvis.stage": "planner_skill_router"})
+                set_attributes(
+                    **{
+                        "jarvis.planner_skill_router_status": "failed",
+                        "jarvis.planner_skill_router_elapsed_ms": elapsed_ms,
+                    }
+                )
+                raise
+
+            selected = _selection_from_payload(parsed, candidates)
+            usage_record = usage_record_from_response(response, stage="planner_skill_router")
+            usage_records = [usage_record] if usage_record is not None else []
+            first = selected.skills[0] if selected.skills else None
+            elapsed_ms = int((time.perf_counter() - started) * 1000)
+            selected_ids = _selected_skill_ids(selected)
+            ignored_reason = selected.reason if not selected_ids else ""
+            logger.info(
+                "planner skill router selected selected_skills=%s reason=%s candidate_count=%s "
+                "candidates=%s model=%s finish_reason=%s content_len=%s elapsed_ms=%s",
+                selected_ids,
+                selected.reason,
+                len(candidates),
+                candidate_ids,
+                response.model,
+                response.finish_reason,
+                len(response.content or ""),
+                elapsed_ms,
+            )
+            if content_capture_enabled():
+                logger.debug("planner skill router raw payload=%s", trace_preview(parsed, limit=1200))
+            set_attributes(
+                **{
+                    "jarvis.planner_skill_router_status": "completed",
+                    "jarvis.planner_skill_selected": selected_ids,
+                    "jarvis.planner_skill_reason": trace_preview(selected.reason, limit=240),
+                    "jarvis.planner_skill_router_elapsed_ms": elapsed_ms,
+                }
+            )
+            add_event(
+                "planner_skill_router.completed",
+                **{
+                    "jarvis.selected_skills": selected_ids,
+                    "jarvis.reason": trace_preview(selected.reason, limit=240),
+                    "jarvis.no_selection_reason": trace_preview(ignored_reason, limit=240),
+                    "jarvis.candidate_count": len(candidates),
+                    "jarvis.elapsed_ms": elapsed_ms,
+                },
+            )
+            return PlannerSkillSelection(
+                skill_id=first.skill_id if first is not None else None,
+                reason=selected.reason,
+                guidance=first.guidance if first is not None else "",
+                selected_skills=selected.skills,
+                usage_records=usage_records,
+            )
 
 
 def _planner_skill_candidates() -> list[Skill]:
@@ -220,3 +330,11 @@ def _selection_from_payload(payload: dict[str, Any], candidates: list[Skill]) ->
     if ignored:
         return PlannerSkillSelection(reason=f"ignored unknown planner skill: {', '.join(ignored)}")
     return PlannerSkillSelection(reason=str(payload.get("reason") or "no planner skill selected").strip())
+
+
+def _skill_ids(skills: list[Skill]) -> list[str]:
+    return [skill.skill_id for skill in skills]
+
+
+def _selected_skill_ids(selection: PlannerSkillSelection) -> list[str]:
+    return [skill.skill_id for skill in selection.skills]

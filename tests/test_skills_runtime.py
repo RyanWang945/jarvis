@@ -78,6 +78,17 @@ def test_finance_analysis_planning_skill_is_planner_skill() -> None:
     assert "公司业务" in package.skill.manifest.planning_guidance
     assert "竞对格局" in package.skill.manifest.planning_guidance
     assert "产品市场景气" in package.skill.manifest.planning_guidance
+    assert "简单询问" in package.skill.manifest.when_to_use
+    assert "不适用于简单询问型价格/行情报价查询" in package.skill.manifest.routing_summary
+    assert "不要生成 evidence_claims.md" in package.skill.manifest.planning_guidance
+
+
+def test_planner_skill_router_prompt_excludes_simple_questions() -> None:
+    prompt = Path("prompt/scenarios/planner_skill_router/versions/v2/system.md").read_text(encoding="utf-8")
+
+    assert "简单询问型请求不要选择 planner skill" in prompt
+    assert "即使它需要工具、搜索或实时信息" in prompt
+    assert "优先返回空数组" in prompt
 
 
 def test_stock_analysis_planning_skill_is_planner_skill() -> None:
