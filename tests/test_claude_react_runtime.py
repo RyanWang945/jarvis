@@ -818,7 +818,7 @@ class TestPromptConstruction:
 
         prompt = _build_user_prompt(_context())
         data = json.loads(prompt)
-        assert "user_objective" in data
+        assert "user_objective" not in data
         assert "node" in data
         assert "resolved_inputs" in data
         assert "temporal_context" in data

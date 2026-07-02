@@ -119,6 +119,7 @@ def test_coder_nodes_get_independent_node_repos_and_provider_run_dirs(monkeypatc
     assert first.run_dir == workspace.node("modify_a").provider_run_dir
     assert second.run_dir == workspace.node("modify_b").provider_run_dir
     assert (workspace.node("modify_a").input_snapshot_path).exists()
+    assert "user_objective" not in workspace.node("modify_a").input_snapshot_path.read_text(encoding="utf-8")
     assert (workspace.node("modify_b").result_path).exists()
     saved_result = json.loads(workspace.node("modify_a").result_path.read_text(encoding="utf-8"))
     assert saved_result["data"]["workspace_path"] == str(workspace.node("modify_a").root_path)

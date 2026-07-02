@@ -279,7 +279,6 @@ def write_node_input_snapshot(
         "objective": node.objective,
         "output_hint": node.output_hint,
         "input_refs": list(node.input_refs),
-        "user_objective": user_objective,
         "resolved_inputs": [item.model_dump(mode="json", exclude_none=True) for item in resolved_inputs],
         "runtime_context": _jsonable(legacy_hints),
         "instructions": list(instructions),
@@ -478,7 +477,6 @@ def _write_initial_node_workspace_files(node_workspace: NodeWorkspaceRef, *, pla
                     f"- Runtime: `{node.runtime}`",
                     f"- Mode: `{node.mode}`",
                     f"- Objective: {node.objective}",
-                    f"- User objective: {plan.user_objective}",
                     f"- Output hint: {node.output_hint or ''}",
                     "",
                 ]

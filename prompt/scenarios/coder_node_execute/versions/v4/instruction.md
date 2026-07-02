@@ -2,7 +2,6 @@
 
 {{ temporal_context }}
 
-用户目标：{{ user_objective }}
 节点 ID：{{ node_id }}
 节点目标：{{ node_objective }}
 输出提示：{{ output_hint }}

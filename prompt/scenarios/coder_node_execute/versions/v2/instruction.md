@@ -2,7 +2,6 @@ Execute one Jarvis plan node as CoderNodeExecuteRuntime.
 
 {{ temporal_context }}
 
-User objective: {{ user_objective }}
 Node id: {{ node_id }}
 Node objective: {{ node_objective }}
 Expected output: {{ expected_output }}

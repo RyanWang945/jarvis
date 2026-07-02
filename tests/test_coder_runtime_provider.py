@@ -105,11 +105,34 @@ def test_coder_node_runtime_builds_provider_request() -> None:
     assert request.repo_id == "jarvis"
     assert request.workdir.name == "jarvis"
     assert "Fix failing tests" in request.instruction
+    assert "用户目标" not in request.instruction
     assert result.runtime == "coder"
     assert result.status == "completed"
     assert result.debug["provider"] == "fake"
     assert result.tool_artifacts[0]["artifact_id"] == "artifact_1"
     assert "tool_artifacts" not in result.data
+
+
+def test_coder_node_runtime_does_not_put_global_user_objective_in_worker_prompt() -> None:
+    provider = RecordingProvider()
+    runtime = CoderNodeExecuteRuntime(provider=provider, git_context_resolver=_noop_git_context)
+
+    runtime.run(
+        NodeExecutionContext(
+            user_objective="review architecture, then use image gen skill to create a diagram",
+            node=PlanNode(
+                id="review_architecture",
+                runtime="coder",
+                objective="Review architecture and produce a markdown report.",
+            ),
+            legacy_hints={"active_repo": "jarvis"},
+        )
+    )
+
+    request = provider.requests[0]
+    assert "Review architecture and produce a markdown report." in request.instruction
+    assert "image gen skill" not in request.instruction
+    assert "review architecture, then" not in request.instruction
 
 
 def test_coder_node_runtime_keeps_git_context_usage_out_of_runtime_context() -> None:

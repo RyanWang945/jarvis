@@ -771,7 +771,6 @@ def _build_finalize_prompt(context, primary_result: dict[str, Any]) -> str:
             "只使用已恢复会话中已有的对话和工具结果来收尾当前节点。"
             "不要调用任何工具。现在返回要求的 JSON schema。"
         ),
-        "user_objective": context.user_objective,
         "node": context.node.model_dump(mode="json"),
         "tool_count": primary_result.get("tool_count", 0),
         "max_turns_reached": primary_result.get("max_turns_reached", False),
@@ -1002,7 +1001,7 @@ def _build_system_prompt(context) -> str:
         bundle = PromptRegistry().load("react_node_execute")
         # Render with dummy payload to get the messages
         messages = bundle.render(
-            {"input_json": json.dumps({"user_objective": "", "node": {}, "resolved_inputs": [], "temporal_context": {}, "runtime_context": {}, "instructions": []}, ensure_ascii=False)}
+            {"input_json": json.dumps({"node": {}, "resolved_inputs": [], "temporal_context": {}, "runtime_context": {}, "instructions": []}, ensure_ascii=False)}
         )
     except Exception:
         logger.warning("claude react runtime failed to load react_node_execute prompt, using fallback", exc_info=True)
@@ -1040,7 +1039,6 @@ def _build_user_prompt(context) -> str:
     from app.task_runtime.node_execute_runtime import _temporal_context
 
     payload = {
-        "user_objective": context.user_objective,
         "node": context.node.model_dump(mode="json"),
         "resolved_inputs": [
             item.model_dump(mode="json", exclude_none=True)

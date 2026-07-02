@@ -702,7 +702,6 @@ def _default_code_node_finalizer() -> CodeNodeFinalizer:
 
 def _llm_messages(context: NodeExecutionContext) -> list[LLMMessage]:
     payload = {
-        "user_objective": context.user_objective,
         "node": context.node.model_dump(mode="json"),
         "resolved_inputs": [item.model_dump(mode="json", exclude_none=True) for item in context.resolved_inputs],
         "temporal_context": _temporal_context(context.runtime_context),
@@ -720,7 +719,6 @@ def _llm_messages(context: NodeExecutionContext) -> list[LLMMessage]:
 
 def _react_messages(context: NodeExecutionContext) -> list[LLMMessage]:
     payload = {
-        "user_objective": context.user_objective,
         "node": context.node.model_dump(mode="json"),
         "resolved_inputs": [item.model_dump(mode="json", exclude_none=True) for item in context.resolved_inputs],
         "temporal_context": _temporal_context(context.runtime_context),
@@ -1202,7 +1200,6 @@ def _coder_instruction(context: NodeExecutionContext) -> str:
     return PromptRegistry().load("coder_node_execute").render_text(
         {
             "temporal_context": _temporal_context_text(context.runtime_context),
-            "user_objective": context.user_objective,
             "node_id": context.node.id,
             "node_objective": context.node.objective,
             "output_hint": context.node.output_hint or "Repository task result.",
