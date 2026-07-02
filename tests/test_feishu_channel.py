@@ -8,6 +8,7 @@ import pytest
 from app.agent_react import ChannelAttachment, ChannelMessage, TurnResult
 from app.channels.feishu import (
     FeishuChannel,
+    _configure_feishu_ws_proxy,
     _ensure_feishu_no_proxy,
     _extract_message_id,
 )
@@ -73,6 +74,44 @@ def test_feishu_no_proxy_includes_ws_hosts(monkeypatch) -> None:
     assert "open.feishu.cn" in hosts
     assert "msg-frontier.feishu.cn" in hosts
     assert ".feishu.cn" in hosts
+
+
+def test_feishu_custom_proxy_removes_ws_hosts_from_no_proxy(monkeypatch) -> None:
+    monkeypatch.delenv("no_proxy", raising=False)
+    monkeypatch.setenv("NO_PROXY", "localhost,127.0.0.1,open.feishu.cn,msg-frontier.feishu.cn,.feishu.cn")
+    for env_name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        monkeypatch.delenv(env_name, raising=False)
+
+    _configure_feishu_ws_proxy("custom", "http://127.0.0.1:7897")
+
+    hosts = {item.strip() for item in os.environ["NO_PROXY"].split(",")}
+    lower_hosts = {host.lower() for host in hosts}
+    assert "localhost" in hosts
+    assert "open.feishu.cn" not in lower_hosts
+    assert "msg-frontier.feishu.cn" not in lower_hosts
+    assert ".feishu.cn" not in lower_hosts
+    assert os.environ["HTTPS_PROXY"] == "http://127.0.0.1:7897"
+    assert os.environ["https_proxy"] == "http://127.0.0.1:7897"
+
+
+def test_feishu_channel_custom_proxy_builds_http_client(monkeypatch) -> None:
+    calls: list[dict] = []
+
+    class FakeHttpClient:
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+
+    monkeypatch.setattr("app.channels.feishu.httpx.Client", FakeHttpClient)
+
+    channel = FeishuChannel(
+        app_id="app",
+        app_secret="secret",
+        proxy_mode="custom",
+        proxy_url="http://127.0.0.1:7897",
+    )
+
+    assert channel._proxy_mode == "custom"
+    assert calls == [{"timeout": 30.0, "trust_env": False, "proxy": "http://127.0.0.1:7897"}]
 
 
 def test_feishu_renderer_renders_codex_approval_buttons() -> None:

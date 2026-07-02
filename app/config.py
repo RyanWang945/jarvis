@@ -75,6 +75,8 @@ class Settings(BaseSettings):
     feishu_app_id: str | None = None
     feishu_app_secret: str | None = None
     feishu_bot_name: str = "Jarvis"
+    feishu_proxy_mode: str = "direct"
+    feishu_proxy_url: str | None = None
     feishu_progress_updates_enabled: bool = False
     feishu_progress_mode: str = "patch"
     feishu_progress_min_interval_seconds: float = 2.0
@@ -118,6 +120,21 @@ class Settings(BaseSettings):
         if isinstance(value, str) and not value.strip():
             return None
         return value
+
+    @field_validator("feishu_proxy_url", mode="before")
+    @classmethod
+    def _empty_proxy_url_as_none(cls, value: object) -> object:
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @field_validator("feishu_proxy_mode")
+    @classmethod
+    def _validate_feishu_proxy_mode(cls, value: str) -> str:
+        mode = str(value or "").strip().lower()
+        if mode not in {"direct", "env", "custom"}:
+            raise ValueError("feishu_proxy_mode must be one of: direct, env, custom")
+        return mode
 
 
 @lru_cache

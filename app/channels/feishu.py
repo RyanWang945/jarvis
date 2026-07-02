@@ -176,10 +176,14 @@ class FeishuChannel:
         app_secret: str,
         *,
         bot_name: str = "Jarvis",
+        proxy_mode: str = "direct",
+        proxy_url: str | None = None,
     ) -> None:
         self._app_id = app_id
         self._app_secret = app_secret
         self._bot_name = bot_name
+        self._proxy_mode = _normalize_feishu_proxy_mode(proxy_mode)
+        self._proxy_url = proxy_url.strip() if isinstance(proxy_url, str) and proxy_url.strip() else None
         self._client: ws.Client | None = None
         self._event_handler: EventDispatcherHandler | None = None
         self._ws_thread: threading.Thread | None = None
@@ -189,7 +193,7 @@ class FeishuChannel:
         self._running = False
         self._lock = threading.Lock()
 
-        self._http = httpx.Client(timeout=30.0, trust_env=False)
+        self._http = _build_feishu_http_client(self._proxy_mode, self._proxy_url)
         self._tenant_access_token: str | None = None
         self._token_expires_at: float = 0.0
         self._renderer = FeishuRenderer(title=bot_name)
@@ -230,7 +234,7 @@ class FeishuChannel:
             raise
 
     def _run_ws_in_thread(self) -> None:
-        _ensure_feishu_no_proxy()
+        _configure_feishu_ws_proxy(self._proxy_mode, self._proxy_url)
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         lark_ws_client.loop = loop
@@ -1358,6 +1362,8 @@ def build_feishu_channel() -> FeishuChannel | None:
         app_id=settings.feishu_app_id,
         app_secret=settings.feishu_app_secret,
         bot_name=settings.feishu_bot_name or "Jarvis",
+        proxy_mode=settings.feishu_proxy_mode,
+        proxy_url=settings.feishu_proxy_url,
     )
 
 
@@ -1410,6 +1416,63 @@ def _ensure_feishu_no_proxy() -> None:
     merged = ",".join(values)
     os.environ["NO_PROXY"] = merged
     os.environ["no_proxy"] = merged
+
+
+def _configure_feishu_ws_proxy(proxy_mode: str, proxy_url: str | None = None) -> None:
+    mode = _normalize_feishu_proxy_mode(proxy_mode)
+    if mode == "direct":
+        _ensure_feishu_no_proxy()
+        return
+    if mode == "custom":
+        proxy = proxy_url.strip() if isinstance(proxy_url, str) else ""
+        if not proxy:
+            raise ValueError("feishu_proxy_url is required when feishu_proxy_mode=custom")
+        _remove_feishu_no_proxy_hosts()
+        for env_name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+            os.environ[env_name] = proxy
+        return
+    if mode == "env":
+        return
+    raise ValueError(f"unsupported feishu proxy mode: {proxy_mode}")
+
+
+def _remove_feishu_no_proxy_hosts() -> None:
+    blocked = {host.lower() for host in _FEISHU_NO_PROXY_HOSTS}
+    values: list[str] = []
+    lowered: set[str] = set()
+    for env_name in ("NO_PROXY", "no_proxy"):
+        for item in os.environ.get(env_name, "").split(","):
+            host = item.strip()
+            lower_host = host.lower()
+            if host and lower_host not in blocked and lower_host not in lowered:
+                values.append(host)
+                lowered.add(lower_host)
+    if values:
+        merged = ",".join(values)
+        os.environ["NO_PROXY"] = merged
+        os.environ["no_proxy"] = merged
+    else:
+        os.environ.pop("NO_PROXY", None)
+        os.environ.pop("no_proxy", None)
+
+
+def _normalize_feishu_proxy_mode(value: str) -> str:
+    mode = str(value or "").strip().lower()
+    if mode in {"direct", "env", "custom"}:
+        return mode
+    raise ValueError("feishu proxy mode must be one of: direct, env, custom")
+
+
+def _build_feishu_http_client(proxy_mode: str, proxy_url: str | None) -> httpx.Client:
+    mode = _normalize_feishu_proxy_mode(proxy_mode)
+    if mode == "env":
+        return httpx.Client(timeout=30.0, trust_env=True)
+    if mode == "custom":
+        proxy = proxy_url.strip() if isinstance(proxy_url, str) else ""
+        if not proxy:
+            raise ValueError("feishu_proxy_url is required when feishu_proxy_mode=custom")
+        return httpx.Client(timeout=30.0, trust_env=False, proxy=proxy)
+    return httpx.Client(timeout=30.0, trust_env=False)
 
 
 def _conversation_chat_type(feishu_chat_type: str) -> str:
