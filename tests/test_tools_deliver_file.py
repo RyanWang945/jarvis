@@ -128,3 +128,60 @@ def test_deliver_file_accepts_file_path_alias(monkeypatch) -> None:
             pass
 
     assert result.ok
+
+
+def test_deliver_file_sends_markdown_artifact(monkeypatch, tmp_path: Path) -> None:
+    store = InMemoryConversationStore()
+    markdown_path = tmp_path / "report.md"
+    markdown_path.write_text("# Report\n\nbody", encoding="utf-8")
+
+    artifact = ToolArtifact(
+        artifact_id="artifact:report:1",
+        kind="file",
+        turn_id=42,
+        tool_call_id="node:write_report",
+        path=str(markdown_path),
+        mime_type="text/markdown",
+        filename="report.md",
+        size_bytes=markdown_path.stat().st_size,
+        source_tool="coder",
+    )
+    store.upsert_artifact(artifact, conversation_id=7)
+
+    class FakeHandler:
+        channel = "feishu"
+
+        def __init__(self) -> None:
+            self.attachments = []
+
+        def upload_attachment(self, attachment):
+            self.attachments.append(attachment)
+            return "file_key_1"
+
+        def send_attachment(self, external_chat_id, attachment, upload_key):
+            return "om_file_1"
+
+        def send_failure_notice(self, external_chat_id, attachment, error_message):
+            raise AssertionError(error_message)
+
+    handler = FakeHandler()
+    register_delivery_handler(handler)
+    monkeypatch.setattr("app.tools.deliver_file._conversation_store", lambda: store)
+
+    result = run_deliver_file(
+        ToolExecutionRequest(
+            tool_name="deliver_file",
+            workdir=None,
+            args={
+                "artifact_id": artifact.artifact_id,
+                "conversation_id": 7,
+                "turn_id": 42,
+                "platform": "feishu",
+                "external_chat_id": "chat_1",
+            },
+        )
+    )
+
+    assert result.ok
+    assert handler.attachments[0].kind == "file"
+    assert handler.attachments[0].filename == "report.md"

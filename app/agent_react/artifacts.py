@@ -26,6 +26,7 @@ IMAGE_MIME_BY_SUFFIX = {
 SVG_MIME = "image/svg+xml"
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_SVG_BYTES = 5 * 1024 * 1024
+MAX_FILE_BYTES = 50 * 1024 * 1024
 _SENSITIVE_NAMES = {".env", ".env.local", ".env.production", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"}
 _SENSITIVE_SUFFIXES = {".pem", ".key", ".crt", ".cer", ".p12", ".pfx", ".sqlite", ".db", ".log"}
 _SENSITIVE_PARTS = {"logs", ".git", ".venv", "env", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
@@ -219,7 +220,7 @@ def _resolve_one(
 
     expected_mime = IMAGE_MIME_BY_SUFFIX.get(suffix)
     if expected_mime is None:
-        return None, "unsupported_type"
+        return _resolve_file_attachment(artifact, resolved)
     guessed_mime = artifact.mime_type or _guess_mime(resolved)
     if guessed_mime != expected_mime:
         return None, "mime_mismatch"
@@ -234,6 +235,29 @@ def _resolve_one(
             kind="image",
             path=str(resolved),
             mime_type=expected_mime,
+            filename=artifact.filename or resolved.name,
+            size_bytes=size,
+            source_tool=artifact.source_tool,
+            metadata=dict(artifact.metadata),
+        ),
+        None,
+    )
+
+
+def _resolve_file_attachment(artifact: ToolArtifact, resolved: Path) -> tuple[ChannelAttachment | None, str | None]:
+    if artifact.kind != "file":
+        return None, "unsupported_type"
+
+    size = resolved.stat().st_size
+    if size > MAX_FILE_BYTES:
+        return None, "file_too_large"
+
+    return (
+        ChannelAttachment(
+            artifact_id=artifact.artifact_id,
+            kind="file",
+            path=str(resolved),
+            mime_type=artifact.mime_type or _guess_mime(resolved) or "application/octet-stream",
             filename=artifact.filename or resolved.name,
             size_bytes=size,
             source_tool=artifact.source_tool,

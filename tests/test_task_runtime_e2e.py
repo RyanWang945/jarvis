@@ -3,18 +3,40 @@ from __future__ import annotations
 from pathlib import Path
 from uuid import uuid4
 
+from app.agent_react.delivery import register_delivery_handler
 from app.gateway.events import InboundEvent
 from app.gateway.service import GatewayService
 from app.progress import ProgressEvent
 from app.task_runtime import TaskAgentRuntime
+from app.task_runtime.agent_runtime import _deliver_aggregation_artifacts
 from app.task_runtime.fast_intent import FastIntentDecision
 from app.task_runtime.node_executor import NodeExecutor
 from app.task_runtime.node_result import NodeArtifact, NodeResult
 from app.task_runtime.planner import ExecutionPlan, PlanNode
 from app.task_runtime.planning_router import PlanningRouterResult
-from app.task_runtime.result_aggregator import ResultAggregator
+from app.task_runtime.result_aggregator import AggregationResult, ResultAggregator
 from app.task_runtime.session_workspace import SessionWorkspaceManager
+from app.tools.common import ToolArtifact
 from tests.helpers.in_memory_store import InMemoryConversationStore
+
+
+class FakeFeishuDeliveryHandler:
+    channel = "feishu"
+
+    def __init__(self) -> None:
+        self.uploaded: list[str] = []
+        self.sent: list[str] = []
+
+    def upload_attachment(self, attachment):
+        self.uploaded.append(attachment.artifact_id)
+        return f"upload_key_{len(self.uploaded)}"
+
+    def send_attachment(self, external_chat_id, attachment, upload_key):
+        self.sent.append(attachment.artifact_id)
+        return f"om_{len(self.sent)}"
+
+    def send_failure_notice(self, external_chat_id, attachment, error_message):
+        raise AssertionError(error_message)
 
 
 class StaticPlanningRouter:
@@ -543,12 +565,12 @@ def test_task_runtime_persists_and_returns_node_tool_artifacts(tmp_path: Path) -
         run_result = runtime.run_turn(gateway_result.turn_id)
 
         assert run_result.status == "completed"
-        assert len(run_result.message.attachments) == 1
-        assert run_result.message.attachments[0].artifact_id == artifact_id
+        assert run_result.message.attachments == ()
         assert store.get_artifact(artifact_id) is not None
         raw_payload = store.list_messages(gateway_result.conversation_id)[-1].raw_payload
         assert raw_payload["artifacts"][0]["artifact_id"] == artifact_id
         assert raw_payload["attachments"][0]["artifact_id"] == artifact_id
+        assert "delivery_results" not in raw_payload
         promoted_path = Path(raw_payload["artifacts"][0]["path"])
         assert promoted_path.parent.name == "artifacts"
         assert promoted_path.parent.parent.parent == tmp_path / "sessions"
@@ -590,8 +612,7 @@ def test_task_runtime_persists_nested_tool_call_artifacts(tmp_path: Path) -> Non
         )
         run_result = runtime.run_turn(gateway_result.turn_id)
 
-        assert len(run_result.message.attachments) == 1
-        assert run_result.message.attachments[0].artifact_id == artifact_id
+        assert run_result.message.attachments == ()
         assert store.get_artifact(artifact_id) is not None
     finally:
         image_path.unlink(missing_ok=True)
@@ -600,6 +621,8 @@ def test_task_runtime_persists_nested_tool_call_artifacts(tmp_path: Path) -> Non
 def test_task_runtime_publishes_node_manifest_artifact_from_session_relative_path(tmp_path: Path) -> None:
     store = InMemoryConversationStore()
     gateway = GatewayService(conversation_store=store)
+    delivery_handler = FakeFeishuDeliveryHandler()
+    register_delivery_handler(delivery_handler)
     plan = ExecutionPlan(
         user_objective="生成报告",
         nodes=[PlanNode(id="write_report", runtime="react", objective="Write report")],
@@ -633,6 +656,70 @@ def test_task_runtime_publishes_node_manifest_artifact_from_session_relative_pat
     assert artifact["metadata"]["source_session_relative_path"].startswith("nodes/write_report/")
     assert Path(artifact["path"]).parent.name == "artifacts"
     assert store.get_artifact(artifact["artifact_id"]) is not None
+    assert raw_payload["delivery_results"][0]["artifact_id"] == artifact["artifact_id"]
+    assert raw_payload["delivery_results"][0]["ok"] is True
+    assert delivery_handler.uploaded == [artifact["artifact_id"]]
+    assert delivery_handler.sent == [artifact["artifact_id"]]
+    assert run_result.message.attachments == ()
+    assert "已发送文件" in run_result.message.content
+    tool_calls = store.list_tool_calls_by_turn(gateway_result.turn_id)
+    assert tool_calls[-1].tool_name == "deliver_file"
+    assert tool_calls[-1].status == "completed"
+    assert tool_calls[-1].input["artifact_id"] == artifact["artifact_id"]
+
+
+def test_delivery_aggregation_can_send_recent_artifact_context(tmp_path: Path) -> None:
+    store = InMemoryConversationStore()
+    delivery_handler = FakeFeishuDeliveryHandler()
+    register_delivery_handler(delivery_handler)
+    artifact_path = tmp_path / "previous-report.md"
+    artifact_path.write_text("# Previous\n\nbody", encoding="utf-8")
+    artifact_id = "artifact:previous:1"
+    store.upsert_artifact(
+        ToolArtifact(
+            artifact_id=artifact_id,
+            kind="file",
+            turn_id=100,
+            path=str(artifact_path),
+            mime_type="text/markdown",
+            filename=artifact_path.name,
+            size_bytes=artifact_path.stat().st_size,
+            source_tool="coder",
+        ),
+        conversation_id=7,
+    )
+
+    results = _deliver_aggregation_artifacts(
+        store=store,
+        aggregation=AggregationResult(
+            status="completed",
+            reply="已找到文档。",
+            artifact_refs=[f"artifact:{artifact_id}"],
+        ),
+        artifacts=[],
+        artifact_context=[
+            {
+                "artifact_id": artifact_id,
+                "kind": "file",
+                "turn_id": 100,
+                "path": str(artifact_path),
+                "mime_type": "text/markdown",
+                "filename": artifact_path.name,
+                "size_bytes": artifact_path.stat().st_size,
+                "source_tool": "coder",
+            }
+        ],
+        platform="feishu",
+        external_chat_id="chat_1",
+        conversation_id=7,
+        turn_id=101,
+    )
+
+    assert results[0]["ok"] is True
+    assert delivery_handler.sent == [artifact_id]
+    tool_calls = store.list_tool_calls_by_turn(101)
+    assert tool_calls[-1].tool_name == "deliver_file"
+    assert tool_calls[-1].input["artifact_id"] == artifact_id
 
 
 def test_task_runtime_rejects_absolute_path_in_node_manifest_artifact(tmp_path: Path) -> None:

@@ -652,6 +652,56 @@ def test_feishu_channel_sends_image_attachments_once(monkeypatch) -> None:
     assert json.loads(sent[1][2]) == {"image_key": "img_key_1"}
 
 
+def test_feishu_channel_uploads_and_sends_file_attachment(monkeypatch, tmp_path) -> None:
+    channel = FeishuChannel(app_id="app", app_secret="secret")
+    file_path = tmp_path / "report.md"
+    file_path.write_text("# Report\n\nbody", encoding="utf-8")
+    sent: list[tuple[str, str, str]] = []
+    posts: list[dict] = []
+
+    class FakeResponse:
+        status_code = 200
+        text = '{"code":0}'
+        headers = {}
+
+        def json(self):
+            return {"code": 0, "data": {"file_key": "file_key_1"}}
+
+    class FakeHttp:
+        def post(self, url, **kwargs):
+            posts.append({"url": url, **kwargs})
+            return FakeResponse()
+
+    monkeypatch.setattr(channel, "_ensure_token", lambda: "token")
+    channel._http = FakeHttp()
+    monkeypatch.setattr(
+        channel,
+        "_send_delivery",
+        lambda receive_id, delivery: sent.append((receive_id, delivery.msg_type, delivery.content))
+        or {"code": 0, "data": {"message_id": "om_file_1"}},
+    )
+
+    attachment = ChannelAttachment(
+        artifact_id="artifact:report",
+        kind="file",
+        path=str(file_path),
+        mime_type="text/markdown",
+        filename="report.md",
+        size_bytes=file_path.stat().st_size,
+        source_tool="coder",
+    )
+
+    upload_key = channel.upload_attachment(attachment)
+    message_id = channel.send_attachment("chat_1", attachment, upload_key)
+
+    assert upload_key == "file_key_1"
+    assert message_id == "om_file_1"
+    assert posts[0]["url"] == "https://open.feishu.cn/open-apis/im/v1/files"
+    assert posts[0]["data"]["file_type"] == "stream"
+    assert posts[0]["data"]["file_name"] == "report.md"
+    assert sent == [("chat_1", "file", '{"file_key": "file_key_1"}')]
+
+
 def test_feishu_channel_sends_attachments_when_structured_codex_approval_requested(monkeypatch) -> None:
     channel = FeishuChannel(app_id="app", app_secret="secret")
     updated: list[tuple[str, str]] = []

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import time
 from dataclasses import replace
@@ -8,7 +9,7 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.agent_react.artifact_context import artifact_records_to_context
-from app.agent_react.artifacts import artifact_to_payload, resolve_channel_attachments
+from app.agent_react.artifacts import artifact_from_payload, artifact_to_payload, resolve_channel_attachments
 from app.agent_react.context_manager import ContextManager
 from app.agent_react.session_state import (
     build_session_state_after_turn,
@@ -27,6 +28,8 @@ from app.observability import (
 from app.progress import ProgressReporter, ensure_progress
 from app.runtime_usage import collect_usage_records, usage_totals
 from app.runtime_types import ChannelMessage, ConversationStore, TurnResult
+from app.tools.common import ToolArtifact, ToolExecutionRequest
+from app.tools.deliver_file import deliver_file_with_store
 from app.task_runtime.approval_types import approval_request_dicts
 from app.task_runtime.artifacts import ArtifactPublisher
 from app.task_runtime.claude_react_runtime import ClaudeReactNodeExecuteRuntime, is_claude_agent_sdk_available
@@ -426,6 +429,16 @@ class TaskAgentRuntime:
                 instructions=[],
                 conversation_metadata=conversation.metadata,
             )
+            delivery_results = _deliver_aggregation_artifacts(
+                store=self._store,
+                aggregation=aggregation,
+                artifacts=artifact_records,
+                artifact_context=current_artifact_context,
+                platform=conversation.platform,
+                external_chat_id=conversation.external_chat_id,
+                conversation_id=turn.conversation_id,
+                turn_id=turn_id,
+            )
             artifact_resolution = resolve_channel_attachments(
                 artifact_records,
                 turn_id=turn_id,
@@ -466,6 +479,14 @@ class TaskAgentRuntime:
                 len(artifact_resolution.attachments),
                 len(artifact_resolution.rejected),
             )
+            for rejection in artifact_resolution.rejected:
+                logger.info(
+                    "task runtime artifact rejected turn_id=%s artifact_id=%s path=%s reason=%s",
+                    turn_id,
+                    rejection.artifact_id,
+                    rejection.path,
+                    rejection.reason,
+                )
             raw_payload = _trace_enriched_payload(
                 {
                     "source": "task_runtime",
@@ -483,6 +504,8 @@ class TaskAgentRuntime:
                 raw_payload["attachments"] = [attachment.__dict__ for attachment in artifact_resolution.attachments]
             if artifact_resolution.rejected:
                 raw_payload["artifact_rejections"] = [item.__dict__ for item in artifact_resolution.rejected]
+            if delivery_results:
+                raw_payload["delivery_results"] = delivery_results
             approval_requests = _approval_requests_from_aggregation(aggregation)
             if approval_requests:
                 raw_payload["approval_requests"] = approval_requests
@@ -493,7 +516,7 @@ class TaskAgentRuntime:
                 aggregation,
             )
             token_usage = usage_totals(usage_records)
-            reply = aggregation.reply
+            reply = _reply_with_delivery_summary(aggregation.reply, delivery_results)
             if usage_records:
                 raw_payload["usage_records"] = usage_records
             if token_usage is not None:
@@ -549,11 +572,12 @@ class TaskAgentRuntime:
                     content=reply,
                     content_type="markdown",
                     summary=reply,
-                    attachments=artifact_resolution.attachments,
+                    attachments=(),
                     metadata={
                         "conversation_id": turn.conversation_id,
                         "turn_id": turn_id,
                         "aggregation_status": aggregation.status,
+                        **({"delivery_results": delivery_results} if delivery_results else {}),
                         **({"usage_records": usage_records} if usage_records else {}),
                         **({"usage": token_usage} if token_usage is not None else {}),
                         **({"approval_requests": approval_requests} if approval_requests else {}),
@@ -777,6 +801,195 @@ def _fill_workspace_from_meta(workspace: dict[str, Any], meta: dict[str, Any]) -
         value = meta.get(source_key)
         if value is not None and not workspace.get(target_key):
             workspace[target_key] = str(value)
+
+
+def _deliver_aggregation_artifacts(
+    *,
+    store: ConversationStore,
+    aggregation: AggregationResult,
+    artifacts: list[ToolArtifact],
+    artifact_context: list[dict[str, Any]],
+    platform: str,
+    external_chat_id: str,
+    conversation_id: int,
+    turn_id: int,
+) -> list[dict[str, Any]]:
+    candidates = _delivery_artifact_candidates(artifacts, artifact_context)
+    selected = _artifacts_selected_for_delivery(
+        aggregation.artifact_refs,
+        candidates,
+    )
+    if not selected:
+        if aggregation.artifact_refs:
+            logger.warning(
+                "task runtime artifact delivery skipped turn_id=%s reason=no_matching_artifact_ref refs=%s candidate_count=%s",
+                turn_id,
+                aggregation.artifact_refs,
+                len(candidates),
+            )
+        return []
+
+    results: list[dict[str, Any]] = []
+    for artifact in selected:
+        request = ToolExecutionRequest(
+            tool_name="deliver_file",
+            workdir=None,
+            args={
+                "artifact_id": artifact.artifact_id,
+                "platform": platform,
+                "external_chat_id": external_chat_id,
+                "conversation_id": conversation_id,
+                "turn_id": turn_id,
+                "_delivery_purpose": "auto",
+            },
+        )
+        started = time.perf_counter()
+        tool_call = _create_delivery_tool_call(store, turn_id=turn_id, args=request.args)
+        tool_result = deliver_file_with_store(request, store)
+        payload = _delivery_payload(tool_result.stdout or tool_result.stderr)
+        _update_delivery_tool_call(store, tool_call, tool_result_ok=tool_result.ok, payload=payload, error=tool_result.stderr)
+        item = {
+            "artifact_id": artifact.artifact_id,
+            "filename": artifact.filename,
+            "artifact_ref": artifact.metadata.get("node_artifact_ref"),
+            "ok": tool_result.ok,
+            "status": payload.get("status") or ("sent" if tool_result.ok else "failed"),
+            "summary": tool_result.summary,
+            "error": tool_result.stderr if not tool_result.ok else "",
+            "elapsed_ms": int((time.perf_counter() - started) * 1000),
+            "results": payload.get("results") if isinstance(payload.get("results"), list) else [],
+        }
+        results.append(item)
+        logger.info(
+            "task runtime artifact delivery finished turn_id=%s artifact_id=%s filename=%s ok=%s status=%s elapsed_ms=%s",
+            turn_id,
+            artifact.artifact_id,
+            artifact.filename,
+            tool_result.ok,
+            item["status"],
+            item["elapsed_ms"],
+        )
+    return results
+
+
+def _delivery_artifact_candidates(
+    artifacts: list[ToolArtifact],
+    artifact_context: list[dict[str, Any]],
+) -> list[ToolArtifact]:
+    result: list[ToolArtifact] = []
+    seen: set[str] = set()
+    for artifact in artifacts:
+        if artifact.artifact_id in seen:
+            continue
+        result.append(artifact)
+        seen.add(artifact.artifact_id)
+    for payload in artifact_context:
+        artifact = artifact_from_payload(payload)
+        if artifact is None or artifact.artifact_id in seen:
+            continue
+        result.append(artifact)
+        seen.add(artifact.artifact_id)
+    return result
+
+
+def _create_delivery_tool_call(store: ConversationStore, *, turn_id: int, args: dict[str, Any]) -> Any | None:
+    create_tool_call = getattr(store, "create_tool_call", None)
+    if not callable(create_tool_call):
+        return None
+    try:
+        return create_tool_call(
+            turn_id=turn_id,
+            tool_name="deliver_file",
+            input=dict(args),
+            provider_tool_call_id=f"aggregation:deliver_file:{args.get('artifact_id')}",
+            step_index=0,
+        )
+    except Exception:
+        logger.exception("delivery tool call create failed turn_id=%s artifact_id=%s", turn_id, args.get("artifact_id"))
+        return None
+
+
+def _update_delivery_tool_call(
+    store: ConversationStore,
+    tool_call: Any | None,
+    *,
+    tool_result_ok: bool,
+    payload: dict[str, Any],
+    error: str,
+) -> None:
+    if tool_call is None:
+        return
+    update_tool_call = getattr(store, "update_tool_call", None)
+    if not callable(update_tool_call):
+        return
+    tool_call_id = getattr(tool_call, "id", None)
+    if tool_call_id is None:
+        return
+    try:
+        update_tool_call(
+            tool_call_id,
+            status="completed" if tool_result_ok else "failed",
+            output=payload,
+            error_message=error or None,
+        )
+    except Exception:
+        logger.exception("delivery tool call update failed tool_call_id=%s", tool_call_id)
+
+
+def _artifacts_selected_for_delivery(refs: list[str], artifacts: list[ToolArtifact]) -> list[ToolArtifact]:
+    if not refs:
+        return []
+    selected: list[ToolArtifact] = []
+    seen: set[str] = set()
+    for ref in refs:
+        for artifact in artifacts:
+            if artifact.artifact_id in seen:
+                continue
+            if not artifact.publish or artifact.kind not in {"file", "image"}:
+                continue
+            if _artifact_matches_ref(artifact, ref):
+                selected.append(artifact)
+                seen.add(artifact.artifact_id)
+    return selected
+
+
+def _artifact_matches_ref(artifact: ToolArtifact, ref: str) -> bool:
+    text = str(ref or "").strip()
+    normalized = text.removeprefix("artifact:").strip()
+    candidates = {
+        artifact.artifact_id,
+        str(artifact.metadata.get("node_artifact_ref") or "").strip(),
+        str(artifact.filename or "").strip(),
+        str(artifact.session_relative_path or "").strip(),
+    }
+    return normalized in {item for item in candidates if item}
+
+
+def _delivery_payload(value: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(value)
+    except (TypeError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _reply_with_delivery_summary(reply: str, delivery_results: list[dict[str, Any]]) -> str:
+    if not delivery_results:
+        return reply
+    sent = [item for item in delivery_results if item.get("ok")]
+    failed = [item for item in delivery_results if not item.get("ok")]
+    lines: list[str] = []
+    if sent:
+        lines.append("已发送文件：")
+        lines.extend(f"- {item.get('filename') or item.get('artifact_id')}" for item in sent)
+    if failed:
+        if lines:
+            lines.append("")
+        lines.append("文件发送失败：")
+        for item in failed:
+            reason = str(item.get("error") or item.get("summary") or "unknown").strip()
+            lines.append(f"- {item.get('filename') or item.get('artifact_id')}：{reason}")
+    return f"{reply.strip()}\n\n" + "\n".join(lines)
 
 
 def _runtime_temporal_hints(now: datetime | None = None) -> dict[str, str]:

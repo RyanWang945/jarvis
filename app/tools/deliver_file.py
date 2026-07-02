@@ -7,6 +7,10 @@ from app.tools.common import ToolArtifact, ToolExecutionRequest, ToolExecutionRe
 
 
 def run_deliver_file(request: ToolExecutionRequest) -> ToolExecutionResult:
+    return deliver_file_with_store(request, _conversation_store())
+
+
+def deliver_file_with_store(request: ToolExecutionRequest, store) -> ToolExecutionResult:
     from app.agent_react.artifacts import resolve_channel_attachments
     from app.agent_react.delivery import get_delivery_manager
 
@@ -21,7 +25,6 @@ def run_deliver_file(request: ToolExecutionRequest) -> ToolExecutionResult:
     if not platform or not external_chat_id:
         return ToolExecutionResult(ok=False, exit_code=None, stderr="delivery channel context is missing", summary="Missing delivery context.")
 
-    store = _conversation_store()
     artifact: ToolArtifact | None = None
     if artifact_id:
         record = getattr(store, "get_artifact", lambda _artifact_id: None)(artifact_id)
@@ -59,7 +62,12 @@ def run_deliver_file(request: ToolExecutionRequest) -> ToolExecutionResult:
     else:
         return ToolExecutionResult(ok=False, exit_code=None, stderr="artifact_id or path is required", summary="Missing file target.")
 
-    resolution = resolve_channel_attachments([artifact], turn_id=turn_id if artifact_id else None)
+    extra_allowed_roots = _artifact_allowed_roots(artifact) if artifact_id else []
+    resolution = resolve_channel_attachments(
+        [artifact],
+        turn_id=None,
+        extra_allowed_roots=extra_allowed_roots,
+    )
     if not resolution.attachments:
         reason = resolution.rejected[0].reason if resolution.rejected else "no_deliverable_attachment"
         update_status = getattr(store, "update_artifact_status", None)
@@ -109,3 +117,13 @@ def _path_digest(value: str) -> str:
     import hashlib
 
     return hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def _artifact_allowed_roots(artifact: ToolArtifact) -> list[Path]:
+    if not artifact.path:
+        return []
+    try:
+        path = Path(artifact.path).expanduser().resolve(strict=True)
+    except OSError:
+        return []
+    return [path.parent] if path.is_file() else []

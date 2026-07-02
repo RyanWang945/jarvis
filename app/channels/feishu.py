@@ -1032,20 +1032,28 @@ class FeishuChannel:
             )
 
     def upload_attachment(self, attachment: ChannelAttachment) -> str | None:
-        if attachment.kind != "image":
-            raise RuntimeError(f"unsupported attachment kind for feishu: {attachment.kind}")
-        return self._upload_image(attachment)
+        if attachment.kind == "image":
+            return self._upload_image(attachment)
+        if attachment.kind == "file":
+            return self._upload_file(attachment)
+        raise RuntimeError(f"unsupported attachment kind for feishu: {attachment.kind}")
 
     def send_attachment(self, external_chat_id: str, attachment: ChannelAttachment, upload_key: str | None) -> str | None:
-        if attachment.kind != "image":
-            raise RuntimeError(f"unsupported attachment kind for feishu: {attachment.kind}")
         if not upload_key:
-            raise RuntimeError("image upload key is required")
+            raise RuntimeError(f"{attachment.kind} upload key is required")
+        if attachment.kind == "image":
+            msg_type = "image"
+            content = {"image_key": upload_key}
+        elif attachment.kind == "file":
+            msg_type = "file"
+            content = {"file_key": upload_key}
+        else:
+            raise RuntimeError(f"unsupported attachment kind for feishu: {attachment.kind}")
         payload = self._send_delivery(
             external_chat_id,
             FeishuDelivery(
-                msg_type="image",
-                content=json.dumps({"image_key": upload_key}, ensure_ascii=False),
+                msg_type=msg_type,
+                content=json.dumps(content, ensure_ascii=False),
             ),
         )
         return _extract_message_id(payload)
@@ -1053,7 +1061,7 @@ class FeishuChannel:
     def send_failure_notice(self, external_chat_id: str, attachment: ChannelAttachment, error_message: str) -> None:
         self._send_text_message(
             external_chat_id,
-            f"图片已生成到本地，但上传飞书失败：{attachment.filename}\n本地路径：{attachment.path}",
+            f"文件已生成到本地，但上传飞书失败：{attachment.filename}\n本地路径：{attachment.path}\n原因：{error_message}",
         )
 
     def find_sent_delivery(
@@ -1226,6 +1234,33 @@ class FeishuChannel:
         if not isinstance(data, dict) or not data.get("image_key"):
             raise RuntimeError(f"feishu image upload missing image_key: {payload}")
         return str(data["image_key"])
+
+    def _upload_file(self, attachment: ChannelAttachment) -> str:
+        token = self._ensure_token()
+        path = Path(attachment.path)
+        with path.open("rb") as fh:
+            resp = self._http.post(
+                "https://open.feishu.cn/open-apis/im/v1/files",
+                headers={"Authorization": f"Bearer {token}"},
+                data={
+                    "file_type": _feishu_file_type(path),
+                    "file_name": attachment.filename or path.name,
+                },
+                files={"file": (attachment.filename or path.name, fh, attachment.mime_type)},
+            )
+        try:
+            payload = resp.json()
+        except ValueError:
+            payload = {"status_code": resp.status_code, "body": resp.text}
+        if resp.status_code >= 400:
+            log_id = resp.headers.get("x-tt-logid") or resp.headers.get("X-Tt-Logid")
+            raise RuntimeError(f"feishu file upload http_error status={resp.status_code} log_id={log_id} payload={payload}")
+        if payload.get("code") != 0:
+            raise RuntimeError(f"feishu file upload failed: {payload}")
+        data = payload.get("data")
+        if not isinstance(data, dict) or not data.get("file_key"):
+            raise RuntimeError(f"feishu file upload missing file_key: {payload}")
+        return str(data["file_key"])
 
     def _update_card_message(self, message_id: str, delivery: FeishuDelivery) -> None:
         if delivery.msg_type != "interactive":
@@ -1840,6 +1875,19 @@ def _selected_feishu_headers(resp: httpx.Response) -> dict[str, str]:
 
 def _feishu_log_id(resp: httpx.Response) -> str | None:
     return resp.headers.get("x-tt-logid") or resp.headers.get("X-Tt-Logid")
+
+
+def _feishu_file_type(path: Path) -> str:
+    suffix = path.suffix.lower().lstrip(".")
+    if suffix in {"doc", "docx"}:
+        return "doc"
+    if suffix in {"xls", "xlsx", "csv"}:
+        return "xls"
+    if suffix in {"ppt", "pptx"}:
+        return "ppt"
+    if suffix == "pdf":
+        return "pdf"
+    return "stream"
 
 
 def _json_object_or_none(value: str) -> dict[str, Any] | None:

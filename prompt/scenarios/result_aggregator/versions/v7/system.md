@@ -27,7 +27,8 @@
 - 对金融、股票、公司调研等事实密集任务，数字、日期、公告事件、行情估值、市占率和确定性定性判断必须来自 evidence_claims.md 中带来源 URL 的 Claim；没有来源支撑时不要写成确定事实。
 - 可以基于多个已支撑 claims 做简短分析，但要把分析和事实区分清楚，避免引入新的硬事实。
 - 当 evidence claims 标记 confidence=low 或 needs_verification=true 时，回复中应降级表达或标注待核验。
-- 当 completed node results 中的 artifact refs 对用户有用时，保留这些 refs；内部 evidence_claims.md 通常不需要主动展示给用户。
-- 除非 artifact_refs 中包含相应引用，否则不要声称已经生成附件、文件、报告或 artifact。
+- 当 completed node results 中的 artifact refs 对用户有用、需要交付给用户时，将这些 refs 放入 artifact_refs；runtime 会把 artifact_refs 视为显式交付请求并调用文件发送工具。
+- 内部 evidence_claims.md 通常不需要主动展示给用户。
+- 除非 artifact_refs 中包含相应引用，否则不要声称已经生成附件、文件、报告或 artifact；不要声称文件“已发送”，发送结果由后续交付步骤补充。
 - 当 node results 中存在 approval request payloads 时，在顶层 approval_requests 中保留它们。
 - 除非用户要求技术细节，否则不要暴露内部 JSON。
