@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 
 from app.skills.loader import SkillPackageLoader
 from app.task_runtime.planner_skills import _selection_from_payload
@@ -52,6 +53,48 @@ def test_planner_skill_selection_ignores_unknown_or_null_skill(tmp_path: Path) -
     assert none.reason == "general"
 
 
+def test_skill_loader_selects_version_from_config(tmp_path: Path) -> None:
+    skills_root = tmp_path / "skills"
+    _write_versioned_planner_skill(skills_root, "code-planning", "v1", guidance="Plan v1.")
+    _write_versioned_planner_skill(skills_root, "code-planning", "v2", guidance="Plan v2.")
+    (skills_root / "config.json").write_text(
+        json.dumps({"default_versions": {"code-planning": "v1"}, "profiles": {}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    [package] = SkillPackageLoader([skills_root]).load()
+
+    assert package.skill.skill_id == "code-planning"
+    assert package.skill.manifest.version == "v1"
+    assert package.skill.manifest.planning_guidance == "Plan v1."
+
+
+def test_skill_loader_selects_version_from_env_var(monkeypatch, tmp_path: Path) -> None:
+    skills_root = tmp_path / "skills"
+    _write_versioned_planner_skill(skills_root, "code-planning", "v1", guidance="Plan v1.")
+    _write_versioned_planner_skill(skills_root, "code-planning", "v2", guidance="Plan v2.")
+    monkeypatch.setenv("JARVIS_SKILL_CODE_PLANNING_VERSION", "v2")
+
+    [package] = SkillPackageLoader([skills_root]).load()
+
+    assert package.skill.skill_id == "code-planning"
+    assert package.skill.manifest.version == "v2"
+    assert package.skill.manifest.planning_guidance == "Plan v2."
+
+
+def test_skill_loader_selects_version_from_mapping_env(monkeypatch, tmp_path: Path) -> None:
+    skills_root = tmp_path / "skills"
+    _write_versioned_planner_skill(skills_root, "code-planning", "v1", guidance="Plan v1.")
+    _write_versioned_planner_skill(skills_root, "code-planning", "v2", guidance="Plan v2.")
+    monkeypatch.setenv("JARVIS_SKILL_VERSIONS", json.dumps({"code-planning": "v2"}))
+
+    [package] = SkillPackageLoader([skills_root]).load()
+
+    assert package.skill.skill_id == "code-planning"
+    assert package.skill.manifest.version == "v2"
+    assert package.skill.manifest.planning_guidance == "Plan v2."
+
+
 def _planner_skill(tmp_path: Path, skill_id: str, *, guidance: str = "Plan as code work."):
     skill_dir = tmp_path / skill_id
     skill_dir.mkdir()
@@ -65,3 +108,17 @@ def _planner_skill(tmp_path: Path, skill_id: str, *, guidance: str = "Plan as co
         encoding="utf-8",
     )
     return SkillPackageLoader([]).load_package(skill_dir).skill
+
+
+def _write_versioned_planner_skill(root: Path, skill_id: str, version: str, *, guidance: str) -> None:
+    skill_dir = root / skill_id / "versions" / version
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        f"description: {skill_id} {version}\n"
+        "skill_type: planner\n"
+        f"planning_guidance: {guidance}\n"
+        "---\n\n"
+        f"Body {version}.\n",
+        encoding="utf-8",
+    )
