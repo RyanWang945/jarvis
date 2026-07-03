@@ -21,6 +21,11 @@ from app.observability import add_event, content_capture_enabled, set_attributes
 from app.prompting import PromptRegistry
 from app.task_runtime.node_result import NodeArtifact, NodeError, NodeResult
 from app.task_runtime.planner import PlanNode
+from app.task_runtime.react_prompting import (
+    build_react_user_prompt,
+    build_runtime_skill_system_section,
+    select_runtime_skills,
+)
 from app.task_runtime.runtime_context import RuntimeContext
 from app.tools.runtime import list_tool_definitions
 
@@ -148,9 +153,14 @@ def _execute(
             "claude-agent-sdk is not installed. Run: pip install claude-agent-sdk",
         )
 
+    selected_runtime_skills = select_runtime_skills(
+        context,
+        available_tool_names=_claude_allowed_jarvis_tool_names(context),
+    )
+
     # Build the system prompt (reuses existing react_node_execute template).
-    system_prompt = _build_system_prompt(context)
-    prompt_text = _build_user_prompt(context)
+    system_prompt = _build_system_prompt(context, selected_runtime_skills=selected_runtime_skills)
+    prompt_text = _build_user_prompt(context, selected_runtime_skills=selected_runtime_skills)
 
     # Resolve model and endpoint.
     model_name = "deepseek-v4-pro"
@@ -802,6 +812,10 @@ def _claude_react_tool_definitions(context) -> list[Any]:
     ]
 
 
+def _claude_allowed_jarvis_tool_names(context) -> set[str]:
+    return {tool.name for tool in _claude_react_tool_definitions(context)}
+
+
 def _claude_disallowed_tools(context) -> list[str]:
     tools = list(_CLAUDE_ALWAYS_DISALLOWED_TOOLS)
     if getattr(context.node, "mode", "read") != "write":
@@ -989,13 +1003,19 @@ def _record_claude_tool_span(
 # ---------------------------------------------------------------------------
 
 
-def _build_system_prompt(context) -> str:
+def _build_system_prompt(context, *, selected_runtime_skills=None) -> str:
     """Build the system prompt for Claude Agent SDK.
 
     Adapts the existing react_node_execute prompt template, removing
     the JSON-output-at-the-end instruction since Claude Agent SDK
     handles its own output formatting.
     """
+    if selected_runtime_skills is None:
+        selected_runtime_skills = select_runtime_skills(
+            context,
+            available_tool_names=_claude_allowed_jarvis_tool_names(context),
+        )
+
     # Load the existing system prompt template content
     try:
         bundle = PromptRegistry().load("react_node_execute")
@@ -1027,6 +1047,9 @@ def _build_system_prompt(context) -> str:
     # Adapt the prompt for Claude Agent SDK environment.
     # Appended instruction guides the agent toward a final structured answer.
     parts = [system_text.strip()]
+    skill_section = build_runtime_skill_system_section(selected_runtime_skills or [])
+    if skill_section:
+        parts.append(skill_section)
     if temporal_line:
         parts.append(temporal_line)
     parts.append(_FINAL_RESPONSE_GUIDANCE)
@@ -1034,24 +1057,18 @@ def _build_system_prompt(context) -> str:
     return adapted
 
 
-def _build_user_prompt(context) -> str:
-    """Build the user prompt as a JSON payload string (same format as existing runtime)."""
-    from app.task_runtime.node_execute_runtime import _temporal_context
+def _build_user_prompt(context, *, selected_runtime_skills=None) -> str:
+    """Build the task prompt passed to Claude Agent SDK."""
 
-    payload = {
-        "node": context.node.model_dump(mode="json"),
-        "resolved_inputs": [
-            item.model_dump(mode="json", exclude_none=True)
-            for item in (context.resolved_inputs or [])
-        ],
-        "temporal_context": _temporal_context(
-            getattr(context, "runtime_context", None)
-            or RuntimeContext.from_hints(context.legacy_hints)
-        ),
-        "runtime_context": getattr(context, "legacy_hints", {}),
-        "instructions": getattr(context, "instructions", []),
-    }
-    return json.dumps(payload, ensure_ascii=False)
+    if selected_runtime_skills is None:
+        selected_runtime_skills = select_runtime_skills(
+            context,
+            available_tool_names=_claude_allowed_jarvis_tool_names(context),
+        )
+    return build_react_user_prompt(
+        context,
+        selected_runtime_skills=selected_runtime_skills,
+    )
 
 
 def _build_temporal_context_line(context) -> str:

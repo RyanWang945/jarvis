@@ -263,7 +263,7 @@ def test_react_node_execute_runtime_runs_tool_loop() -> None:
     assert "deliver_file" in tool_names
     assert chat.calls[0]["messages"][0].role == "system"
     assert "最新" in chat.calls[0]["messages"][0].content
-    assert "temporal_context" in chat.calls[0]["messages"][1].content
+    assert "## Time Context" in chat.calls[0]["messages"][1].content
     assert "2026-05-25" in chat.calls[0]["messages"][1].content
     assert chat.calls[1]["messages"][-1].role == "tool"
     assert "trace evidence" in chat.calls[1]["messages"][-1].content

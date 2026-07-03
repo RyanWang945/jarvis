@@ -121,9 +121,9 @@
     }
   },
   "tavily_search": {
-    "description": "使用 Tavily AI Search API 搜索网页。当用户询问当前事件、事实或任何需要互联网最新信息的内容时使用。它也可以查找已索引的 X/Twitter 页面或 X/Twitter 活动的网页/新闻报道；当用户明确要求直接 X/Twitter 帖子时，优先使用专用 x_search 工具。每个问题只搜索一次。收到结果后，立即总结并回复用户。不要对同一主题重复搜索。",
+    "description": "使用 Tavily AI Search API 搜索网页。当用户询问当前事件、事实或任何需要互联网最新信息的内容时使用。不要盲目复制很短、歧义或强时效性的用户原话；应根据真实信息需求构造 query。对于价格、行情、汇率、赛程、政策、软件版本、商品库存等时间敏感事实，在 query 中加入 today/current/live/latest 或具体当前日期，优先数据页、行情页、官方页、源头页和带明确更新时间的页面，避免旧新闻和 SEO 摘要。可以为同一主题用少量不同 phrasing 搜索以校验时效和口径。它也可以查找已索引的 X/Twitter 页面或 X/Twitter 活动的网页/新闻报道；当用户明确要求直接 X/Twitter 帖子时，优先使用专用 x_search 工具。收到结果后，检查标题、snippet、日期、来源类型、单位、更新时间和结果是否真的包含所需数值；如果无法确认新鲜度，应把不确定性返回给下游，而不是包装成实时事实。",
     "properties": {
-      "query": "搜索 query 字符串。",
+      "query": "搜索 query 字符串。短查询、强时效查询或歧义查询不要直接照抄用户原话；自行加入具体对象、口径、today/current/live/latest 或当前日期等约束。",
       "search_depth": "'basic' 表示快速结果（1-2 秒），'advanced' 表示更全面研究（5-10 秒）。",
       "topic": "'general' 表示广泛网页搜索，'news' 表示最近 7 天的当前事件。",
       "max_results": "最多返回结果数（1-10）。",

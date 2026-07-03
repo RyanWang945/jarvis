@@ -42,13 +42,18 @@
 - 节点表示可交给某个 runtime 完成的一段工作，不表示工具调用、命令、文件操作、搜索查询、重试或推理步骤。
 - 不要创建只用于最终总结、润色、汇总或格式化的 node。
 - 通常不超过 3 个 nodes；复杂任务可以按 skill 规则增加，但必须保持粗粒度。
-- 每个 node 必须自包含，写清目标、限制、上下文和期望输出。
+- 每个 node 必须自包含，写清目标、限制、上下文和期望输出；优先写进 objective，不依赖 output_hint。
+- 对需要外部网页信息、当前事实、行情、价格、政策、新闻、天气、版本、库存或赛程的 react read node，objective 必须说明：
+  - 这是证据收集任务，不是最终用户回复任务。
+  - 默认口径或关键假设。
+  - 时效性要求。
+  - 旧数据或不确定数据不能包装成当前确定数据。
 - input_refs 只能引用已有 artifact、previous node result、明确解析出的 branch，或本计划中的 node。
 
 ## Skill 使用
 
 - planner_skill_section 是领域规划规则，不是 runtime 执行说明。
-- skill 只能影响 routing、mode、拆分、资源绑定和 output_hint。
+- skill 只能影响 routing、mode、拆分、资源绑定和 objective。
 - 多个 skill 同时适用时，按主要交付物拆分节点。例如：先 research 后 code，生成 research node 和 code node；不要把 research 细节塞进 code node。
 - skill 规则与主 planner 冲突时，以主 planner 的 schema、安全边界、available runtime 和 resource 约束为准。{{#planner_skill_section}}
 
@@ -66,9 +71,6 @@
 
 {
   "user_objective": "string",
-  "finalization_hint": {
-    "user_facing": false
-  },
   "nodes": [
     {
       "id": "string",
@@ -76,8 +78,7 @@
       "mode": "read | write | publish",
       "objective": "string",
       "repo_id": "string（仅需要仓库能力时使用）",
-      "input_refs": ["artifact:A1", "node:node_id", "branch:repo_branch"],
-      "output_hint": "string"
+      "input_refs": ["artifact:A1", "node:node_id", "branch:repo_branch"]
     }
   ]
 }

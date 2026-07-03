@@ -31,6 +31,11 @@ from app.task_runtime.coder_provider import (
 from app.task_runtime.node_finalizer import CodeNodeFinalizer, LLMCodeNodeFinalizerAgent
 from app.task_runtime.node_result import NodeArtifact, NodeError, NodeResult, ResolvedInput
 from app.task_runtime.planner import PlanNode
+from app.task_runtime.react_prompting import (
+    build_react_user_prompt,
+    build_runtime_skill_system_section,
+    select_runtime_skills,
+)
 from app.task_runtime.runtime_context import (
     RuntimeContext,
     truncate,
@@ -718,16 +723,24 @@ def _llm_messages(context: NodeExecutionContext) -> list[LLMMessage]:
 
 
 def _react_messages(context: NodeExecutionContext) -> list[LLMMessage]:
-    payload = {
-        "node": context.node.model_dump(mode="json"),
-        "resolved_inputs": [item.model_dump(mode="json", exclude_none=True) for item in context.resolved_inputs],
-        "temporal_context": _temporal_context(context.runtime_context),
-        "runtime_context": context.legacy_hints,
-        "instructions": context.instructions,
-    }
-    messages = PromptRegistry().load("react_node_execute").render(
-        {"input_json": json.dumps(payload, ensure_ascii=False)}
+    selected_skills = select_runtime_skills(
+        context,
+        available_tool_names=_react_allowed_tool_names(context),
     )
+    messages = PromptRegistry().load("react_node_execute").render(
+        {
+            "input_json": build_react_user_prompt(
+                context,
+                selected_runtime_skills=selected_skills,
+            )
+        }
+    )
+    skill_section = build_runtime_skill_system_section(selected_skills)
+    if skill_section:
+        for message in messages:
+            if message.role == "system":
+                message.content = f"{message.content.strip()}\n\n{skill_section}"
+                break
     skill_listing = _skill_listing_message()
     if skill_listing is not None:
         messages.append(skill_listing)

@@ -423,6 +423,9 @@ reply 字段必须是干净的 Markdown，不要输出纯文本伪表格。
 如果 Markdown 表格证据过长，使用简洁的 Markdown 小节和 bullet lists。
 除非 artifact_refs 非空且引用了附件、报告或 artifact，否则不要声称它们存在。
 不要编造 execution_report 中不存在的事实。对不确定或时间敏感的事实要明确标注。
+如果 node results 的 data.uncertainties 非空，reply 必须体现这些不确定性。
+时间敏感信息缺少 timestamp、trading date、publication date、update context 或 source 时，不要包装成确定实时信息。
+如果 evidence 显示旧数据、滞后数据或 freshness_assessment=stale/uncertain，必须降级表达并说明限制。
 如果 user message payload 中包含 evidence_artifacts，优先基于其中的 evidence_claims.md Markdown 证据表汇总；金融、股票、公告、行情和财务数字没有来源 URL 支撑时不要写成确定事实。
 如果 execution_report 表明工作失败或被阻塞，说明具体失败原因或缺失输入，不要泛泛道歉。
 不要调用工具。只使用 user message 提供的 JSON payload。

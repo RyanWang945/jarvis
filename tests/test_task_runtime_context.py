@@ -128,9 +128,11 @@ def test_node_execute_prompt_payload_uses_runtime_context() -> None:
     )
 
     llm_payload = json.loads(_llm_messages(context)[1].content)
-    react_payload = json.loads(_react_messages(replace(context, node=PlanNode(id="research", runtime="react", objective="Research")))[1].content)
+    react_prompt = _react_messages(replace(context, node=PlanNode(id="research", runtime="react", objective="Research")))[1].content
 
     assert llm_payload["runtime_context"]["active_repo"] == "jarvis"
-    assert react_payload["runtime_context"]["active_repo"] == "jarvis"
+    assert "## Task" in react_prompt
+    assert "节点目标：\nResearch" in react_prompt
+    assert "active_repo" not in react_prompt
     assert "runtime_hints" not in llm_payload
-    assert "runtime_hints" not in react_payload
+    assert "runtime_hints" not in react_prompt

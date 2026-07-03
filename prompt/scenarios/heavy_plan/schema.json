@@ -14,7 +14,7 @@
       "items": {
         "type": "object",
         "additionalProperties": true,
-        "required": ["id", "runtime", "mode", "objective", "input_refs", "output_hint"],
+        "required": ["id", "runtime", "mode", "objective", "input_refs"],
         "properties": {
           "id": {
             "type": "string"

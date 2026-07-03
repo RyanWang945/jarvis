@@ -11,15 +11,12 @@
 - 只能使用 runtime_context.available_runtimes 中列出的 runtime values。
 - input_refs 只能引用 artifacts、previous_node_results 或本 plan 中存在的 node。
 - repo_id 只能来自 registered_repositories；react node 不要设置 repo_id。
-- 不要输出 tool_name、runtime_hints、provider、markdown、注释、隐藏推理或额外字段。
-- finalization_hint 只包含 user_facing；已规划的 react/coder/多 node 设为 false。
+- 不要输出 tool_name、runtime_hints、provider、finalization_hint、output_hint、markdown、注释、隐藏推理或额外字段。
+- 对需要外部网页信息、当前事实、行情、价格、政策、新闻、天气、版本、库存或赛程的 react read node，把默认口径、时效性要求和旧数据处理边界写入 objective。
 
 输出结构：
 {
   "user_objective": "string",
-  "finalization_hint": {
-    "user_facing": false
-  },
   "nodes": [
     {
       "id": "string",
@@ -27,8 +24,7 @@
       "mode": "read | write",
       "objective": "string",
       "repo_id": "string（仅 coder nodes 使用；react 省略）",
-      "input_refs": ["artifact:A1", "node:node_id"],
-      "output_hint": "string"
+      "input_refs": ["artifact:A1", "node:node_id"]
     }
   ]
 }

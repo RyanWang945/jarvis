@@ -817,12 +817,33 @@ class TestPromptConstruction:
         from app.task_runtime.claude_react_runtime import _build_user_prompt
 
         prompt = _build_user_prompt(_context())
-        data = json.loads(prompt)
-        assert "user_objective" not in data
-        assert "node" in data
-        assert "resolved_inputs" in data
-        assert "temporal_context" in data
-        assert "instructions" in data
+        assert prompt.startswith("你正在执行一个 Jarvis React 节点")
+        assert "## Task" in prompt
+        assert "节点 ID：" in prompt
+        assert "## Time Context" in prompt
+        assert "## Resolved Inputs" in prompt
+        assert "user_objective" not in prompt
+
+    def test_gold_price_prompt_selects_web_search_skill(self):
+        from app.task_runtime.claude_react_runtime import _build_system_prompt, _build_user_prompt
+
+        context = _context(
+            node=_plan_node(
+                id="check_gold_price",
+                objective=(
+                    "收集当前黄金行情证据，供最终回复使用。用户未指定口径，默认优先查看国际现货黄金 XAU/USD；"
+                    "如能获取可靠来源，再补充国内人民币/克口径。必须判断数据时效性，旧数据不能包装成当前数据。"
+                    "不要直接生成最终用户回复。"
+                ),
+            )
+        )
+
+        user_prompt = _build_user_prompt(context)
+        system_prompt = _build_system_prompt(context)
+
+        assert "- runtime/web-search" in user_prompt
+        assert "Runtime Skill: Web Search" in system_prompt
+        assert "旧数据不能包装成当前数据" in user_prompt
 
     def test_endpoint_resolution_deepseek(self):
         from app.task_runtime.claude_react_runtime import _resolve_claude_endpoint
