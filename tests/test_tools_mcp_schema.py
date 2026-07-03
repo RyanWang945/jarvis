@@ -1,4 +1,10 @@
-from app.tools.mcp.schema import MAX_TOOL_NAME_LENGTH, mcp_input_schema, qualify_tool_name, sanitize_json_schema
+from app.tools.mcp.schema import (
+    MAX_TOOL_NAME_LENGTH,
+    mcp_input_schema,
+    mcp_tool_description,
+    qualify_tool_name,
+    sanitize_json_schema,
+)
 
 
 def test_qualify_tool_name_sanitizes_and_hashes_long_names() -> None:
@@ -35,3 +41,11 @@ def test_sanitize_json_schema_adds_array_items() -> None:
     schema = sanitize_json_schema({"type": "array"})
 
     assert schema == {"type": "array", "items": {"type": "string"}}
+
+
+def test_mcp_tool_description_uses_server_description_verbatim() -> None:
+    official_description = "宏观及行业经济指标数据查询工具，主要覆盖大宗商品数据。"
+
+    description = mcp_tool_description("ifind_edb", {"name": "get_edb_data", "description": official_description})
+
+    assert description == official_description

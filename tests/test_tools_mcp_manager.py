@@ -3,7 +3,7 @@ from typing import Any
 
 from app.tools.common import ToolExecutionRequest
 from app.tools.mcp.config import McpServerConfig
-from app.tools.mcp.http_client import _parse_sse_json
+from app.tools.mcp.http_client import HttpMcpClient, _parse_sse_json
 from app.tools.mcp.manager import McpToolManager
 
 
@@ -62,6 +62,47 @@ def test_parse_sse_json_uses_first_data_event() -> None:
 
     assert parsed["id"] == 1
     assert parsed["result"]["ok"] is True
+
+
+def test_http_client_uses_configured_protocol_version_header() -> None:
+    captured: dict[str, Any] = {}
+
+    class FakeResponse:
+        headers: dict[str, str] = {}
+        status_code = 204
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class FakeStream:
+        def __enter__(self) -> FakeResponse:
+            return FakeResponse()
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+            return None
+
+    class FakeHttpClient:
+        def stream(self, method: str, url: str, **kwargs: Any) -> FakeStream:
+            captured["method"] = method
+            captured["url"] = url
+            captured["headers"] = kwargs["headers"]
+            return FakeStream()
+
+        def close(self) -> None:
+            return None
+
+    client = HttpMcpClient(
+        McpServerConfig(
+            name="ifind_stock",
+            url="https://api-mcp.51ifind.com:8643/ds-mcp-servers/hexin-ifind-ds-stock-mcp",
+            protocol_version="2025-03-26",
+        )
+    )
+    client._client = FakeHttpClient()  # type: ignore[assignment]
+
+    client._post({"jsonrpc": "2.0", "method": "notifications/initialized"}, timeout=1, allow_empty=True)
+
+    assert captured["headers"]["MCP-Protocol-Version"] == "2025-03-26"
 
 
 def test_manager_registers_filtered_mcp_tools_and_executes_original_tool_name() -> None:

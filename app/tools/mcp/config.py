@@ -17,6 +17,7 @@ class McpServerConfig:
     name: str
     url: str
     transport: str = "streamable_http"
+    protocol_version: str = "2024-11-05"
     enabled: bool = True
     required: bool = False
     startup_timeout_sec: float = 10.0
@@ -108,6 +109,10 @@ def _load_server(name: str, item: dict[str, Any], *, settings: Settings) -> McpS
 
     http_headers = _string_map(item.get("http_headers") or item.get("headers") or {}, f"{name}.http_headers")
     env_http_headers = _string_map(item.get("env_http_headers") or {}, f"{name}.env_http_headers")
+    for header, env_name in env_http_headers.items():
+        value = _config_var_value(env_name, settings=settings)
+        if value:
+            http_headers.setdefault(header, value)
     enabled_tools = _optional_string_tuple(item.get("enabled_tools"), f"{name}.enabled_tools")
     disabled_tools = _string_tuple(item.get("disabled_tools"), f"{name}.disabled_tools")
 
@@ -115,6 +120,7 @@ def _load_server(name: str, item: dict[str, Any], *, settings: Settings) -> McpS
         name=name,
         url=expanded_url,
         transport=transport,
+        protocol_version=_optional_string(item.get("protocol_version")) or "2024-11-05",
         enabled=bool(item.get("enabled", True)),
         required=bool(item.get("required", False)),
         startup_timeout_sec=_positive_float(item.get("startup_timeout_sec"), default=10.0),
@@ -167,14 +173,24 @@ _CONFIG_VAR_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 def _expand_config_vars(value: str, *, settings: Settings) -> str:
     def replace(match: re.Match[str]) -> str:
         name = match.group(1)
-        env_value = os.getenv(name)
+        env_value = _config_var_value(name, settings=settings)
         if env_value is not None:
             return env_value
-        if name == "JARVIS_TUSHARE_TOKEN" and settings.tushare_token:
-            return settings.tushare_token
         return match.group(0)
 
     return os.path.expandvars(_CONFIG_VAR_PATTERN.sub(replace, value))
+
+
+def _config_var_value(name: str, *, settings: Settings) -> str | None:
+    env_value = os.getenv(name)
+    if env_value is not None:
+        return env_value
+    if name.startswith("JARVIS_"):
+        setting_name = name.removeprefix("JARVIS_").lower()
+        value = getattr(settings, setting_name, None)
+        if value is not None:
+            return str(value)
+    return None
 
 
 def _is_tushare_server(config: McpServerConfig) -> bool:

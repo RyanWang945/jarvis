@@ -27,7 +27,7 @@ class HttpMcpClient:
             response = self._request_locked(
                 "initialize",
                 {
-                    "protocolVersion": "2024-11-05",
+                    "protocolVersion": self.config.protocol_version,
                     "capabilities": {},
                     "clientInfo": {
                         "name": "jarvis",
@@ -100,7 +100,7 @@ class HttpMcpClient:
         headers = {
             "Accept": "application/json, text/event-stream",
             "Content-Type": "application/json",
-            "MCP-Protocol-Version": "2024-11-05",
+            "MCP-Protocol-Version": self.config.protocol_version,
             **self.config.request_headers(),
         }
         if self._session_id:

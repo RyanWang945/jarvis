@@ -1,15 +1,24 @@
 ---
 name: A股股票指标规划
 description: 用于 A 股股票基础行情、股本、财务指标、估值指标和简单派生指标计算的 planner skill。
-when_to_use: 用户要求分析 A 股、股票代码、上市公司行情估值、PE/PB/市值/ROE/毛利率/净利率等简单金融指标，尤其需要结合 Tushare MCP 或公开行情数据计算。
+when_to_use: 用户要求分析 A 股、股票代码、上市公司行情估值、PE/PB/市值/ROE/毛利率/净利率等简单金融指标，尤其需要结合 iFinD MCP、Tushare MCP 或公开行情数据计算。
 skill_type: planner
 user_invocable: false
 disable_model_invocation: true
-routing_summary: 适用于 A 股股票分析、行情估值、股本市值、财务指标和简单派生指标计算；优先使用 Tushare MCP 获取结构化数据。
+routing_summary: 适用于 A 股股票分析、行情估值、股本市值、财务指标和简单派生指标计算；优先使用 iFinD MCP 获取结构化数据，Tushare MCP 作为补充或交叉验证。
 planning_guidance: |
-  A 股股票分析任务应优先规划结构化市场数据节点，使用可用 MCP 工具（尤其是 tushareMcp）获取行情、股本和财务数据；网页搜索只作为公告、行业、风险和交叉验证补充。
+  A 股股票分析任务应优先规划结构化市场数据节点，使用可用 MCP 工具获取行情、股本和财务数据；当前优先级为 iFinD MCP > Tushare MCP > 公开网页/公告补充。网页搜索只作为公告、行业、风险和交叉验证补充。
 
-  如果 runtime_context 的可用工具包含 tushareMcp 相关 MCP 工具，Planner 应生成一个 react mode=write 节点 collect_market_data，用于：
+  如果 runtime_context 的可用工具包含 `mcp__ifind_stock__...` 相关 MCP 工具，Planner 应生成一个 react mode=write 节点 collect_market_data，优先使用：
+  - `mcp__ifind_stock__get_stock_info`：证券身份、上市日期、基础资料。
+  - `mcp__ifind_stock__get_stock_performance`：日频行情与技术指标。
+  - `mcp__ifind_stock__get_stock_shareholders`：股本结构、股东数据。
+  - `mcp__ifind_stock__get_stock_financials`：财务数据和衍生财务指标。
+  - `mcp__ifind_stock__get_risk_indicators`：定量风险指标。
+  - `mcp__ifind_stock__get_stock_events`：重大事件类指标。
+  - `mcp__ifind_stock__stock_highfreq_quotes`：交易日日内实时/高频行情；仅在用户询问当前价、盘中、分时、1分钟/5分钟等需求时使用。
+
+  如果 runtime_context 没有 iFinD 工具但包含 tushareMcp 相关 MCP 工具，Planner 应回退使用 Tushare MCP。collect_market_data 节点用于：
   - 确认证券身份：股票代码、交易所、公司简称、上市日期。
   - 获取交易日行情：收盘价、涨跌幅、成交量、成交额。
   - 获取每日指标或股本结构：总股本、流通股本、总市值、流通市值、PE、PB（如 MCP 提供）。
@@ -21,7 +30,7 @@ planning_guidance: |
   - value：数值，必须是阿拉伯数字，不要混入单位。
   - unit：统一单位，例如 CNY/share, share, 100m_CNY, CNY, pct, times。
   - date_or_period：交易日或报告期。
-  - source：例如 tushare:daily, tushare:daily_basic, tushare:fina_indicator, filing, web。
+  - source：例如 ifind:get_stock_performance, ifind:get_stock_financials, tushare:daily, tushare:daily_basic, tushare:fina_indicator, filing, web。
   - note：口径说明或待核验说明。
 
   简单 A 股指标计算公式：
